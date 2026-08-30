@@ -1,0 +1,74 @@
+# In git the image points at a moving TAG; the PUBLISHED chart pins a DIGEST,
+# rewritten by ci-release at package time (D65).
+image:
+  repository: ghcr.io/yadgarhq/gateway
+  tag: latest
+
+# At least two, always (D55) — load-bearing here too: Envoy Gateway balances
+# ordinary L4/L7 traffic across whatever the Service has, so a single replica
+# would make every request a single point of failure at the one place all
+# traffic already funnels through.
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+# gateway's only upstream today (D16): the task logic service, over gRPC.
+task:
+  host: task
+  port: 50052
+
+# DEVELOPMENT ONLY. gateway refuses to boot unless EITHER this is true OR an
+# iam address is configured — there is no third, safer default, because a
+# gateway that boots with neither would accept every caller's self-asserted
+# identity silently rather than loudly. Setting this trusts identity the
+# caller attaches to its own request, with nothing behind it verifying that
+# claim. This value exists only because `iam` does not yet: the moment it
+# ships, this flag and the env var it drives are deleted, not merely defaulted
+# to false — a false default left in place is a setting someone can still
+# flip in a real deployment.
+trustUnauthenticatedHeaders: true
+
+# D68: scale on CONCURRENCY, not CPU. gateway is a synchronous, sync-gRPC-class
+# service in D68's table — it waits on `task` for every call, so it saturates
+# at low CPU exactly like the logic services it fronts.
+#
+# The signal is call RATE per replica, read from D67's metrics — the same
+# `yadgar_calls_total` series every service emits, scoped to this chart's name.
+# Rate rather than an in-flight gauge because nothing tracks in-flight requests
+# yet: rate is what the instrumentation actually exposes today, and pretending
+# otherwise would give a scaler that reads nothing. Stated here rather than
+# silently substituted.
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  # At least two, always (D55) — the floor is a correctness property, not a
+  # tuning knob: one replica makes a class of defect unreachable.
+  maxReplicas: 6
+  # Calls per second per replica before adding one.
+  threshold: "10"
+  prometheusAddress: http://prometheus-server.observability.svc.cluster.local
+
+# The Service this chart creates. Named here because the HTTPRoute forwards to
+# it by port number, and two literals that must agree are one literal too many.
+service:
+  port: 8080
+
+# Where this service attaches to the TLS edge (D71). The Gateway and its
+# certificate live in yadgarhq/deploy — shared edge infrastructure outlives any
+# one module — while the HTTPRoute lives in this chart, so the route and the
+# backend it names share a lifecycle.
+#
+# `listener` is the Gateway's listener NAME, not just the Gateway: a Gateway may
+# carry several, and attaching to the wrong one serves this on a hostname nobody
+# expects. `hostname` must match what the certificate was issued for AND what the
+# root CA's nameConstraints extension permits — three places that have to agree,
+# or verification fails after signing succeeds.
+gateway:
+  name: edge
+  listener: https
+  hostname: gateway.yadgar.localhost

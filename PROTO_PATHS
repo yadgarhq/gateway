@@ -1,0 +1,12 @@
+# What this module vendors from yadgarhq/proto (D70). buf closes the import graph
+# itself, so listing taskapi also brings yadgar/task/v1 (for Task and TaskStatus,
+# which taskapi.proto imports) and yadgar/common/v1.
+#
+# Unlike task/PROTO_PATHS, yadgar/task/v1 is NOT listed here as a second explicit
+# path. task lists it because task is a CLIENT of TaskDbService and needs the
+# service definition itself — an import closure brings only the messages a proto
+# references, not a service another proto declares. gateway is a client of
+# TaskService only, so the closure already brings everything it needs; a second
+# explicit path would just re-export what --path yadgar/taskapi/v1 already
+# exports.
+yadgar/taskapi/v1

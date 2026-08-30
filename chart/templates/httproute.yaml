@@ -1,0 +1,43 @@
+# What attaches this service to the TLS edge (D71).
+#
+# IN THIS CHART, NOT IN yadgarhq/deploy, and the placement is the point. The route
+# and the Service it forwards to have one lifecycle: deploy the chart and the
+# route appears, remove it and the route goes with it. Put in `deploy` it would be
+# a second place that has to know this service's name and port, and the failure
+# mode is a route pointing at a backend that no longer exists — which Gateway API
+# reports as ResolvedRefs=False on an object nobody is looking at.
+#
+# The Gateway itself stays in `deploy`: it is shared edge infrastructure that
+# outlives any one module, and it holds the certificate. A module owns its route;
+# the substrate owns the listener.
+#
+# SAME NAMESPACE as the Gateway, which is what makes this work without a
+# ReferenceGrant — the Gateway's listener sets `allowedRoutes.namespaces.from:
+# Same`, so a route from anywhere else would be silently unattached rather than
+# rejected.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .Chart.Name }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      # The listener by name, not just the Gateway. A Gateway may carry several
+      # listeners and attaching to the wrong one would serve this on a port or a
+      # hostname nobody expects.
+      sectionName: {{ .Values.gateway.listener }}
+  hostnames:
+    - {{ .Values.gateway.hostname | quote }}
+  rules:
+    # MCP is ONE endpoint and every request is a POST to it, so a single prefix
+    # rule at / is the whole routing table. There is no per-method or per-tool
+    # path to match on: the method lives in the JSON-RPC body, which a router
+    # does not read. That is also why the spec mirrors it into the Mcp-Method
+    # header — so an HTTP layer can police traffic it cannot parse.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ .Chart.Name }}
+          port: {{ .Values.service.port }}

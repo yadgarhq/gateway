@@ -1,0 +1,15 @@
+# An ORDINARY ClusterIP, not headless. task-db is headless because D23's
+# client-side balancing needs every pod address individually resolvable; nothing
+# balances across gateway replicas that way — gateway is reached through a
+# Gateway API HTTPRoute (D71), and Envoy does the balancing in front of it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Chart.Name }}
+spec:
+  selector:
+    app: {{ .Chart.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http

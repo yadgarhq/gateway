@@ -1,0 +1,114 @@
+// The task module's PUBLIC API — what a gateway calls (D4).
+//
+// WHY A SEPARATE PACKAGE, and it is worth knowing before copying this shape:
+// the logic service and the -db twin are two contracts with different audiences
+// and different rates of change, and `buf lint` enforces that by refusing to let
+// two RPCs share a request or response type. So they cannot share messages even
+// where the fields happen to match today — which is the point, since the moment
+// one needs a field the other must not have, a shared message would force it on
+// both.
+//
+// The `-db` contract took `yadgar.task.v1` first and is already tagged and
+// implemented, so moving it here would be a breaking change the D16 gate
+// correctly refuses. FOR EVERY MODULE AFTER THIS ONE: put the LOGIC service in
+// `yadgar/<module>/v1` and the storage boundary in `yadgar/<module>db/v1`. This
+// package exists because that order was discovered rather than planned.
+syntax = "proto3";
+
+package yadgar.taskapi.v1;
+
+import "google/protobuf/field_mask.proto";
+import "yadgar/common/v1/common.proto";
+import "yadgar/task/v1/task.proto";
+
+message CreateTaskRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  yadgar.common.v1.Scope scope = 2;
+
+  // The caller supplies content, never identity. `id`, `number`, `version` and
+  // every Meta field are assigned by the module — a client that could set them
+  // could collide with, or overwrite, a record it does not own (D42).
+  string title = 3;
+  string body = 4;
+  repeated string tags = 5;
+  repeated string links = 6;
+}
+message CreateTaskResponse {
+  yadgar.common.v1.Meta meta = 1;
+  uint32 number = 2;
+}
+
+message ReadTaskRequest {
+  yadgar.common.v1.Scope scope = 1;
+  oneof key {
+    string id = 2;
+    uint32 number = 3;
+  }
+}
+message ReadTaskResponse {
+  yadgar.task.v1.Task task = 1;
+}
+
+message FindTasksRequest {
+  yadgar.common.v1.Scope scope = 1;
+  repeated yadgar.task.v1.TaskStatus statuses = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+message FindTasksResponse {
+  repeated yadgar.task.v1.Task tasks = 1;
+  string next_page_token = 2;
+}
+
+message EditTaskRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  yadgar.common.v1.Scope scope = 2;
+  string id = 3;
+  uint64 expect_version = 4;
+  string title = 5;
+  string body = 6;
+  google.protobuf.FieldMask update_mask = 7;
+}
+message EditTaskResponse {
+  yadgar.common.v1.Meta meta = 1;
+}
+
+// A status change is a REQUEST, not a field write.
+//
+// Status is deliberately absent from EditTaskRequest. A plain field write cannot
+// express which transitions are legal, so that rule would have to live in every
+// caller — which is how it stops being a rule. A dedicated RPC makes the legal
+// set a property of the contract instead.
+message TransitionTaskRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  yadgar.common.v1.Scope scope = 2;
+  string id = 3;
+  uint64 expect_version = 4;
+  yadgar.task.v1.TaskStatus to = 5;
+}
+message TransitionTaskResponse {
+  yadgar.common.v1.Meta meta = 1;
+  // What it moved FROM, so a caller that raced another writer sees what actually
+  // happened rather than assuming its own read was current.
+  yadgar.task.v1.TaskStatus from = 2;
+}
+
+message RemoveTaskRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  yadgar.common.v1.Scope scope = 2;
+  string id = 3;
+  uint64 expect_version = 4;
+}
+message RemoveTaskResponse {}
+
+// Holds no store. Reaches its data ONLY over TaskDbService, never by opening a
+// connection of its own — which is what makes the twin a connection
+// concentrator rather than merely a boundary (D4).
+service TaskService {
+  rpc CreateTask(CreateTaskRequest) returns (CreateTaskResponse);
+  rpc ReadTask(ReadTaskRequest) returns (ReadTaskResponse);
+  rpc FindTasks(FindTasksRequest) returns (FindTasksResponse);
+  rpc EditTask(EditTaskRequest) returns (EditTaskResponse);
+  rpc TransitionTask(TransitionTaskRequest) returns (TransitionTaskResponse);
+  rpc RemoveTask(RemoveTaskRequest) returns (RemoveTaskResponse);
+}

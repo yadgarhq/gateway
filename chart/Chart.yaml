@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gateway
+description: The bilingual edge (D16) — MCP over HTTP inward, gRPC outward to modules.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
