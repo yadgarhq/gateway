@@ -32,7 +32,7 @@ yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "2c1aab6e275
 
 # The shared instrumentation seam (D67). Pinned by revision like every other
 # in-org crate — a branch is a moving target.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1273e45e641c6af5187af1203dfb153d4369b5bc", features = [
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1694475a7eab9a8332f2955671987c57bf3234e8", features = [
   "grpc",
 ] }
 
