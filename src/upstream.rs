@@ -3,33 +3,25 @@
 //! The gateway is a client of every module and a gRPC server to none, which is
 //! why `build.rs` generates the client half only.
 
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
-/// Connect to the `task` logic service.
+/// Connect to the `task` logic service, balancing across its replicas.
 ///
-/// **A single-endpoint channel, and that is a known limitation rather than a
-/// choice.** gRPC holds one long-lived HTTP/2 connection, so a Service with a
-/// virtual IP pins this process to ONE upstream pod and the other replicas take
-/// no traffic — the problem D23 solved for `task -> task-db` with a headless
-/// Service and client-side balancing.
+/// **This used to pin to a single pod, and fixing it took a change in two
+/// repositories.** gRPC holds one long-lived HTTP/2 connection, so against a
+/// Service with a virtual IP every request from this process reached the same
+/// upstream pod while the others sat idle looking perfectly healthy — and D68's
+/// autoscaler would have answered the resulting latency by adding replicas that
+/// also received nothing.
 ///
-/// `task`'s Service is not headless (`kubectl get svc task` returns a ClusterIP,
-/// where `task-db` returns None), because until now nothing called `task` over
-/// gRPC — the gateway is its first client. Fixing it properly means making that
-/// Service headless AND moving the balancing helper out of `task/src/balance.rs`
-/// into a shared crate, since two services now need it and the invariant is that
-/// anything every service needs is implemented once. That is a change to another
-/// repository and a decision about shared-crate layout, so it is filed rather
-/// than smuggled in here.
+/// `task`'s Service is headless now, so DNS returns every pod address, and
+/// `yadgar-dial` balances across them and re-resolves as pods come and go.
 ///
-/// The consequence today: correctness is unaffected, load distribution is not.
-/// One `task` replica serves everything this gateway sends.
-pub async fn connect_task(host: &str, port: u16) -> Result<Channel, tonic::transport::Error> {
-    Endpoint::from_shared(format!("http://{host}:{port}"))?
-        // A connect timeout, so a dead upstream fails the request rather than
-        // hanging it. The gateway is the user-facing hop: a request that never
-        // returns is worse here than anywhere else in the system.
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .connect()
-        .await
+/// The balancing code is a shared crate rather than a copy of
+/// `task/src/balance.rs`. Two services needing the same logic is precisely the
+/// case the invariant covers: a copy is how they come to disagree about how they
+/// find their peers, and the disagreement is invisible until one of them is
+/// wrong.
+pub async fn connect_task(host: &str, port: u16) -> Result<Channel, yadgar_dial::BalanceError> {
+    yadgar_dial::connect(host, port).await
 }
