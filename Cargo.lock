@@ -1454,6 +1454,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "yadgar-dial"
+version = "0.1.0"
+source = "git+https://github.com/yadgarhq/dial.git?rev=2c1aab6e2754317e9dcea53c1d8c2d37e5d10042#2c1aab6e2754317e9dcea53c1d8c2d37e5d10042"
+dependencies = [
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
 name = "yadgar-gateway"
 version = "0.1.0"
 dependencies = [
@@ -1472,6 +1483,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yadgar-dial",
  "yadgar-telemetry",
 ]
 

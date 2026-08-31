@@ -77,19 +77,16 @@ on it would be wrong with no error anywhere.
 | `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents |
 | `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                             |
 
-## Known limitation
+## Balancing
 
-**It pins to one `task` replica.** gRPC holds one long-lived HTTP/2 connection,
-and `task`'s Service has a virtual IP rather than being headless — so every
-request from this process reaches the same upstream pod and the other replicas
-take no traffic. This is D23's problem, unsolved for this hop because until now
-nothing called `task` over gRPC; the gateway is its first client.
+The gateway balances across `task`'s replicas rather than pinning to one.
 
-Fixing it means making that Service headless **and** moving the balancing helper
-out of `task/src/balance.rs` into a shared crate, since two services now need it
-and anything every service needs is implemented once. That is a change to another
-repository plus a decision about shared-crate layout, so it is filed rather than
-smuggled in here. Correctness is unaffected; load distribution is not.
+This was a real defect until `task`'s Service became headless: gRPC holds one
+long-lived HTTP/2 connection, so against a virtual IP every request reached the
+same upstream pod while the other sat idle looking healthy. The balancing itself
+lives in `yadgar-dial`, shared with `task` rather than copied, because two
+services holding their own copy is how they come to disagree about how they find
+their peers.
 
 ## Development
 
