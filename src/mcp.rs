@@ -328,6 +328,71 @@ mod tests {
         assert_eq!(err.code(), codes::UNSUPPORTED_PROTOCOL_VERSION);
     }
 
+    /// A `tools/call` envelope, which is the shape that carries `params.name`.
+    fn call_req(name: &str) -> Request {
+        serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "_meta": good_meta(), "name": name }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn headers_that_agree_with_the_body_are_accepted() {
+        // MUTATION THIS CATCHES: `cross_check_headers` returning
+        // `Err(HEADER_MISMATCH)` unconditionally. Both mismatch tests below pass
+        // under it — they only ever assert that SOMETHING was refused — so every
+        // well-formed request in the system would be rejected with the whole
+        // suite green. An assertion that a check REJECTS is only half of it.
+        let meta = req(good_meta()).validate().unwrap();
+        assert!(
+            cross_check_headers(&meta, Some(PROTOCOL_VERSION), Some("tools/list"), None).is_ok(),
+            "a header triple agreeing with the body must be accepted"
+        );
+
+        let meta = call_req("create_task").validate().unwrap();
+        assert!(
+            cross_check_headers(
+                &meta,
+                Some(PROTOCOL_VERSION),
+                Some("tools/call"),
+                Some("create_task"),
+            )
+            .is_ok(),
+            "all three headers agreeing must be accepted"
+        );
+    }
+
+    #[test]
+    fn the_name_header_is_cross_checked_too() {
+        // "Three headers, not one" — and until now `meta.name` was None in every
+        // test in this file, so this branch was never entered and two of the
+        // three were unproven. A proxy routing on `Mcp-Name: read_task` while the
+        // body called `create_task` is the failure: the thing that policed the
+        // request and the thing that executed it saw different requests.
+        let meta = call_req("create_task").validate().unwrap();
+        let err = cross_check_headers(
+            &meta,
+            Some(PROTOCOL_VERSION),
+            Some("tools/call"),
+            Some("read_task"),
+        )
+        .expect_err("the Mcp-Name header disagrees with the body");
+        assert_eq!(err.code(), codes::HEADER_MISMATCH);
+        assert_eq!(err.http_status(), 400);
+    }
+
+    #[test]
+    fn an_absent_name_header_is_not_this_functions_error_to_raise() {
+        // Deliberate: the header is required for the methods that name a thing,
+        // but an ABSENCE is not a disagreement, and refusing it here would move
+        // that rule out of the place that knows which methods those are.
+        let meta = call_req("create_task").validate().unwrap();
+        assert!(
+            cross_check_headers(&meta, Some(PROTOCOL_VERSION), Some("tools/call"), None).is_ok()
+        );
+    }
+
     #[test]
     fn a_header_disagreeing_with_the_body_is_a_mismatch() {
         let meta = req(good_meta()).validate().unwrap();

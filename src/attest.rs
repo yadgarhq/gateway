@@ -45,6 +45,18 @@ pub enum AttestError {
 
     #[error("request is missing the {0} header, which identifies the caller")]
     MissingIdentity(&'static str),
+
+    #[error(
+        "{IAM_ADDR} is set to {0}, and iam-backed attestation is not implemented \
+         yet (ledger 452). This refuses at BOOT rather than accepting the \
+         setting: the alternative is a process that logs \"attesting caller \
+         identity\", binds its listener, passes readiness, and then panics on the \
+         first tools/call — which inverts the D69 rule this module exists to \
+         follow, and turns a deploy-time misconfiguration into an outage under \
+         load. Unset {IAM_ADDR} until iam-backed attestation lands, or set \
+         {TRUST_HEADERS}=1 for local development."
+    )]
+    IamUnimplemented(String),
 }
 
 /// How this process decided who the caller is. Chosen ONCE at boot.
@@ -73,14 +85,28 @@ impl Attestation {
     /// Called from `main` BEFORE the listener is bound, so a misconfigured
     /// deployment never accepts a request it cannot attest.
     pub fn from_env() -> Result<Self, AttestError> {
-        if let Ok(addr) = std::env::var(IAM_ADDR) {
-            if !addr.is_empty() {
-                return Ok(Self::Iam { addr });
-            }
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// The same decision, over an injected lookup.
+    ///
+    /// **A seam, because environment variables are process-global.** A test that
+    /// sets one steers every other test running in the same binary, so the boot
+    /// gate — the thing standing between a deployment and trusting whatever the
+    /// caller claims — could not be tested at all without this. `from_env` is the
+    /// one-line adapter; everything decided here is decided once.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, AttestError> {
+        if let Some(addr) = lookup(IAM_ADDR).filter(|a| !a.is_empty()) {
+            // REFUSED AT BOOT. The variant exists so this file can already tell
+            // "not configured" from "configured for iam", and so that adding iam
+            // changes this file and nothing else — but until `attest` can honour
+            // it, accepting the setting means a green boot and a panic on the
+            // first call.
+            return Err(AttestError::IamUnimplemented(addr));
         }
         // Exactly "1". A permissive parse here — "0", "false", "no" all enabling
         // it — is how a setting meant to be off ends up on.
-        if std::env::var(TRUST_HEADERS).as_deref() == Ok("1") {
+        if lookup(TRUST_HEADERS).as_deref() == Some("1") {
             return Ok(Self::TrustedHeaders);
         }
         Err(AttestError::Unconfigured)
@@ -129,18 +155,93 @@ pub fn attest(
             request_id,
         }),
 
-        // Deliberately unimplemented rather than silently falling back to the
-        // trusted-header path. A fallback here would mean a deployment that
-        // believes it is authenticating while it is not.
-        Attestation::Iam { .. } => {
-            unimplemented!("iam-backed attestation lands with ledger 452")
-        }
+        // An ERROR rather than a fallback to the trusted-header path, which would
+        // mean a deployment that believes it is authenticating while it is not —
+        // and rather than the `unimplemented!()` that used to stand here, which
+        // panicked the process on the first call. `from_lookup` already refuses
+        // this variant at boot, so reaching here means somebody constructed it
+        // directly; the answer is still a refusal, not a crash.
+        Attestation::Iam { addr } => Err(AttestError::IamUnimplemented(addr.clone())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lookup over a fixed table, standing in for the process environment.
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn only_the_exact_string_one_enables_trusted_headers() {
+        // MUTATION THIS CATCHES: `== Ok("1")` relaxed to `.is_ok()`, or to any
+        // truthiness parse. Under it, `YADGAR_TRUST_UNAUTHENTICATED_HEADERS=0` —
+        // written by somebody deliberately turning the setting OFF — turns
+        // authentication off instead, and the gateway trusts whatever the caller
+        // claims. Nothing sat behind this gate before.
+        assert!(matches!(
+            Attestation::from_lookup(env(&[(TRUST_HEADERS, "1")])),
+            Ok(Attestation::TrustedHeaders)
+        ));
+        for off in ["0", "false", "no", "", "true", "yes"] {
+            assert!(
+                matches!(
+                    Attestation::from_lookup(env(&[(TRUST_HEADERS, off)])),
+                    Err(AttestError::Unconfigured)
+                ),
+                "{off:?} must not enable trusted headers"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unset_environment_refuses_to_start() {
+        // The default must be a refusal. Defaulting to trusting the caller is a
+        // gateway that attests nothing while its contract says it does, and it
+        // would go green in a development cluster and stay green.
+        assert!(matches!(
+            Attestation::from_lookup(env(&[])),
+            Err(AttestError::Unconfigured)
+        ));
+    }
+
+    #[test]
+    fn an_iam_address_is_refused_at_boot_rather_than_panicking_on_the_first_call() {
+        // MUTATION THIS CATCHES — and the bug this test was written for:
+        // `Ok(Self::Iam { addr })`. The process then logs "attesting caller
+        // identity", binds its listener, passes readiness, and panics inside
+        // `attest` on the first tools/call.
+        let err = Attestation::from_lookup(env(&[(IAM_ADDR, "iam:50052")]))
+            .expect_err("an unimplemented identity source must not boot");
+        assert!(matches!(err, AttestError::IamUnimplemented(a) if a == "iam:50052"));
+
+        // An EMPTY value is not a configuration, and must fall through to the
+        // ordinary refusal rather than being reported as an iam deployment.
+        assert!(matches!(
+            Attestation::from_lookup(env(&[(IAM_ADDR, "")])),
+            Err(AttestError::Unconfigured)
+        ));
+    }
+
+    #[test]
+    fn attesting_under_iam_is_an_error_and_never_a_panic() {
+        let err = attest(
+            &Attestation::Iam {
+                addr: "iam:50052".into(),
+            },
+            Claimed::default(),
+            "REQ-0".to_string(),
+        )
+        .expect_err("iam-backed attestation is not implemented");
+        assert!(matches!(err, AttestError::IamUnimplemented(_)));
+    }
 
     #[test]
     fn scope_carries_the_request_id_it_was_given() {

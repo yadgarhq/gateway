@@ -44,7 +44,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "identity is UNAUTHENTICATED: caller-supplied headers are trusted. \
              Development only — iam replaces this (ledger 452)."
         ),
-        other => tracing::info!(source = %other, "attesting caller identity"),
+        // UNREACHABLE BY CONSTRUCTION, and deliberately still an arm.
+        // `Attestation::from_env` refuses YADGAR_IAM_ADDR outright until
+        // iam-backed attestation lands (ledger 452), so this process can no
+        // longer be in that state. The arm stays so adding iam changes
+        // `attest.rs` and this line and nothing else — but it no longer logs
+        // "attesting caller identity", which was the sentence that made a boot
+        // into an unimplemented identity source look survivable.
+        other => tracing::warn!(
+            source = %other,
+            "identity source is not implemented; this process should not have started"
+        ),
     }
 
     let task_host = env_or("TASK_HOST", "task");

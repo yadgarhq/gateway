@@ -50,6 +50,18 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `ServiceExt::oneshot`, to drive `router()` in-process. axum is built on tower
+# and already carries it transitively; naming it here is what makes the trait
+# importable from a test, and it adds nothing to the dependency tree.
+tower = { version = "0.5", features = ["util"] }
+# A recorder to assert AGAINST, for the D67 coverage test. `metrics` is the
+# facade yadgar-telemetry already publishes through and `metrics-util` ships the
+# debugging recorder that can be snapshotted in-process; both are already in this
+# tree via metrics-exporter-prometheus, so neither adds anything to the build.
+metrics = "0.24"
+metrics-util = { version = "0.20", default-features = false, features = [
+  "debugging",
+] }
 
 [lints.rust]
 unsafe_code = "forbid"

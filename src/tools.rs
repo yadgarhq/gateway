@@ -10,7 +10,7 @@ use tonic::transport::Channel;
 use crate::pb::yadgar::common::v1::{Idempotency, Scope};
 use crate::pb::yadgar::taskapi::v1::{
     read_task_request::Key, task_service_client::TaskServiceClient, CreateTaskRequest,
-    FindTasksRequest, ReadTaskRequest,
+    FindTasksRequest, FindTasksResponse, ReadTaskRequest,
 };
 
 /// A tool's name, as a bounded value.
@@ -103,6 +103,34 @@ pub enum ToolError {
     Unknown(String),
 }
 
+/// The `content` payload for one tool call, and how many records it carried.
+///
+/// **The row count is returned rather than dropped**, which is the whole reason
+/// this is a pair. `CallRecord.rows_returned` was `0` on every gateway call while
+/// `find_tasks` knew `resp.tasks.len()` and discarded it — so D67 could say what
+/// a call cost in bytes and never how much it fetched, and "twenty tasks" and
+/// "one task" were indistinguishable in the roll-ups.
+pub struct Output {
+    pub content: Value,
+    pub rows: u32,
+}
+
+/// Shape a `find_tasks` response, and count what it returned.
+///
+/// Split out so the count is testable without a task service behind it: `build.rs`
+/// generates the CLIENT half only, so there is no server stub to fake, and a row
+/// count that only a live upstream can exercise is a row count nothing pins.
+fn find_tasks_output(resp: FindTasksResponse) -> Output {
+    let rows = resp.tasks.len() as u32;
+    Output {
+        content: json!({
+            "tasks": resp.tasks.into_iter().map(|t| TaskView::from(Some(t))).collect::<Vec<_>>(),
+            "next_page_token": resp.next_page_token,
+        }),
+        rows,
+    }
+}
+
 /// Call one tool.
 ///
 /// Returns the `content` payload for a successful `tools/call` result. Telemetry
@@ -115,7 +143,7 @@ pub async fn call(
     scope: Scope,
     name: &str,
     args: &Value,
-) -> Result<Value, ToolError> {
+) -> Result<Output, ToolError> {
     let mut client = TaskServiceClient::new(channel);
 
     match name {
@@ -151,7 +179,11 @@ pub async fn call(
                 .await?
                 .into_inner();
             let meta = resp.meta.unwrap_or_default();
-            Ok(json!({ "id": meta.id, "number": resp.number, "version": meta.version }))
+            Ok(Output {
+                content: json!({ "id": meta.id, "number": resp.number, "version": meta.version }),
+                // One task created is one row written.
+                rows: 1,
+            })
         }
 
         READ_TASK => {
@@ -178,7 +210,10 @@ pub async fn call(
                 })
                 .await?
                 .into_inner();
-            Ok(serde_json::to_value(TaskView::from(resp.task)).unwrap_or(Value::Null))
+            Ok(Output {
+                content: serde_json::to_value(TaskView::from(resp.task)).unwrap_or(Value::Null),
+                rows: 1,
+            })
         }
 
         FIND_TASKS => {
@@ -195,10 +230,7 @@ pub async fn call(
                 })
                 .await?
                 .into_inner();
-            Ok(json!({
-                "tasks": resp.tasks.into_iter().map(|t| TaskView::from(Some(t))).collect::<Vec<_>>(),
-                "next_page_token": resp.next_page_token,
-            }))
+            Ok(find_tasks_output(resp))
         }
 
         other => Err(ToolError::Unknown(other.to_string())),
@@ -271,6 +303,29 @@ mod tests {
         for tool in definitions().as_array().unwrap() {
             assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
         }
+    }
+
+    #[test]
+    fn find_tasks_reports_how_many_tasks_it_returned() {
+        // MUTATION THIS CATCHES: `Outcome { ..Default::default() }` at the call
+        // site, or a `rows: 1` here. `rows_returned` was 0 on every gateway call
+        // while the response knew its own length, so D67 could report what a call
+        // cost and never how much it fetched.
+        use crate::pb::yadgar::task::v1::Task;
+
+        let empty = find_tasks_output(FindTasksResponse::default());
+        assert_eq!(empty.rows, 0);
+
+        let three = find_tasks_output(FindTasksResponse {
+            tasks: vec![Task::default(), Task::default(), Task::default()],
+            next_page_token: "next".into(),
+        });
+        assert_eq!(three.rows, 3, "the row count is the number of tasks");
+        assert_eq!(
+            three.content["tasks"].as_array().map(Vec::len),
+            Some(3),
+            "and it must agree with the payload the caller receives"
+        );
     }
 
     #[test]
