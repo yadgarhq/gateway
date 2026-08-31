@@ -21,6 +21,13 @@ use crate::tools;
 
 const SERVICE: &str = "gateway";
 
+/// The bounded labels for the two methods that are not `tools/call`.
+///
+/// `&'static str` and a closed set, for the same reason `tools::label_for`
+/// exists: a metric label must come from a fixed range (D67).
+const DISCOVER: &str = "server/discover";
+const TOOLS_LIST: &str = "tools/list";
+
 pub struct AppState {
     pub attestation: Attestation,
     pub task: Channel,
@@ -59,13 +66,25 @@ async fn method_not_allowed() -> Response {
 /// headers. Absence is allowed because a non-browser client sends no Origin —
 /// which is exactly why it cannot substitute for attestation.
 fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    match headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-    {
-        None => true,
-        Some(origin) => state.allowed_origins.iter().any(|a| a == origin),
-    }
+    let Some(raw) = headers.get(axum::http::header::ORIGIN) else {
+        // Absent, and allowed: a non-browser client sends no Origin — which is
+        // exactly why this cannot substitute for attestation.
+        return true;
+    };
+    // PRESENT AND UNPARSEABLE IS PRESENT AND INVALID, and the spec's MUST covers
+    // it: "If the Origin header is present and invalid, servers MUST respond with
+    // HTTP 403 Forbidden."
+    //
+    // This used to be `.and_then(|v| v.to_str().ok())`, which collapsed a header
+    // of non-ASCII bytes into `None` and took the absent arm — so the one Origin
+    // that could not be checked was the one that was waved through.
+    let Ok(origin) = raw.to_str() else {
+        return false;
+    };
+    // An EMPTY allowlist denies every origin. `is_empty() || any()` is the
+    // plausible-looking "fix" that would accept every origin in the default
+    // configuration, and it would pass a suite that only tested a populated list.
+    state.allowed_origins.iter().any(|a| a == origin)
 }
 
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -115,22 +134,14 @@ async fn handle(State(state): State<Arc<AppState>>, headers: HeaderMap, body: By
     };
 
     match request.method.as_str() {
-        "server/discover" => reply(200, discover(&id)),
-        "tools/list" => reply(
-            200,
-            mcp::result(
-                &id,
-                as_object(json!({
-                    "tools": tools::definitions(),
-                    // Cacheable by anyone: the tool list is identical for every
-                    // caller. It becomes `cacheScope: "private"` the day a tool
-                    // is gated on who is asking.
-                    "ttlMs": 300_000,
-                    "cacheScope": "public",
-                })),
-            ),
-        ),
+        DISCOVER => measured(DISCOVER, || discover(&id)),
+        TOOLS_LIST => measured(TOOLS_LIST, || tools_list(&id)),
         "tools/call" => tools_call(state, &id, &request.params, &headers).await,
+        // NO record for an unknown method, deliberately. Its only available label
+        // is the string the caller invented, and D67's cardinality rule means a
+        // caller must not be able to mint a Prometheus series — the same reason
+        // `tools::label_for` resolves a tool name to a bounded label before
+        // anything is measured.
         other => reply(
             200,
             mcp::error(
@@ -139,6 +150,64 @@ async fn handle(State(state): State<Arc<AppState>>, headers: HeaderMap, body: By
                 &format!("unknown method: {other}"),
             ),
         ),
+    }
+}
+
+/// The `tools/list` payload.
+fn tools_list(id: &Value) -> Value {
+    mcp::result(
+        id,
+        as_object(json!({
+            "tools": tools::definitions(),
+            // Cacheable by anyone: the tool list is identical for every caller. It
+            // becomes `cacheScope: "private"` the day a tool is gated on who is
+            // asking.
+            "ttlMs": 300_000,
+            "cacheScope": "public",
+        })),
+    )
+}
+
+/// Answer, and record what it cost (D67).
+///
+/// **`Call::start` used to be reached only inside `tools_call`**, so two of the
+/// three methods this server implements returned bytes nothing measured — and
+/// `tools/list` is the larger payload of the two. A method that emits no record
+/// looks exactly like a method nobody calls, which is the reading D15's
+/// retirement rule would act on.
+fn measured(tool: &'static str, build: impl FnOnce() -> Value) -> Response {
+    // Started BEFORE the work, so the duration covers the handler.
+    let call = Call::start(SERVICE, tool, Kind::Read, tel(crate::request_id()));
+    let rendered = serde_json::to_string(&build()).unwrap_or_default();
+    call.finish(Outcome {
+        status: "OK",
+        encoded_bytes: Some(rendered.len() as u64),
+        payload: rendered.clone(),
+        // One document, not a collection: `tools/list` returns a single result
+        // object, and counting its tools as rows would make the number mean
+        // something different from what it means on `find_tasks`.
+        rows: 1,
+        ..Default::default()
+    });
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        rendered,
+    )
+        .into_response()
+}
+
+/// A telemetry scope for a call with no attested identity.
+///
+/// `user_id` and `project_id` stay empty rather than being filled from what the
+/// caller claimed: on these paths nothing has been attested, and a scope that
+/// carried a claim would put an unverified identity into the record.
+fn tel(request_id: String) -> yadgar_telemetry::observe::Scope {
+    yadgar_telemetry::observe::Scope {
+        request_id,
+        instance_id: String::new(),
+        user_id: String::new(),
+        project_id: String::new(),
     }
 }
 
@@ -202,21 +271,23 @@ async fn tools_call(
     ) {
         Ok(s) => s,
         Err(e) => {
+            // A REFUSED call is still a call, and it is the one most worth
+            // seeing. Recorded here because the `Call` for the success path
+            // cannot be started until there is an attested scope to carry — so
+            // without this, every authentication failure in the system is
+            // invisible to D67 and a credential-stuffing run looks like silence.
+            Call::start(SERVICE, label, kind_of(name), tel(request_id)).fail("UNAUTHENTICATED");
             return reply(
                 401,
                 mcp::error(Some(id), codes::INVALID_REQUEST, &e.to_string()),
-            )
+            );
         }
     };
 
     let call = Call::start(
         SERVICE,
         label,
-        if tools::is_write(name) {
-            Kind::Write
-        } else {
-            Kind::Read
-        },
+        kind_of(name),
         yadgar_telemetry::observe::Scope {
             request_id,
             instance_id: scope.instance_id.clone(),
@@ -226,41 +297,8 @@ async fn tools_call(
     );
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    let (status, payload) = match tools::call(state.task.clone(), scope, name, &args).await {
-        Ok(content) => (
-            "OK",
-            mcp::result(
-                id,
-                as_object(json!({
-                    // Structured AND textual. `structuredContent` is what a
-                    // program consumes; `content` is what a model reads, and a
-                    // client that understands only one still works.
-                    "content": [{ "type": "text", "text": content.to_string() }],
-                    "structuredContent": content,
-                })),
-            ),
-        ),
-        Err(e) => {
-            // A TOOL-level failure, not a protocol error: the MCP request was
-            // well formed and the tool ran and failed. Returning a JSON-RPC
-            // error here would tell the client its request was malformed, and it
-            // would stop retrying things that are worth retrying.
-            let status = match &e {
-                tools::ToolError::Upstream(s) => yadgar_telemetry::grpc::status_name(s),
-                _ => "INVALID_ARGUMENT",
-            };
-            (
-                status,
-                mcp::result(
-                    id,
-                    as_object(json!({
-                        "content": [{ "type": "text", "text": e.to_string() }],
-                        "isError": true,
-                    })),
-                ),
-            )
-        }
-    };
+    let outcome = tools::call(state.task.clone(), scope, name, &args).await;
+    let (status, rows, payload) = shape(id, outcome);
 
     // Serialise ONCE, and measure exactly what goes on the wire.
     //
@@ -273,6 +311,7 @@ async fn tools_call(
         status,
         encoded_bytes: Some(rendered.len() as u64),
         payload: rendered.clone(),
+        rows,
         ..Default::default()
     });
 
@@ -282,6 +321,67 @@ async fn tools_call(
         rendered,
     )
         .into_response()
+}
+
+/// One tool's result, as the three things the record and the reply both need:
+/// the bounded status label, the row count, and the JSON-RPC body.
+///
+/// Split out of `tools_call` because that function crossed the function-size
+/// ceiling — along the seam that was already there, since this is the only part
+/// of it that is a pure transformation of what the tool returned.
+fn shape(
+    id: &Value,
+    result: Result<tools::Output, tools::ToolError>,
+) -> (&'static str, u32, Value) {
+    match result {
+        Ok(out) => (
+            "OK",
+            // The count the tool already knew, carried through instead of
+            // discarded — see `tools::Output`.
+            out.rows,
+            mcp::result(
+                id,
+                as_object(json!({
+                    // Structured AND textual. `structuredContent` is what a
+                    // program consumes; `content` is what a model reads, and a
+                    // client that understands only one still works.
+                    "content": [{ "type": "text", "text": out.content.to_string() }],
+                    "structuredContent": out.content,
+                })),
+            ),
+        ),
+        Err(e) => {
+            // A TOOL-level failure, not a protocol error: the MCP request was
+            // well formed and the tool ran and failed. Returning a JSON-RPC error
+            // here would tell the client its request was malformed, and it would
+            // stop retrying things that are worth retrying.
+            let status = match &e {
+                tools::ToolError::Upstream(s) => yadgar_telemetry::grpc::status_name(s),
+                _ => "INVALID_ARGUMENT",
+            };
+            (
+                status,
+                0,
+                mcp::result(
+                    id,
+                    as_object(json!({
+                        "content": [{ "type": "text", "text": e.to_string() }],
+                        "isError": true,
+                    })),
+                ),
+            )
+        }
+    }
+}
+
+/// Read or write, for `CallRecord.kind`. A wrong answer here makes read and
+/// write traffic indistinguishable in the roll-ups.
+fn kind_of(name: &str) -> Kind {
+    if tools::is_write(name) {
+        Kind::Write
+    } else {
+        Kind::Read
+    }
 }
 
 fn as_object(v: Value) -> serde_json::Map<String, Value> {
@@ -299,3 +399,6 @@ fn reply(status: u16, body: Value) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests;
