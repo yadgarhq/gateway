@@ -16,6 +16,7 @@ use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::attest::{self, Attestation, Claimed};
+use crate::limit::{Decision, Limiter};
 use crate::mcp::{self, codes, headers, meta_keys};
 use crate::tools;
 
@@ -31,6 +32,9 @@ const TOOLS_LIST: &str = "tools/list";
 pub struct AppState {
     pub attestation: Attestation,
     pub task: Channel,
+    /// D74's token buckets, in the shared cache. Held here rather than built per
+    /// request so one connection manager serves the whole process.
+    pub limiter: Limiter,
     /// Origins permitted to reach this server from a browser. Empty means no
     /// browser origin is accepted at all, which is the correct default for a
     /// server whose clients are agents.
@@ -243,10 +247,16 @@ async fn tools_call(
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    // Resolved to a BOUNDED label before anything is measured. An unknown tool
+    // Resolved to BOUNDED values before anything is measured. An unknown tool
     // never reaches the metric layer, so a caller cannot mint Prometheus series
-    // by inventing names (D67's cardinality rule).
-    let Some(label) = tools::label_for(name) else {
+    // by inventing names (D67's cardinality rule) — nor a token bucket per
+    // invented name, which would be the same defect in the shared cache.
+    //
+    // These two are the only components of the bucket key that this bounds. The
+    // third, the user id, arrives as a header and is bounded where the key is
+    // built instead — see `limit::user_component`, which is where that half of
+    // the same argument now lives.
+    let (Some(label), Some(module)) = (tools::label_for(name), tools::module_for(name)) else {
         return reply(
             200,
             mcp::error(
@@ -260,7 +270,7 @@ async fn tools_call(
     // Minted here, never read from the request (D67). See `crate::request_id`.
     let request_id = crate::request_id();
 
-    let scope = match attest::attest(
+    let attested = match attest::attest(
         &state.attestation,
         Claimed {
             user_id: header(headers, "x-yadgar-user"),
@@ -283,11 +293,43 @@ async fn tools_call(
             );
         }
     };
+    let scope = attested.scope;
+
+    // D74, and BEFORE any upstream work: refusing here means the loop this
+    // protects against costs `task` nothing at all. Enforcing per module would
+    // let it cost every service its work before the last one said no.
+    let kind = kind_of(name);
+    if let Some(refusal) =
+        throttled(&state, id, &scope, label, module, kind, &attested.limits).await
+    {
+        // A throttled call is a call, for the same reason the refusal above is.
+        // Without this a throttling storm is indistinguishable from silence,
+        // which is the reading D15's retirement rule would act on.
+        //
+        // The ATTESTED scope rides on it, unlike the UNAUTHENTICATED record above
+        // — there identity was never established, here it was, and "who is being
+        // throttled" is the first question anyone reading this record has. It
+        // goes in the wide event and NOT in a metric label, which is the same
+        // split every other record on this path already makes.
+        Call::start(
+            SERVICE,
+            label,
+            kind,
+            yadgar_telemetry::observe::Scope {
+                request_id,
+                instance_id: scope.instance_id.clone(),
+                user_id: scope.user_id.clone(),
+                project_id: scope.project_id.clone(),
+            },
+        )
+        .fail("RESOURCE_EXHAUSTED");
+        return refusal;
+    }
 
     let call = Call::start(
         SERVICE,
         label,
-        kind_of(name),
+        kind,
         yadgar_telemetry::observe::Scope {
             request_id,
             instance_id: scope.instance_id.clone(),
@@ -319,6 +361,143 @@ async fn tools_call(
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         rendered,
+    )
+        .into_response()
+}
+
+/// Spend a token, and build the refusal if there is none to spend (D74).
+///
+/// `Some` is a 429 the caller must be sent; `None` means carry on. Split out of
+/// `tools_call` because a limiter that has three outcomes and only one of them
+/// returns is exactly the shape that belongs behind a name.
+async fn throttled(
+    state: &AppState,
+    id: &Value,
+    scope: &crate::pb::yadgar::common::v1::Scope,
+    label: &'static str,
+    module: &'static str,
+    kind: Kind,
+    overrides: &crate::limit::Overrides,
+) -> Option<Response> {
+    match state
+        .limiter
+        .check(&scope.user_id, module, kind, overrides)
+        .await
+    {
+        Decision::Allowed => None,
+
+        Decision::Throttled { retry_after } => Some(refusal(
+            id,
+            module,
+            kind,
+            retry_after,
+            "the {module} {kind} bucket is empty",
+        )),
+
+        // FAIL OPEN ONTO A FLOOR, LOUDLY. The argument is on
+        // `Decision::Degraded`; the loudness is here, and it is the condition
+        // that argument depends on. No user in the log line and none in the label
+        // — D72 and D77 both keep usernames out of both, and an unbounded label
+        // would breach D67 besides.
+        Decision::Degraded(why) => {
+            degraded(label, module, why, "allowed");
+            None
+        }
+
+        // DEGRADED AND REFUSED, which is what makes the floor a floor. Counted
+        // apart from the allowed case: a floor that has started refusing real
+        // traffic must be visible, or "the degradation is not silent" — the whole
+        // ground the floor is accepted on — is untrue.
+        Decision::DegradedThrottled {
+            reason,
+            retry_after,
+        } => {
+            degraded(label, module, reason, "throttled");
+            Some(refusal(
+                id,
+                module,
+                kind,
+                retry_after,
+                "the shared cache cannot be reached and this replica's own floor for the \
+                 {module} {kind} bucket is empty",
+            ))
+        }
+    }
+}
+
+/// Count and log one degraded call.
+///
+/// `outcome` is `allowed` or `throttled` — two values, so the series stays inside
+/// D67's cardinality rule, and the distinction is the one an operator needs:
+/// whether the floor is merely in force or is turning traffic away.
+fn degraded(
+    label: &'static str,
+    module: &'static str,
+    why: crate::limit::Degrade,
+    outcome: &'static str,
+) {
+    metrics::counter!(
+        crate::limit::DEGRADED,
+        "service" => SERVICE,
+        "tool" => label,
+        "reason" => why.label(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+    tracing::warn!(
+        reason = %why,
+        tool = label,
+        module,
+        outcome,
+        "rate limiting is DEGRADED: the shared cache could not answer, so this call is held to \
+         this replica's local floor of rate/maxReplicas rather than the shared bucket (D74)"
+    );
+}
+
+/// The 429 a refused call receives, from either bucket that can refuse it.
+///
+/// **The two are deliberately indistinguishable to a CLIENT**: the correct client
+/// behaviour is identical, and a client that could tell a degraded refusal from an
+/// ordinary one would be tempted to treat one of them as advisory. They are
+/// distinguished to an operator, in the metric `degraded` emits.
+///
+/// `what` is a template with `{module}` and `{kind}` in it rather than a formatted
+/// string, so the two call sites cannot drift on how they name the bucket.
+fn refusal(
+    id: &Value,
+    module: &'static str,
+    kind: Kind,
+    retry_after: std::time::Duration,
+    what: &str,
+) -> Response {
+    // WHOLE SECONDS in the header (RFC 9110), and never zero: `0` reads as
+    // "retry immediately", which is the herd this exists to avoid. The exact
+    // figure rides in `data`.
+    let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+    let header_value = seconds.to_string();
+    let kind_name = crate::limit::kind_str(kind);
+    let message = format!(
+        "{}; retry in {seconds}s",
+        what.replace("{module}", module)
+            .replace("{kind}", kind_name)
+    );
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::RETRY_AFTER, header_value.as_str()),
+        ],
+        mcp::error_data(
+            Some(id),
+            codes::RATE_LIMITED,
+            &message,
+            json!({
+                "retryAfterMs": (retry_after.as_secs_f64() * 1000.0).ceil() as u64,
+                "module": module,
+                "kind": kind_name,
+            }),
+        )
+        .to_string(),
     )
         .into_response()
 }

@@ -67,6 +67,29 @@ spec:
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
               value: {{ .Values.task.port | quote }}
+            # D74. The ADDRESS is required and gateway exits without it: a
+            # gateway with nowhere to keep its buckets enforces no capacity
+            # limit at all, and that is a deployment mistake rather than an
+            # outage, so D69's fail-at-boot rule applies. An unreachable Valkey
+            # at RUNTIME is the other case, and there the call proceeds.
+            - name: YADGAR_VALKEY_ADDR
+              value: {{ .Values.rateLimit.addr | quote }}
+            - name: YADGAR_RATE_LIMITS
+              value: {{ .Values.rateLimit.limits | quote }}
+            - name: YADGAR_RATE_LIMIT_DEFAULT
+              value: {{ .Values.rateLimit.default | quote }}
+            - name: YADGAR_RATE_LIMIT_TIMEOUT_MS
+              value: {{ .Values.rateLimit.timeoutMs | quote }}
+            # The DIVISOR of the degraded-mode floor, and required for the same
+            # reason the address is. While Valkey cannot answer, each replica
+            # holds callers to rate/this on its own; the aggregate bound that
+            # makes that acceptable holds only if this is the real ceiling. Taken
+            # from the autoscaler's own maximum when it is enabled, and from the
+            # fixed replica count when it is not — a constant in the binary and a
+            # number here would be two places that must agree, and only one of
+            # them gets edited.
+            - name: YADGAR_MAX_REPLICAS
+              value: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas | quote }}{{ else }}{{ .Values.replicaCount | quote }}{{ end }}
             # No default here (see main.rs / from_default_env): unset means
             # silent, which is the exact failure this line exists to prevent.
             - name: RUST_LOG

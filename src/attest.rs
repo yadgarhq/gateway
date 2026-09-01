@@ -20,6 +20,7 @@
 
 use std::fmt;
 
+use crate::limit::Overrides;
 use crate::pb::yadgar::common::v1::Scope;
 
 /// The environment variable is named for WHAT IT DOES, not for where it runs.
@@ -125,6 +126,28 @@ pub struct Claimed<'a> {
     pub instance_id: Option<&'a str>,
 }
 
+/// What one lookup established about the caller.
+///
+/// **Identity and spending limits together, because D74 says they travel
+/// together**: `ResolveCredentialResponse` carries the effective buckets, so the
+/// gateway learns who you are and what you may spend in one lookup, cached
+/// together and invalidated together. Two lookups would mean two cache lifetimes
+/// and a window in which a tightened limit is not yet in force.
+#[derive(Debug)]
+pub struct Attested {
+    pub scope: Scope,
+    /// The caller's per-user bucket overrides (D74).
+    ///
+    /// **Empty on every path today, and that is the honest answer rather than a
+    /// stub.** Overrides come from `iam`, the contract does not carry them yet,
+    /// and there is no header that could: a caller who could name its own limits
+    /// would raise them, which is the same reason `team_ids` is never taken from
+    /// the caller. Empty means "no override", and the limiter then applies the
+    /// configured default — which is what the deployment should do while no user
+    /// has one.
+    pub limits: Overrides,
+}
+
 /// Build the attested scope for one request.
 ///
 /// `request_id` is passed in rather than read from the caller, and that is the
@@ -133,26 +156,30 @@ pub fn attest(
     how: &Attestation,
     claimed: Claimed<'_>,
     request_id: String,
-) -> Result<Scope, AttestError> {
+) -> Result<Attested, AttestError> {
     match how {
-        Attestation::TrustedHeaders => Ok(Scope {
-            user_id: claimed
-                .user_id
-                .ok_or(AttestError::MissingIdentity("X-Yadgar-User"))?
-                .to_string(),
-            project_id: claimed
-                .project_id
-                .ok_or(AttestError::MissingIdentity("X-Yadgar-Project"))?
-                .to_string(),
-            // A session identifier, not an identity — D46 throttles on it and
-            // D39 addresses notices with it. Absent is legitimate: a one-shot
-            // client has no session.
-            instance_id: claimed.instance_id.unwrap_or_default().to_string(),
-            // Team membership comes from iam. Empty means "no team visibility",
-            // which is the restrictive answer and the right default while the
-            // only identity source is a header the caller wrote.
-            team_ids: Vec::new(),
-            request_id,
+        Attestation::TrustedHeaders => Ok(Attested {
+            limits: Overrides::default(),
+            scope: Scope {
+                user_id: claimed
+                    .user_id
+                    .ok_or(AttestError::MissingIdentity("X-Yadgar-User"))?
+                    .to_string(),
+                project_id: claimed
+                    .project_id
+                    .ok_or(AttestError::MissingIdentity("X-Yadgar-Project"))?
+                    .to_string(),
+                // A session identifier, not an identity — D46 throttles on it
+                // and D39 addresses notices with it. Absent is legitimate: a
+                // one-shot client has no session.
+                instance_id: claimed.instance_id.unwrap_or_default().to_string(),
+                // Team membership comes from iam. Empty means "no team
+                // visibility", which is the restrictive answer and the right
+                // default while the only identity source is a header the caller
+                // wrote.
+                team_ids: Vec::new(),
+                request_id,
+            },
         }),
 
         // An ERROR rather than a fallback to the trusted-header path, which would
@@ -255,8 +282,10 @@ mod tests {
             "REQ-1".to_string(),
         )
         .expect("complete claim attests");
-        assert_eq!(scope.request_id, "REQ-1");
-        assert_eq!(scope.user_id, "max");
+        assert_eq!(scope.scope.request_id, "REQ-1");
+        assert_eq!(scope.scope.user_id, "max");
+        // No override arrives on this path and none can: see `Attested::limits`.
+        assert!(scope.limits.is_empty());
     }
 
     #[test]
@@ -275,7 +304,7 @@ mod tests {
             "REQ-2".to_string(),
         )
         .expect("complete claim attests");
-        assert!(scope.team_ids.is_empty());
+        assert!(scope.scope.team_ids.is_empty());
     }
 
     #[test]

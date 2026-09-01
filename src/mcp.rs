@@ -56,6 +56,16 @@ pub mod codes {
     pub const HEADER_MISMATCH: i32 = -32020;
     pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i32 = -32021;
     pub const UNSUPPORTED_PROTOCOL_VERSION: i32 = -32022;
+
+    /// The caller's token bucket is empty (D74).
+    ///
+    /// ALLOCATED HERE, in the MCP-reserved range, following this module's own
+    /// precedent for the three above. The 2026-07-28 revision was read for a code
+    /// meaning "slow down" and none was found; if one is added later this
+    /// constant is the single place to change. The HTTP status is what a client
+    /// will actually key on — 429 with `Retry-After` is unambiguous at the
+    /// transport layer regardless of what the JSON-RPC body says.
+    pub const RATE_LIMITED: i32 = -32023;
 }
 
 /// Headers the client sends, mirroring what is in the body.
@@ -271,6 +281,20 @@ pub fn error(id: Option<&Value>, code: i32, message: &str) -> Value {
         "jsonrpc": "2.0",
         "id": id.cloned().unwrap_or(Value::Null),
         "error": { "code": code, "message": message },
+    })
+}
+
+/// The same, carrying machine-readable `data`.
+///
+/// Exists for D74's `retry-after`, which must be EXACT. The HTTP header is whole
+/// seconds by RFC 9110, so a wait of 340ms becomes `Retry-After: 1` — correct but
+/// coarse, and a client that honoured only the header would idle three times
+/// longer than its own bucket needs. The precise figure rides here.
+pub fn error_data(id: Option<&Value>, code: i32, message: &str, data: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.cloned().unwrap_or(Value::Null),
+        "error": { "code": code, "message": message, "data": data },
     })
 }
 

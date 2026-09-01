@@ -14,8 +14,13 @@ axum = "0.8"
 tower-http = { version = "0.7", features = ["limit"] }
 
 # INWARD: gRPC to the module services. No sqlx and no yadgar-store here, for the
-# same reason a logic service has none (D4): the gateway reaches data only over a
-# module's API, never by opening a connection of its own.
+# same reason a logic service has none (D4): the gateway reaches no module's
+# DATABASE except over that module's API.
+#
+# Valkey below is not a counter-example, and the distinction is the one D21
+# draws: the shared cache is INFRASTRUCTURE, not a service, and it fronts
+# nobody's database. D77 already accepted the same cost in the same words —
+# "the gateway now holds state between two calls, and it did not before".
 tonic = { version = "0.14", default-features = false, features = [
   "codegen",
   "transport",
@@ -28,13 +33,44 @@ prost-types = "0.14"
 # Client-side balancing over task's headless Service (D23). Shared rather than
 # copied from task, per the invariant that anything every service needs is
 # implemented once.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "2c1aab6e2754317e9dcea53c1d8c2d37e5d10042" }
+#
+# The FULL 40-character revision, like every other in-org pin in this file. An
+# abbreviation is a prefix match: it resolves today and can become ambiguous as
+# the upstream repository grows, and there is no version to fall back on for a
+# git dependency.
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "abd9c3105f2a2746faa795c6d4936b0fb195f4a8" }
 
 # The shared instrumentation seam (D67). Pinned by revision like every other
 # in-org crate — a branch is a moving target.
 yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1694475a7eab9a8332f2955671987c57bf3234e8", features = [
   "grpc",
 ] }
+
+# The shared cache (D21), holding D74's token buckets. `script` is not optional:
+# the read-compute-write MUST be one atomic operation or the limit is silently
+# multiplied by the replica count. Default features are off — acl, streams,
+# geospatial and num-bigint are surface this service never touches.
+redis = { version = "1.6", default-features = false, features = [
+  "script",
+  "tokio-comp",
+  "connection-manager",
+] }
+
+# The metrics facade, DIRECTLY rather than through yadgar-telemetry. The three
+# D67 signals go through that seam and still do; the rate limiter's degradation
+# counter is a fourth signal belonging to this service alone, and putting it in
+# the shared crate would make every service carry a metric only one can emit.
+# Already in this tree via yadgar-telemetry, so it adds nothing to the build.
+metrics = "0.24"
+
+# ONE HASH, for one purpose: the user id in D74's bucket key. The id is
+# caller-supplied under `Attestation::TrustedHeaders` and the key lands in the
+# cache D21 shares with four other subsystems, so it must be bounded before it
+# gets there. Cryptographic rather than a fast non-cryptographic hash because a
+# user who can choose their own name could otherwise search offline for one that
+# collides with somebody else's bucket and throttle them. Default features off:
+# no `std` detection of CPU features is needed for a 32-byte digest per request.
+sha2 = "0.10"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

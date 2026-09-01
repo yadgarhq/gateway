@@ -75,7 +75,60 @@ on it would be wrong with no error anywhere.
 | `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only                                                             |
 | `YADGAR_IAM_ADDR`                      | unset            | real attestation, not yet implemented                                                                     |
 | `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents |
+| `YADGAR_VALKEY_ADDR`                   | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                         |
+| `YADGAR_RATE_LIMITS`                   | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                |
+| `YADGAR_RATE_LIMIT_DEFAULT`            | `10:100`         | the bucket for a `(module, kind)` nobody named                                                            |
+| `YADGAR_RATE_LIMIT_TIMEOUT_MS`         | `20`             | how long one bucket lookup may take before the call falls back to the local floor                         |
+| `YADGAR_MAX_REPLICAS`                  | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                      |
 | `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                             |
+
+## Rate limiting
+
+Every user-attributed call spends a token from a bucket keyed on
+`(user, module, kind)` (D74). An empty bucket is `429` with an exact
+`Retry-After`. Nothing runs on a timer: the refill is computed from elapsed time
+on each request.
+
+**The buckets live in Valkey, and the read-compute-write is one Lua script.** This
+is the whole reason the module is not a `HashMap`. The gateway runs at least two
+replicas and scales to six; done as a read then a write, two replicas both see one
+token left, both allow, and the configured limit is quietly multiplied by the
+replica count — under exactly the load the limit exists for. `tests/rate_limit.rs`
+measures both: 200 concurrent callers against a bucket of 20 were granted **200**
+by a read-then-write and exactly **20** by the script.
+
+The script reads Valkey's own clock rather than taking one from the caller, so
+replica clock skew cannot buy anybody extra tokens.
+
+**A key's lifetime is a property of the deployment, not of the bucket that wrote
+it.** An absent key is read as a full bucket, so a key must outlive the refill
+window of whichever bucket READS it — and the writer's window is the same number
+only while nobody changes a limit. Every key therefore gets one hour, and a bucket
+that would take longer than an hour to refill is refused at boot.
+
+**The user id reaches the key hashed.** It is caller-supplied under
+`YADGAR_TRUST_UNAUTHENTICATED_HEADERS`, and the key lands in the one Valkey D21
+shares with four other subsystems under `allkeys-lru`. Hashing bounds the size of
+a key; it does not bound how many a caller can mint, and that half is inside D74's
+posture — capacity protection, not authorisation.
+
+**If Valkey cannot answer, the call PROCEEDS under a local floor** — each replica
+holds callers to `rate / YADGAR_MAX_REPLICAS` in process, so six replicas sum to
+the configured rate and never more. It is loud:
+`yadgar_gateway_rate_limit_degraded_total` counts every degraded call under
+`unreachable`, `timeout` or `error` and under whether the floor allowed or refused
+it, and a warning is logged. The argument is on `limit::Decision::Degraded`; the
+short form is that D74 calls this capacity protection rather than authorisation,
+and this Valkey is one replica with no persistence, so failing closed would make
+it a hard dependency of every call at the one hop all traffic already passes
+through — while failing open with no floor at all would leave the number
+unenforced for the length of the outage.
+
+**Per-user overrides are not wired yet.** D74 puts them on
+`ResolveCredentialResponse`, which does not carry them and which this service does
+not call at all while `iam` attestation is unimplemented. `limit::Overrides` is
+the shape they will fill; it is empty on every call today, and empty means the
+configured default applies.
 
 ## Balancing
 
@@ -93,6 +146,19 @@ their peers.
 ```bash
 make proto    # refresh vendored protos from the pin in PROTO_VERSION
 make test
+```
+
+The rate-limit tests need a real Valkey — a bucket's only interesting property
+is what concurrent callers get, and nothing but a real server can answer that.
+**CI runs them**: the shared workflow supplies a Valkey beside its MariaDB
+(`yadgarhq/actions#30`). Locally they skip loudly without one, and **on a runner
+they FAIL rather than skip** (`CI=true` with `YADGAR_TEST_VALKEY` unset is a
+panic), so they cannot silently stop running if that service is ever removed.
+
+```bash
+podman run -d --rm --name valkey-test -p 16379:6379 \
+    docker.io/valkey/valkey:9.1.1 --save "" --appendonly no
+YADGAR_TEST_VALKEY=127.0.0.1:16379 cargo test --all-features -- --nocapture
 ```
 
 `protoc` must be on `PATH` with its well-known types available — `build.rs`
