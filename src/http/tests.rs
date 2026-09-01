@@ -19,10 +19,23 @@ use crate::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 /// `connect_lazy` builds a `Channel` without a server behind it: none of the
 /// paths asserted here gets as far as an RPC, and one that did would fail loudly
 /// rather than quietly passing.
+///
+/// **The limiter points at nothing either, and that is deliberate rather than
+/// convenient.** Every `tools/call` in this file therefore takes D74's degraded
+/// path, so these tests assert the property that path exists for: an unreachable
+/// shared cache must not change any status code this file decides. A limiter that
+/// failed closed would turn most of them into 429 and this suite would say so.
 fn state(allowed_origins: Vec<String>) -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::TrustedHeaders,
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        limiter: crate::limit::Limiter::new(
+            // Nothing listens on port 1, and the refusal is immediate.
+            "127.0.0.1:1",
+            crate::limit::Limits::parse("task.write=1:1", "1:1").expect("the limits parse"),
+            std::time::Duration::from_millis(200),
+        )
+        .expect("the limiter opens"),
         allowed_origins,
     })
 }

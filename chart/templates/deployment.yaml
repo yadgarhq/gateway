@@ -67,6 +67,19 @@ spec:
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
               value: {{ .Values.task.port | quote }}
+            # D74. The ADDRESS is required and gateway exits without it: a
+            # gateway with nowhere to keep its buckets enforces no capacity
+            # limit at all, and that is a deployment mistake rather than an
+            # outage, so D69's fail-at-boot rule applies. An unreachable Valkey
+            # at RUNTIME is the other case, and there the call proceeds.
+            - name: YADGAR_VALKEY_ADDR
+              value: {{ .Values.rateLimit.addr | quote }}
+            - name: YADGAR_RATE_LIMITS
+              value: {{ .Values.rateLimit.limits | quote }}
+            - name: YADGAR_RATE_LIMIT_DEFAULT
+              value: {{ .Values.rateLimit.default | quote }}
+            - name: YADGAR_RATE_LIMIT_TIMEOUT_MS
+              value: {{ .Values.rateLimit.timeoutMs | quote }}
             # No default here (see main.rs / from_default_env): unset means
             # silent, which is the exact failure this line exists to prevent.
             - name: RUST_LOG

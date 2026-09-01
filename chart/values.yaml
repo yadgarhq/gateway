@@ -22,6 +22,43 @@ task:
   host: task
   port: 50052
 
+# D74's token buckets: one per (user, module, kind), held in the shared cache
+# (D21) so every replica of this Deployment spends from the same one. A
+# per-replica bucket would silently multiply every limit below by replicaCount.
+#
+# `addr` is REQUIRED and gateway exits without it. That is not the same rule as
+# what happens when Valkey is unreachable at runtime — then the call PROCEEDS
+# unlimited and says so, loudly, in yadgar_gateway_rate_limit_degraded_total.
+# The reasoning is on `limit::Decision::Degraded`; the short form is that this
+# valkey is one replica with no persistence, and failing closed would make it a
+# hard dependency of every user-attributed call at the one hop all traffic
+# already funnels through.
+rateLimit:
+  addr: valkey:6379
+  # `<module>.<kind>=<rate>:<burst>`, comma separated. `rate` is the sustained
+  # refill per second and `burst` is the bucket's size, so a caller may spend
+  # `burst` at once and is then held to `rate`.
+  #
+  # SET GENEROUSLY, and this is D74's own instruction rather than timidity: an
+  # empty bucket refills at `rate` rather than being handed a fresh allowance
+  # each minute, so a badly chosen rate is felt permanently rather than in
+  # bursts. The per-user override in `iam` exists to handle the exception, not
+  # to paper over a bad default.
+  #
+  # Writes are tighter than reads because the damage D74 protects against is a
+  # loop WRITING ten thousand tasks — there the writing is the failure, and
+  # refusing it is the only response that helps.
+  limits: task.write=2:120,task.read=20:600
+  # The bucket for a (module, kind) nobody named above. A new tool is limited
+  # rather than unlimited on the day it ships; the alternative is a tool that
+  # goes unprotected until somebody remembers to add a line here.
+  default: "10:300"
+  # Milliseconds. This is on the hot path of every user-attributed call, at the
+  # one hop all traffic passes through, so a hung round trip to the cache must
+  # not become the gateway's latency. A timeout degrades exactly like an
+  # unreachable cache: the call proceeds, and the counter says it did.
+  timeoutMs: 20
+
 # DEVELOPMENT ONLY. gateway refuses to boot unless EITHER this is true OR an
 # iam address is configured — there is no third, safer default, because a
 # gateway that boots with neither would accept every caller's self-asserted

@@ -39,6 +39,24 @@ pub fn is_write(name: &str) -> bool {
     name == CREATE_TASK
 }
 
+/// The MODULE a tool belongs to, as a bounded value.
+///
+/// D74 keys a token bucket on `(user, module, kind)`, so this is the second half
+/// of that key — and it is `&'static str` from a closed set for the same reason
+/// [`label_for`] is: an arbitrary caller string here would put one bucket, and
+/// one metric series, per invented name.
+///
+/// Every tool this gateway serves today reaches `task`. The function exists
+/// rather than the constant being inlined because the next module makes this a
+/// real mapping, and a limit keyed on a hardcoded `"task"` would silently pool
+/// `memory` writes into `task`'s bucket.
+pub fn module_for(name: &str) -> Option<&'static str> {
+    match name {
+        CREATE_TASK | READ_TASK | FIND_TASKS => Some("task"),
+        _ => None,
+    }
+}
+
 /// The `tools/list` payload.
 ///
 /// `inputSchema` is REQUIRED and must be a valid JSON Schema object — not null,
@@ -326,6 +344,19 @@ mod tests {
             Some(3),
             "and it must agree with the payload the caller receives"
         );
+    }
+
+    #[test]
+    fn every_advertised_tool_belongs_to_a_bounded_module() {
+        // The (user, module, kind) key D74 buckets on. A tool with no module
+        // could not be limited at all, and the gateway must not serve a tool it
+        // cannot key a bucket for.
+        for tool in definitions().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(module_for(name).is_some(), "{name} has no module");
+        }
+        assert!(module_for("../../etc/passwd").is_none());
+        assert!(module_for("").is_none());
     }
 
     #[test]

@@ -14,9 +14,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use yadgar_gateway::attest::Attestation;
 use yadgar_gateway::http::{router, AppState};
+use yadgar_gateway::limit::{Limiter, Limits};
 use yadgar_gateway::upstream;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -57,6 +59,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
+    // D74's token buckets. The ADDRESS is required, and its absence exits —
+    // which is NOT the same rule as the runtime one. An unconfigured limiter is a
+    // deployment mistake and D69 fails boot on those; an UNREACHABLE Valkey is an
+    // outage of one component, and the call proceeds (see `limit::Decision`).
+    // Conflating the two would either hide the mistake or turn the outage into
+    // one of our own.
+    let valkey_addr = std::env::var("YADGAR_VALKEY_ADDR")
+        .ok()
+        .filter(|a| !a.is_empty())
+        .ok_or(
+            "YADGAR_VALKEY_ADDR is unset. Every user-attributed call spends a token from a \
+             bucket held in the shared cache (D74), and a gateway with nowhere to keep them \
+             enforces no capacity limit at all. Set it to the Valkey service, e.g. valkey:6379.",
+        )?;
+    // A misparsed limit must not become a default: a limit nobody notices is
+    // gone is the failure this refusal exists to prevent.
+    //
+    // `.to_string()` on the way out, and not decoration: `main` returns
+    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` here would
+    // put `UnknownKind("wrote")` on the operator's terminal instead of the
+    // sentence saying which kinds exist.
+    let limits = Limits::parse(
+        &env_or("YADGAR_RATE_LIMITS", ""),
+        &env_or("YADGAR_RATE_LIMIT_DEFAULT", "10:100"),
+    )
+    .map_err(|e| format!("YADGAR_RATE_LIMITS is not usable: {e}"))?;
+    // SHORT, and on the hot path of every call. A hung round trip to the cache
+    // would otherwise put its latency at the one hop all traffic passes through;
+    // a timeout degrades into the same fail-open path as unreachable.
+    let limit_timeout = Duration::from_millis(
+        env_or("YADGAR_RATE_LIMIT_TIMEOUT_MS", "20")
+            .parse()
+            .map_err(|e| format!("YADGAR_RATE_LIMIT_TIMEOUT_MS is not a whole number: {e}"))?,
+    );
+    let limiter = Limiter::new(&valkey_addr, limits, limit_timeout)?;
+    tracing::info!(
+        addr = %valkey_addr,
+        timeout_ms = limit_timeout.as_millis(),
+        "rate limiting enabled (D74)"
+    );
+
     let task_host = env_or("TASK_HOST", "task");
     let task_port: u16 = env_or("TASK_PORT", "50052").parse()?;
     let task = upstream::connect_task(&task_host, task_port).await?;
@@ -90,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router(Arc::new(AppState {
             attestation,
             task,
+            limiter,
             allowed_origins,
         })),
     )

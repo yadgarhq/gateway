@@ -39,6 +39,21 @@ allow = [
     # Not avoidable: it is a hard dependency of sqlx's tls-rustls features, and
     # the alternative is native-tls, which D63 rules out.
     "CDLA-Permissive-2.0",
+
+    # ADDED DELIBERATELY 2026-09-01, the same gate working the same way. Adding
+    # `redis` for D74's token buckets failed on xxhash-rust, and O10 says a new
+    # licence is a decision.
+    #
+    # READ THE SPDX IDENTIFIER, NOT THE ABBREVIATION. `BSL-1.0` is the BOOST
+    # Software License 1.0 — permissive, no copyleft, no attribution obligation
+    # on binary distribution. The Business Source License, which D24 exists to
+    # keep out of this stack, is `BUSL-1.1` and is a different licence entirely.
+    # Rejecting this one on the strength of three shared letters would be
+    # rejecting a licence more permissive than MIT.
+    #
+    # Not avoidable: xxhash-rust is a hard, non-optional dependency of `redis`
+    # 1.6, with no feature that removes it.
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 # The allowlist is a DECIDED set, not a description of today's tree. Entries
