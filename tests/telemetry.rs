@@ -26,6 +26,8 @@ fn state() -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::TrustedHeaders,
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        // Never reached: nothing in this file posts to /auth/login.
+        iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         // Unreachable, so D74's limiter degrades and the call proceeds — which is
         // what keeps this file measuring instrumentation rather than rate limits.
         // A limiter that failed closed would turn the tools/call below into a 429

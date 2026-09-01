@@ -38,7 +38,7 @@ Consequences here:
 |                   |                                                                                                                                               |
 | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                       |
-| One endpoint      | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open.                                                   |
+| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login` is the one non-MCP path.       |
 | `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                          |
 | Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`. |
 | `resultType`      | Required on every result. This server only returns `complete`.                                                                                |
@@ -65,6 +65,40 @@ service logs a warning naming it on every boot.
 that could set it could make two unrelated calls collide, and every roll-up built
 on it would be wrong with no error anywhere.
 
+### `POST /auth/login`
+
+The one unauthenticated path (D75). `yaadgaar login` posts
+`{"username", "password", "label"}` and reads `{"token"}` back; the gateway
+translates that to `iam.Login` and drops `credential_id`, which nothing reads.
+
+**Two statuses, and that is the security property.** `UNAUTHENTICATED` is `401`;
+**every** other gRPC code is one opaque `503` with a constant body.
+
+Some of those other codes are raised only after the password has verified —
+`Internal` when the token cannot be minted, and whatever `create_credential`
+propagates from `iam-db` after that — so a caller able to pick one out would learn
+from the status alone that its password was right. The gateway **cannot tell which
+side of the check a code came from**: the same `Unavailable` arrives from
+`get_password_hash`, which runs before any password is checked, and from
+`create_credential`, which runs after, and `upstream_failed` preserves the
+upstream code either way. Having nothing to distinguish them by, it collapses all
+of them. Mapping everything to `401` closes the same leak and was rejected: it
+tells a person with the right password that it is wrong every time `iam-db` is
+down.
+
+`http::login_answer` decides both the status and the body from a `tonic::Code` —
+**not** a `tonic::Status`, so no upstream message is in scope to be interpolated
+into a body the client never reads. `login_failure` builds the whole response from
+it, and its test walks all 17 codes asserting one refusal, one identical
+`(status, body)` for everything else, no `WWW-Authenticate` (D72 — this deployment
+implements no discovery flow) and `application/json` throughout.
+
+The RPC carries a 10s deadline; a stall answers through the same `login_failure`
+as every other problem, so it is not a third thing to keep opaque.
+
+No rate limit and no audit record. Both are absent org-wide rather than skipped
+here; D74's buckets key on a user and a login has none yet.
+
 ## Configuration
 
 | Variable                               | Default          |                                                                                                           |
@@ -72,6 +106,7 @@ on it would be wrong with no error anywhere.
 | `LISTEN`                               | `0.0.0.0:8080`   | MCP endpoint                                                                                              |
 | `METRICS_LISTEN`                       | `0.0.0.0:9090`   | Prometheus                                                                                                |
 | `TASK_HOST` / `TASK_PORT`              | `task` / `50052` | the upstream module                                                                                       |
+| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | where `POST /auth/login` is sent — **not** attestation, and not `YADGAR_IAM_ADDR`                         |
 | `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only                                                             |
 | `YADGAR_IAM_ADDR`                      | unset            | real attestation, not yet implemented                                                                     |
 | `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents |

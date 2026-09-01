@@ -102,6 +102,9 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // enforces at the gateway precisely so a refused call costs `task`
         // nothing.
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        // Never reached. /auth/login spends no token at all — D74's buckets key
+        // on a user, and a login has none yet.
+        iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         limiter: Limiter::new(&addr, limits, Duration::from_millis(500), 6).expect("limiter"),
         allowed_origins: Vec::new(),
     });

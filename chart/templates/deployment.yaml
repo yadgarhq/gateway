@@ -67,6 +67,14 @@ spec:
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
               value: {{ .Values.task.port | quote }}
+            # Where POST /auth/login is sent (D75). The pair matches TASK_HOST /
+            # TASK_PORT deliberately, and is NOT YADGAR_IAM_ADDR: that variable
+            # means iam-backed attestation, which attest.rs refuses at boot, so
+            # setting it here would stop the pod starting. See values.yaml.
+            - name: IAM_HOST
+              value: {{ .Values.iam.host | quote }}
+            - name: IAM_PORT
+              value: {{ .Values.iam.port | quote }}
             # D74. The ADDRESS is required and gateway exits without it: a
             # gateway with nowhere to keep its buckets enforces no capacity
             # limit at all, and that is a deployment mistake rather than an

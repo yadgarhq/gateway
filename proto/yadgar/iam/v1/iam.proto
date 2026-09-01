@@ -1,0 +1,118 @@
+// The identity module's PUBLIC API — what the gateway calls (D4, D72).
+//
+// The LOGIC service lives here and the storage boundary in yadgar/iamdb/v1,
+// which is the ordering taskapi.proto records as the lesson: `buf lint` refuses
+// to let two RPCs share a request or response type, so the two contracts cannot
+// share messages even where the fields match today.
+syntax = "proto3";
+
+package yadgar.iam.v1;
+
+import "yadgar/common/v1/common.proto";
+
+// Resolve a credential to the identity it belongs to.
+//
+// THE ONLY RPC ON THE REQUEST PATH, and the reason the module exists. The
+// gateway calls it on a cache miss, never per request (D72): `recall` is the
+// latency-critical path (D25) and every call crosses this boundary.
+message ResolveCredentialRequest {
+  // The token as presented, NEVER its hash. Hashing is the module's job — a
+  // caller that hashed it first would have to agree on the algorithm forever,
+  // and changing it would then be a breaking change to every caller rather than
+  // an implementation detail here.
+  string token = 1;
+}
+message ResolveCredentialResponse {
+  // Exactly the two fields Scope needs filled in, and deliberately nothing else.
+  // A response carrying the user's name or e-mail would put personal data on the
+  // hot path and into every cache holding this answer.
+  string user_id = 1;
+  repeated string team_ids = 2;
+
+  // When this answer stops being trustworthy without re-checking. The cache
+  // TTL is a BACKSTOP, not the invalidation mechanism — revocation and team
+  // changes arrive as broker events (D72). A caller that treats this as the only
+  // signal keeps honouring a revoked credential until it expires.
+  int64 valid_for_seconds = 3;
+}
+
+// Exchange a username and password for a long-lived token.
+//
+// Called by the GATEWAY, on behalf of `yadgar login` — never by an agent. This
+// is the one sign-in a person ever performs (D72); the token it returns is what
+// the client stores and attaches from then on.
+message LoginRequest {
+  string username = 1;
+  // Never logged, never stored, and never echoed. Compared against an Argon2id
+  // hash in `iam-db` and discarded.
+  string password = 2;
+  // Free text naming the machine, so a person can tell their laptop's
+  // credential from their desktop's when revoking one.
+  string label = 3;
+}
+message LoginResponse {
+  // Shown once. The store holds only a hash (D72).
+  string token = 1;
+  string credential_id = 2;
+}
+
+// Everything below is administrative (D72): minting is GitOps or CLI, never an
+// agent operation. Kept in the same service because the audience is the same —
+// an operator tool — and splitting one small service in two buys nothing.
+
+message IssueCredentialRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  string user_id = 2;
+  // Free text for a human: which machine, which purpose. Not a key.
+  string label = 3;
+  // Zero means no expiry.
+  int64 expires_in_seconds = 4;
+}
+message IssueCredentialResponse {
+  // Returned ONCE and never again — the store holds only a hash (D72). A
+  // credential store that can hand back its own tokens is a different class of
+  // risk, and the difference is invisible from the outside.
+  string token = 1;
+  string credential_id = 2;
+}
+
+message RevokeCredentialRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  string credential_id = 2;
+}
+message RevokeCredentialResponse {}
+
+message CreateUserRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  string external_id = 2; // how an operator names this person
+  string display_name = 3;
+}
+message CreateUserResponse {
+  yadgar.common.v1.Meta meta = 1;
+}
+
+message AddTeamMemberRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  string team_id = 2;
+  string user_id = 3;
+}
+message AddTeamMemberResponse {}
+
+message RemoveTeamMemberRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  string team_id = 2;
+  string user_id = 3;
+}
+message RemoveTeamMemberResponse {}
+
+// Holds no store. Reaches its data ONLY over IamDbService (D4).
+service IamService {
+  rpc ResolveCredential(ResolveCredentialRequest) returns (ResolveCredentialResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  rpc IssueCredential(IssueCredentialRequest) returns (IssueCredentialResponse);
+  rpc RevokeCredential(RevokeCredentialRequest) returns (RevokeCredentialResponse);
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+  rpc AddTeamMember(AddTeamMemberRequest) returns (AddTeamMemberResponse);
+  rpc RemoveTeamMember(RemoveTeamMemberRequest) returns (RemoveTeamMemberResponse);
+}
