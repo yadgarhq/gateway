@@ -148,12 +148,12 @@ make proto    # refresh vendored protos from the pin in PROTO_VERSION
 make test
 ```
 
-The rate-limit tests need a real Valkey and SKIP loudly without one — a bucket's
-only interesting property is what concurrent callers get, and nothing but a real
-server can answer that. CI supplies MariaDB to every Rust repository and no
-Valkey, so they do not run there yet. **On a runner they FAIL rather than skip**
-(`CI=true` with `YADGAR_TEST_VALKEY` unset is a panic), so the day the shared
-workflow gains a Valkey these cannot silently stay unrun.
+The rate-limit tests need a real Valkey — a bucket's only interesting property
+is what concurrent callers get, and nothing but a real server can answer that.
+**CI runs them**: the shared workflow supplies a Valkey beside its MariaDB
+(`yadgarhq/actions#30`). Locally they skip loudly without one, and **on a runner
+they FAIL rather than skip** (`CI=true` with `YADGAR_TEST_VALKEY` unset is a
+panic), so they cannot silently stop running if that service is ever removed.
 
 ```bash
 podman run -d --rm --name valkey-test -p 16379:6379 \
