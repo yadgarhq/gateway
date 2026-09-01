@@ -35,6 +35,11 @@ pub mod pb {
                 include!(concat!(env!("OUT_DIR"), "/yadgar.taskapi.v1.rs"));
             }
         }
+        pub mod iam {
+            pub mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/yadgar.iam.v1.rs"));
+            }
+        }
     }
 }
 

@@ -125,6 +125,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = upstream::connect_task(&task_host, task_port).await?;
     tracing::info!(host = %task_host, port = task_port, "connected to task");
 
+    // The upstream for POST /auth/login (D75), and NOT for identity.
+    //
+    // **The pair is IAM_HOST/IAM_PORT, matching TASK_HOST/TASK_PORT, and it is
+    // deliberately NOT YADGAR_IAM_ADDR.** That variable names iam-backed
+    // ATTESTATION, which `attest.rs` refuses outright: setting it fails
+    // `Attestation::from_env` at the top of this function, before the listener
+    // binds, and the process exits. Two settings that both read as "where iam is"
+    // is one too many, so the difference is written down here — this one says
+    // where to send a login, that one would say where identity comes from, and
+    // only the first is implemented.
+    //
+    // LAZY, and the one place this file's opening claim is actually true.
+    // `connect_task` above resolves DNS eagerly and `?` turns a name that does not
+    // resolve into a failed boot — so the module comment's "the upstream
+    // connection is NOT gated" does not hold for `task` today. `connect_iam` does
+    // not repeat that: no name is resolved here, so an `iam` that is not deployed
+    // yet costs a 503 on `/auth/login` and nothing at all on `/`. The alternative
+    // was a gateway that refuses to serve MCP because a SECONDARY upstream is
+    // missing, which is the cascading-outage shape this file opens by rejecting.
+    //
+    // `?` still stands on both lines, and what it now covers is configuration
+    // rather than reachability: a port that is not a number, and a host string
+    // that cannot form a URI. Those are deployment mistakes, which is exactly the
+    // class D69 says should fail boot.
+    let iam_host = env_or("IAM_HOST", "iam");
+    let iam_port: u16 = env_or("IAM_PORT", "50052").parse()?;
+    let iam = upstream::connect_iam(&iam_host, iam_port)?;
+    tracing::info!(host = %iam_host, port = iam_port, "iam channel ready (connects on first login)");
+
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure is
     // logged and ignored: telemetry must never fail a call (D25), and that rule
@@ -153,6 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router(Arc::new(AppState {
             attestation,
             task,
+            iam,
             limiter,
             allowed_origins,
         })),

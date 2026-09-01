@@ -10,3 +10,10 @@
 # explicit path would just re-export what --path yadgar/taskapi/v1 already
 # exports.
 yadgar/taskapi/v1
+
+# Login (D75), and listed explicitly for the same reason task lists
+# yadgar/task/v1: gateway is a CLIENT of IamService, and an import closure brings
+# only the messages a proto references, never a service another proto declares.
+# Nothing here reaches yadgar/iamdb/v1 — that is iam's own upstream, not this
+# one's.
+yadgar/iam/v1

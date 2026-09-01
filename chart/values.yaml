@@ -17,9 +17,31 @@ resources:
   limits:
     memory: 128Mi
 
-# gateway's only upstream today (D16): the task logic service, over gRPC.
+# The task logic service, over gRPC (D16).
 task:
   host: task
+  port: 50052
+
+# The iam logic service, for POST /auth/login and NOTHING ELSE (D75).
+#
+# NOT ATTESTATION. This is where a login is sent, not where identity comes from —
+# gateway still trusts the caller's headers, and trustUnauthenticatedHeaders below
+# is still what decides that. The two are easy to conflate because both are "an
+# iam address", so: setting YADGAR_IAM_ADDR — a DIFFERENT variable, not this one —
+# is a boot-killer. `attest.rs` refuses it outright until iam-backed attestation
+# lands, and it is read before the listener binds, so a pod given it exits at
+# startup. This chart never sets it.
+#
+# `iam`'s Service is a VIP rather than headless, so this pins to one connection
+# rather than balancing across replicas. Fine for the rate a person types a
+# password at, and left alone deliberately — see `upstream::connect_iam`.
+#
+# ORDERING-SAFE. The channel is lazy, so this name is not resolved at startup:
+# installing gateway before `iam` exists costs a 503 on /auth/login and nothing
+# on /. A pod that refused to serve MCP because a secondary upstream was missing
+# is the failure that shape avoids.
+iam:
+  host: iam
   port: 50052
 
 # D74's token buckets: one per (user, module, kind), held in the shared cache
