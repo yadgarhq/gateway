@@ -11,13 +11,21 @@
 //!
 //! **The read-compute-write is one atomic operation in a SHARED store, and that
 //! is the whole reason this module is not fifty lines of `HashMap`.** Done as a
-//! `GET` then a `SET` from Rust, two gateway replicas both read `tokens = 1`,
-//! both allow, and the configured limit is quietly multiplied by the replica
-//! count — under exactly the load the limit exists for. So it is a Lua script:
-//! one round trip, atomic by construction, the same shape as D58's migration
-//! lock. The race appears only under concurrency, which is why it cannot be found
-//! by testing against one replica, and why `tests/rate_limit.rs` drives
-//! concurrent callers at a real Valkey and counts what was granted.
+//! `GET` then a `SET` from Rust, every caller racing inside that window reads
+//! the same `tokens` and every one of them allows — so the limit is not
+//! multiplied, it is GONE. Measured against a real Valkey on ONE replica: 200
+//! concurrent callers against `burst = 20` were granted 200; the Lua script
+//! granted 20. So it is a Lua script: one round trip, atomic by construction,
+//! the same shape as D58's migration lock.
+//!
+//! The over-grant scales with callers racing in that window, NOT with the
+//! replica count — one replica is enough to lose the limit entirely. D74 said
+//! "multiplied by the replica count" and has been amended; that magnitude
+//! belongs to a different defect, a per-replica in-process bucket, which is what
+//! `Floor` below deliberately accepts in exchange for being bounded. The race
+//! appears only under concurrency, which is why a sequential test cannot find
+//! it, and why `tests/rate_limit.rs` drives concurrent callers at a real Valkey
+//! and counts what was granted.
 //!
 //! **The clock is Valkey's, never the caller's.** `redis.call('TIME')` inside the
 //! script gives every replica one clock. Passing `SystemTime::now()` in from Rust
