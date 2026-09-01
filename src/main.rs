@@ -14,9 +14,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use yadgar_gateway::attest::Attestation;
 use yadgar_gateway::http::{router, AppState};
+use yadgar_gateway::limit::{Limiter, Limits};
 use yadgar_gateway::upstream;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -57,6 +59,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
+    // D74's token buckets. The ADDRESS is required, and its absence exits —
+    // which is NOT the same rule as the runtime one. An unconfigured limiter is a
+    // deployment mistake and D69 fails boot on those; an UNREACHABLE Valkey is an
+    // outage of one component, and the call proceeds (see `limit::Decision`).
+    // Conflating the two would either hide the mistake or turn the outage into
+    // one of our own.
+    let valkey_addr = std::env::var("YADGAR_VALKEY_ADDR")
+        .ok()
+        .filter(|a| !a.is_empty())
+        .ok_or(
+            "YADGAR_VALKEY_ADDR is unset. Every user-attributed call spends a token from a \
+             bucket held in the shared cache (D74), and a gateway with nowhere to keep them \
+             enforces no capacity limit at all. Set it to the Valkey service, e.g. valkey:6379.",
+        )?;
+    // A misparsed limit must not become a default: a limit nobody notices is
+    // gone is the failure this refusal exists to prevent.
+    //
+    // `.to_string()` on the way out, and not decoration: `main` returns
+    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` here would
+    // put `UnknownKind("wrote")` on the operator's terminal instead of the
+    // sentence saying which kinds exist.
+    let limits = Limits::parse(
+        &env_or("YADGAR_RATE_LIMITS", ""),
+        &env_or("YADGAR_RATE_LIMIT_DEFAULT", "10:100"),
+    )
+    .map_err(|e| format!("YADGAR_RATE_LIMITS is not usable: {e}"))?;
+    // SHORT, and on the hot path of every call. A hung round trip to the cache
+    // would otherwise put its latency at the one hop all traffic passes through;
+    // a timeout degrades into the same fail-open path as unreachable.
+    let limit_timeout = Duration::from_millis(
+        env_or("YADGAR_RATE_LIMIT_TIMEOUT_MS", "20")
+            .parse()
+            .map_err(|e| format!("YADGAR_RATE_LIMIT_TIMEOUT_MS is not a whole number: {e}"))?,
+    );
+    // REQUIRED, for the same reason the address is, and it exits for the same
+    // reason. It is the divisor of the degraded-mode floor: while Valkey cannot
+    // answer, each replica enforces `rate / max_replicas` on its own, and the
+    // aggregate bound that makes that acceptable holds only if this number is the
+    // real ceiling. Defaulting it to 1 would leave the floor at the full
+    // configured rate PER REPLICA — the configured number silently multiplied by
+    // the replica count, which is the exact failure D74 names, on the error path
+    // where nobody looks. A deployment that cannot say how far it scales cannot
+    // have a correct floor, so it does not start.
+    let max_replicas: u32 = env_or("YADGAR_MAX_REPLICAS", "")
+        .parse()
+        .ok()
+        .filter(|n| (1..=1000).contains(n))
+        .ok_or(
+            "YADGAR_MAX_REPLICAS is unset or is not a whole number between 1 and 1000. It is \
+             the largest number of replicas the autoscaler may run, and it divides the local \
+             floor this gateway falls back to while the shared cache cannot answer (D74). The \
+             chart wires it from autoscaling.maxReplicas.",
+        )?;
+    let limiter = Limiter::new(&valkey_addr, limits, limit_timeout, max_replicas)?;
+    tracing::info!(
+        addr = %valkey_addr,
+        timeout_ms = limit_timeout.as_millis(),
+        max_replicas,
+        "rate limiting enabled (D74)"
+    );
+
     let task_host = env_or("TASK_HOST", "task");
     let task_port: u16 = env_or("TASK_PORT", "50052").parse()?;
     let task = upstream::connect_task(&task_host, task_port).await?;
@@ -90,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router(Arc::new(AppState {
             attestation,
             task,
+            limiter,
             allowed_origins,
         })),
     )

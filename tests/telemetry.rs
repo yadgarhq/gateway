@@ -26,6 +26,17 @@ fn state() -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::TrustedHeaders,
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        // Unreachable, so D74's limiter degrades and the call proceeds — which is
+        // what keeps this file measuring instrumentation rather than rate limits.
+        // A limiter that failed closed would turn the tools/call below into a 429
+        // and the UNAUTHENTICATED record it asserts would never be emitted.
+        limiter: yadgar_gateway::limit::Limiter::new(
+            "127.0.0.1:1",
+            yadgar_gateway::limit::Limits::parse("task.write=1:1", "1:1").expect("limits"),
+            std::time::Duration::from_millis(200),
+            6,
+        )
+        .expect("limiter"),
         allowed_origins: Vec::new(),
     })
 }
