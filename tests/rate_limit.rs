@@ -17,15 +17,17 @@
 //! that the naive version over-grants would be a flaky test asserting a
 //! probability.
 //!
-//! # This test does not run in CI today
+//! # These tests do not run in CI today, and CANNOT quietly stay that way
 //!
 //! The shared workflow (`yadgarhq/actions`, `ci-pr.yaml`) supplies MariaDB to
-//! every Rust repository and no Valkey, so `YADGAR_TEST_VALKEY` is unset there
-//! and these skip LOUDLY rather than panicking — which would make this
-//! repository's CI red on every pull request for a reason unrelated to the pull
-//! request. That is a gap, it is named in the pull request, and the fix is a
-//! Valkey service beside the MariaDB one in the shared workflow; the comment
-//! there already argues for running it in every Rust repository rather than
+//! every Rust repository and no Valkey, so `YADGAR_TEST_VALKEY` is unset there.
+//! Locally that is a loud skip. **On a runner it is a failure** — see
+//! `common::resolve`. A skip printed into a green run is a control only while
+//! somebody reads it, and after merge nobody does; the panic is what makes the
+//! gap impossible to carry silently past the day the shared workflow gains a
+//! Valkey, or past a later change that takes it away again. The fix is that
+//! Valkey service, the YAML is in `MIGRATION_NOTES.md`, and the workflow's own
+//! comment already argues for running one in every Rust repository rather than
 //! detecting which need it.
 //!
 //! Run locally with:
@@ -54,7 +56,9 @@ fn limiter(addr: &str, module: &str, bucket: Bucket) -> Limiter {
         "1000:1000",
     )
     .expect("the limits parse");
-    Limiter::new(addr, limits, Duration::from_millis(500)).expect("the limiter opens")
+    // Six, the chart's `autoscaling.maxReplicas`. It divides only the degraded
+    // floor, which these tests do not take — every one of them has a real Valkey.
+    Limiter::new(addr, limits, Duration::from_millis(500), 6).expect("the limiter opens")
 }
 
 /// A module name nothing else will collide with, so a re-run starts empty and
@@ -338,7 +342,7 @@ async fn one_drained_bucket_does_not_throttle_another_user_module_or_kind() {
         "1000:1000",
     )
     .expect("the limits parse");
-    let limiter = Limiter::new(&addr, limits, Duration::from_millis(500)).expect("limiter");
+    let limiter = Limiter::new(&addr, limits, Duration::from_millis(500), 6).expect("limiter");
     let overrides = Overrides::default();
 
     assert_eq!(
@@ -384,7 +388,8 @@ async fn a_per_user_override_is_what_gets_enforced() {
             rate: 0.1,
             burst: 3.0,
         },
-    )]);
+    )])
+    .expect("a usable override");
 
     for n in 1..=3 {
         assert_eq!(
@@ -411,7 +416,8 @@ async fn a_per_user_override_is_what_gets_enforced() {
 async fn an_unreachable_cache_degrades_rather_than_refusing_the_call() {
     let limits = Limits::parse("task.write=1:1", "1:1").expect("parse");
     // Port 1: nothing listens, and the refusal is immediate.
-    let limiter = Limiter::new("127.0.0.1:1", limits, Duration::from_millis(500)).expect("limiter");
+    let limiter =
+        Limiter::new("127.0.0.1:1", limits, Duration::from_millis(500), 6).expect("limiter");
 
     assert_eq!(
         limiter
@@ -422,4 +428,242 @@ async fn an_unreachable_cache_degrades_rather_than_refusing_the_call() {
          rather than `timeout` — an operator reading the counter must not be sent looking for a \
          slow cache when there is an absent one; see limit::Decision::Degraded"
     );
+}
+
+/// **The degraded path is floored, not unlimited.**
+///
+/// While Valkey cannot answer, each replica applies an in-process bucket of
+/// `rate / maxReplicas`. The claim that makes this acceptable where D74 rejects a
+/// per-replica bucket is that it is BOUNDED: at `maxReplicas` replicas the
+/// aggregate can never exceed the configured number. A test that only checked the
+/// floor compiles would not measure that, so this drives concurrent callers at an
+/// unreachable cache and counts what was granted.
+///
+/// Needs no Valkey — the point is that there is none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_unreachable_cache_is_floored_rather_than_unlimited() {
+    const CALLERS: usize = 200;
+    const REPLICAS: u32 = 6;
+
+    // Twelve tokens a second into a bucket of twelve, divided six ways: this
+    // replica's floor is 2/s with a burst of 2. A rate low enough that less than
+    // one token can refill during the run, so the answer is deterministic.
+    let limits = Limits::parse("task.write=0.6:12", "1000:1000").expect("parse");
+    let limiter = Arc::new(
+        Limiter::new("127.0.0.1:1", limits, Duration::from_millis(50), REPLICAS).expect("limiter"),
+    );
+
+    let mut handles = Vec::with_capacity(CALLERS);
+    for _ in 0..CALLERS {
+        let limiter = Arc::clone(&limiter);
+        handles.push(tokio::spawn(async move {
+            limiter
+                .check("max", "task", Kind::Write, &Overrides::default())
+                .await
+        }));
+    }
+    let (mut proceeded, mut refused) = (0, 0);
+    for h in handles {
+        match h.await.expect("the caller finished") {
+            Decision::Degraded(Degrade::Unreachable) => proceeded += 1,
+            Decision::DegradedThrottled { .. } => refused += 1,
+            other => panic!("with no cache every answer is degraded; got {other:?}"),
+        }
+    }
+
+    eprintln!(
+        "cache unreachable: {CALLERS} concurrent callers, configured burst 12 over {REPLICAS} \
+         replicas, PROCEEDED {proceeded}, REFUSED {refused}"
+    );
+    assert_eq!(
+        proceeded + refused,
+        CALLERS,
+        "every call is answered, degraded or not"
+    );
+    assert_eq!(
+        proceeded, 2,
+        "the floor is burst/{REPLICAS} = 2 on this replica; {proceeded} means the degraded \
+         path is unlimited, which is what D74 objects to"
+    );
+    // AND THE AGGREGATE IS THE POINT. Six replicas each holding 2 is 12, the
+    // configured burst — the floor cannot multiply the number the way the
+    // per-replica bucket D74 rejects would.
+    assert_eq!(proceeded * REPLICAS as usize, 12);
+
+    // A second wave finds it empty: the floor refills at rate/replicas rather
+    // than being handed a fresh allowance, exactly as the shared bucket does.
+    let again = limiter
+        .check("max", "task", Kind::Write, &Overrides::default())
+        .await;
+    assert!(
+        matches!(again, Decision::DegradedThrottled { .. }),
+        "an empty floor is not refilled by asking again; got {again:?}"
+    );
+}
+
+/// **A key written by one bucket is read by another, and expiry must not hand
+/// over the difference.**
+///
+/// The TTL is derived from the bucket that WROTE the key; correctness needs the
+/// bucket that READS it. Loosen a limit — a rolling deploy that changes
+/// `YADGAR_RATE_LIMITS`, or a per-user override from `iam` — and a key written
+/// under the old, shorter TTL expires before the new refill window has elapsed.
+/// The reader then finds nothing and treats absent as full.
+///
+/// Measured before the fix, with the same key state and 12 seconds elapsed: the
+/// loosened bucket handed over its whole burst instead of the six tokens that had
+/// actually accrued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_loosened_bucket_does_not_read_an_expired_key_as_full() {
+    let Some(addr) = addr() else { return };
+
+    let module = unique_module("ttl");
+    // THE OLD POD's configuration: five tokens, refilling one every two seconds.
+    // Its refill window is ten seconds, and that used to be the key's whole life.
+    let tight = Bucket {
+        rate: 0.5,
+        burst: 5.0,
+    };
+    // THE NEW POD's, after somebody loosened the limit. Same rate, far larger
+    // bucket, so the refill window is twenty minutes rather than ten seconds.
+    let loose = Bucket {
+        rate: 0.5,
+        burst: 600.0,
+    };
+
+    let writer = limiter(&addr, &module, tight);
+    let overrides = Overrides::default();
+    // Drain it, so the key holds ~0 tokens and a timestamp.
+    let mut drained = 0;
+    while writer.check("max", &module, Kind::Write, &overrides).await == Decision::Allowed {
+        drained += 1;
+        assert!(drained <= 10, "a bucket of 5 granted more than 10");
+    }
+    assert_eq!(drained, tight.burst as usize, "the tight bucket is empty");
+
+    // LONGER THAN THE TIGHT BUCKET'S REFILL WINDOW, which is what the TTL used to
+    // be. Everything the reader sees after this depends on whether the key lived.
+    let elapsed = Duration::from_millis(12_000);
+    tokio::time::sleep(elapsed).await;
+
+    let reader = limiter(&addr, &module, loose);
+    let mut granted = 0;
+    while reader.check("max", &module, Kind::Write, &overrides).await == Decision::Allowed {
+        granted += 1;
+        assert!(
+            granted <= loose.burst as usize + 1,
+            "granted past the burst"
+        );
+    }
+
+    let accrued = elapsed.as_secs_f64() * loose.rate;
+    eprintln!(
+        "loosened bucket after {:?}: GRANTED {granted}, accrued {accrued:.2}, burst {}",
+        elapsed, loose.burst
+    );
+    assert!(
+        (granted as f64) < accrued + 3.0,
+        "after {elapsed:?} at {}/s the reader may spend about {accrued:.2} tokens; it was \
+         granted {granted}. A count near the burst of {} means the key written under the \
+         tighter bucket's TTL expired and absent was read as full",
+        loose.rate,
+        loose.burst
+    );
+}
+
+/// **A caller-supplied user id reaches a key in a cache four other subsystems
+/// share, and nothing bounded it.**
+///
+/// `header()` does `to_str().ok()` and no more, so under
+/// `Attestation::TrustedHeaders` — which the shipped chart enables — the id is
+/// whatever the caller wrote. `http.rs` already bounds `label` and `module` for
+/// exactly this reason and then the key took the raw header.
+///
+/// **The bypass half is inside D74's accepted posture** and is asserted here
+/// rather than fixed: a caller who rotates its id gets a fresh bucket every time,
+/// which is not a runaway loop, and D74 says outright that this is capacity
+/// protection rather than authorisation. **The cache-pressure half is the
+/// finding**: `deploy/infra/valkey/valkey.yaml` runs `--maxmemory 512mb
+/// --maxmemory-policy allkeys-lru`, and that one instance also holds D17's
+/// caches, D29's conversation tokens, D46's throttle counters and D52's
+/// `last_seen_at`. Evicting D46's throttle counters is itself a limit bypass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_cannot_choose_how_much_of_the_shared_cache_its_key_occupies() {
+    use std::collections::HashSet;
+
+    let Some(addr) = addr() else { return };
+
+    let module = unique_module("keysize");
+    let limiter = limiter(
+        &addr,
+        &module,
+        Bucket {
+            rate: 2.0,
+            burst: 2.0,
+        },
+    );
+    let overrides = Overrides::default();
+
+    // 300 distinct ids, exactly as a rotating caller mints them.
+    let mut granted = 0;
+    for n in 0..300 {
+        if limiter
+            .check(
+                &format!("minted-{n:0>64}"),
+                &module,
+                Kind::Write,
+                &overrides,
+            )
+            .await
+            == Decision::Allowed
+        {
+            granted += 1;
+        }
+    }
+    // And one absurd id, which nothing rejects on the way in.
+    let huge = "x".repeat(4000);
+    let _ = limiter.check(&huge, &module, Kind::Write, &overrides).await;
+
+    let client = redis::Client::open(format!("redis://{addr}")).expect("client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect");
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("gw:rl:*:{module}:write"))
+        .query_async(&mut conn)
+        .await
+        .expect("list the keys");
+
+    let lengths: HashSet<usize> = keys.iter().map(String::len).collect();
+    let longest = keys.iter().map(String::len).max().unwrap_or(0);
+    eprintln!(
+        "300 distinct user ids and one of 4000 bytes: {} keys minted, {granted} allowed, \
+         longest key {longest} bytes, distinct key lengths {}",
+        keys.len(),
+        lengths.len()
+    );
+
+    assert_eq!(
+        lengths.len(),
+        1,
+        "every bucket key must be the same length whatever the caller wrote; got {lengths:?}"
+    );
+    assert!(
+        longest < 128,
+        "a 4000-byte user id produced a {longest}-byte key in a cache four other subsystems \
+         share under allkeys-lru"
+    );
+
+    // THE RESIDUAL, asserted so it is disclosed rather than assumed away: hashing
+    // bounds a key's SIZE and not the NUMBER of them. A caller that rotates its
+    // id is still not throttled and still mints one bucket per id. That is inside
+    // D74's accepted posture — the mechanism is capacity protection, not
+    // authorisation — and this assertion is here to fail loudly on the day
+    // somebody believes otherwise.
+    assert_eq!(
+        granted, 300,
+        "a rotating id is NOT throttled, by design; each id is a caller of its own"
+    );
+    assert_eq!(keys.len(), 301, "and each one minted a bucket of its own");
 }

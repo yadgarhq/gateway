@@ -249,8 +249,13 @@ async fn tools_call(
 
     // Resolved to BOUNDED values before anything is measured. An unknown tool
     // never reaches the metric layer, so a caller cannot mint Prometheus series
-    // by inventing names (D67's cardinality rule) — nor, now, a token bucket per
+    // by inventing names (D67's cardinality rule) — nor a token bucket per
     // invented name, which would be the same defect in the shared cache.
+    //
+    // These two are the only components of the bucket key that this bounds. The
+    // third, the user id, arrives as a header and is bounded where the key is
+    // built instead — see `limit::user_component`, which is where that half of
+    // the same argument now lives.
     let (Some(label), Some(module)) = (tools::label_for(name), tools::module_for(name)) else {
         return reply(
             200,
@@ -381,58 +386,120 @@ async fn throttled(
     {
         Decision::Allowed => None,
 
-        Decision::Throttled { retry_after } => {
-            // WHOLE SECONDS in the header (RFC 9110), and never zero: `0` reads
-            // as "retry immediately", which is the herd this exists to avoid.
-            // The exact figure rides in `data`.
-            let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
-            let header_value = seconds.to_string();
-            let kind_name = crate::limit::kind_str(kind);
-            Some(
-                (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    [
-                        (axum::http::header::CONTENT_TYPE, "application/json"),
-                        (axum::http::header::RETRY_AFTER, header_value.as_str()),
-                    ],
-                    mcp::error_data(
-                        Some(id),
-                        codes::RATE_LIMITED,
-                        &format!("the {module} {kind_name} bucket is empty; retry in {seconds}s"),
-                        json!({
-                            "retryAfterMs": (retry_after.as_secs_f64() * 1000.0).ceil() as u64,
-                            "module": module,
-                            "kind": kind_name,
-                        }),
-                    )
-                    .to_string(),
-                )
-                    .into_response(),
-            )
-        }
+        Decision::Throttled { retry_after } => Some(refusal(
+            id,
+            module,
+            kind,
+            retry_after,
+            "the {module} {kind} bucket is empty",
+        )),
 
-        // FAIL OPEN, LOUDLY. The argument is on `Decision::Degraded`; the
-        // loudness is here, and it is the condition that argument depends on. No
-        // user in the log line and none in the label — D72 and D77 both keep
-        // usernames out of both, and an unbounded label would breach D67 besides.
+        // FAIL OPEN ONTO A FLOOR, LOUDLY. The argument is on
+        // `Decision::Degraded`; the loudness is here, and it is the condition
+        // that argument depends on. No user in the log line and none in the label
+        // — D72 and D77 both keep usernames out of both, and an unbounded label
+        // would breach D67 besides.
         Decision::Degraded(why) => {
-            metrics::counter!(
-                crate::limit::DEGRADED,
-                "service" => SERVICE,
-                "tool" => label,
-                "reason" => why.label(),
-            )
-            .increment(1);
-            tracing::warn!(
-                reason = %why,
-                tool = label,
-                module,
-                "rate limiting is DEGRADED: the shared cache could not answer, so this call \
-                 proceeds unlimited (D74)"
-            );
+            degraded(label, module, why, "allowed");
             None
         }
+
+        // DEGRADED AND REFUSED, which is what makes the floor a floor. Counted
+        // apart from the allowed case: a floor that has started refusing real
+        // traffic must be visible, or "the degradation is not silent" — the whole
+        // ground the floor is accepted on — is untrue.
+        Decision::DegradedThrottled {
+            reason,
+            retry_after,
+        } => {
+            degraded(label, module, reason, "throttled");
+            Some(refusal(
+                id,
+                module,
+                kind,
+                retry_after,
+                "the shared cache cannot be reached and this replica's own floor for the \
+                 {module} {kind} bucket is empty",
+            ))
+        }
     }
+}
+
+/// Count and log one degraded call.
+///
+/// `outcome` is `allowed` or `throttled` — two values, so the series stays inside
+/// D67's cardinality rule, and the distinction is the one an operator needs:
+/// whether the floor is merely in force or is turning traffic away.
+fn degraded(
+    label: &'static str,
+    module: &'static str,
+    why: crate::limit::Degrade,
+    outcome: &'static str,
+) {
+    metrics::counter!(
+        crate::limit::DEGRADED,
+        "service" => SERVICE,
+        "tool" => label,
+        "reason" => why.label(),
+        "outcome" => outcome,
+    )
+    .increment(1);
+    tracing::warn!(
+        reason = %why,
+        tool = label,
+        module,
+        outcome,
+        "rate limiting is DEGRADED: the shared cache could not answer, so this call is held to \
+         this replica's local floor of rate/maxReplicas rather than the shared bucket (D74)"
+    );
+}
+
+/// The 429 a refused call receives, from either bucket that can refuse it.
+///
+/// **The two are deliberately indistinguishable to a CLIENT**: the correct client
+/// behaviour is identical, and a client that could tell a degraded refusal from an
+/// ordinary one would be tempted to treat one of them as advisory. They are
+/// distinguished to an operator, in the metric `degraded` emits.
+///
+/// `what` is a template with `{module}` and `{kind}` in it rather than a formatted
+/// string, so the two call sites cannot drift on how they name the bucket.
+fn refusal(
+    id: &Value,
+    module: &'static str,
+    kind: Kind,
+    retry_after: std::time::Duration,
+    what: &str,
+) -> Response {
+    // WHOLE SECONDS in the header (RFC 9110), and never zero: `0` reads as
+    // "retry immediately", which is the herd this exists to avoid. The exact
+    // figure rides in `data`.
+    let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+    let header_value = seconds.to_string();
+    let kind_name = crate::limit::kind_str(kind);
+    let message = format!(
+        "{}; retry in {seconds}s",
+        what.replace("{module}", module)
+            .replace("{kind}", kind_name)
+    );
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (axum::http::header::RETRY_AFTER, header_value.as_str()),
+        ],
+        mcp::error_data(
+            Some(id),
+            codes::RATE_LIMITED,
+            &message,
+            json!({
+                "retryAfterMs": (retry_after.as_secs_f64() * 1000.0).ceil() as u64,
+                "module": module,
+                "kind": kind_name,
+            }),
+        )
+        .to_string(),
+    )
+        .into_response()
 }
 
 /// One tool's result, as the three things the record and the reply both need:

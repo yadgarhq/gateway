@@ -33,15 +33,21 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
+use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 /// The metric this module emits, over and above D67's three.
 ///
-/// Bounded labels only: `reason` comes from [`Degrade`], a closed set of three.
+/// Bounded labels only: `reason` comes from [`Degrade`], a closed set of three,
+/// and `outcome` is `allowed` or `throttled` — whether the degraded call
+/// proceeded on this replica's floor or was refused by it. The second label is
+/// what makes the floor observable, and the floor is accepted (see
+/// [`Decision::Degraded`]) on the ground that it is not silent.
 /// **The user is never a label here.** D72 and D77 both keep usernames out of
 /// logs and metrics, and a per-user label on a degradation counter is exactly how
 /// one gets in — it would also be unbounded, which D67 forbids for its own
@@ -54,6 +60,85 @@ pub const DEGRADED: &str = "yadgar_gateway_rate_limit_degraded_total";
 /// alongside as `gw:exp:` rather than having to reorganise this one.
 const PREFIX: &str = "gw:rl";
 
+/// How long a bucket key lives, **whatever bucket wrote it**.
+///
+/// # Why this is a constant and not `burst / rate`
+///
+/// An absent key is read as a full bucket, so a key must outlive the refill
+/// window of whichever bucket READS it. Deriving the TTL from the bucket that
+/// WROTE it is the same number only while one bucket does both. Loosen a limit —
+/// a rolling deploy that changes `YADGAR_RATE_LIMITS`, or a per-user override
+/// arriving from `iam` — and keys written under the old, shorter TTL expire
+/// before the new refill window has elapsed, and the reader treats absent as
+/// full. Measured against a real container before this was a constant: a key
+/// drained under `0.5:5` and read twelve seconds later under `0.5:600` handed
+/// over **600** tokens where **6** had accrued.
+///
+/// A TTL derived from the largest bucket the process knows about does not fix it
+/// either, because during a rolling deploy the old process does not know the new
+/// configuration. Only a lifetime that is a property of the DEPLOYMENT rather
+/// than of the bucket survives that, which is what this is.
+///
+/// # Why an hour
+///
+/// It is the trade between this invariant and the key-count exposure below. The
+/// invariant wants it large — every bucket's refill window must fit inside it,
+/// which [`ConfigError::Unrefillable`] enforces at boot. The cache wants it
+/// small: a caller under `Attestation::TrustedHeaders` mints one key per user id
+/// it invents, and the shared cache runs `--maxmemory 512mb
+/// --maxmemory-policy allkeys-lru` with four other subsystems in it. An hour is
+/// the point where expiry roughly keeps pace with the rate at which a caller can
+/// mint keys: at the autoscaler's own ceiling of six replicas times ten calls a
+/// second, an hour of minting is about 216,000 keys, which at the ~150 bytes a
+/// two-field hash costs is ~32MB — a slice of the cache rather than the whole of
+/// it. A day would be twenty-four times that.
+///
+/// **The residual, stated rather than implied:** a bucket key still expires, so
+/// this narrows the window rather than closing it. Raise the constant itself, or
+/// configure a bucket whose refill window exceeds it, and the defect returns —
+/// which is why the second of those is refused at boot rather than documented.
+const KEY_TTL_SECONDS: f64 = 3600.0;
+
+/// The user id, as a fixed-width component of a key in a SHARED cache.
+///
+/// **The id is caller-supplied and nothing bounded it.** `http::header` does
+/// `to_str().ok()` and no more, so under `Attestation::TrustedHeaders` — which
+/// the shipped chart enables — this string is whatever the caller wrote.
+/// Measured against the built binary: a 4000-byte id produced a 4017-byte key.
+/// `http.rs` already resolves `label` and `module` to bounded values before
+/// anything is measured, for exactly this reason, and then the key took the raw
+/// header.
+///
+/// The cache is the reason it matters. D21 puts one Valkey behind the whole
+/// system and `deploy/infra/valkey/valkey.yaml` runs it `--maxmemory 512mb
+/// --maxmemory-policy allkeys-lru`; the same instance holds D17's caches, D29's
+/// conversation tokens, D46's throttle counters and D52's `last_seen_at`. Keys a
+/// caller chose the size of evict OTHER tenants, and evicting D46's throttle
+/// counters is itself a limit bypass.
+///
+/// **SHA-256, truncated to 128 bits.** A fast non-cryptographic hash would bound
+/// the length just as well, and would let a user who can choose their own name
+/// search offline for one whose bucket collides with somebody else's — throttling
+/// a stranger. 128 bits leaves collision by accident out of reach.
+///
+/// **What this does NOT do**, because the difference is the whole finding: it
+/// bounds a key's SIZE, not the NUMBER of keys. A caller rotating its id still
+/// mints one bucket per id and is still not throttled. That half is inside D74's
+/// accepted posture — "capacity protection, not authorisation" — and
+/// `tests/rate_limit.rs` asserts it so it stays a decision rather than an
+/// assumption.
+fn user_component(user_id: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(user_id.as_bytes());
+    let mut out = String::with_capacity(32);
+    for byte in &digest[..16] {
+        // Infallible into a String; the result is discarded rather than
+        // unwrapped so a formatting error could never fail a call (D25).
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 /// One bucket's two numbers.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bucket {
@@ -64,17 +149,57 @@ pub struct Bucket {
 }
 
 impl Bucket {
-    /// How long a full bucket takes to refill from empty.
+    /// How long this bucket takes to refill from empty.
     ///
-    /// This is the key's TTL, and the choice is not arbitrary: after this long an
-    /// absent key and a present key describe the same bucket — a full one — so
-    /// expiry can never hand anybody tokens they did not have.
+    /// **This used to be the key's TTL, and that was wrong.** The reasoning is on
+    /// [`KEY_TTL_SECONDS`]: the number is a property of the bucket that WROTE a
+    /// key, and the correctness argument needs the bucket that READS it. What it
+    /// is still good for is stating how long a bucket may take to come back, which
+    /// is what [`ConfigError::Unrefillable`] bounds at boot.
     fn refill_seconds(&self) -> f64 {
         if self.rate <= 0.0 {
             return 0.0;
         }
         self.burst / self.rate
     }
+
+    /// The TTL a key gets when this bucket writes it. Whole seconds, because
+    /// `EXPIRE` takes whole seconds and a sub-second TTL rounds to zero, which
+    /// would delete the key on every write.
+    ///
+    /// The `max` is belt and braces rather than a live branch: [`validate`]
+    /// refuses a bucket whose refill window exceeds [`KEY_TTL_SECONDS`], on both
+    /// the configured path and the override path, so this cannot exceed the
+    /// constant today. It stays because the invariant it protects — a key
+    /// outlives its reader's refill window — should not depend on a validation
+    /// somewhere else staying correct.
+    fn key_ttl_seconds(&self) -> u64 {
+        KEY_TTL_SECONDS.max(self.refill_seconds()).ceil().max(1.0) as u64
+    }
+}
+
+/// Refuse a bucket that cannot be enforced correctly, on EITHER path into one.
+///
+/// **`Limits::parse` validated and `Overrides::from_pairs` did not**, and the
+/// unvalidated one is the path `iam` will drive. Traced through the script: a
+/// `rate` of zero makes the Lua `(cost - tokens) / rate` evaluate to `inf`, which
+/// comes back as the string `"inf"`, parses as `f64::INFINITY` and is clamped to
+/// 86,400 — no panic anywhere, and a permanent lockout with a 24-hour
+/// `Retry-After`.
+fn validate(bucket: Bucket, whole: &str) -> Result<Bucket, ConfigError> {
+    for (what, n) in [("rate", bucket.rate), ("burst", bucket.burst)] {
+        if !n.is_finite() || n <= 0.0 {
+            return Err(ConfigError::NotPositive(
+                format!("{what} {n}"),
+                whole.to_string(),
+            ));
+        }
+    }
+    let window = bucket.refill_seconds();
+    if window > KEY_TTL_SECONDS {
+        return Err(ConfigError::Unrefillable(whole.to_string(), window));
+    }
+    Ok(bucket)
 }
 
 /// What a limit configuration can be wrong in, refused at boot rather than
@@ -91,6 +216,10 @@ pub enum ConfigError {
     NotPositive(String, String),
     #[error("{0:?} is not a kind; expected one of read, write, generate")]
     UnknownKind(String),
+    #[error(
+        "{0:?} takes {1:.0}s to refill from empty, and a bucket key lives          {KEY_TTL_SECONDS:.0}s. Beyond that the key expires while the bucket is          still empty and the next call reads absent as FULL, which hands over the          whole burst. Raise `rate` or lower `burst`."
+    )]
+    Unrefillable(String, f64),
 }
 
 /// The configured defaults (D43), and the fallback for a pair nobody named.
@@ -142,10 +271,13 @@ fn parse_bucket(spec: &str, whole: &str) -> Result<Bucket, ConfigError> {
             .filter(|n| n.is_finite() && *n > 0.0)
             .ok_or_else(|| ConfigError::NotPositive(s.to_string(), whole.to_string()))
     };
-    Ok(Bucket {
-        rate: number(rate)?,
-        burst: number(burst)?,
-    })
+    validate(
+        Bucket {
+            rate: number(rate)?,
+            burst: number(burst)?,
+        },
+        whole,
+    )
 }
 
 impl Limits {
@@ -209,15 +341,35 @@ impl Limits {
 pub struct Overrides(HashMap<String, Bucket>);
 
 impl Overrides {
-    /// Build from what a resolved credential carried.
+    /// Build from what a resolved credential carried, refusing what cannot be
+    /// enforced.
     ///
     /// The call site is `attest`, and the input will be the repeated field D74
     /// describes. Taking `(module.kind, rate, burst)` triples rather than a
     /// generated protobuf type keeps this module off the contract's schedule:
     /// when the proto lands, one `map` in `attest.rs` changes and nothing here
     /// does.
-    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, Bucket)>) -> Self {
-        Self(pairs.into_iter().collect())
+    ///
+    /// **Validated, because this is the path `iam` will drive and it was the
+    /// unvalidated one.** `Limits::parse` refuses a `rate` of zero and this did
+    /// not; the effect was not a panic but a permanent lockout with a 24-hour
+    /// `Retry-After` — see [`validate`].
+    ///
+    /// **The call site must refuse the credential, not drop the bad bucket.** An
+    /// override that cannot be parsed is a limit somebody set on purpose, and
+    /// skipping it silently applies the configured default instead — which for an
+    /// override that TIGHTENS a limit is the limit-nobody-notices-is-gone shape
+    /// D69 and this module's own `ConfigError` both exist to refuse. A refused
+    /// credential is an unusable credential, and `attest` already has a shape for
+    /// that.
+    pub fn from_pairs(
+        pairs: impl IntoIterator<Item = (String, Bucket)>,
+    ) -> Result<Self, ConfigError> {
+        pairs
+            .into_iter()
+            .map(|(pair, bucket)| Ok((pair.clone(), validate(bucket, &pair)?)))
+            .collect::<Result<HashMap<_, _>, ConfigError>>()
+            .map(Self)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -265,7 +417,8 @@ pub enum Decision {
     /// callers are not all told to return at the same instant, which is a
     /// thundering herd built into the protocol.
     Throttled { retry_after: Duration },
-    /// The shared store could not answer, and **the call proceeds unlimited**.
+    /// The shared store could not answer. **The call proceeds, under this
+    /// replica's own floor** — see [`Floor`].
     ///
     /// # Why fail open, when D69 fails closed on a missing capability
     ///
@@ -288,23 +441,173 @@ pub enum Decision {
     /// non-security control as a security control, and pays a security control's
     /// availability price for it.
     ///
-    /// **The failure shapes are not symmetric.** Fail open during an outage: a
-    /// looping client can write faster than intended for the length of the
-    /// outage, bounded by `task`'s own capacity and visible in D67's counters.
-    /// Fail closed during the same outage: every caller gets 429, every client
-    /// retries on the `retry-after` it was handed, and the retry storm outlives
-    /// the outage that caused it.
+    /// **The failure shapes are not symmetric.** Fail closed during an outage:
+    /// every caller gets 429, every client retries on the `retry-after` it was
+    /// handed, and the retry storm outlives the outage that caused it. Fail open:
+    /// a looping client writes faster than intended for the length of the outage,
+    /// which is why it is floored rather than left alone.
     ///
-    /// **An in-process fallback bucket is rejected, not overlooked.** It is the
-    /// per-replica bucket D74 names as the defect and D18 forbids outright, and
-    /// it would silently multiply the limit by the replica count — the exact
-    /// thing this module's Lua script exists to prevent, reintroduced on the
-    /// error path where nobody looks.
+    /// # Why a floor rather than nothing, which is the correction to what stood
+    /// here
+    ///
+    /// This used to say an in-process bucket was "the per-replica bucket D74
+    /// names as the defect and D18 forbids outright". **The D18 citation was
+    /// wrong**, and it was load-bearing: D18 governs cache-coherence mechanisms —
+    /// epochs, scope versions, per-id invalidation — and says nothing about
+    /// rate-limit state. The borrowed absoluteness is what carried the rejection.
+    ///
+    /// It also used to say the fail-open cost was "bounded by `task`'s own
+    /// capacity". **It is not.** A grep of `yadgarhq/task/src` finds no rate
+    /// limit, no semaphore, no concurrency cap and no in-flight bound, so the
+    /// phrase resolved to "bounded by MariaDB saturating" — which is the failure
+    /// D74 exists to prevent, offered as the mitigation for it.
+    ///
+    /// What D74 actually objects to in a per-replica bucket is that **the
+    /// configured number silently becomes a lie in the primary mechanism**. A
+    /// degraded-mode floor is a different thing on each count. It is not silent:
+    /// [`DEGRADED`] counts every degraded call under its reason and its outcome,
+    /// and a warning is logged. It is not permanent: the connection is a
+    /// `OnceCell` that does not cache its error, so a Valkey that comes back is
+    /// picked up by the next call with no restart. And it is not unbounded: at
+    /// `maxReplicas` replicas each holding `rate / maxReplicas`, the aggregate
+    /// never exceeds the configured rate.
     ///
     /// **The condition is that this is LOUD.** A silent fail-open is the D76
-    /// shape: a dead mechanism that reads healthy. So every degraded call
-    /// increments [`DEGRADED`] under its reason and logs at warn.
+    /// shape: a dead mechanism that reads healthy.
     Degraded(Degrade),
+
+    /// The shared store could not answer AND this replica's floor is empty.
+    ///
+    /// A 429, like [`Decision::Throttled`], and deliberately indistinguishable
+    /// from one to a client: the correct client behaviour is the same. It is
+    /// distinguished to an OPERATOR, by [`DEGRADED`] carrying `outcome` —
+    /// otherwise a floor that has started refusing real traffic is invisible, and
+    /// "not silent" is the whole ground on which the floor is accepted above.
+    DegradedThrottled {
+        reason: Degrade,
+        retry_after: Duration,
+    },
+}
+
+/// The in-process bucket that applies while the shared store cannot answer.
+///
+/// **Per replica, and that is the point rather than an oversight.** Nothing
+/// coordinates during a cache outage — coordination is the thing that is
+/// missing — so the only number a replica can enforce alone is its own share.
+/// Dividing by the largest number of replicas the autoscaler may run makes the
+/// aggregate bound hold at every scale: at `maxReplicas` the sum is the
+/// configured rate, and below it the floor is tighter than configured, which errs
+/// toward refusing rather than toward the multiplication D74 rejects.
+///
+/// `maxReplicas` is read from the chart (`YADGAR_MAX_REPLICAS`, wired from
+/// `autoscaling.maxReplicas`) rather than hardcoded, because a constant here and
+/// a number in `values.yaml` are two places that must agree and only one of them
+/// gets edited.
+///
+/// **The burst has a floor of one token**, or a configured burst below
+/// `maxReplicas` would divide to less than a token and refuse every call during
+/// an outage — turning a fail-open decision into a fail-closed one by arithmetic.
+/// The consequence, stated because the aggregate bound above is what makes this
+/// acceptable: for a configured burst below `maxReplicas`, the aggregate degraded
+/// burst can reach `maxReplicas` tokens rather than the configured burst. That is
+/// bounded, small, and only reachable for buckets configured tighter than the
+/// replica count.
+///
+/// **The map is bounded**, because the key includes a caller-supplied user id and
+/// an unbounded map here would be the same defect as an unbounded key. When it is
+/// full, entries that have refilled to full are dropped — an entry idle for its
+/// own refill window holds exactly what an absent one would, so dropping it
+/// changes no answer. If that frees nothing, the call is refused rather than
+/// allowed untracked: refusing is the safe direction, and it is only reachable
+/// with [`FLOOR_CAPACITY`] distinct callers holding non-full buckets on one
+/// replica during a cache outage.
+struct Floor {
+    replicas: f64,
+    entries: Mutex<HashMap<String, Local>>,
+}
+
+/// How many distinct callers one replica tracks while degraded.
+const FLOOR_CAPACITY: usize = 4096;
+
+/// One caller's degraded-mode bucket.
+///
+/// `full_at` is stored rather than recomputed so the capacity sweep does not need
+/// each entry's own rate and burst — the only question it asks is whether an
+/// entry has refilled to full, and that is a time.
+#[derive(Debug, Clone, Copy)]
+struct Local {
+    tokens: f64,
+    at: Instant,
+    full_at: Instant,
+}
+
+impl Floor {
+    fn new(replicas: u32) -> Self {
+        Self {
+            replicas: f64::from(replicas.max(1)),
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Spend one token from the local floor, or say how long until there is one.
+    ///
+    /// `now` is injected so the arithmetic is testable without sleeping.
+    fn check(&self, key: &str, bucket: Bucket, now: Instant) -> Result<(), Duration> {
+        let rate = bucket.rate / self.replicas;
+        let burst = (bucket.burst / self.replicas).max(1.0);
+        // A POISONED LOCK MUST NOT FAIL A CALL. The only writer is this function
+        // and it holds no invariant across the boundary, so the recovered map is
+        // as usable as any other.
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let mut tokens = match entries.get(key) {
+            Some(local) => {
+                let elapsed = now.saturating_duration_since(local.at).as_secs_f64();
+                burst.min(local.tokens + elapsed * rate)
+            }
+            None => {
+                if entries.len() >= FLOOR_CAPACITY {
+                    entries.retain(|_, local| local.full_at > now);
+                }
+                if entries.len() >= FLOOR_CAPACITY {
+                    return Err(seconds(1.0 / rate));
+                }
+                burst
+            }
+        };
+
+        let allowed = tokens >= 1.0;
+        if allowed {
+            tokens -= 1.0;
+        }
+        entries.insert(
+            key.to_string(),
+            Local {
+                tokens,
+                at: now,
+                full_at: now + seconds((burst - tokens) / rate),
+            },
+        );
+        if allowed {
+            Ok(())
+        } else {
+            Err(seconds((1.0 - tokens) / rate))
+        }
+    }
+}
+
+/// A duration from seconds, clamped so a slow bucket cannot overflow one.
+///
+/// `Duration::from_secs_f64` PANICS on a value that does not fit, and the input
+/// here is a quotient of configured numbers. The ceiling is the same 86,400 the
+/// `retry_after` on the shared path is clamped to, so the two paths cannot
+/// disagree about the longest wait this service will name.
+fn seconds(n: f64) -> Duration {
+    Duration::from_secs_f64(if n.is_finite() {
+        n.clamp(0.0, 86_400.0)
+    } else {
+        86_400.0
+    })
 }
 
 /// The atomic read-compute-write.
@@ -330,8 +633,9 @@ local state  = redis.call('HMGET', key, 'tokens', 'ts')
 local tokens = tonumber(state[1])
 local ts     = tonumber(state[2])
 if tokens == nil or ts == nil then
-  -- An absent bucket is a FULL one. The key's TTL is the time a full bucket
-  -- takes to refill, so this can never grant more than waiting would have.
+  -- An absent bucket is a FULL one. That is sound only while the key outlives
+  -- the refill window of the bucket READING it, which is what a TTL fixed for
+  -- the whole deployment buys -- see KEY_TTL_SECONDS in this file.
   tokens = burst
   ts     = now
 end
@@ -352,7 +656,19 @@ else
 end
 
 redis.call('HSET', key, 'tokens', tokens, 'ts', now)
-redis.call('EXPIRE', key, ttl)
+-- EXTEND ONLY, NEVER SHORTEN. Two processes may hold different configurations
+-- during a rolling deploy, and the shorter TTL must not win: a key whose life
+-- is cut expires while its bucket is still empty, and the next read treats
+-- absent as full. TTL returns -2 for an absent key and -1 for one with no
+-- expiry, and both compare below any real ttl, so both set it.
+--
+-- Not `EXPIRE key ttl GT`: GT treats a key with no TTL as having an infinite
+-- one and refuses to set the first expiry at all, which is exactly the call
+-- that must not be skipped.
+local current = redis.call('TTL', key)
+if current < ttl then
+  redis.call('EXPIRE', key, ttl)
+end
 
 return {allowed, tostring(tokens), tostring(retry)}
 "#;
@@ -390,17 +706,30 @@ pub struct Limiter {
     limits: Limits,
     timeout: Duration,
     script: redis::Script,
+    /// What applies while `conn` cannot answer. See [`Floor`].
+    floor: Floor,
 }
 
 impl Limiter {
     /// `addr` is `host:port`. No I/O happens here.
-    pub fn new(addr: &str, limits: Limits, timeout: Duration) -> Result<Self, redis::RedisError> {
+    ///
+    /// `max_replicas` is the largest number of replicas of this Deployment the
+    /// autoscaler may run, and it is the divisor of the degraded-mode floor —
+    /// see [`Floor`]. It is a parameter rather than a constant because the
+    /// authority for it is the chart.
+    pub fn new(
+        addr: &str,
+        limits: Limits,
+        timeout: Duration,
+        max_replicas: u32,
+    ) -> Result<Self, redis::RedisError> {
         Ok(Self {
             client: redis::Client::open(format!("redis://{addr}"))?,
             conn: OnceCell::new(),
             limits,
             timeout,
             script: redis::Script::new(SCRIPT),
+            floor: Floor::new(max_replicas),
         })
     }
 
@@ -411,7 +740,9 @@ impl Limiter {
     /// Spend one token, or refuse.
     ///
     /// `user_id` reaches the KEY and nothing else — never a log line and never a
-    /// metric label (D72, D77).
+    /// metric label (D72, D77) — and it reaches the key HASHED, because the key
+    /// lives in a cache four other subsystems share and the id is caller-supplied.
+    /// See [`user_component`].
     pub async fn check(
         &self,
         user_id: &str,
@@ -420,10 +751,14 @@ impl Limiter {
         overrides: &Overrides,
     ) -> Decision {
         let bucket = self.limits.effective(module, kind, overrides);
-        let key = format!("{PREFIX}:{user_id}:{module}:{}", kind_str(kind));
-        match tokio::time::timeout(self.timeout, self.spend(&key, bucket)).await {
-            Ok(Ok(decision)) => decision,
-            Ok(Err(degrade)) => Decision::Degraded(degrade),
+        let key = format!(
+            "{PREFIX}:{}:{module}:{}",
+            user_component(user_id),
+            kind_str(kind)
+        );
+        let reason = match tokio::time::timeout(self.timeout, self.spend(&key, bucket)).await {
+            Ok(Ok(decision)) => return decision,
+            Ok(Err(degrade)) => degrade,
             // TIMED OUT, and the reason it timed out decides the label. A Valkey
             // that is simply DOWN would otherwise be reported as "timeout",
             // because the connect attempt outlives this budget and the outer
@@ -431,8 +766,17 @@ impl Limiter {
             // looking for a slow cache rather than an absent one. If no
             // connection has ever been established, "unreachable" is the true
             // answer; once one has, a later stall really is a stall.
-            Err(_elapsed) if self.conn.get().is_none() => Decision::Degraded(Degrade::Unreachable),
-            Err(_elapsed) => Decision::Degraded(Degrade::Timeout),
+            Err(_elapsed) if self.conn.get().is_none() => Degrade::Unreachable,
+            Err(_elapsed) => Degrade::Timeout,
+        };
+        // DEGRADED, AND FLOORED. The call proceeds on this replica's own share
+        // rather than unlimited — the argument is on `Decision::Degraded`.
+        match self.floor.check(&key, bucket, Instant::now()) {
+            Ok(()) => Decision::Degraded(reason),
+            Err(retry_after) => Decision::DegradedThrottled {
+                reason,
+                retry_after,
+            },
         }
     }
 
@@ -464,9 +808,9 @@ impl Limiter {
             .map_err(|_| Degrade::Unreachable)?
             .clone();
 
-        // At least one second: EXPIRE takes whole seconds, and a sub-second TTL
-        // rounds to zero, which deletes the key on every write.
-        let ttl = bucket.refill_seconds().ceil().max(1.0) as u64;
+        // A property of the DEPLOYMENT, not of this bucket. See
+        // `Bucket::key_ttl_seconds` and `KEY_TTL_SECONDS`.
+        let ttl = bucket.key_ttl_seconds();
 
         let (allowed, _tokens, retry): (i64, String, String) = self
             .script
@@ -519,7 +863,8 @@ mod tests {
                 rate: 99.0,
                 burst: 999.0,
             },
-        )]);
+        )])
+        .expect("a usable override");
         assert_eq!(
             limits.effective("task", Kind::Write, &mine),
             Bucket {
@@ -572,6 +917,12 @@ mod tests {
             "task.write=2:abc",   // not a number
             ".write=2:20",        // no module
             "task.write=2:20,,,", // trailing separators are fine
+            // A bucket that takes longer to refill than a key lives. The key
+            // expires while the bucket is still empty, and the next call reads
+            // absent as FULL — the whole burst, handed over. Refused at boot
+            // rather than documented, because there is no correct value of
+            // KEY_TTL_SECONDS that covers an arbitrary one.
+            "task.write=0.001:100",
         ] {
             let parsed = Limits::parse(bad, "10:100");
             if bad == "task.write=2:20,,," {
@@ -587,26 +938,212 @@ mod tests {
     }
 
     #[test]
-    fn the_ttl_is_the_time_a_full_bucket_takes_to_refill() {
-        // A SHORTER TTL WOULD HAND OUT TOKENS. An expired key is read as a full
-        // bucket, so the key must not expire before waiting would have refilled
-        // it anyway. This is the property, stated as arithmetic.
+    fn a_keys_lifetime_does_not_depend_on_the_bucket_that_wrote_it() {
+        // MUTATION THIS CATCHES: `key_ttl_seconds` going back to
+        // `refill_seconds().ceil()`. Under it the TTL is the writer's number
+        // while correctness needs the reader's, so loosening a limit lets keys
+        // written under the old one expire early and be read as full buckets.
+        // Measured against a real container before the fix: 600 tokens handed
+        // over where 6 had accrued.
+        let tight = Bucket {
+            rate: 0.5,
+            burst: 5.0,
+        };
+        let loose = Bucket {
+            rate: 0.5,
+            burst: 600.0,
+        };
+        assert_eq!(tight.refill_seconds(), 10.0, "ten seconds apart as buckets");
+        assert_eq!(loose.refill_seconds(), 1200.0);
         assert_eq!(
+            tight.key_ttl_seconds(),
+            loose.key_ttl_seconds(),
+            "and the SAME lifetime as keys, or the tighter one's key expires \
+             before the looser one's refill window has elapsed"
+        );
+        assert_eq!(tight.key_ttl_seconds(), KEY_TTL_SECONDS as u64);
+    }
+
+    #[test]
+    fn every_configurable_bucket_refills_inside_a_keys_lifetime() {
+        // The invariant the constant rests on, checked rather than assumed: no
+        // bucket that PARSES may outlive the key it writes. If one could, the
+        // TTL would have to vary again and the defect above would return.
+        for spec in [
+            "task.write=2:120",
+            "task.read=20:600",
+            "memory.write=0.5:600",
+            "recall.read=10:300",
+        ] {
+            let limits = Limits::parse(spec, "10:300").expect("{spec} parses");
+            for bucket in limits.per_pair.values().chain([&limits.fallback]) {
+                assert!(
+                    bucket.refill_seconds() <= KEY_TTL_SECONDS,
+                    "{spec}: a bucket that outlives its key would be refused"
+                );
+                assert_eq!(bucket.key_ttl_seconds(), KEY_TTL_SECONDS as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn a_caller_cannot_choose_the_size_of_its_key_in_the_shared_cache() {
+        // MUTATION THIS CATCHES: the key taking the raw header again. The id is
+        // caller-supplied under `Attestation::TrustedHeaders`, and the key lands
+        // in the one Valkey D21 shares with D17, D29, D46 and D52 under
+        // `allkeys-lru` — so a caller who picks the key size evicts other
+        // tenants' entries, and evicting D46's throttle counters is itself a
+        // limit bypass. Measured before the fix: a 4000-byte id, a 4017-byte key.
+        let short = user_component("max");
+        let huge = user_component(&"x".repeat(4000));
+        assert_eq!(short.len(), 32, "128 bits of SHA-256, as hex");
+        assert_eq!(huge.len(), short.len(), "whatever the caller wrote");
+        assert!(
+            short.chars().all(|c| c.is_ascii_hexdigit()),
+            "and nothing of the caller's own bytes survives into the key"
+        );
+        assert_ne!(short, user_component("ada"), "two callers, two buckets");
+        // The same id is the same bucket on every replica, which is the whole
+        // point of putting it in a shared store.
+        assert_eq!(short, user_component("max"));
+        // A colon in the id must not be able to forge another component: the
+        // hash is hex, so no separator can survive it.
+        assert!(!user_component("max:task:write").contains(':'));
+    }
+
+    #[test]
+    fn an_override_is_validated_like_a_configured_limit() {
+        // TRACED, not guessed: `rate = 0` makes the Lua `(cost - tokens) / rate`
+        // evaluate to `inf`, which returns as the string "inf", parses as
+        // f64::INFINITY and is clamped to 86_400. No panic — a permanent lockout
+        // with a 24-hour Retry-After, on the path `iam` will drive.
+        for bad in [
+            Bucket {
+                rate: 0.0,
+                burst: 20.0,
+            },
+            Bucket {
+                rate: -1.0,
+                burst: 20.0,
+            },
+            Bucket {
+                rate: 2.0,
+                burst: 0.0,
+            },
+            Bucket {
+                rate: f64::NAN,
+                burst: 20.0,
+            },
+            Bucket {
+                rate: f64::INFINITY,
+                burst: 20.0,
+            },
+            // Refills more slowly than its key lives, exactly as on the
+            // configured path.
+            Bucket {
+                rate: 0.001,
+                burst: 100.0,
+            },
+        ] {
+            assert!(
+                Overrides::from_pairs([("task.write".to_string(), bad)]).is_err(),
+                "{bad:?} must be refused on the override path too"
+            );
+        }
+        assert!(Overrides::from_pairs([(
+            "task.write".to_string(),
             Bucket {
                 rate: 2.0,
                 burst: 20.0
             }
-            .refill_seconds(),
-            10.0
+        )])
+        .is_ok());
+    }
+
+    #[test]
+    fn a_degraded_call_is_held_to_this_replicas_share_and_not_to_the_whole_limit() {
+        // THE ARITHMETIC THE FLOOR RESTS ON. Twelve tokens a second over six
+        // replicas is two a second each, so six replicas sum to the configured
+        // twelve and never more — which is the difference between this and the
+        // per-replica bucket D74 rejects, where each replica would hold twelve.
+        let floor = Floor::new(6);
+        let bucket = Bucket {
+            rate: 12.0,
+            burst: 12.0,
+        };
+        let t0 = Instant::now();
+
+        for n in 1..=2 {
+            assert!(
+                floor.check("k", bucket, t0).is_ok(),
+                "spend {n} of this replica's burst of 2"
+            );
+        }
+        let wait = floor
+            .check("k", bucket, t0)
+            .expect_err("the floor is empty");
+        assert!(
+            wait > Duration::from_millis(400) && wait < Duration::from_millis(600),
+            "a floor of 2/s is half a second from its next token; got {wait:?}"
         );
-        assert_eq!(
-            Bucket {
-                rate: 100.0,
-                burst: 100.0
-            }
-            .refill_seconds(),
-            1.0
+
+        // It refills at rate/replicas, from elapsed time, exactly as the shared
+        // bucket does — no fresh allowance on the next call.
+        assert!(floor
+            .check("k", bucket, t0 + Duration::from_millis(500))
+            .is_ok());
+        assert!(floor
+            .check("k", bucket, t0 + Duration::from_millis(500))
+            .is_err());
+
+        // And it is keyed, so one caller draining it does not refuse another.
+        assert!(floor.check("other", bucket, t0).is_ok());
+    }
+
+    #[test]
+    fn a_burst_smaller_than_the_replica_count_still_grants_one_call() {
+        // Two over six replicas is a third of a token, and a floor that granted
+        // nothing would turn the fail-OPEN decision into a fail-closed one by
+        // arithmetic. The cost is stated on `Floor`: for a configured burst below
+        // the replica count, the aggregate degraded burst can reach the replica
+        // count rather than the configured burst. Bounded, and small.
+        let floor = Floor::new(6);
+        let tiny = Bucket {
+            rate: 2.0,
+            burst: 2.0,
+        };
+        assert!(floor.check("k", tiny, Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn the_degraded_map_is_bounded_and_refuses_rather_than_growing() {
+        // THE KEY CARRIES A CALLER-SUPPLIED USER ID, so an unbounded map here
+        // would be the same defect as an unbounded key, moved into the process.
+        let floor = Floor::new(1);
+        // A bucket that takes an hour to refill, so nothing sweeps out.
+        let slow = Bucket {
+            rate: 1.0,
+            burst: 3600.0,
+        };
+        let t0 = Instant::now();
+        for n in 0..FLOOR_CAPACITY {
+            assert!(floor.check(&format!("caller-{n}"), slow, t0).is_ok());
+        }
+        assert!(
+            floor.check("one-too-many", slow, t0).is_err(),
+            "a new caller past the cap is REFUSED, not allowed untracked — refusing is the \
+             safe direction and untracked would be a bypass"
         );
+        // A caller already tracked is unaffected: the cap bounds how many are
+        // remembered, not how the remembered ones are treated.
+        assert!(floor.check("caller-0", slow, t0).is_ok());
+
+        // AND THE SWEEP IS WHAT KEEPS IT USABLE. Every entry has refilled to full
+        // an hour later, and a full entry holds exactly what an absent one would,
+        // so dropping it changes no answer.
+        assert!(floor
+            .check("one-too-many", slow, t0 + Duration::from_secs(7200))
+            .is_ok());
     }
 
     #[test]

@@ -80,6 +80,16 @@ spec:
               value: {{ .Values.rateLimit.default | quote }}
             - name: YADGAR_RATE_LIMIT_TIMEOUT_MS
               value: {{ .Values.rateLimit.timeoutMs | quote }}
+            # The DIVISOR of the degraded-mode floor, and required for the same
+            # reason the address is. While Valkey cannot answer, each replica
+            # holds callers to rate/this on its own; the aggregate bound that
+            # makes that acceptable holds only if this is the real ceiling. Taken
+            # from the autoscaler's own maximum when it is enabled, and from the
+            # fixed replica count when it is not — a constant in the binary and a
+            # number here would be two places that must agree, and only one of
+            # them gets edited.
+            - name: YADGAR_MAX_REPLICAS
+              value: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas | quote }}{{ else }}{{ .Values.replicaCount | quote }}{{ end }}
             # No default here (see main.rs / from_default_env): unset means
             # silent, which is the exact failure this line exists to prevent.
             - name: RUST_LOG

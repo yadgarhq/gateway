@@ -25,6 +25,13 @@ use crate::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 /// path, so these tests assert the property that path exists for: an unreachable
 /// shared cache must not change any status code this file decides. A limiter that
 /// failed closed would turn most of them into 429 and this suite would say so.
+///
+/// **A FRESH limiter per call, which the degraded floor makes load-bearing.**
+/// While the cache is unreachable each replica holds callers to
+/// `rate / maxReplicas` in process, so a shared limiter would let the second
+/// `tools/call` in this file be refused by the first one's spending — and the
+/// status codes asserted here would depend on test order. One limiter per state
+/// is one floor per test.
 fn state(allowed_origins: Vec<String>) -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::TrustedHeaders,
@@ -34,6 +41,7 @@ fn state(allowed_origins: Vec<String>) -> Arc<AppState> {
             "127.0.0.1:1",
             crate::limit::Limits::parse("task.write=1:1", "1:1").expect("the limits parse"),
             std::time::Duration::from_millis(200),
+            6,
         )
         .expect("the limiter opens"),
         allowed_origins,

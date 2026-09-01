@@ -10,8 +10,8 @@
 //! cannot share one with the rest of the suite.
 //!
 //! Needs a real Valkey and therefore does not run in CI today — see the module
-//! comment on `rate_limit.rs` for why that is a gate rather than a panic, and how
-//! to run it.
+//! comment on `rate_limit.rs` for how to run it, and why an absent Valkey is a
+//! skip locally and a failure on a runner.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,7 +102,7 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // enforces at the gateway precisely so a refused call costs `task`
         // nothing.
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
-        limiter: Limiter::new(&addr, limits, Duration::from_millis(500)).expect("limiter"),
+        limiter: Limiter::new(&addr, limits, Duration::from_millis(500), 6).expect("limiter"),
         allowed_origins: Vec::new(),
     });
 

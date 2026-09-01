@@ -27,12 +27,14 @@ task:
 # per-replica bucket would silently multiply every limit below by replicaCount.
 #
 # `addr` is REQUIRED and gateway exits without it. That is not the same rule as
-# what happens when Valkey is unreachable at runtime — then the call PROCEEDS
-# unlimited and says so, loudly, in yadgar_gateway_rate_limit_degraded_total.
-# The reasoning is on `limit::Decision::Degraded`; the short form is that this
-# valkey is one replica with no persistence, and failing closed would make it a
-# hard dependency of every user-attributed call at the one hop all traffic
-# already funnels through.
+# what happens when Valkey is unreachable at runtime — then the call PROCEEDS,
+# held to a local floor of rate/maxReplicas on each replica, and says so loudly
+# in yadgar_gateway_rate_limit_degraded_total. The reasoning is on
+# `limit::Decision::Degraded`; the short form is that this valkey is one replica
+# with no persistence, and failing closed would make it a hard dependency of
+# every user-attributed call at the one hop all traffic already funnels through.
+# The floor is what keeps failing open from meaning "no limit at all": six
+# replicas at rate/6 sum to the configured rate and never more.
 rateLimit:
   addr: valkey:6379
   # `<module>.<kind>=<rate>:<burst>`, comma separated. `rate` is the sustained

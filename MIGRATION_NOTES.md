@@ -2,11 +2,19 @@
 
 ## D74 token buckets — the chart and the image must move together
 
-`gateway` now **exits at boot** without `YADGAR_VALKEY_ADDR`. A gateway with
-nowhere to keep its buckets enforces no capacity limit at all, and that is a
-deployment mistake rather than an outage, so D69's fail-at-boot rule applies to
-it. An unreachable Valkey at runtime is the other case entirely: there the call
-proceeds and the degradation is counted.
+`gateway` now **exits at boot** without `YADGAR_VALKEY_ADDR` or without
+`YADGAR_MAX_REPLICAS`. A gateway with nowhere to keep its buckets enforces no
+capacity limit at all, and one that cannot say how far it scales cannot compute a
+correct degraded-mode floor — `rate / max_replicas` per replica, whose aggregate
+bound is the whole reason the floor is acceptable. Both are deployment mistakes
+rather than outages, so D69's fail-at-boot rule applies to them. An unreachable
+Valkey at runtime is the other case entirely: there the call proceeds under that
+floor and the degradation is counted.
+
+`YADGAR_MAX_REPLICAS` comes from `autoscaling.maxReplicas` when autoscaling is
+enabled and from `replicaCount` when it is not. **Raising either without rolling
+the pods leaves the floor computed from the old number** — too loose by the ratio,
+and only while Valkey is unreachable. Roll the Deployment after changing it.
 
 The chart in this repository sets the variable, so an ordinary GitOps sync needs
 nothing done by hand. **The ordering matters only if the image and the chart are

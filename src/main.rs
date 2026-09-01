@@ -93,10 +93,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()
             .map_err(|e| format!("YADGAR_RATE_LIMIT_TIMEOUT_MS is not a whole number: {e}"))?,
     );
-    let limiter = Limiter::new(&valkey_addr, limits, limit_timeout)?;
+    // REQUIRED, for the same reason the address is, and it exits for the same
+    // reason. It is the divisor of the degraded-mode floor: while Valkey cannot
+    // answer, each replica enforces `rate / max_replicas` on its own, and the
+    // aggregate bound that makes that acceptable holds only if this number is the
+    // real ceiling. Defaulting it to 1 would leave the floor at the full
+    // configured rate PER REPLICA — the configured number silently multiplied by
+    // the replica count, which is the exact failure D74 names, on the error path
+    // where nobody looks. A deployment that cannot say how far it scales cannot
+    // have a correct floor, so it does not start.
+    let max_replicas: u32 = env_or("YADGAR_MAX_REPLICAS", "")
+        .parse()
+        .ok()
+        .filter(|n| (1..=1000).contains(n))
+        .ok_or(
+            "YADGAR_MAX_REPLICAS is unset or is not a whole number between 1 and 1000. It is \
+             the largest number of replicas the autoscaler may run, and it divides the local \
+             floor this gateway falls back to while the shared cache cannot answer (D74). The \
+             chart wires it from autoscaling.maxReplicas.",
+        )?;
+    let limiter = Limiter::new(&valkey_addr, limits, limit_timeout, max_replicas)?;
     tracing::info!(
         addr = %valkey_addr,
         timeout_ms = limit_timeout.as_millis(),
+        max_replicas,
         "rate limiting enabled (D74)"
     );
 

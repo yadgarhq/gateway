@@ -360,6 +360,39 @@ mod tests {
     }
 
     #[test]
+    fn no_module_contains_the_separator_the_bucket_key_is_built_from() {
+        // LOAD-BEARING AND OTHERWISE UNASSERTED. `limit::Limiter::check` builds
+        // `gw:rl:<user>:<module>:<kind>`, and the key is unambiguous only
+        // because every component after the user is drawn from a closed,
+        // colon-free set. A module named `a:b` would make
+        // `gw:rl:u:a:b:write` and `gw:rl:u:a:b:write` reachable from two
+        // different `(module, kind)` pairs, so one pair would spend the other's
+        // tokens.
+        //
+        // The kinds are checked with it: `kind_str` is the other closed set on
+        // the same key, and both are cheap to break by adding a variant.
+        for tool in definitions().as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let module = module_for(name).expect("a module");
+            assert!(
+                !module.contains(':'),
+                "{module:?} would make the bucket key ambiguous"
+            );
+        }
+        for kind in [
+            yadgar_telemetry::pb::yadgar::telemetry::v1::Kind::Read,
+            yadgar_telemetry::pb::yadgar::telemetry::v1::Kind::Write,
+            yadgar_telemetry::pb::yadgar::telemetry::v1::Kind::Generate,
+        ] {
+            let name = crate::limit::kind_str(kind);
+            assert!(
+                !name.contains(':'),
+                "{name:?} would make the bucket key ambiguous"
+            );
+        }
+    }
+
+    #[test]
     fn only_create_is_a_write() {
         assert!(is_write(CREATE_TASK));
         assert!(!is_write(READ_TASK));

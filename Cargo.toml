@@ -33,7 +33,12 @@ prost-types = "0.14"
 # Client-side balancing over task's headless Service (D23). Shared rather than
 # copied from task, per the invariant that anything every service needs is
 # implemented once.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "abd9c31" }
+#
+# The FULL 40-character revision, like every other in-org pin in this file. An
+# abbreviation is a prefix match: it resolves today and can become ambiguous as
+# the upstream repository grows, and there is no version to fall back on for a
+# git dependency.
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "abd9c3105f2a2746faa795c6d4936b0fb195f4a8" }
 
 # The shared instrumentation seam (D67). Pinned by revision like every other
 # in-org crate — a branch is a moving target.
@@ -57,6 +62,15 @@ redis = { version = "1.6", default-features = false, features = [
 # the shared crate would make every service carry a metric only one can emit.
 # Already in this tree via yadgar-telemetry, so it adds nothing to the build.
 metrics = "0.24"
+
+# ONE HASH, for one purpose: the user id in D74's bucket key. The id is
+# caller-supplied under `Attestation::TrustedHeaders` and the key lands in the
+# cache D21 shares with four other subsystems, so it must be bounded before it
+# gets there. Cryptographic rather than a fast non-cryptographic hash because a
+# user who can choose their own name could otherwise search offline for one that
+# collides with somebody else's bucket and throttle them. Default features off:
+# no `std` detection of CPU features is needed for a 32-byte digest per request.
+sha2 = "0.10"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
