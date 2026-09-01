@@ -67,8 +67,17 @@ service:
 # carry several, and attaching to the wrong one serves this on a hostname nobody
 # expects. `hostname` must match what the certificate was issued for AND what the
 # root CA's nameConstraints extension permits — three places that have to agree,
-# or verification fails after signing succeeds.
+# or verification fails after signing succeeds. A hostname the listener does not
+# serve fails more quietly than that: the route simply never attaches.
+#
+# .test rather than .localhost, and the change is not cosmetic. RFC 6761 forces
+# .localhost names to loopback, so a client on any other machine resolves this
+# address to itself and never reaches the gateway — measured from a VM, where an
+# /etc/hosts entry pointing the old name at the host was ignored outright. .test
+# is reserved by the same RFC with no such mandate, so it resolves wherever the
+# local network says. Moving it needs the root CA reissued under a matching name
+# constraint; the ordering is in yadgarhq/deploy's MIGRATION_NOTES.
 gateway:
   name: edge
   listener: https
-  hostname: gateway.yadgar.localhost
+  hostname: gateway.yadgar.test
