@@ -357,6 +357,25 @@ redis.call('EXPIRE', key, ttl)
 return {allowed, tostring(tokens), tostring(retry)}
 "#;
 
+/// Which degradation a client error actually is.
+///
+/// **The distinction the counter is for.** A connection this process HAD and then
+/// lost reaches here as a command error, not as a failed init — so without this
+/// the reconnect case would be filed under `error` and an operator would look for
+/// a broken script rather than an absent server.
+fn classify(e: redis::RedisError) -> Degrade {
+    if e.is_connection_refusal() || e.is_connection_dropped() {
+        Degrade::Unreachable
+    } else if e.is_timeout() {
+        // A server that ANSWERS SLOWLY, which is a different thing to look at
+        // from one that is not there. This arm is reachable only because the
+        // inner response budget is smaller than the outer one.
+        Degrade::Timeout
+    } else {
+        Degrade::Error
+    }
+}
+
 /// The token bucket, over the shared cache.
 pub struct Limiter {
     client: redis::Client,
@@ -418,15 +437,25 @@ impl Limiter {
     }
 
     async fn spend(&self, key: &str, bucket: Bucket) -> Result<Decision, Degrade> {
-        // BOUNDED RETRIES on the manager's own reconnection. Its default is a
-        // long exponential backoff, which on a hot path means a queue of calls
-        // all waiting on the same doomed connect — the outer timeout releases
-        // each caller, but the work behind them keeps piling up.
+        // NO RETRIES, AND AN INNER BUDGET SMALLER THAN THE OUTER ONE. Both
+        // numbers exist so the REASON survives.
+        //
+        // The manager's default is a long exponential backoff. Under it every
+        // failure outlived `self.timeout`, so the outer timeout was always what
+        // fired and every degradation — refused connection, dropped socket, bad
+        // reply — arrived labelled `timeout`. An operator reading that counter
+        // would go looking for a slow cache while the real one was absent, which
+        // is the exact misdirection the label was added to prevent. Two thirds of
+        // the budget leaves room for the real error to come back and be named.
+        //
+        // Retrying inside one call is the wrong place for it besides: the next
+        // call reconnects anyway, and a queue of callers all waiting on the same
+        // doomed connect is latency at the one hop all traffic passes through.
+        let inner = self.timeout.mul_f32(0.66);
         let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(self.timeout))
-            .set_response_timeout(Some(self.timeout))
-            .set_number_of_retries(1)
-            .set_max_delay(Duration::from_millis(200));
+            .set_connection_timeout(Some(inner))
+            .set_response_timeout(Some(inner))
+            .set_number_of_retries(0);
 
         let mut conn = self
             .conn
@@ -448,7 +477,7 @@ impl Limiter {
             .arg(ttl)
             .invoke_async(&mut conn)
             .await
-            .map_err(|_| Degrade::Error)?;
+            .map_err(classify)?;
 
         if allowed == 1 {
             return Ok(Decision::Allowed);

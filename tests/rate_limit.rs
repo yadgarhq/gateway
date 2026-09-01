@@ -39,24 +39,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+use common::addr;
+
 use yadgar_gateway::limit::{Bucket, Decision, Degrade, Limiter, Limits, Overrides};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
-
-/// The address of a real Valkey, or `None` and a loud line saying why nothing
-/// ran. See the module comment for why this is not a panic.
-fn addr() -> Option<String> {
-    match std::env::var("YADGAR_TEST_VALKEY") {
-        Ok(a) if !a.is_empty() => Some(a),
-        _ => {
-            eprintln!(
-                "SKIPPED: YADGAR_TEST_VALKEY is unset, so the concurrency property D74 exists \
-                 for was NOT exercised. These tests are the only thing that can tell an atomic \
-                 read-compute-write from a per-replica one. See the module comment to run them."
-            );
-            None
-        }
-    }
-}
 
 /// A limiter over one named bucket, and the key it will use.
 fn limiter(addr: &str, module: &str, bucket: Bucket) -> Limiter {
@@ -282,6 +269,52 @@ async fn the_bucket_refills_from_elapsed_time_with_no_timer_anywhere() {
         limiter.check("max", &module, Kind::Write, &overrides).await,
         Decision::Allowed,
         "elapsed time alone refills the bucket"
+    );
+}
+
+/// **A rejected call must not eat the refill it was rejected for.**
+///
+/// The script writes `ts = now` on the reject branch as well as the allow branch,
+/// which is the line worth checking: if the tokens accrued since the last call
+/// were not carried across at the same time, every rejection would reset the
+/// clock and a client polling faster than the refill would be throttled FOREVER
+/// while its bucket sat at zero. The arithmetic says that cannot happen; this
+/// measures it rather than trusting the reading.
+///
+/// Ten tokens a second into a bucket of one, polled every 10ms for a second: a
+/// caller that keeps asking should be granted roughly ten over that second, not
+/// one and not none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn polling_a_rejected_bucket_does_not_starve_it() {
+    let Some(addr) = addr() else { return };
+
+    let bucket = Bucket {
+        rate: 10.0,
+        burst: 1.0,
+    };
+    let module = unique_module("poll");
+    let limiter = limiter(&addr, &module, bucket);
+    let overrides = Overrides::default();
+
+    // Drain the one token the bucket starts with, so what follows is refill only.
+    assert_eq!(
+        limiter.check("max", &module, Kind::Write, &overrides).await,
+        Decision::Allowed
+    );
+
+    let started = std::time::Instant::now();
+    let mut granted = 0;
+    while started.elapsed() < Duration::from_millis(1000) {
+        if limiter.check("max", &module, Kind::Write, &overrides).await == Decision::Allowed {
+            granted += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        (8..=12).contains(&granted),
+        "one second at 10 tokens/s should grant about ten however often it is asked; got \
+         {granted}. Far fewer means a rejection consumed the refill it was rejected for"
     );
 }
 

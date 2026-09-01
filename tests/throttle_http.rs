@@ -16,6 +16,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request, StatusCode};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -75,16 +77,7 @@ async fn call(state: Arc<AppState>, user: &str) -> (StatusCode, Option<String>, 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
-    let Ok(addr) = std::env::var("YADGAR_TEST_VALKEY").map(|a| a.trim().to_string()) else {
-        eprintln!(
-            "SKIPPED: YADGAR_TEST_VALKEY is unset, so what a throttled caller receives was NOT \
-             exercised. See the module comment on tests/rate_limit.rs to run it."
-        );
-        return;
-    };
-    if addr.is_empty() {
-        return;
-    }
+    let Some(addr) = common::addr() else { return };
 
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
@@ -156,10 +149,19 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         .into_iter()
         .any(|(key, _, _, value)| {
             let key = key.key();
+            // BOTH labels, not just the outcome. The recorder is global to this
+            // test binary, so a later test throttling a different tool would
+            // otherwise satisfy this assertion and quietly make it vacuous —
+            // which is why `telemetry.rs` matches on the pair too.
+            let label = |want: &str| {
+                key.labels()
+                    .find(|l| l.key() == want)
+                    .map(|l| l.value().to_string())
+                    .unwrap_or_default()
+            };
             key.name() == yadgar_telemetry::metrics::CALLS
-                && key
-                    .labels()
-                    .any(|l| l.key() == "outcome" && l.value() == "RESOURCE_EXHAUSTED")
+                && label("outcome") == "RESOURCE_EXHAUSTED"
+                && label("tool") == "create_task"
                 && matches!(value, DebugValue::Counter(n) if n >= 1)
         });
     assert!(recorded, "a throttled call must emit a D67 record");
