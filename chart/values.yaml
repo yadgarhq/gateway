@@ -106,8 +106,23 @@ service:
 # carry several, and attaching to the wrong one serves this on a hostname nobody
 # expects. `hostname` must match what the certificate was issued for AND what the
 # root CA's nameConstraints extension permits — three places that have to agree,
-# or verification fails after signing succeeds.
+# or verification fails after signing succeeds. A hostname the listener does not
+# serve fails more quietly than that: the route simply never attaches.
+#
+# .internal rather than .localhost, and the change is not cosmetic. RFC 6761
+# §6.3.3 says resolvers SHOULD return loopback for .localhost names, and clients
+# on one machine disagree about it: measured from a Debian VM with an /etc/hosts
+# entry, `getent`, Python and `wget` all resolved the old name to the host's
+# bridge address and wget reached the gateway, while curl returned loopback —
+# curl implements §6.3.3 itself and never consults NSS. A name that resolves for
+# some clients and not others is harder to diagnose than one that fails cleanly,
+# and curl is the tool everyone diagnoses with. .internal is reserved by ICANN
+# (Board Resolution 2024.07.29.06) from the DNS root zone for private use, and no
+# resolver treats it specially — it is NOT an IETF special-use domain — so it
+# resolves wherever the local network says. Moving it needs the root CA reissued
+# under a matching name constraint; the ordering is in yadgarhq/deploy's
+# MIGRATION_NOTES.
 gateway:
   name: edge
   listener: https
-  hostname: gateway.yadgar.localhost
+  hostname: gateway.yadgar.internal
