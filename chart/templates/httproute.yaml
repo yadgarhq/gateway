@@ -15,6 +15,15 @@
 # ReferenceGrant — the Gateway's listener sets `allowedRoutes.namespaces.from:
 # Same`, so a route from anywhere else would be silently unattached rather than
 # rejected.
+#
+# GUARDED (D80): a CRD from `gateway.networking.k8s.io` does not exist on a
+# cluster whose ingress is not a Gateway API implementation. Gateway API itself
+# is permitted — D71 chose it as a specification, not a product — but requiring
+# it unconditionally is not: an adopter running NGINX, Traefik, HAProxy, an ALB
+# or an Application Gateway could not install this chart at all. `false` here
+# turns this resource off; see `gateway.enabled` in values.yaml for what an
+# adopter does instead.
+{{- if .Values.gateway.enabled }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -41,3 +50,4 @@ spec:
       backendRefs:
         - name: {{ .Chart.Name }}
           port: {{ .Values.service.port }}
+{{- end }}
