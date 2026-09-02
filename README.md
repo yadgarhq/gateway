@@ -93,12 +93,34 @@ because the only available default was trusting the caller; that gate is gone
 along with the reason for it, which is a stronger reading of D69 than the gate was
 — a deployment can no longer reach the trusting path by forgetting something.
 
-**The lookup runs per request, and D72 says it should not.** The contract's words
-are "the gateway calls it on a cache miss, never per request". There is no cache
-yet, so every `tools/call` pays one `iam` round trip, and an `iam` outage now
-degrades all MCP traffic rather than `/auth/login` alone. The lookup carries a 5s
-deadline; a stall answers through the same opaque status as any other upstream
-problem.
+**The lookup runs on a cache miss, never per request** — D72's words, and this
+paragraph used to say the cache did not exist. It does: each replica holds what
+`iam` answered, keyed on a SHA-256 of the token, in its own memory. The lookup
+carries a 5s deadline; a stall answers through the same opaque status as any other
+upstream problem.
+
+**What clears that cache is a broker event, not the TTL.** `gateway` subscribes to
+`yadgar.iam.credential.revoked` and `yadgar.iam.user.teams-changed`, and both evict
+every entry for the named person — `iam` holds a credential id on a revoke and
+never sees the token this cache is keyed on, so the person is the only unit an
+event can address. The subscription carries no queue group, because every replica
+holds its own map and must receive every message. A broker it cannot reach does
+not stop this service starting: it says so at every boot, retries, and
+`YADGAR_CREDENTIAL_TTL_SECONDS` is the bound meanwhile.
+
+**Three ways that connection fails, and the log says which.** UNREACHABLE is an
+outage and is retried every 5 seconds. REFUSED — a wrong password, or no password
+against a broker whose `authorization` block demands one — does not end by itself,
+so it is logged as a deployment error and retried a minute apart. FORBIDDEN is the
+one with no other symptom: a subject this account may not subscribe to leaves the
+connection OPEN and answers an asynchronous `-ERR`, which `async-nats` logs at
+`debug!`. `gateway` registers an event callback for it, logs it at ERROR, and ENDS
+the subscription so the redial reports it again. NATS acknowledges no `SUB` and
+`async-nats`' `flush` is a local socket flush, so the boot line is best-effort:
+a broker slower than the short window `gateway` waits gets a boot line that the
+ERROR then contradicts — alert on the ERROR. With
+`YADGAR_CREDENTIAL_TTL_SECONDS=0` there is no cache to evict from, so the broker
+is not dialled at all and the boot warning says so.
 
 `request_id` is minted here and **overwrites anything the client sent**. A caller
 that could set it could make two unrelated calls collide, and every roll-up built
@@ -179,24 +201,28 @@ does Argon2id work for anyone who can reach the port.
 
 ## Configuration
 
-| Variable                               | Default          |                                                                                                                                      |
-| -------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `LISTEN`                               | `0.0.0.0:8080`   | MCP endpoint                                                                                                                         |
-| `METRICS_LISTEN`                       | `0.0.0.0:9090`   | Prometheus                                                                                                                           |
-| `TASK_HOST` / `TASK_PORT`              | `task` / `50052` | the upstream module                                                                                                                  |
-| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | the whole credential lifecycle: `/auth/login`, `/auth/enrol` and attestation                                                         |
-| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`                                         |
-| `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents                            |
-| `YADGAR_VALKEY_ADDR`                   | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                                                    |
-| `YADGAR_RATE_LIMITS`                   | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                                           |
-| `YADGAR_RATE_LIMIT_DEFAULT`            | `10:100`         | the bucket for a `(module, kind)` nobody named                                                                                       |
-| `YADGAR_RATE_LIMIT_TIMEOUT_MS`         | `20`             | how long one bucket lookup may take before the call falls back to the local floor                                                    |
-| `YADGAR_MAX_REPLICAS`                  | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                                                 |
-| `YADGAR_VALKEY_PASSWORD_FILE`          | unset            | a FILE holding the cache's `requirepass`. Unset dials the cache unauthenticated and WARNs; set-but-unreadable or empty EXITS at boot |
-| `YADGAR_TRUSTED_PROXY_HOPS`            | unset            | how many proxies append to `X-Forwarded-For` in front. Unset RECORDS NO SOURCE ADDRESS; a non-number EXITS at boot                   |
-| `YADGAR_LOGIN_RATE_LIMIT`              | `0.2:10`         | `<rate>:<burst>` for `/auth/login` and `/auth/enrol`, per ATTRIBUTABLE client address                                                |
-| `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT` | `10:100`         | the same, per OBSERVED HOP, which is what applies while no trust boundary is declared                                                |
-| `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                                                        |
+| Variable                               | Default          |                                                                                                                                                        |
+| -------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `LISTEN`                               | `0.0.0.0:8080`   | MCP endpoint                                                                                                                                           |
+| `METRICS_LISTEN`                       | `0.0.0.0:9090`   | Prometheus                                                                                                                                             |
+| `TASK_HOST` / `TASK_PORT`              | `task` / `50052` | the upstream module                                                                                                                                    |
+| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | the whole credential lifecycle: `/auth/login`, `/auth/enrol` and attestation                                                                           |
+| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`                                                           |
+| `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents                                              |
+| `YADGAR_VALKEY_ADDR`                   | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                                                                      |
+| `YADGAR_RATE_LIMITS`                   | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                                                             |
+| `YADGAR_RATE_LIMIT_DEFAULT`            | `10:100`         | the bucket for a `(module, kind)` nobody named                                                                                                         |
+| `YADGAR_RATE_LIMIT_TIMEOUT_MS`         | `20`             | how long one bucket lookup may take before the call falls back to the local floor                                                                      |
+| `YADGAR_MAX_REPLICAS`                  | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                                                                   |
+| `YADGAR_VALKEY_PASSWORD_FILE`          | unset            | a FILE holding the cache's `requirepass`. Unset dials the cache unauthenticated and WARNs; set-but-unreadable or empty EXITS at boot                   |
+| `YADGAR_CREDENTIAL_TTL_SECONDS`        | `30`             | how long one resolved credential is reused. The backstop for a missed invalidation event; `0` disables the cache; above `300` EXITS at boot            |
+| `NATS_URL`                             | unset            | the broker carrying D72's cache invalidation. Unset consumes NOTHING and WARNs at every boot; unreachable or REFUSED is loud and retried               |
+| `NATS_USER`                            | unset            | the broker account this gateway authenticates as. It is NOT `iam`'s. Set without `NATS_PASSWORD_FILE` EXITS at boot                                    |
+| `NATS_PASSWORD_FILE`                   | unset            | a FILE holding that account's password. Unset is REFUSED by a broker that demands one, and says so; set-but-unreadable, empty, or without a user EXITS |
+| `YADGAR_TRUSTED_PROXY_HOPS`            | unset            | how many proxies append to `X-Forwarded-For` in front. Unset RECORDS NO SOURCE ADDRESS; a non-number EXITS at boot                                     |
+| `YADGAR_LOGIN_RATE_LIMIT`              | `0.2:10`         | `<rate>:<burst>` for `/auth/login` and `/auth/enrol`, per ATTRIBUTABLE client address                                                                  |
+| `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT` | `10:100`         | the same, per OBSERVED HOP, which is what applies while no trust boundary is declared                                                                  |
+| `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                                                                          |
 
 ## The source address, and what bounds login
 

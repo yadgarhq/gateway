@@ -93,6 +93,24 @@ metrics = "0.24"
 # no `std` detection of CPU features is needed for a 32-byte digest per request.
 sha2 = "0.10"
 
+# THE BROKER (D22), for consuming D72's cache invalidation. The SAME version
+# `iam` publishes with: the two speak the NATS wire protocol through a server and
+# share no crate, but a version skew is a difference nobody would think to look
+# for.
+#
+# Default features, as `iam` has them, and NOT a counter-example to the
+# `tls-ring` reasoning above. That reasoning is about aws-lc-rs, which needs cmake
+# and would break the musl build (D63); `async-nats` reaches rustls through ring,
+# which this tree already carries. CHECKED rather than assumed:
+# `cargo tree -e normal -i aws-lc-rs` matches no package, and every rustls path
+# under this crate resolves to `ring v0.17.14`. So this adds NO native dependency
+# the build image did not already have to satisfy.
+async-nats = "0.50"
+# `StreamExt::merge`, so both invalidation subscriptions are drained by one loop
+# rather than by two tasks that would each have to be supervised. Already in this
+# tree by way of tonic, so it adds nothing to the build.
+tokio-stream = "0.1"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
@@ -112,7 +130,21 @@ tonic-prost-build = "0.14"
 # feature on the real one, for the same reason `router` below is: the v2 resolver
 # keeps dev-dependency features out of a normal build, so the shipped binary
 # carries no test clock. Both entries resolve to one crate version.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+#
+# `net`, `io-util` and `sync` for the fake broker in
+# `tests/credential_invalidation.rs`, which binds its own listener and reads the
+# `SUB` lines off the socket to assert what actually went on the wire. Named here
+# rather than relied on: `async-nats` enables all three, so feature unification
+# would supply them today, and a dependency that moved would take these tests
+# with it.
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+  "net",
+  "io-util",
+  "sync",
+] }
 # `Server::add_service`, so a TEST can answer as `iam`. Without one the only
 # reachable outcomes on the attested path are "no credential" and "the transport
 # failed" — and the answer `iam` gives as `Ok` with an empty `user_id`, for a token

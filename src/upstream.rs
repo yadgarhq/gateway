@@ -355,7 +355,11 @@ fn iam_endpoint(
 /// kept serving throughout, which was true while identity came from headers. It is
 /// not true now: attestation goes through this channel, so an `iam` that cannot
 /// answer stops MCP traffic too. The mitigation D72 names is a cache in front of
-/// the lookup — "on a cache miss, never per request" — and it is not built yet.
+/// the lookup — "on a cache miss, never per request" — and it IS built:
+/// [`crate::attest::Credentials`], cleared by the broker events
+/// [`crate::invalidate`] consumes. So an `iam` outage costs a resolve per cache
+/// miss rather than one per request, bounded by
+/// `YADGAR_CREDENTIAL_TTL_SECONDS`.
 ///
 /// **It pins ONE connection, and does not balance.** `iam`'s Service is a VIP
 /// rather than headless, so there is one address to reach regardless; the
