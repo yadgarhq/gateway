@@ -144,7 +144,12 @@ trustUnauthenticatedHeaders: false
 # otherwise would give a scaler that reads nothing. Stated here rather than
 # silently substituted.
 autoscaling:
-  enabled: true
+  # D80: KEDA's CRD is not something every adopter has installed. `false` here
+  # is the chart's own default so `helm template`/`helm install` succeed on a
+  # bare cluster; the reference deployment in yadgarhq/deploy sets this true
+  # (autoscaling.enabled=true in its values for this chart) to get the scaling
+  # behaviour described below.
+  enabled: false
   minReplicas: 2
   # At least two, always (D55) — the floor is a correctness property, not a
   # tuning knob: one replica makes a class of defect unreachable.
@@ -184,6 +189,19 @@ service:
 # under a matching name constraint; the ordering is in yadgarhq/deploy's
 # MIGRATION_NOTES.
 gateway:
+  # D80: an HTTPRoute needs the `gateway.networking.k8s.io` CRD, which does not
+  # exist on a cluster whose ingress is not a Gateway API implementation. `true`
+  # is the reference-deployment default — yadgarhq/deploy runs Envoy Gateway and
+  # ships this chart against it unmodified.
+  #
+  # SET FALSE ON ANY OTHER INGRESS. This chart still creates its own Service
+  # (see `service.port` above) whether the route is enabled or not; set this to
+  # false and point your own Ingress, NGINX, Traefik, HAProxy, ALB or
+  # Application Gateway config at that Service by name and port. The chart
+  # never creates that Ingress object for you — its shape is specific to the
+  # ingress in use, which is exactly what this value exists to keep out of the
+  # chart.
+  enabled: true
   name: edge
   listener: https
   hostname: gateway.yadgar.internal
