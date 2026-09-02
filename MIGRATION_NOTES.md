@@ -1,5 +1,48 @@
 # Migration notes
 
+## The Valkey password — this image first, the cache second (ledger 518)
+
+`gateway` can now present a password to the shared cache. **Nothing to run
+against the cluster from here**, and nothing in this repository changes what the
+running deployment does until `yadgarhq/deploy` gives the cache a `requirepass`.
+
+**The ordering is not symmetric, and getting it backwards is an outage.** Merge
+this repository first and `yadgarhq/deploy` second:
+
+- **This image under a cache with no password**: unchanged behaviour.
+  `rateLimit.passwordSecret` is empty by default, so the chart sets no password
+  variable, and gateway dials the cache exactly as it always did. It logs a
+  warning at every boot saying the hop is unauthenticated, which is true and is
+  the point.
+- **The cache with a password, under an image that predates this**: every
+  user-attributed call gets `NOAUTH` from the cache, the old code files that
+  under `error`, and every call falls open onto the degraded floor —
+  `rate / maxReplicas` on each replica, for as long as the mistake stands. The
+  gateway keeps serving, which is why nobody would notice.
+
+So the cache must not gain a password before this image is running everywhere.
+Argo auto-syncs `yadgarhq/deploy`, so that ordering is decided by which pull
+request merges first.
+
+**The two failure modes, and they are deliberately different.**
+`YADGAR_VALKEY_PASSWORD_FILE` set with no readable, non-empty file behind it
+**exits at boot** naming the path — the same rule `TASK_TLS_CA_FILE` already
+applies, and it is what stops a missing Secret from silently becoming an
+unauthenticated connection. A cache that demands a password this process cannot
+satisfy is **refused at the first call** with a `503`, not held to the floor. It
+cannot be caught at boot, because nothing dials the cache at boot: `Limiter`'s
+connection is built on first use so a slow cache cannot stop this pod binding its
+listener, and that decision is unchanged.
+
+**To revert**, clear `rateLimit.passwordSecret` in the chart. That is one value
+and no new image, the same shape as `trustUnauthenticatedHeaders` — but it is
+only the revert while the cache still accepts an unauthenticated client, so
+revert `yadgarhq/deploy` first if `requirepass` has already landed.
+
+`yadgar_gateway_rate_limit_degraded_total{reason="unauthenticated"}` is how you
+tell. Any value above zero is a deployment error rather than an outage: it does
+not recover on its own.
+
 ## iam-backed attestation — DONE, and here is what it cost
 
 **The switch is thrown.** `trustUnauthenticatedHeaders` is `false` in the chart, so

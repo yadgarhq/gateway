@@ -53,6 +53,7 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         limiter: crate::limit::Limiter::new(
             // Nothing listens on port 1, and the refusal is immediate.
             "127.0.0.1:1",
+            None,
             crate::limit::Limits::parse("task.write=1:1", "1:1").expect("the limits parse"),
             std::time::Duration::from_millis(200),
             6,
@@ -1167,6 +1168,7 @@ async fn state_resolving_to(
         // credential bought. The limiter is not what these tests are measuring.
         limiter: crate::limit::Limiter::new(
             "127.0.0.1:1",
+            None,
             crate::limit::Limits::parse("task.read=600:600", "600:600").expect("the limits parse"),
             std::time::Duration::from_millis(200),
             6,

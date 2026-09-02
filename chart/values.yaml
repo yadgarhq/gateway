@@ -200,6 +200,57 @@ rateLimit:
   # unreachable cache: the call proceeds, and the counter says it did.
   timeoutMs: 20
 
+  # The Secret holding the cache's `requirepass` (ledger 518).
+  #
+  # SET BY DEFAULT, unlike `task.tls` above, and the difference is worth the
+  # paragraph. That value is off by default because turning it on against a
+  # server which cannot answer BREAKS the hop. This one is on by default because
+  # the reference deployment has nowhere else to put it: `yadgarhq/argocd`'s
+  # ApplicationSet enumerates modules rather than listing them (D54), so its Helm
+  # values are uniform across every module and cannot carry a per-module Secret
+  # name. The module's own values.yaml is the override point that comment names.
+  #
+  # AN ADOPTER WHOSE CACHE HAS NO PASSWORD CLEARS THIS, and empty is a fully
+  # supported state: the chart then sends the binary no password variable, and it
+  # dials the cache exactly as every deployment did before this. The cost of
+  # getting it wrong is loud rather than silent — a pod that exits at boot naming
+  # `/var/run/secrets/valkey/password`, not one that quietly serves.
+  #
+  # THE SECRET MUST EXIST BEFORE THIS CHART SYNCS. It is not created here and not
+  # in git; `yadgarhq/deploy`'s MIGRATION_NOTES.md has the `kubectl create secret`
+  # for it, alongside the one the cache itself reads. Same object, both ends.
+  #
+  # WHILE IT IS EMPTY THE HOP IS UNAUTHENTICATED and gateway says so in a warning
+  # at every boot. Anything on the pod network can read and rewrite D74's token
+  # buckets: reset one to grant unlimited capacity, or empty one to throttle a
+  # named user. The cache also holds D18's epoch counters, D29's conversation
+  # tokens and D46's throttle counters, none of which are this chart's to fix.
+  #
+  # A SECRET, AND A PASSWORD IS ACTUALLY SECRET — unlike the CA bundles above,
+  # which are Secrets only because that is where an issuer writes them. It is
+  # mounted as a FILE rather than read into an environment variable, because an
+  # environment variable is visible in `kubectl describe pod` and to every
+  # `/proc/<pid>/environ` in the container.
+  #
+  # NOT A PASSWORD PASTED INTO THIS FILE, and not one spliced into `addr` above.
+  # A published chart is a public artefact, and a credential in `addr` would be a
+  # credential in every `helm get values` and every Argo diff.
+  #
+  # THERE IS NO SILENT MIDDLE STATE, and the two halves fail differently on
+  # purpose. Set with no readable, non-empty file behind it: the pod exits at boot
+  # naming the path, because a deployment that asked for a credential and cannot
+  # produce one has a mistake in it. Unset against a cache that DOES demand a
+  # password: the pod starts (nothing dials the cache at boot, deliberately) and
+  # the first call is REFUSED with a 503 — not held to the degraded floor an
+  # UNREACHABLE cache gets. The floor exists for an outage, which ends; a refused
+  # credential does not end, and failing open onto the floor for ever would be a
+  # rate limiter that reads healthy while enforcing a sixth of what it says.
+  passwordSecret: valkey-password
+  # The key inside that Secret which holds the password, mounted as `password`.
+  # Named rather than assumed, for the same reason the CA keys above are: a Secret
+  # assembled by hand is free to call it something else.
+  passwordSecretKey: password
+
 # DEVELOPMENT ONLY, and the switch is now thrown.
 #
 # Setting this trusts the identity the caller attaches to its own request, with

@@ -51,11 +51,19 @@ use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 /// The metric this module emits, over and above D67's three.
 ///
-/// Bounded labels only: `reason` comes from [`Degrade`], a closed set of three,
-/// and `outcome` is `allowed` or `throttled` — whether the degraded call
-/// proceeded on this replica's floor or was refused by it. The second label is
-/// what makes the floor observable, and the floor is accepted (see
+/// Bounded labels only: `reason` comes from [`Degrade`], a closed set of four,
+/// and `outcome` is `allowed`, `throttled` or `refused` — whether the degraded
+/// call proceeded on this replica's floor, was refused by it, or never reached it
+/// because the cache rejected this gateway's credential. The second label is what
+/// makes the floor observable, and the floor is accepted (see
 /// [`Decision::Degraded`]) on the ground that it is not silent.
+///
+/// **`reason = "unauthenticated"` is the one to alert on**, and it is the only
+/// value here that does not describe an outage. The other three end by
+/// themselves; a rejected credential is a deployment somebody assembled wrong and
+/// stays wrong until somebody changes it. It always carries `outcome = "refused"`,
+/// because that case never takes the floor — see [`Decision::Unauthenticated`].
+///
 /// **The user is never a label here.** D72 and D77 both keep usernames out of
 /// logs and metrics, and a per-user label on a degradation counter is exactly how
 /// one gets in — it would also be unbounded, which D67 forbids for its own
@@ -399,6 +407,18 @@ pub enum Degrade {
     /// It answered, and the answer was an error or a shape this code does not
     /// understand.
     Error,
+    /// The cache demanded a credential this process could not satisfy: it wanted
+    /// a password and none was configured (`NOAUTH`), the one configured is wrong
+    /// (`WRONGPASS`, or a failed handshake), or the user it names may not run the
+    /// script (`NOPERM`).
+    ///
+    /// **Alone among these, it is not an outage**, and that is why it does not
+    /// share their answer — see [`Decision::Unauthenticated`]. The other three
+    /// describe a component that is absent, slow or confused, and all three end
+    /// on their own. A rejected credential is a deployment that was assembled
+    /// wrong; it will still be wrong on the next call, and on every call after
+    /// that, until somebody changes the deployment.
+    Unauthenticated,
 }
 
 impl Degrade {
@@ -407,6 +427,7 @@ impl Degrade {
             Self::Unreachable => "unreachable",
             Self::Timeout => "timeout",
             Self::Error => "error",
+            Self::Unauthenticated => "unauthenticated",
         }
     }
 }
@@ -497,6 +518,31 @@ pub enum Decision {
         reason: Degrade,
         retry_after: Duration,
     },
+    /// The shared cache refused this process's credential. **The call does NOT
+    /// proceed**, and this is the one answer here that is not a 429.
+    ///
+    /// # Why this one does not fail open
+    ///
+    /// The argument on [`Decision::Degraded`] is an argument about an OUTAGE: the
+    /// least-available component in the installation must not become a hard
+    /// dependency of every user-attributed call, because an outage ends and the
+    /// floor bounds what happens meanwhile. Every clause of it depends on the
+    /// failure being transient.
+    ///
+    /// A rejected credential is not transient. Nothing about it recovers, the
+    /// floor would apply to every call for as long as the deployment stands, and
+    /// the state it describes — a gateway talking to a cache that will not have
+    /// it — is one somebody built by hand and can unbuild. Failing open here
+    /// would mean an operator who set `requirepass` on the cache and forgot the
+    /// Secret gets a gateway that serves traffic at `rate / maxReplicas` for ever
+    /// while a counter nobody is watching says so. That is precisely the shape
+    /// this whole change exists to remove: a control that reads healthy while
+    /// enforcing nothing.
+    ///
+    /// So it is loud and it is total. A 503 stops the deployment being usable,
+    /// which is what makes it get fixed, and a 503 is also honest — this gateway
+    /// genuinely cannot do the thing it is for.
+    Unauthenticated,
 }
 
 /// The in-process bucket that applies while the shared store cannot answer.
@@ -690,7 +736,25 @@ return {allowed, tostring(tokens), tostring(retry)}
 /// the reconnect case would be filed under `error` and an operator would look for
 /// a broken script rather than an absent server.
 fn classify(e: redis::RedisError) -> Degrade {
-    if e.is_connection_refusal() || e.is_connection_dropped() {
+    // FIRST, and before the connection arms, because the two overlap. A wrong
+    // password is refused during the handshake, and `redis` reports that as a
+    // failed connection attempt — so an auth arm placed after those would never
+    // be reached for the case an operator is most likely to create.
+    //
+    // TWO SHAPES, because `redis` 1.6 produces two. A password this process sent
+    // and the server rejected fails inside the handshake and arrives as
+    // `ErrorKind::AuthenticationFailed` with no code (`connection.rs`, the AUTH
+    // reply check). A password this process never sent, against a server that
+    // wanted one, is not a handshake failure at all — the connection is
+    // established and the FIRST COMMAND comes back `-NOAUTH`, which `redis` has
+    // no known kind for and surfaces as an extension code. Matching only the kind
+    // would leave the missing-credential case, which is the whole point of this
+    // arm, filed as an ordinary error and failed open.
+    if e.kind() == redis::ErrorKind::AuthenticationFailed
+        || matches!(e.code(), Some("NOAUTH" | "WRONGPASS" | "NOPERM"))
+    {
+        Degrade::Unauthenticated
+    } else if e.is_connection_refusal() || e.is_connection_dropped() {
         Degrade::Unreachable
     } else if e.is_timeout() {
         // A server that ANSWERS SLOWLY, which is a different thing to look at
@@ -723,18 +787,39 @@ pub struct Limiter {
 impl Limiter {
     /// `addr` is `host:port`. No I/O happens here.
     ///
+    /// `password` is the cache's `requirepass`, or `None` for a cache that asks
+    /// for none. **It is passed as a value rather than spliced into `addr`**: a
+    /// URL carries a password only percent-encoded, so `redis://:{password}@host`
+    /// silently truncates at the first `@`, `/` or `#` and sends a DIFFERENT
+    /// password than the one in the Secret. `set_password` takes the bytes as
+    /// they are, so nothing about the credential's alphabet has to be true.
+    ///
     /// `max_replicas` is the largest number of replicas of this Deployment the
     /// autoscaler may run, and it is the divisor of the degraded-mode floor —
     /// see [`Floor`]. It is a parameter rather than a constant because the
     /// authority for it is the chart.
     pub fn new(
         addr: &str,
+        password: Option<&str>,
         limits: Limits,
         timeout: Duration,
         max_replicas: u32,
     ) -> Result<Self, redis::RedisError> {
+        use redis::IntoConnectionInfo;
+
+        let info = format!("redis://{addr}").into_connection_info()?;
+        // NO CONNECTION IS MADE HERE, with or without a password. The credential
+        // is only recorded on the handshake this process will perform later, on
+        // first use — `conn` is still a `OnceCell`, for the reason on it.
+        let info = match password {
+            Some(p) => {
+                let redis = info.redis_settings().clone().set_password(p);
+                info.set_redis_settings(redis)
+            }
+            None => info,
+        };
         Ok(Self {
-            client: redis::Client::open(format!("redis://{addr}"))?,
+            client: redis::Client::open(info)?,
             conn: OnceCell::new(),
             limits,
             timeout,
@@ -779,6 +864,12 @@ impl Limiter {
             Err(_elapsed) if self.conn.get().is_none() => Degrade::Unreachable,
             Err(_elapsed) => Degrade::Timeout,
         };
+        // BEFORE THE FLOOR, and that ordering is the whole of the change. The
+        // floor is what makes failing open acceptable, and it is acceptable only
+        // for a failure that ends. See `Decision::Unauthenticated`.
+        if reason == Degrade::Unauthenticated {
+            return Decision::Unauthenticated;
+        }
         // DEGRADED, AND FLOORED. The call proceeds on this replica's own share
         // rather than unlimited — the argument is on `Decision::Degraded`.
         match self.floor.check(&key, bucket, Instant::now()) {
@@ -815,7 +906,19 @@ impl Limiter {
             .conn
             .get_or_try_init(|| self.client.get_connection_manager_with_config(config))
             .await
-            .map_err(|_| Degrade::Unreachable)?
+            // `classify` RATHER THAN a flat `Unreachable`, and this line is where
+            // the wrong-password case is actually decided. `redis` performs the
+            // AUTH inside the connection setup, so a rejected credential never
+            // reaches the command below — it fails here, and the discarded error
+            // this line used to throw away was the only thing that said so.
+            .map_err(|e| match classify(e) {
+                Degrade::Unauthenticated => Degrade::Unauthenticated,
+                // EVERYTHING ELSE STAYS `Unreachable`, deliberately. A failure to
+                // establish a connection is what that label means, and the
+                // distinctions `classify` draws between kinds of command failure
+                // do not apply to one.
+                _ => Degrade::Unreachable,
+            })?
             .clone();
 
         // A property of the DEPLOYMENT, not of this bucket. See
