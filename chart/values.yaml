@@ -35,9 +35,10 @@ task:
 #
 # `iam`'s Service is a VIP rather than headless, so this pins to one connection
 # rather than balancing across replicas. That was sized for the rate a person types
-# a password at, and attestation puts far more traffic through it — revisit when
-# the credential lookup gets its cache (D72: "on a cache miss, never per request"),
-# which is what should be reducing that traffic. See `upstream::connect_iam`.
+# a password at, and attestation put far more traffic through it — which is what
+# credentialCache below reduces (D72: "on a cache miss, never per request").
+# Revisit if the miss rate makes one connection a bottleneck; the hit rate is
+# visible in yadgar_gateway_credential_cache_total. See `upstream::connect_iam`.
 #
 # ORDERING-SAFE, and the cost of being out of order is higher than it was. The
 # channel is lazy, so this name is not resolved at startup and installing gateway
@@ -48,6 +49,31 @@ task:
 iam:
   host: iam
   port: 50052
+
+# D72's cache in front of `iam.ResolveCredential`, so identity is not a round trip
+# on every tools/call. Keyed on a hash of the bearer token, held IN EACH REPLICA'S
+# OWN MEMORY rather than in the shared cache (D21) — the reasoning is on
+# `attest::Credentials`, and the short form is that attestation runs before D74's
+# limiter, so an unauthenticated caller decides how many keys the cache gains and
+# that keyspace must not sit in a 512MB LRU shared with four other subsystems.
+#
+# **ttlSeconds IS A SECURITY PARAMETER, NOT A TUNING KNOB.** ADR-0491 says the
+# cache is "invalidated by a broker event, never by calling iam per request", and
+# records in its own consequences that revocation does not publish that event yet
+# — ledger 457, with 467 as the `iam` side. Until it does, THIS NUMBER IS THE ONLY
+# BOUND on how long a credential revoked in `iam` keeps working here. gateway logs
+# a warning saying so at every boot, and refuses anything above 300 (which is
+# `iam`'s own declared lifetime for a live credential, and a cache of a thing may
+# not outlive it).
+#
+# 30 buys almost the whole hit rate: a client making one call a second is served
+# thirty times per lookup. Raising it to 300 multiplies the revocation window by
+# ten to buy the last few percent.
+#
+# `0` disables the cache and restores the per-request round trip. It is the revert,
+# and it needs no new image — the same shape as trustUnauthenticatedHeaders below.
+credentialCache:
+  ttlSeconds: 30
 
 # D74's token buckets: one per (user, module, kind), held in the shared cache
 # (D21) so every replica of this Deployment spends from the same one. A

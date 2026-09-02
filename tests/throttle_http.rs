@@ -23,7 +23,7 @@ use axum::http::{Method, Request, StatusCode};
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use serde_json::{json, Value};
 use tower::ServiceExt;
-use yadgar_gateway::attest::Attestation;
+use yadgar_gateway::attest::{Attestation, Credentials};
 use yadgar_gateway::http::{router, AppState};
 use yadgar_gateway::limit::{Limiter, Limits};
 use yadgar_gateway::mcp::{codes, headers, meta_keys, PROTOCOL_VERSION};
@@ -105,6 +105,10 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // Never reached. /auth/login spends no token at all — D74's buckets key
         // on a user, and a login has none yet.
         iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        // Never reached either: the trusted-header path resolves no credential, so
+        // there is nothing to cache. Present because AppState holds it, not because
+        // this file exercises it.
+        credentials: Credentials::new(Duration::from_secs(30)),
         limiter: Limiter::new(&addr, limits, Duration::from_millis(500), 6).expect("limiter"),
         allowed_origins: Vec::new(),
     });

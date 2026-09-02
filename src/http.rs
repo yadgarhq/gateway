@@ -26,7 +26,7 @@ use tonic::transport::Channel;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
-use crate::attest::{self, Attestation, Claimed};
+use crate::attest::{self, Attestation, Claimed, Credentials};
 use crate::limit::{Decision, Limiter};
 use crate::mcp::{self, codes, headers, meta_keys};
 use crate::pb::yadgar::common::v1::Idempotency;
@@ -77,6 +77,10 @@ pub struct AppState {
     /// second address for one service, which is the confusion the deleted
     /// `YADGAR_IAM_ADDR` was.
     pub iam: Channel,
+    /// What `iam` last said about each token this replica has seen (D72,
+    /// ADR-0491). Held here for the same reason the limiter is: it is process
+    /// state, and one built per request would cache nothing.
+    pub credentials: Credentials,
     /// D74's token buckets, in the shared cache. Held here rather than built per
     /// request so one connection manager serves the whole process.
     pub limiter: Limiter,
@@ -661,6 +665,7 @@ async fn tools_call(
     let attested = match attest::attest(
         &state.attestation,
         &state.iam,
+        &state.credentials,
         header(headers, axum::http::header::AUTHORIZATION.as_str()),
         Claimed {
             user_id: header(headers, "x-yadgar-user"),
@@ -705,11 +710,12 @@ async fn tools_call(
     // it was.** Attestation runs above, and it has to: the bucket keys on the
     // resolved user id, so there is nothing to spend from until the credential has
     // been resolved. An authenticated caller in a loop therefore costs `iam` one
-    // unthrottled `ResolveCredential` per request, and this limiter cannot shield
-    // it. The bound is D72's cache — "on a cache miss, never per request" — which
-    // is not built yet, and the same absence the per-request lookup already costs.
-    // Throttling the lookup instead would need a bucket keyed on something known
-    // before the identity is, which is the caller's own claim.
+    // `ResolveCredential` this limiter cannot shield — and the bound on that is
+    // D72's cache, "on a cache miss, never per request", which `attest::Credentials`
+    // now is. It is a bound and not a cure: the loop costs one lookup per TTL
+    // rather than one per request, and a caller ROTATING tokens still misses every
+    // time. Throttling the lookup itself would need a bucket keyed on something
+    // known before the identity is, which is the caller's own claim.
     let kind = kind_of(name);
     if let Some(refusal) =
         throttled(&state, id, &scope, label, module, kind, &attested.limits).await

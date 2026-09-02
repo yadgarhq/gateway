@@ -28,6 +28,9 @@ fn state() -> Arc<AppState> {
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         // Never reached: nothing in this file posts to /auth/login.
         iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        // Never reached either: identity comes from a trusted header on this path,
+        // so no credential is resolved and nothing is cached.
+        credentials: yadgar_gateway::attest::Credentials::new(std::time::Duration::from_secs(30)),
         // Unreachable, so D74's limiter degrades and the call proceeds — which is
         // what keeps this file measuring instrumentation rather than rate limits.
         // A limiter that failed closed would turn the tools/call below into a 429

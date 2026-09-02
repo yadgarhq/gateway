@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use yadgar_gateway::attest::Attestation;
+use yadgar_gateway::attest::{Attestation, Credentials};
 use yadgar_gateway::http::{router, AppState};
 use yadgar_gateway::limit::{Limiter, Limits};
 use yadgar_gateway::upstream;
@@ -55,6 +55,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // INFO, because this is the ordinary case now. It used to be a warning
         // saying the source was not implemented.
         source => tracing::info!(%source, "attesting caller identity from the bearer token"),
+    }
+
+    // D72's cache in front of that lookup. A bad value EXITS rather than falling
+    // back to the default, for the same reason a bad rate limit does: this number
+    // is the only bound on how long a revoked credential keeps working, and an
+    // operator who wrote one should never be silently given another.
+    let credentials = Credentials::from_env()?;
+    if credentials.ttl().is_zero() {
+        tracing::warn!(
+            "the credential cache is DISABLED (YADGAR_CREDENTIAL_TTL_SECONDS=0), so every \
+             tools/call resolves its bearer token against iam. Identity is then a per-request \
+             round trip and an iam outage stops all MCP traffic — which is what D72's cache \
+             exists to prevent."
+        );
+    } else {
+        // A WARNING, not an info line, and it stays one until ledger 457/467 lands.
+        // ADR-0491 decides that revocation publishes a broker event; its own
+        // consequences record that nothing publishes one yet. So this TTL is the
+        // whole revocation bound, and an operator reading the boot log should be
+        // told that rather than left to find it in a decision record.
+        tracing::warn!(
+            ttl_seconds = credentials.ttl().as_secs(),
+            "credential cache enabled (D72). NO INVALIDATION EVENT IS CONSUMED YET \
+             (ADR-0491, ledger 457/467), so a credential revoked in iam keeps working here \
+             for up to this long. The TTL is the only bound."
+        );
     }
 
     // D74's token buckets. The ADDRESS is required, and its absence exits —
@@ -148,9 +174,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MCP traffic, not one endpoint. Staying lazy is still right — a pod stuck in
     // startup is one D68's autoscaler cannot help, and a per-request failure is
     // recoverable where a refusal to boot is not — but the cost of the outage it
-    // survives is larger than it was, and a cache in front of this lookup (D72
-    // says the gateway resolves "on a cache miss, never per request") is what
-    // brings it back down.
+    // survives is larger than it was, and `attest::Credentials` above is what
+    // brings it back down: D72's "on a cache miss, never per request", so an `iam`
+    // outage now costs the callers whose entries expire during it rather than
+    // every call in flight.
     //
     // `?` still stands on both lines, and what it now covers is configuration
     // rather than reachability: a port that is not a number, and a host string
@@ -190,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             attestation,
             task,
             iam,
+            credentials,
             limiter,
             allowed_origins,
         })),
