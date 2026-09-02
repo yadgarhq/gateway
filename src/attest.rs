@@ -38,15 +38,14 @@
 //! **THE LOOKUP IS CACHED, AND THE CACHE IS WHERE THE REVOCATION WINDOW LIVES.**
 //! D72 and ADR-0491 both say the gateway reads a credential "through a cache keyed
 //! on the token hash and invalidated by a broker event, never by calling iam per
-//! request". Half of that is built here: the cache and the key. The broker event is
-//! NOT built — ADR-0491 records the gap itself, and it is ledger 457/467 in `iam`.
-//! Until it lands, [`Credentials::ttl`] is the ONLY thing that bounds how long a
-//! revoked credential keeps working, which makes it a security parameter and not a
-//! tuning knob. That is why the default is short, why a long one is refused at
-//! boot, and why [`Credentials::forget_credential`] and
-//! [`Credentials::forget_user`] exist and are called by nothing yet: the seam the
-//! consumer will attach to is named, tested and visible, rather than a shape
-//! somebody has to invent later.
+//! request". The cache and the key are here; the broker event is consumed by
+//! [`crate::invalidate`], which calls [`Credentials::forget_user`] for both of the
+//! subjects `iam` publishes.
+//!
+//! [`Credentials::ttl`] is therefore the BACKSTOP for a missed event rather than
+//! the mechanism — but it is still what bounds a revoked credential whenever the
+//! broker is unreachable, so it stays a security parameter and not a tuning knob.
+//! That is why the default is short and why a long one is refused at boot.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -223,12 +222,13 @@ const CREDENTIAL_TTL: &str = "YADGAR_CREDENTIAL_TTL_SECONDS";
 
 /// The default lifetime of a cached resolution, in seconds.
 ///
-/// **Short, because it is the whole revocation bound.** With the broker event
-/// unbuilt (ledger 457/467) a credential revoked in `iam` keeps working here for
-/// up to this long, so the number is chosen against that cost rather than against
-/// the hit rate. It buys almost all of the hit rate anyway: an agent making even
-/// one call a second serves thirty of them per lookup, and raising this to `iam`'s
-/// own 300 would multiply the revocation window by ten to buy the last few percent.
+/// **Short, because it is the revocation bound whenever the broker is not
+/// reachable.** The invalidation event ([`crate::invalidate`]) is the mechanism and
+/// this is its backstop, so the number is chosen against the cost of a missed event
+/// rather than against the hit rate. It buys almost all of the hit rate anyway: an
+/// agent making even one call a second serves thirty of them per lookup, and raising
+/// this to `iam`'s own 300 would multiply that window by ten to buy the last few
+/// percent.
 const DEFAULT_TTL_SECONDS: u64 = 30;
 
 /// The largest lifetime this gateway will accept, in seconds.
@@ -324,11 +324,10 @@ fn is_live(answer: &ResolveCredentialResponse) -> bool {
 /// every sense that matters, and the residual is a constant multiple of the replica
 /// count rather than of the traffic.
 ///
-/// And when the broker consumer is built it must run on EVERY replica — a fan-out
-/// subscription, not a work queue with one consumer — or an eviction reaches one
-/// pod and the others serve the revoked credential to its TTL. That requirement is
-/// the price of this choice and is written on [`Credentials::forget_credential`]
-/// where the consumer's author will read it.
+/// And the broker consumer runs on EVERY replica, because it has to: a work queue
+/// with one consumer would evict one pod and leave the others serving the revoked
+/// credential to its TTL. [`crate::invalidate`] subscribes with no queue group,
+/// which is the fan-out delivery that requirement names.
 ///
 /// **D80, applied to this decision.** Nothing here is a platform capability: no
 /// ingress feature, no cloud service, no CRD, no operator. A process-local
@@ -377,10 +376,10 @@ impl Credentials {
         if seconds > MAX_TTL_SECONDS {
             return Err(format!(
                 "{CREDENTIAL_TTL} is {seconds}, above the {MAX_TTL_SECONDS} second ceiling. \
-                 Nothing publishes the invalidation event this cache is supposed to be cleared \
-                 by yet (ADR-0491, ledger 457), so this value is the ONLY bound on how long a \
-                 revoked credential keeps working — and iam declares 300 seconds as a live \
-                 credential's own lifetime, which a cache of it may not outlive."
+                 This value is the bound on how long a revoked credential keeps working \
+                 whenever the invalidation event is missed or the broker is unreachable \
+                 (D72) — and iam declares 300 seconds as a live credential's own lifetime, \
+                 which a cache of it may not outlive."
             ));
         }
         Ok(Self::new(Duration::from_secs(seconds)))
@@ -402,26 +401,15 @@ impl Credentials {
 
     /// Forget one credential, by the token itself.
     ///
-    /// **NOTHING CALLS THIS YET, and that is the state of the world rather than an
-    /// oversight.** ADR-0491 decides that revocation publishes a broker event and
-    /// records in its own consequences that the publisher does not exist — filed as
-    /// ledger 457, with 467 as the `iam` side. This is the seam that consumer
-    /// attaches to, named and tested now so the shape is not invented under
-    /// pressure later.
+    /// **NO INVALIDATION EVENT REACHES THIS, and that is D72 rather than an
+    /// omission.** `iam` holds a credential ID on a revoke and never sees the
+    /// token, so neither published subject can name a key in this map — both land
+    /// on [`Credentials::forget_user`] instead. This is the by-token eviction for
+    /// a caller that holds the token itself.
     ///
-    /// **THE CONSUMER MUST RUN ON EVERY REPLICA.** The map is this pod's own (see
-    /// the type comment), so a subscription that delivers each event to exactly one
-    /// consumer — a work queue, a shared consumer group — evicts one pod and leaves
-    /// every other one serving the revoked credential until its TTL. It needs
-    /// fan-out delivery, and that is a property of how the subscription is
-    /// declared, not of this function.
-    ///
-    /// It takes the TOKEN and not a hash, because the event will carry whatever
-    /// `iam` holds and the key derivation belongs on this side of the boundary —
-    /// the same argument `attest` already makes for not hashing before the RPC. If
-    /// the event turns out to carry `iam`'s own stored hash instead, this is where
-    /// that mismatch has to be resolved, and it is one function rather than a
-    /// convention.
+    /// It takes the TOKEN and not a hash, because the key derivation belongs on
+    /// this side of the boundary — the same argument `attest` already makes for
+    /// not hashing before the RPC.
     pub fn forget_credential(&self, token: &str) {
         let key = fingerprint(token);
         self.live
@@ -436,14 +424,17 @@ impl Credentials {
 
     /// Forget every credential resolved to one user.
     ///
-    /// The second half of D72's invalidation: "revocation OR TEAM CHANGE". A team
-    /// change names a person, not a token, and this cache is keyed by token — so it
-    /// is a scan rather than a lookup. That is affordable precisely because it is
-    /// rare and [`CAPACITY`] is small; making it a lookup would need a second index
-    /// maintained on the hot path to serve an event that arrives a few times a day.
+    /// **BOTH of D72's invalidation events land here** — `credential.revoked` as
+    /// well as `user.teams-changed` — because both name a person and this cache is
+    /// keyed by token. So it is a scan rather than a lookup. That is affordable
+    /// precisely because it is rare and [`CAPACITY`] is small; making it a lookup
+    /// would need a second index maintained on the hot path to serve an event that
+    /// arrives a few times a day.
     ///
-    /// Unwired, for the same reason [`Credentials::forget_credential`] is, and it
-    /// carries the same fan-out requirement.
+    /// It over-invalidates, dropping that person's other credentials' entries too.
+    /// That costs one resolve each and is the safe direction to be wrong in; the
+    /// alternative is a cache the event cannot address at all, which fails by
+    /// leaving the revoked credential working. [`crate::invalidate`] is the caller.
     ///
     /// Only live answers are touched: a refusal carries no user to match.
     pub fn forget_user(&self, user_id: &str) {
@@ -1508,10 +1499,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn forgetting_one_credential_sends_the_next_request_back_to_iam() {
-        // THE INVALIDATION SEAM. Nothing calls it yet — ADR-0491 records that
-        // revocation publishes no event, filed as ledger 457/467 — so this test is
-        // what keeps it from rotting into a function that compiles and does
-        // nothing.
+        // THE BY-TOKEN EVICTION. No published subject reaches it — both land on
+        // `forget_user`, because `iam` never sees the token — so this test is what
+        // keeps it from rotting into a function that compiles and does nothing.
         let cache = Credentials::new(TEST_TTL);
         let calls = AtomicUsize::new(0);
         through(&cache, "tok-golf", &calls, &resolved("u-golf-6103")).await;
@@ -1708,11 +1698,11 @@ mod tests {
     }
 
     #[test]
-    fn a_ttl_above_the_ceiling_is_refused_because_nothing_else_bounds_revocation() {
+    fn a_ttl_above_the_ceiling_is_refused_rather_than_clamped() {
         // MUTATION THIS CATCHES: clamping instead of refusing. A clamp reads as
         // accepted, so an operator who wrote 3600 believes they got it — and the
-        // one number that decides how long a revoked credential keeps working is
-        // then a number nobody agreed on.
+        // one number that bounds a revocation whose event was missed is then a
+        // number nobody agreed on.
         assert!(
             Credentials::from_lookup(env(&[(CREDENTIAL_TTL, &MAX_TTL_SECONDS.to_string())]))
                 .is_ok(),
@@ -1721,8 +1711,8 @@ mod tests {
         let err = Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "3600")]))
             .expect_err("an hour-long revocation window must not be accepted silently");
         assert!(
-            err.contains("457"),
-            "the message must name the ledger task that closes the gap: {err}"
+            err.contains(&MAX_TTL_SECONDS.to_string()),
+            "the message must name the ceiling it refused against: {err}"
         );
     }
 }

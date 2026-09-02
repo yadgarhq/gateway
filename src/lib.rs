@@ -12,6 +12,7 @@
 
 pub mod attest;
 pub mod http;
+pub mod invalidate;
 pub mod limit;
 pub mod mcp;
 pub mod source;

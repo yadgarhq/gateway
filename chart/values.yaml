@@ -145,21 +145,89 @@ iam:
 #
 # **ttlSeconds IS A SECURITY PARAMETER, NOT A TUNING KNOB.** ADR-0491 says the
 # cache is "invalidated by a broker event, never by calling iam per request", and
-# records in its own consequences that revocation does not publish that event yet
-# — ledger 457, with 467 as the `iam` side. Until it does, THIS NUMBER IS THE ONLY
-# BOUND on how long a credential revoked in `iam` keeps working here. gateway logs
-# a warning saying so at every boot, and refuses anything above 300 (which is
-# `iam`'s own declared lifetime for a live credential, and a cache of a thing may
-# not outlive it).
+# and the `nats` block below is where that event is consumed. So this number is
+# the BACKSTOP for a missed event rather than the mechanism — and it becomes THE
+# ONLY BOUND on how long a credential revoked in `iam` keeps working here whenever
+# the broker is unreachable, which gateway says in a warning at every boot it is
+# not consuming. Anything above 300 is refused: that is `iam`'s own declared
+# lifetime for a live credential, and a cache of a thing may not outlive it.
 #
 # 30 buys almost the whole hit rate: a client making one call a second is served
-# thirty times per lookup. Raising it to 300 multiplies the revocation window by
+# thirty times per lookup. Raising it to 300 multiplies the missed-event window by
 # ten to buy the last few percent.
 #
 # `0` disables the cache and restores the per-request round trip. It is the revert,
 # and it needs no new image — the same shape as trustUnauthenticatedHeaders below.
 credentialCache:
   ttlSeconds: 30
+
+# The broker (D22), carrying the cache invalidation `iam` publishes on a
+# revocation or a team change. NOT a startup dependency: gateway is the only
+# ingress in the system, so a boot gate here would turn a broker outage into a
+# total outage of every MCP call. It starts, says at every boot that it is NOT
+# consuming, retries, and credentialCache.ttlSeconds above is the bound meanwhile.
+nats:
+  # SET, BECAUSE THE ACCOUNT NOW EXISTS. `yadgarhq/deploy#15` merged: the broker's
+  # authorization block declares a `gateway` user with `subscribe.allow` on
+  # exactly the two subjects below and `publish.deny: ">"`, and the Secret named
+  # below holds its password. Both halves of the cut-over are in place, so this
+  # points at the broker and the consumer runs.
+  #
+  # **THE ORDER MATTERED AND NO LONGER DOES.** A NATS server with an authorization
+  # block REFUSES a credential-less CONNECT — `-ERR 'Authorization Violation'`,
+  # connection closed, exactly as for a wrong password — so pointing at this broker
+  # without an account was never "connects unauthenticated": it was every pod
+  # refused, consuming nothing, redialling for ever. That is why this value waited
+  # for the account rather than shipping ahead of it.
+  #
+  # EMPTY IS STILL A SUPPORTED STATE and is the revert: no broker is dialled,
+  # nothing is consumed, and credentialCache.ttlSeconds above is the bound. It is
+  # read BEFORE the credential below, so clearing this one value turns the whole
+  # block off. See MIGRATION_NOTES.md.
+  #
+  # **WITH THIS SET, THE SECRET BELOW IS A HARD PREREQUISITE AND ITS ABSENCE
+  # FAILS THE BOOT.** While this was empty, passwordSecret was inert: the binary
+  # stopped at the url and never looked for the password. Set, it looks — and the
+  # Secret mount is `optional: true`, so a missing Secret is an empty directory
+  # rather than a stuck pod, the file is not there, and gateway EXITS naming
+  # /var/run/secrets/nats/password. That is deliberate and it is loud, but it is a
+  # boot failure rather than a degraded start: do not point this at a broker in a
+  # cluster where nats-auth-gateway does not exist. Clear this url instead.
+  url: nats://nats:4222
+
+  # The Secret holding this gateway's OWN broker password.
+  #
+  # NOT `iam`'s. The broker's authorization block names one account per service so
+  # that any single service's access can be revoked; sharing one credential would
+  # also let a subscriber publish, and this service has no business publishing on
+  # a subject `iam` owns.
+  #
+  # EMPTY IS A FULLY SUPPORTED STATE — an adopter whose broker declares no
+  # authorization block clears this and gateway connects with no credential. It is
+  # not the reference deployment's state: that broker demands one, and a gateway
+  # without it is REFUSED rather than connected. The cost of getting this wrong is
+  # loud either way: a pod that exits at boot naming
+  # `/var/run/secrets/nats/password`, or one whose log says the broker refused it.
+  #
+  # `nats-auth-gateway` is the Secret `yadgarhq/deploy` creates for this service's
+  # OWN account. It is inert whenever `url` above is empty, because the binary
+  # reads the url first and stops there — which is what let this value land before
+  # the account did.
+  #
+  # AN ADOPTER SUPPLIES IT HOWEVER THEY LIKE (D80). The chart names a Secret and
+  # mounts a key from it, so Vault, External Secrets, SOPS or a cloud secret
+  # manager substitute for however the reference deployment creates it, and this
+  # chart is unchanged.
+  passwordSecret: nats-auth-gateway
+  # The key inside that Secret which holds the password, mounted as `password`.
+  # Named rather than assumed, for the same reason the CA keys are: a Secret
+  # assembled by hand is free to call it something else.
+  passwordSecretKey: password
+  # The account this service authenticates as, which must match a user in the
+  # broker's `authorization` block. Required whenever `passwordSecret` is set: the
+  # block names an account and a password together, and gateway refuses to start
+  # with one and not the other, in BOTH directions.
+  user: gateway
 
 # D74's token buckets: one per (user, module, kind), held in the shared cache
 # (D21) so every replica of this Deployment spends from the same one. A

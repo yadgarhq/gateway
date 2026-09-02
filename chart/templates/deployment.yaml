@@ -147,13 +147,73 @@ spec:
             {{- end }}
             # D72. How long one resolved credential is reused before iam is asked
             # again. SET UNCONDITIONALLY rather than only when it differs from the
-            # binary's default: this is the only bound on how long a revoked
-            # credential keeps working while nothing publishes the invalidation
-            # event (ADR-0491, ledger 457), and a security bound that is present in
-            # the manifest can be read off the running pod. Set it to 0 to disable
-            # the cache and go back to a round trip per call. See values.yaml.
+            # binary's default: it is the backstop for a missed invalidation event
+            # and the whole bound whenever the broker below is unreachable, and a
+            # security bound that is present in the manifest can be read off the
+            # running pod. Set it to 0 to disable the cache and go back to a round
+            # trip per call. See values.yaml.
             - name: YADGAR_CREDENTIAL_TTL_SECONDS
               value: {{ .Values.credentialCache.ttlSeconds | quote }}
+            # The broker carrying that invalidation (D22, D72). Absent, unreachable
+            # or REFUSING is survivable and loudly logged at every boot: gateway is
+            # the only ingress, so a boot gate here would turn a broker outage into
+            # a total outage of every MCP call, and the TTL above is the backstop
+            # for exactly that window.
+            #
+            # SET BY DEFAULT, so the consumer runs. It is read BEFORE the
+            # credential below, so CLEARING it is the revert and turns the whole
+            # block off — the two variables that follow go inert rather than
+            # needing to be cleared themselves.
+            #
+            # It could not have shipped set before the broker had an account for
+            # this service: a NATS server with an authorization block REFUSES a
+            # credential-less CONNECT rather than accepting it unauthenticated.
+            # See values.yaml.
+            - name: NATS_URL
+              value: {{ .Values.nats.url | quote }}
+            {{- if .Values.nats.passwordSecret }}
+            # RENDERED ONLY WHEN THE BROKER ASKS FOR A CREDENTIAL, so an adopter
+            # whose broker declares no authorization block clears
+            # `nats.passwordSecret` and this whole block disappears. The reference
+            # deployment's Secret IS the default, because that broker demands a
+            # credential.
+            #
+            # **WITH `nats.url` SET, THE SECRET IS A HARD PREREQUISITE.** These two
+            # variables are inert only while the url is empty, because the binary
+            # reads the url first and stops there. With it set, a
+            # `nats.passwordSecret` naming a Secret that does not exist mounts an
+            # empty directory and the pod EXITS at boot naming the path below.
+            # That is the designed failure — loud, and never a silent connection
+            # without the credential it was told to present — but it is a boot
+            # failure, not a degraded start.
+            #
+            # BOTH, OR NEITHER. The broker's authorization block names an account
+            # and a password together, so gateway refuses to start with either one
+            # alone, in BOTH directions. Which makes the `if` load-bearing rather
+            # than tidy: it renders this variable and the password path TOGETHER,
+            # so an adopter who clears `nats.passwordSecret` drops both and boots
+            # with no credential — the supported state — even though `nats.user`
+            # still carries its default.
+            #
+            # `required` here rather than a bare lookup: an override that nulled
+            # the user would otherwise render an empty string, and the failure
+            # would be a CrashLoop three layers from its cause.
+            - name: NATS_USER
+              value: {{ required "nats.user names the broker account gateway authenticates as and must be set whenever nats.passwordSecret is; see the chart's values.yaml" .Values.nats.user | quote }}
+            # A PATH, never the value (D80). A password in the environment is a
+            # password in `kubectl describe pod`; a file is readable only inside
+            # the container.
+            #
+            # THERE IS NO SILENT MIDDLE STATE. A path that names no readable,
+            # non-empty file fails the pod at boot naming the path — gateway never
+            # falls back to a broker connection carrying no credential. A broker
+            # that REFUSES this gateway — a wrong password, or no password against
+            # a broker that demands one — is survivable and logged as a deployment
+            # error rather than as an outage, and backed off harder than an
+            # outage is.
+            - name: NATS_PASSWORD_FILE
+              value: /var/run/secrets/nats/password
+            {{- end }}
             # D74. The ADDRESS is required and gateway exits without it: a
             # gateway with nowhere to keep its buckets enforces no capacity
             # limit at all, and that is a deployment mistake rather than an
@@ -243,7 +303,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret }}
+          {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
           volumeMounts:
             {{- if .Values.rateLimit.passwordSecret }}
             # A DIRECTORY MOUNT, never subPath — the same rule the CA mounts
@@ -252,6 +312,15 @@ spec:
             # process and the pod would keep presenting the old one.
             - name: valkey-password
               mountPath: /var/run/secrets/valkey
+              readOnly: true
+            {{- end }}
+            {{- if .Values.nats.passwordSecret }}
+            # A DIRECTORY MOUNT, never subPath — same rule as the cache password
+            # above. A subPath mount is a one-time copy kubelet never refreshes, so
+            # a rotated broker password would never reach this process and it would
+            # keep presenting the old one.
+            - name: nats-password
+              mountPath: /var/run/secrets/nats
               readOnly: true
             {{- end }}
             {{- if .Values.task.tls.enabled }}
@@ -272,7 +341,7 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret }}
+      {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
       volumes:
         {{- if .Values.rateLimit.passwordSecret }}
         - name: valkey-password
@@ -293,6 +362,26 @@ spec:
             # the binary's configuration.
             items:
               - key: {{ required "rateLimit.passwordSecretKey names the key inside rateLimit.passwordSecret that holds the cache password and must be set whenever rateLimit.passwordSecret is; see the chart's values.yaml" .Values.rateLimit.passwordSecretKey | quote }}
+                path: password
+        {{- end }}
+        {{- if .Values.nats.passwordSecret }}
+        - name: nats-password
+          secret:
+            secretName: {{ .Values.nats.passwordSecret }}
+            # OPTIONAL, and it means what it means on the cache password above:
+            # the process MUST NOT START without the password, and optional is
+            # simply which error says so. An optional mount produces an empty
+            # directory, the binary finds no file at NATS_PASSWORD_FILE, and it
+            # exits naming THAT PATH rather than leaving the pod in
+            # ContainerCreating with a FailedMount event about a volume. There is
+            # no third outcome in which this pod connects to the broker without a
+            # credential it was told to present.
+            optional: true
+            # ONE KEY, renamed to the `password` the environment names above, so
+            # whatever the Secret's author called it does not have to travel into
+            # the binary's configuration.
+            items:
+              - key: {{ required "nats.passwordSecretKey names the key inside nats.passwordSecret that holds the broker password and must be set whenever nats.passwordSecret is; see the chart's values.yaml" .Values.nats.passwordSecretKey | quote }}
                 path: password
         {{- end }}
         {{- if .Values.task.tls.enabled }}

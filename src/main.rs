@@ -70,30 +70,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // D72's cache in front of that lookup. A bad value EXITS rather than falling
-    // back to the default, for the same reason a bad rate limit does: this number
-    // is the only bound on how long a revoked credential keeps working, and an
-    // operator who wrote one should never be silently given another.
+    // back to the default, for the same reason a bad rate limit does: it bounds how
+    // long a revoked credential keeps working whenever the invalidation event below
+    // is missed, and an operator who wrote a number should never be silently given
+    // another.
     let credentials = Credentials::from_env()?;
-    if credentials.ttl().is_zero() {
+    let ttl = credentials.ttl();
+    if ttl.is_zero() {
         tracing::warn!(
             "the credential cache is DISABLED (YADGAR_CREDENTIAL_TTL_SECONDS=0), so every \
              tools/call resolves its bearer token against iam. Identity is then a per-request \
              round trip and an iam outage stops all MCP traffic — which is what D72's cache \
-             exists to prevent."
-        );
-    } else {
-        // A WARNING, not an info line, and it stays one until ledger 457/467 lands.
-        // ADR-0491 decides that revocation publishes a broker event; its own
-        // consequences record that nothing publishes one yet. So this TTL is the
-        // whole revocation bound, and an operator reading the boot log should be
-        // told that rather than left to find it in a decision record.
-        tracing::warn!(
-            ttl_seconds = credentials.ttl().as_secs(),
-            "credential cache enabled (D72). NO INVALIDATION EVENT IS CONSUMED YET \
-             (ADR-0491, ledger 457/467), so a credential revoked in iam keeps working here \
-             for up to this long. The TTL is the only bound."
+             exists to prevent. NO INVALIDATION IS CONSUMED either, and the broker is not \
+             dialled at all: an event names a person whose cached answer does not exist."
         );
     }
+    // What clears that cache when `iam` says an identity has changed (D72). READ
+    // HERE, so a half-configured broker credential exits at boot with the rest of
+    // the configuration mistakes; the CONNECTION is made further down, once there
+    // is a cache to hand it.
+    let broker = yadgar_gateway::invalidate::Broker::from_env()?;
 
     // D74's token buckets. The ADDRESS is required, and its absence exits —
     // which is NOT the same rule as the runtime one. An unconfigured limiter is a
@@ -370,6 +366,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
+    let state = Arc::new(AppState {
+        attestation,
+        task,
+        iam,
+        credentials,
+        limiter,
+        allowed_origins,
+        trust,
+        credential_limits,
+    });
+
+    // D72's invalidation, BEFORE the listener binds. The first dial is awaited so
+    // the line below says what is true rather than what was configured: a broker
+    // this gateway could not reach must not produce a boot log claiming an
+    // invalidation path it does not have. See `invalidate::start` for why an
+    // unreachable broker degrades loudly instead of failing the boot.
+    //
+    // `Arc<AppState>` rather than a share of the cache alone, so `AppState` keeps
+    // owning it and no handler changes.
+    //
+    // **SKIPPED ENTIRELY WHEN THE CACHE IS OFF, and the warning above says so.**
+    // With no cache there is nothing an event could evict, so a connection, two
+    // subscriptions and a redial loop would all be spent on calling `forget_user`
+    // against an empty map. It also keeps `credentialCache.ttlSeconds: 0` the
+    // clean revert MIGRATION_NOTES.md says it is: back to a round trip per call,
+    // with no dependency on the broker at all. What is NOT skipped is
+    // `Broker::from_env` above — a half-configured credential is a deployment
+    // mistake at any TTL, and it still fails the boot.
+    let consuming = if ttl.is_zero() {
+        false
+    } else {
+        yadgar_gateway::invalidate::start(broker, {
+            let state = Arc::clone(&state);
+            // BOTH SUBJECTS EVICT A PERSON, never a token: `iam` holds a
+            // credential id on a revoke and never sees the token this cache is
+            // keyed on. See D72 and `Credentials::forget_user`.
+            move |user_id: &str| state.credentials.forget_user(user_id)
+        })
+        .await
+    };
+    if !ttl.is_zero() && !consuming {
+        // A WARNING, and it is the honest form of the one this used to print
+        // unconditionally. It is no longer a statement about what was built; it is
+        // a statement about what THIS process managed to connect to.
+        tracing::warn!(
+            ttl_seconds = ttl.as_secs(),
+            "credential cache enabled (D72) with NO INVALIDATION BEING CONSUMED, so a \
+             credential revoked in iam keeps working here for up to this long. The TTL is the \
+             only bound."
+        );
+    } else if !ttl.is_zero() {
+        tracing::info!(
+            ttl_seconds = ttl.as_secs(),
+            "credential cache enabled (D72), invalidated by broker events with the TTL as the \
+             backstop for a missed one"
+        );
+    }
+
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:8080").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, protocol = yadgar_gateway::mcp::PROTOCOL_VERSION, "gateway listening");
@@ -382,17 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // an unthrottleable, unattributable request, which is the state this
         // whole change exists to leave. It is the one line that makes the rest
         // reachable in the shipped binary.
-        router(Arc::new(AppState {
-            attestation,
-            task,
-            iam,
-            credentials,
-            limiter,
-            allowed_origins,
-            trust,
-            credential_limits,
-        }))
-        .into_make_service_with_connect_info::<SocketAddr>(),
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;

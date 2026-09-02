@@ -117,12 +117,12 @@ to remove from a manifest, and nothing to run against the cluster.
 on a SHA-256 of the token, in **each replica's own memory**. `tools/call` resolves
 against `iam` on a miss instead of on every request (D72, ADR-0491).
 
-**`credentialCache.ttlSeconds` is the only bound on revocation, and it defaults to 30.** ADR-0491 decides that revocation publishes a broker event the cache is
-cleared by, and records in its own consequences that nothing publishes one yet —
-ledger 457, with 467 as the `iam` side. Until that lands, **a credential revoked in
-`iam` keeps working at the gateway for up to this many seconds.** `gateway` logs a
-warning saying so at every boot, and refuses any value above 300 at boot rather
-than clamping it.
+**`credentialCache.ttlSeconds` is the backstop for a missed invalidation event, and
+it defaults to 30.** The event itself is consumed from the broker — see the section
+below. Whenever `gateway` is not consuming, **a credential revoked in `iam` keeps
+working at the gateway for up to this many seconds**, and `gateway` logs a warning
+saying exactly that at every boot. Any value above 300 is refused at boot rather
+than clamped.
 
 Nothing to run against the cluster. The chart sets the variable, so an ordinary
 GitOps sync carries it. Rolling the image without the chart is safe here — the
@@ -137,6 +137,93 @@ the same shape as `trustUnauthenticatedHeaders`.
 `yadgar_gateway_credential_cache_total{outcome="hit"|"miss"}` is how you tell
 whether it is working. A miss rate near 100% with steady traffic means tokens are
 rotating, or the TTL is shorter than the gap between one client's calls.
+
+## The invalidation consumer — the broker needs an account for `gateway`
+
+`gateway` now subscribes to `yadgar.iam.credential.revoked` and
+`yadgar.iam.user.teams-changed`, which `iam` has published all along, and evicts
+every cached entry for the named user (D72). The subscription carries **no queue
+group**, so every replica receives every message — a queue group would evict one
+pod and leave the rest serving the revoked credential.
+
+**Nothing to run against the cluster from this repository.** `nats.url` is set to
+`nats://nats:4222` and the chart carries the credential, so an ordinary GitOps
+sync starts the consumer.
+
+**Both halves are in place.** `yadgarhq/deploy#15` merged on 2026-09-02 at
+20:51:33Z. Verified live, read-only, on the reference cluster: `cm/nats-config` in
+namespace `yadgar` declares a `gateway` user whose `subscribe.allow` names exactly
+`yadgar.iam.credential.revoked` and `yadgar.iam.user.teams-changed`, with
+`publish.deny: ">"`, and Secret `nats-auth-gateway` exists carrying key
+`password`.
+
+**Why the order mattered.** A NATS server with an `authorization` block REFUSES a
+credential-less `CONNECT` — `-ERR 'Authorization Violation'`, connection closed,
+exactly as for a wrong password. Before deploy#15 that block declared only `iam`,
+so a chart pointing at this broker would have put every gateway pod in a state
+where it is refused, consumes nothing, and redials for ever. That is not "connects
+unauthenticated", and it is why the url waited for the account rather than
+shipping ahead of it.
+
+The chart sets `nats.passwordSecret: nats-auth-gateway`, `nats.user: gateway` and
+the mount. Those are inert whenever `nats.url` is empty, because the binary reads
+the url first and returns "no broker configured" before it looks at a credential
+at all.
+
+**Now that `nats.url` is set, the Secret is a hard prerequisite of the chart's
+defaults.** The volume is `optional: true`, so a cluster without
+`nats-auth-gateway` mounts an empty directory, `NATS_PASSWORD_FILE` names a file
+that is not there, and **the pod exits at boot naming that path**. It is the
+designed failure — gateway never falls back to presenting no credential — but it
+is a boot failure, not a degraded start, and it is new: while the url was empty
+the same missing Secret was inert. Deploying these defaults into a cluster that
+has not applied `yadgarhq/deploy#15` crash-loops the gateway. Clear `nats.url`
+there instead.
+
+**What `yadgarhq/deploy` owns, and now carries.** In its `infra/nats.yaml`:
+
+- a second user, `gateway`, in `config.merge.authorization.users`, with its
+  password from a **new** Secret — `nats-auth-gateway`, key `password`. A new
+  Secret rather than a second key in `nats-auth`, because `infra/bootstrap/`
+  creates Secrets with `create`-only RBAC and treats the `409 AlreadyExists` on
+  every later run as success: a key added to an existing Secret would never
+  materialise on a running cluster.
+- **subscribe-only permissions** on exactly those two subjects, and publish denied.
+  This service has no business publishing on a subject `iam` owns, and no
+  request/reply, so it needs no `_INBOX.>` either.
+- `gateway` added to the `nats-ingress` NetworkPolicy in
+  `infra/network-policies/shared-infrastructure.yaml`, whose 4222 rule named only
+  `app: iam`. Nothing enforces NetworkPolicy on the reference cluster's CNI, so
+  this is for the day one does.
+
+Both, or neither: the pod exits at boot naming `/var/run/secrets/nats/password` if
+only one of `nats.passwordSecret` and `nats.user` is set, in either direction.
+
+**A FORBIDDEN SUBSCRIPTION IS THE FAILURE TO WATCH FOR after the cut-over**, and
+it is the quiet one. A wrong password closes the connection and is impossible to
+miss. A subject missing from the `subscribe.allow` list does not: the broker
+leaves the connection open and answers an asynchronous
+`-ERR 'Permissions Violation for Subscription to ...'`. `gateway` registers an
+event callback for exactly that, logs it at ERROR, and ENDS the subscription so
+the redial reports it again for as long as it stands.
+
+**The boot line can still be wrong for one cycle, and that is a real limit rather
+than an oversight.** NATS acknowledges no `SUB`, and `async-nats`' `flush` is a
+local socket flush that enqueues no `PING` — so nothing in the client can wait for
+the server's verdict. `gateway` gives a refusal a short window before it writes its
+boot line; a broker slower than that window gets a boot line saying "consuming"
+which the ERROR and the redial then contradict. **Alert on the ERROR, not on the
+boot line.**
+
+The subjects are now written in three places — `iam`'s publisher, `gateway`'s
+constants, and the broker's `subscribe.allow` list — and only the first two are
+pinned by a test. A typo in the third shows up solely in that ERROR.
+
+**To revert**, clear `nats.url`. One value, no new image: no broker is dialled and
+`credentialCache.ttlSeconds` is the bound again. Setting
+`credentialCache.ttlSeconds: 0` also stops the consumer, because with no cache
+there is nothing for an event to evict — the binary skips the broker entirely and
+says so at boot.
 
 ## D74 token buckets — the chart and the image must move together
 
