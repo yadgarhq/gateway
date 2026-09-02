@@ -411,8 +411,42 @@ fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
     state.allowed_origins.iter().any(|a| a == origin)
 }
 
+/// A header as text, with ABSENT AND UNREADABLE COLLAPSED INTO ONE ANSWER.
+///
+/// That collapse is safe ONLY where absence and an undecodable value deserve the
+/// same treatment, which is true of the CLAIMED values this is left serving: a
+/// `x-yadgar-project` nobody can read is a project nobody claimed, and an
+/// unreadable `Authorization` is a credential that will fail attestation either
+/// way. It is NOT true of anything being VALIDATED — see [`readable`], and the
+/// bug it exists to close.
 fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
     h.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The same lookup, keeping PRESENT-BUT-UNREADABLE apart from ABSENT.
+///
+/// `Ok(None)` is absent, `Ok(Some(_))` is a value, and `Err(name)` is a header
+/// the caller sent that this server cannot decode.
+///
+/// **PRESENT AND UN-DECODABLE IS PRESENT AND INVALID.** `HeaderValue::is_valid`
+/// is `b >= 32 && b != 127 || b == b'\t'`, so every byte of a UTF-8 multibyte
+/// sequence is at least 0x80 and passes — the value travels as obs-text and
+/// arrives whole. `\r`, `\n`, `\0` and `\x7F` are refused outright, so nothing
+/// here is request splitting. What it is, is a header that reached the server
+/// intact and could not be read.
+///
+/// [`header`] answers `None` for that, and `None` at the cross-check means THERE
+/// IS NOTHING TO COMPARE — so the one `Mcp-Method` or `Mcp-Name` that could not
+/// be checked was the one waved through, and a validation that does not validate
+/// is worse than none, because the record says the request was policed. This is
+/// the identical bug [`origin_ok`] carried until it was fixed, in the identical
+/// shape; it became reachable on this path when clients started sending the two
+/// mirror headers.
+fn readable<'a>(h: &'a HeaderMap, name: &'a str) -> Result<Option<&'a str>, &'a str> {
+    match h.get(name) {
+        None => Ok(None),
+        Some(v) => v.to_str().map(Some).map_err(|_| name),
+    }
 }
 
 async fn handle(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
@@ -440,12 +474,37 @@ async fn handle(State(state): State<Arc<AppState>>, headers: HeaderMap, body: By
         }
     };
 
-    if let Err(e) = mcp::cross_check_headers(
-        &meta,
-        header(&headers, headers::PROTOCOL_VERSION),
-        header(&headers, headers::METHOD),
-        header(&headers, headers::NAME),
+    // A HEADER THAT CANNOT BE READ IS A REFUSAL, NOT A SKIP, and it is refused
+    // here rather than inside `cross_check_headers` because that function
+    // compares two decoded strings and this is not a disagreement between them.
+    //
+    // `INVALID_PARAMS` AND 400, following the precedent one arm below: a missing
+    // `MCP-Protocol-Version` — the other header-layer defect that is not a
+    // mismatch — already answers exactly that. `-32020 HeaderMismatch` is
+    // documented as "a header disagrees with the `_meta` field it mirrors" and
+    // saying it here would report a disagreement nobody established. A new code
+    // in the MCP-reserved range would need the 2026-07-28 revision to name this
+    // condition and a client that recognised it, which is the bar `RATE_LIMITED`
+    // had to clear and this does not.
+    let (header_version, header_method, header_name) = match (
+        readable(&headers, headers::PROTOCOL_VERSION),
+        readable(&headers, headers::METHOD),
+        readable(&headers, headers::NAME),
     ) {
+        (Ok(v), Ok(m), Ok(n)) => (v, m, n),
+        (Err(bad), _, _) | (_, Err(bad), _) | (_, _, Err(bad)) => {
+            return reply(
+                400,
+                mcp::error(
+                    request.id.as_ref(),
+                    codes::INVALID_PARAMS,
+                    &format!("the {bad} header is not readable as text"),
+                ),
+            )
+        }
+    };
+
+    if let Err(e) = mcp::cross_check_headers(&meta, header_version, header_method, header_name) {
         return reply(
             e.http_status(),
             mcp::error(request.id.as_ref(), e.code(), &e.to_string()),
