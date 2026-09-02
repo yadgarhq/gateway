@@ -33,8 +33,17 @@ use crate::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 /// status codes asserted here would depend on test order. One limiter per state
 /// is one floor per test.
 fn state(allowed_origins: Vec<String>) -> Arc<AppState> {
+    state_with(Attestation::TrustedHeaders, allowed_origins)
+}
+
+/// The same state, under a chosen identity source.
+///
+/// A SEAM, because the two sources answer the same request differently and the
+/// difference is the property worth asserting. `state` is the development one and
+/// every test above it uses that; the tests that compare the two reach for this.
+fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<AppState> {
     Arc::new(AppState {
-        attestation: Attestation::TrustedHeaders,
+        attestation,
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         limiter: crate::limit::Limiter::new(
@@ -513,31 +522,36 @@ async fn an_unreachable_iam_is_an_opaque_503() {
     );
 }
 
-/// Nothing in the ROUTER adds `WWW-Authenticate` on the way out.
+/// Nothing in the ROUTER adds `WWW-Authenticate` on the way out, on EITHER path.
 ///
-/// `every_login_failure_is_opaque_in_body_and_headers` proves `login_failure`
-/// sets no such header, over every code. It cannot prove a LAYER does not add one
-/// afterwards, because it never goes through the router — so this drives the real
-/// stack and checks what actually reaches the wire. One code is enough for that
-/// question: layers do not vary by gRPC status.
+/// `every_login_failure_is_opaque_in_body_and_headers` and its enrolment twin
+/// prove the two builders set no such header, over every code. Neither can prove a
+/// LAYER does not add one afterwards, because neither goes through the router — so
+/// this drives the real stack and checks what actually reaches the wire. One code
+/// is enough for that question: layers do not vary by gRPC status.
 #[tokio::test]
 async fn no_layer_adds_an_authentication_challenge() {
-    let req = HttpRequest::builder()
-        .method(Method::POST)
-        .uri("/auth/login")
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"username":"u","password":"p"}"#.to_string()))
-        .expect("request");
-    let resp = router(state(Vec::new()))
-        .oneshot(req)
-        .await
-        .expect("the router answers");
-    assert!(
-        resp.headers()
-            .get(axum::http::header::WWW_AUTHENTICATE)
-            .is_none(),
-        "D72: no WWW-Authenticate on this endpoint"
-    );
+    for (path, body) in [
+        ("/auth/login", r#"{"username":"u","password":"p"}"#),
+        ("/auth/enrol", r#"{"secret":"s","password":"p"}"#),
+    ] {
+        let req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        let resp = router(state(Vec::new()))
+            .oneshot(req)
+            .await
+            .expect("the router answers");
+        assert!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none(),
+            "D72: no WWW-Authenticate on {path}"
+        );
+    }
 }
 
 /// Malformed JSON is the gateway's own 400, not the upstream's problem.
@@ -609,5 +623,538 @@ async fn the_body_limit_covers_login() {
         status,
         StatusCode::PAYLOAD_TOO_LARGE,
         "the 1MiB limit must apply to /auth/login"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// POST /auth/enrol (D73). The second unauthenticated path.
+// ---------------------------------------------------------------------------
+
+/// POST a body to `/auth/enrol` and read the raw answer.
+async fn enrol_post(body: &str) -> (StatusCode, String) {
+    let req = HttpRequest::builder()
+        .method(Method::POST)
+        .uri("/auth/enrol")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let resp = router(state(Vec::new()))
+        .oneshot(req)
+        .await
+        .expect("the router answers");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The route exists at all.
+///
+/// The same test `/auth/login` has, for the same reason: `yaadgaar enrol` POSTs
+/// here, and a 404 would look exactly like the endpoint never having been written.
+#[tokio::test]
+async fn the_enrol_route_is_served() {
+    let (status, _) = enrol_post(r#"{"secret":"s","password":"p","label":"l"}"#).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "/auth/enrol must be routed");
+}
+
+/// ONE FAILURE, NOT THREE — over every code, in body and headers.
+///
+/// The contract calls `RedeemEnrolment` "UNAUTHENTICATED BY CONSTRUCTION" and
+/// requires that an unknown secret, a spent one and an expired one are one
+/// indistinguishable answer. The gateway must not undo that, and the way it could
+/// is by giving one gRPC code a status or a body of its own.
+///
+/// `InvalidArgument` is the code this walks over that looks safest to single out —
+/// the contract runs VALIDATION BEFORE LOOKUP so a password-policy refusal arrives
+/// without the secret having been checked. It is also what a replayed idempotency
+/// key with a different password returns, and THAT check runs only once the store
+/// has confirmed the secret was good. One code, both sides of the lookup.
+#[tokio::test]
+async fn every_enrol_failure_is_opaque_in_body_and_headers() {
+    let mut answers = std::collections::BTreeSet::new();
+    let mut refusals = 0;
+
+    for code in ALL_CODES {
+        let resp = enrol_failure(code);
+        let status = resp.status();
+
+        assert!(
+            resp.headers()
+                .get(axum::http::header::WWW_AUTHENTICATE)
+                .is_none(),
+            "D72: {code:?} must not advertise an authentication scheme"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "{code:?} must answer JSON"
+        );
+
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read the body");
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+
+        if code == tonic::Code::Unauthenticated {
+            refusals += 1;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        } else {
+            answers.insert((status.as_u16(), body.clone()));
+        }
+        // NOTHING IN THE REFUSAL NAMES ONE OF THE THREE. A sentence that fitted
+        // only "already spent" or only "expired" would be the hint the contract's
+        // one-failure rule exists to withhold, and it would sit inside a body no
+        // client-side test ever reads.
+        for word in [
+            "spent",
+            "expired",
+            "unknown",
+            "redeemed already",
+            "not found",
+        ] {
+            assert!(
+                !body.contains(word),
+                "{code:?} named one of the three failures: {body}"
+            );
+        }
+    }
+
+    assert_eq!(refusals, 1, "exactly one code is a refusal");
+    assert_eq!(
+        answers.len(),
+        1,
+        "every non-refusal code must answer one identical status AND body; got {answers:?}"
+    );
+    // **PINNED TO THE ACTUAL PAIR, not merely to its uniqueness.** A mutation
+    // returning 401 for all 17 codes passed everything above: `refusals` counts
+    // only `Unauthenticated`, and one collapsed answer stays one collapsed answer
+    // whatever its value. Only the cross-endpoint test caught it, so this test did
+    // not stand on its own. `login`'s twin closes the same gap the same way.
+    assert_eq!(
+        answers.into_iter().next().expect("one answer"),
+        (
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            r#"{"error":"enrolment is unavailable"}"#.to_string()
+        ),
+        "collapsing onto 401 would tell a person with a good secret it is bad \
+         whenever iam is down"
+    );
+    let (status, body) = enrol_answer(tonic::Code::Unauthenticated);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, r#"{"error":"this enrolment cannot be redeemed"}"#);
+}
+
+/// **The two credential endpoints share the STATUS RULE and not the WORDS.**
+///
+/// This is the assertion that says which of "reuse" and "duplicate" happened, and
+/// it relates the two endpoints to each other rather than each to a constant. A
+/// second copy of the rule that drifted — a 400 added to one of them for
+/// `InvalidArgument`, say — fails the first half. A copy-paste of login's bodies
+/// into `enrol_answer` fails the second: telling a person redeeming an enrolment
+/// that their "username or password" was invalid sends them looking for an account
+/// they do not have yet.
+#[test]
+fn the_two_credential_endpoints_share_the_status_rule_and_not_the_words() {
+    for code in ALL_CODES {
+        assert_eq!(
+            login_answer(code).0,
+            enrol_answer(code).0,
+            "{code:?} must reach the same status on both paths"
+        );
+        assert_ne!(
+            login_answer(code).1,
+            enrol_answer(code).1,
+            "{code:?} must not answer an enrolment in login's words"
+        );
+    }
+}
+
+/// The rule itself, over every code: 401 for exactly one, one status for the rest.
+///
+/// `login_status_leaks_nothing_beyond_the_refusal` and
+/// `every_other_grpc_code_is_the_same_opaque_status` assert this THROUGH
+/// `/auth/login`. This asserts it on the function all three paths now share, so a
+/// fourth caller added later inherits a rule that is already pinned.
+#[test]
+fn the_opaque_rule_admits_exactly_one_distinguishable_code() {
+    let statuses: std::collections::BTreeSet<u16> = ALL_CODES
+        .iter()
+        .filter(|c| **c != tonic::Code::Unauthenticated)
+        .map(|c| opaque_status(*c).as_u16())
+        .collect();
+    assert_eq!(
+        statuses.len(),
+        1,
+        "no gRPC code other than UNAUTHENTICATED may get a status of its own; got {statuses:?}"
+    );
+    let opaque = *statuses.iter().next().expect("one status");
+    assert_ne!(
+        opaque,
+        StatusCode::UNAUTHORIZED.as_u16(),
+        "collapsing everything onto 401 tells a caller whose credential is good \
+         that it is not, every time iam is down"
+    );
+    assert_eq!(
+        opaque_status(tonic::Code::Unauthenticated),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// An unreachable `iam` is an opaque 503 with a fixed body, here too.
+#[tokio::test]
+async fn an_unreachable_iam_is_an_opaque_503_on_enrol() {
+    let (status, body) = enrol_post(r#"{"secret":"s","password":"p","label":"l"}"#).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, r#"{"error":"enrolment is unavailable"}"#);
+}
+
+/// Malformed JSON is the gateway's own 400, not the upstream's problem.
+#[tokio::test]
+async fn malformed_json_is_a_400_on_enrol() {
+    let (status, body) = enrol_post("{not json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("invalid JSON"), "got {body}");
+}
+
+/// A missing field is refused HERE rather than sent on as an empty string.
+///
+/// An empty `secret` would reach `iam`, fail to resolve, and come back as a 401 —
+/// telling the person their enrolment cannot be redeemed when what was wrong was
+/// the request. It also spends the constant Argon2id work the contract requires on
+/// an attempt that could not have succeeded.
+#[tokio::test]
+async fn a_missing_field_is_a_400_on_enrol() {
+    for body in [
+        r#"{"password":"p","label":"l"}"#,
+        r#"{"secret":"s","label":"l"}"#,
+        r#"{}"#,
+    ] {
+        let (status, _) = enrol_post(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} must be refused");
+    }
+    // `label` is NOT in that list, for the reason it is not in `login`'s: it only
+    // names the machine, and requiring it would add a rule the proto does not
+    // have. Absent, the request goes upstream — the unreachable-iam path here.
+    let (status, _) = enrol_post(r#"{"secret":"s","password":"p"}"#).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// The wrong method on the enrolment path is 405, not 404.
+#[tokio::test]
+async fn only_post_reaches_enrol() {
+    for method in [Method::GET, Method::DELETE, Method::PUT] {
+        let req = HttpRequest::builder()
+            .method(method.clone())
+            .uri("/auth/enrol")
+            .body(Body::empty())
+            .expect("request");
+        let (status, _) = send(state(Vec::new()), req).await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} must be 405"
+        );
+    }
+}
+
+/// The body limit covers the enrolment route.
+///
+/// **`Router::layer` applies only to routes registered BEFORE it**, so a
+/// `/auth/enrol` added below the `.layer(...)` call would be an unauthenticated
+/// endpoint accepting a body of any size. The route order in `router()` is
+/// load-bearing and nothing else would say so.
+#[tokio::test]
+async fn the_body_limit_covers_enrol() {
+    let huge = format!(r#"{{"secret":"{}","password":"p"}}"#, "s".repeat(2_000_000));
+    let (status, _) = enrol_post(&huge).await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the 1MiB limit must apply to /auth/enrol"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Attestation: which of the two sources a header can reach.
+// ---------------------------------------------------------------------------
+
+/// One `tools/call` carrying a FULL set of caller-supplied identity headers, and
+/// optionally a bearer token.
+async fn tools_call_under(attestation: Attestation, credential: Option<&str>) -> StatusCode {
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "_meta": {
+                meta_keys::PROTOCOL_VERSION: PROTOCOL_VERSION,
+                meta_keys::CLIENT_CAPABILITIES: {},
+            },
+            "name": "find_tasks",
+            "arguments": {},
+        }
+    });
+    let mut req = post()
+        .header(headers::METHOD, "tools/call")
+        .header(headers::NAME, "find_tasks")
+        // A name nothing in this process could have chosen for itself.
+        .header("x-yadgar-user", "forged-by-the-caller")
+        .header("x-yadgar-project", "acme/demo")
+        .header("x-yadgar-instance", "i-1");
+    if let Some(credential) = credential {
+        req = req.header(axum::http::header::AUTHORIZATION, credential);
+    }
+    let req = req.body(Body::from(body.to_string())).expect("request");
+    send(state_with(attestation, Vec::new()), req).await.0
+}
+
+/// A self-asserted username attests on the DEVELOPMENT path and nowhere else.
+///
+/// **The assertion that matters relates the two paths to each other**, not each to
+/// a constant: the same bytes, sent twice, must not be attested the same way.
+/// Under `TrustedHeaders` the header IS the identity and the call proceeds; under
+/// `Iam` the identity comes from the bearer token, this request carries none, and
+/// nothing it claims about itself can stand in for one.
+///
+/// MUTATION THIS CATCHES: reading `x-yadgar-user` on the `iam` path as a fallback
+/// when no token is presented. Anyone who can reach the port is then anyone they
+/// name, which is the defect this change exists to close — and every other test in
+/// this file would still pass.
+#[tokio::test]
+async fn a_user_header_attests_only_on_the_development_path() {
+    let dev = tools_call_under(Attestation::TrustedHeaders, None).await;
+    let real = tools_call_under(Attestation::Iam, None).await;
+    assert_ne!(
+        dev, real,
+        "a forged x-yadgar-user must not buy the same answer under both sources"
+    );
+    assert_eq!(
+        dev,
+        StatusCode::OK,
+        "the development path trusts the header"
+    );
+    assert_eq!(
+        real,
+        StatusCode::UNAUTHORIZED,
+        "a claim is not a credential, and iam is never asked about one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A stub `iam`, so that a credential which RESOLVES is reachable at all.
+// ---------------------------------------------------------------------------
+
+/// An `iam` that answers `ResolveCredential` with one canned response.
+///
+/// **Every other test in this file points `iam` at a closed port**, which makes
+/// exactly two outcomes reachable on the attested path: "no credential was
+/// presented" and "the transport failed". A credential that RESOLVES was
+/// unreachable, and so was the answer that matters most — the one `iam` returns as
+/// `Ok` with an empty `user_id` when a token is unknown, revoked or expired. That
+/// gap hid an authentication bypass: the gateway read the negative answer as a
+/// success and attested `user_id: ""`, so `Bearer <anything>` was a 200 and
+/// revocation was inert.
+///
+/// The other eleven RPCs are refused rather than implemented. A test that reached
+/// one would be a test asserting something this stub was never built to say.
+struct StubIam {
+    answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
+}
+
+/// Write the stub's whole `IamService` impl: one real method and eleven refusals.
+///
+/// **THE MACRO EMITS THE `#[tonic::async_trait]` ATTRIBUTE TOO, and it has to.**
+/// That attribute is a proc macro that rewrites every `async fn` in the block into
+/// the boxed future the generated trait actually declares. An attribute applied
+/// AROUND a `macro_rules!` call sees an unexpanded token tree where those methods
+/// should be, leaves them alone, and every one of them then fails to match the
+/// trait's lifetimes. Generating the attribute from inside the macro puts the
+/// expansion in the right order.
+macro_rules! stub_iam_service {
+    ($($method:ident($req:ident) -> $resp:ident;)*) => {
+        #[tonic::async_trait]
+        impl crate::pb::yadgar::iam::v1::iam_service_server::IamService for StubIam {
+            async fn resolve_credential(
+                &self,
+                _: tonic::Request<crate::pb::yadgar::iam::v1::ResolveCredentialRequest>,
+            ) -> Result<
+                tonic::Response<crate::pb::yadgar::iam::v1::ResolveCredentialResponse>,
+                tonic::Status,
+            > {
+                Ok(tonic::Response::new(self.answer.clone()))
+            }
+
+            $(
+                async fn $method(
+                    &self,
+                    _: tonic::Request<crate::pb::yadgar::iam::v1::$req>,
+                ) -> Result<tonic::Response<crate::pb::yadgar::iam::v1::$resp>, tonic::Status> {
+                    Err(tonic::Status::unimplemented(
+                        "this stub answers ResolveCredential and nothing else",
+                    ))
+                }
+            )*
+        }
+    };
+}
+
+stub_iam_service! {
+    login(LoginRequest) -> LoginResponse;
+    redeem_enrolment(RedeemEnrolmentRequest) -> RedeemEnrolmentResponse;
+    issue_credential(IssueCredentialRequest) -> IssueCredentialResponse;
+    revoke_credential(RevokeCredentialRequest) -> RevokeCredentialResponse;
+    list_credentials(ListCredentialsRequest) -> ListCredentialsResponse;
+    issue_enrolment(IssueEnrolmentRequest) -> IssueEnrolmentResponse;
+    create_user(CreateUserRequest) -> CreateUserResponse;
+    set_user_admin(SetUserAdminRequest) -> SetUserAdminResponse;
+    set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
+    add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
+    remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
+}
+
+/// Serve `answer` as `iam`, and return a channel pointed at it.
+///
+/// `TcpIncoming::bind` on port 0 takes an ephemeral port and keeps the listener,
+/// so there is no window between discovering the port and serving on it.
+async fn stub_iam(answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse) -> Channel {
+    let incoming =
+        tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
+            .expect("the stub binds");
+    let addr = incoming.local_addr().expect("a bound port");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                crate::pb::yadgar::iam::v1::iam_service_server::IamServiceServer::new(StubIam {
+                    answer,
+                }),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("a URI")
+        .connect_lazy()
+}
+
+/// One `tools/call` with a bearer token, against an `iam` that answers `answer`.
+async fn tools_call_resolving_to(
+    answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
+) -> StatusCode {
+    let state = Arc::new(AppState {
+        attestation: Attestation::Iam,
+        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        iam: stub_iam(answer).await,
+        limiter: crate::limit::Limiter::new(
+            "127.0.0.1:1",
+            crate::limit::Limits::parse("task.write=1:1", "1:1").expect("the limits parse"),
+            std::time::Duration::from_millis(200),
+            6,
+        )
+        .expect("the limiter opens"),
+        allowed_origins: Vec::new(),
+    });
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "_meta": {
+                meta_keys::PROTOCOL_VERSION: PROTOCOL_VERSION,
+                meta_keys::CLIENT_CAPABILITIES: {},
+            },
+            "name": "find_tasks",
+            "arguments": {},
+        }
+    });
+    let req = post()
+        .header(headers::METHOD, "tools/call")
+        .header(headers::NAME, "find_tasks")
+        .header("x-yadgar-project", "acme/demo")
+        .header(axum::http::header::AUTHORIZATION, "Bearer some-token")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    send(state, req).await.0
+}
+
+/// **A CREDENTIAL THAT DOES NOT RESOLVE IS A 401, AND `iam` REPORTS THAT AS `Ok`.**
+///
+/// This is the test for an authentication bypass that shipped in review: `iam-db`
+/// answers an unknown, revoked, expired or soft-deleted credential with an EMPTY
+/// response rather than an error — `iamdb.proto` says "Empty user_id means no live
+/// credential matched. NOT an error… one is a 401, the other is a 503" — and the
+/// gateway is the caller that owes the 401. Reading it as a success attested
+/// `user_id: ""` for `Bearer <anything>`, made revocation and expiry inert, and
+/// collapsed every bypasser into one D12 namespace.
+///
+/// **The two answers differ only in the response `iam` gives**, which is what makes
+/// this an assertion about the rule rather than about a constant: identical request,
+/// identical stub, one field changed.
+#[tokio::test]
+async fn a_credential_that_iam_does_not_recognise_is_refused() {
+    let live = crate::pb::yadgar::iam::v1::ResolveCredentialResponse {
+        user_id: "u-that-iam-resolved".to_string(),
+        valid_for_seconds: 300,
+        ..Default::default()
+    };
+    // The negative answer, exactly as `iam` builds it: empty user, zero lifetime.
+    let dead = crate::pb::yadgar::iam::v1::ResolveCredentialResponse::default();
+
+    let attested = tools_call_resolving_to(live).await;
+    let refused = tools_call_resolving_to(dead).await;
+
+    assert_ne!(
+        attested, refused,
+        "a credential iam did not recognise must not buy what a live one buys"
+    );
+    assert_eq!(
+        refused,
+        StatusCode::UNAUTHORIZED,
+        "an empty user_id is the negative answer and owes a 401"
+    );
+    // The live one gets through attestation and on to `task`, which is unreachable
+    // here — a tool-level failure, which this server reports as 200 with `isError`.
+    // The point is that it passed the boundary the other did not.
+    assert_eq!(attested, StatusCode::OK);
+}
+
+/// A zero lifetime is the same negative answer, from the other direction.
+///
+/// `iam` sets `valid_for_seconds: if resolved { 300 } else { 0 }`, so the two
+/// signals always agree today. Checking both is what keeps an `iam` that later
+/// regresses on one of them from being believed.
+#[tokio::test]
+async fn a_credential_with_no_lifetime_is_refused_even_with_a_user() {
+    let inconsistent = crate::pb::yadgar::iam::v1::ResolveCredentialResponse {
+        user_id: "u-with-no-lifetime".to_string(),
+        valid_for_seconds: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        tools_call_resolving_to(inconsistent).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A credential that cannot be RESOLVED is an upstream failure, not a refusal.
+///
+/// **This is `login_status`'s argument on the attested path.** `iam` here is
+/// `connect_lazy` at a closed port, so the lookup fails in the transport and
+/// arrives as `UNAVAILABLE`. Answering 401 would tell a person holding a perfectly
+/// good token that it is invalid every time `iam` is down — and `yaadgaar` would
+/// then discard a working credential and prompt for a fresh login. That is the
+/// same lie `login_answer` rejects mapping-everything-to-401 for.
+///
+/// It is also the END-TO-END half of the property `opaque_status` pins over every
+/// code: it proves the handler routes an upstream failure through that rule rather
+/// than answering some other way.
+#[tokio::test]
+async fn a_credential_that_cannot_be_resolved_is_an_outage_and_not_a_refusal() {
+    assert_eq!(
+        tools_call_under(
+            Attestation::Iam,
+            Some("Bearer a-token-iam-cannot-be-asked-about")
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
     );
 }

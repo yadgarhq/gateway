@@ -1,10 +1,13 @@
 //! Wiring, and the one thing that must happen before the listener binds.
 //!
-//! **Attestation is resolved first, and a failure here exits.** D69 makes a
-//! missing capability fail boot rather than fail later, and identity is a
-//! capability: a gateway that cannot say who the caller is has nothing safe to do
-//! with a request. Binding first and discovering it later would mean serving
-//! traffic under an identity nobody attested.
+//! **Attestation is resolved first, and it can no longer fail.** It used to exit
+//! the process when neither identity source was configured, because the only
+//! available default was trusting the caller — D69's rule for a missing
+//! capability, applied to identity. iam-backed attestation is implemented now, so
+//! an unset environment selects THAT, and a deployment reaches the trusting path
+//! only by naming it. There is no unconfigured state left to refuse. Resolving it
+//! first is still worth the line: the log below says which source this process
+//! will use, before it accepts anything.
 //!
 //! The upstream connection is NOT gated the same way, deliberately — same
 //! reasoning as `task`: the twin's own boot is gated, so an unreachable `task`
@@ -39,24 +42,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // FIRST. See the module comment — this is the boot gate.
-    let attestation = Attestation::from_env()?;
+    // FIRST. See the module comment.
+    let attestation = Attestation::from_env();
     match &attestation {
+        // A WARNING, and it stays one. This is the development path: the caller's
+        // own headers name the caller, verified by nothing.
         Attestation::TrustedHeaders => tracing::warn!(
             "identity is UNAUTHENTICATED: caller-supplied headers are trusted. \
-             Development only — iam replaces this (ledger 452)."
+             Development only — unset YADGAR_TRUST_UNAUTHENTICATED_HEADERS to \
+             resolve the bearer token against iam instead."
         ),
-        // UNREACHABLE BY CONSTRUCTION, and deliberately still an arm.
-        // `Attestation::from_env` refuses YADGAR_IAM_ADDR outright until
-        // iam-backed attestation lands (ledger 452), so this process can no
-        // longer be in that state. The arm stays so adding iam changes
-        // `attest.rs` and this line and nothing else — but it no longer logs
-        // "attesting caller identity", which was the sentence that made a boot
-        // into an unimplemented identity source look survivable.
-        other => tracing::warn!(
-            source = %other,
-            "identity source is not implemented; this process should not have started"
-        ),
+        // INFO, because this is the ordinary case now. It used to be a warning
+        // saying the source was not implemented.
+        source => tracing::info!(%source, "attesting caller identity from the bearer token"),
     }
 
     // D74's token buckets. The ADDRESS is required, and its absence exits —
@@ -125,25 +123,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task = upstream::connect_task(&task_host, task_port).await?;
     tracing::info!(host = %task_host, port = task_port, "connected to task");
 
-    // The upstream for POST /auth/login (D75), and NOT for identity.
+    // The upstream for BOTH halves of the credential lifecycle: POST /auth/login
+    // and POST /auth/enrol issue a token through this channel (D75, D73), and
+    // `attest` resolves one through it on every tools/call.
     //
-    // **The pair is IAM_HOST/IAM_PORT, matching TASK_HOST/TASK_PORT, and it is
-    // deliberately NOT YADGAR_IAM_ADDR.** That variable names iam-backed
-    // ATTESTATION, which `attest.rs` refuses outright: setting it fails
-    // `Attestation::from_env` at the top of this function, before the listener
-    // binds, and the process exits. Two settings that both read as "where iam is"
-    // is one too many, so the difference is written down here — this one says
-    // where to send a login, that one would say where identity comes from, and
-    // only the first is implemented.
+    // **ONE pair, IAM_HOST/IAM_PORT, matching TASK_HOST/TASK_PORT.** There used to
+    // be a second variable, YADGAR_IAM_ADDR, reserving the identity half — and it
+    // was a boot-killer, because that half was unimplemented. Both halves are this
+    // channel now, so the reservation is deleted rather than honoured: two
+    // settings that both read as "where iam is" is one too many, and the one that
+    // named a service nothing could reach is the one to lose.
     //
     // LAZY, and the one place this file's opening claim is actually true.
     // `connect_task` above resolves DNS eagerly and `?` turns a name that does not
     // resolve into a failed boot — so the module comment's "the upstream
     // connection is NOT gated" does not hold for `task` today. `connect_iam` does
     // not repeat that: no name is resolved here, so an `iam` that is not deployed
-    // yet costs a 503 on `/auth/login` and nothing at all on `/`. The alternative
-    // was a gateway that refuses to serve MCP because a SECONDARY upstream is
-    // missing, which is the cascading-outage shape this file opens by rejecting.
+    // yet costs a bounded failure per request rather than a pod that never starts.
+    //
+    // **`iam` IS NO LONGER A SECONDARY UPSTREAM, and this comment used to say it
+    // was.** It said an absent `iam` cost "a 503 on /auth/login and nothing at all
+    // on /", which was true while identity came from headers. Attestation resolves
+    // the bearer token through this channel now, so an `iam` outage degrades ALL
+    // MCP traffic, not one endpoint. Staying lazy is still right — a pod stuck in
+    // startup is one D68's autoscaler cannot help, and a per-request failure is
+    // recoverable where a refusal to boot is not — but the cost of the outage it
+    // survives is larger than it was, and a cache in front of this lookup (D72
+    // says the gateway resolves "on a cache miss, never per request") is what
+    // brings it back down.
     //
     // `?` still stands on both lines, and what it now covers is configuration
     // rather than reachability: a port that is not a number, and a host string
@@ -152,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let iam_host = env_or("IAM_HOST", "iam");
     let iam_port: u16 = env_or("IAM_PORT", "50052").parse()?;
     let iam = upstream::connect_iam(&iam_host, iam_port)?;
-    tracing::info!(host = %iam_host, port = iam_port, "iam channel ready (connects on first login)");
+    tracing::info!(host = %iam_host, port = iam_port, "iam channel ready (connects on first use)");
 
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure is

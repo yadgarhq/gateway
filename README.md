@@ -35,31 +35,70 @@ cutoff.
 
 Consequences here:
 
-|                   |                                                                                                                                               |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                       |
-| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login` is the one non-MCP path.       |
-| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                          |
-| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`. |
-| `resultType`      | Required on every result. This server only returns `complete`.                                                                                |
-| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.       |
+|                   |                                                                                                                                                              |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                                      |
+| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login` and `POST /auth/enrol` are the non-MCP paths. |
+| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                                         |
+| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`.                |
+| `resultType`      | Required on every result. This server only returns `complete`.                                                                                               |
+| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                      |
 
 ## Identity
 
-`Scope` is constructed in **exactly one function**, `attest::attest`. Everything
+`Scope` is constructed in **exactly one function**, `attest::scope`. Everything
 else receives one; nothing else builds one. `grep 'Scope {' src/` returns a single
 hit, which is what makes the contract's claim — "attested by the gateway… never
-supplied by the caller itself" — checkable rather than merely asserted.
+supplied by the caller itself" — checkable rather than merely asserted. Two
+identity sources did not become two literals: both call that one function.
 
-**The process refuses to start unless a source of identity is configured.**
-Either `YADGAR_IAM_ADDR` or `YADGAR_TRUST_UNAUTHENTICATED_HEADERS=1`. There is no
-default, because the only available default would be trusting the caller — a
-gateway that attests nothing while its contract says it does, going green in a
-development cluster and staying green. D69's rule for capabilities, applied to
-identity.
+**The user is RESOLVED; the project and the instance are CLAIMED.** ADR-0488
+requires a scope to be minted here and never supplied, and the three fields are
+not alike:
 
-Until `iam` ships (ledger 452), development uses the trusted-header path and the
-service logs a warning naming it on every boot.
+| field         | where it comes from                            | why                                                                                                                        |
+| ------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `user_id`     | `iam.ResolveCredential`, from the bearer token | a self-asserted username is forgeable by anyone holding any valid token                                                    |
+| `project_id`  | `X-Yadgar-Project`                             | a workspace fact. It changes as a person moves between checkouts, and a token cannot carry it                              |
+| `instance_id` | `X-Yadgar-Instance`                            | a session marker rather than an identity (D46 throttles on it, D39 addresses notices with it)                              |
+| `team_ids`    | `iam.ResolveCredential`                        | teams decide what a TEAM-visible record is readable by (D12), so a caller naming its own would read other people's records |
+
+`X-Yadgar-User` is **ignored** on the `iam` path rather than refused: clients
+already in flight send it, an ignored forged header is inert, and refusing one
+would add a rollout failure that buys nothing. The function that builds a scope
+from a resolved credential takes no claimed user at all — the property is in the
+signature, not in a rule.
+
+**A credential that does not resolve is a `401`, and `iam` reports that as `Ok`.**
+`iam-db` answers an unknown, revoked, expired or soft-deleted credential with an
+EMPTY response rather than an error — `iamdb.proto`: _"Empty user_id means no live
+credential matched. NOT an error… one is a 401, the other is a 503."_ **The gateway
+is the caller that owes the 401**, and nothing downstream would catch a miss: no
+service checks for an empty `user_id` on a read path, and every bypasser would
+share `user_id: ""`, collapsing D12's scoping into one namespace. `from_resolved`
+refuses on either half of the negative answer — an empty `user_id` or a
+`valid_for_seconds` of zero, which `iam` sets together — and the refusal goes
+through the same `opaque_status` as any other.
+
+The rule is **not** in the proto this crate vendors: `yadgar/iam/v1/iam.proto`
+describes `user_id` only as "Identity and AUTHORITY". Only `yadgar/iamdb/v1` states
+it, and the gateway deliberately does not vendor that file, so the rule is written
+down beside the code that depends on it.
+
+**The secure source is the DEFAULT.** An unset environment resolves the bearer
+token against `iam`. `YADGAR_TRUST_UNAUTHENTICATED_HEADERS=1` is an explicit,
+named opt-OUT for development, and the service logs a warning on every boot under
+it. The process used to refuse to start unless one of two variables was set,
+because the only available default was trusting the caller; that gate is gone
+along with the reason for it, which is a stronger reading of D69 than the gate was
+— a deployment can no longer reach the trusting path by forgetting something.
+
+**The lookup runs per request, and D72 says it should not.** The contract's words
+are "the gateway calls it on a cache miss, never per request". There is no cache
+yet, so every `tools/call` pays one `iam` round trip, and an `iam` outage now
+degrades all MCP traffic rather than `/auth/login` alone. The lookup carries a 5s
+deadline; a stall answers through the same opaque status as any other upstream
+problem.
 
 `request_id` is minted here and **overwrites anything the client sent**. A caller
 that could set it could make two unrelated calls collide, and every roll-up built
@@ -67,7 +106,7 @@ on it would be wrong with no error anywhere.
 
 ### `POST /auth/login`
 
-The one unauthenticated path (D75). `yaadgaar login` posts
+One of two unauthenticated paths (D75). `yaadgaar login` posts
 `{"username", "password", "label"}` and reads `{"token"}` back; the gateway
 translates that to `iam.Login` and drops `credential_id`, which nothing reads.
 
@@ -99,6 +138,45 @@ as every other problem, so it is not a third thing to keep opaque.
 No rate limit and no audit record. Both are absent org-wide rather than skipped
 here; D74's buckets key on a user and a login has none yet.
 
+### `POST /auth/enrol`
+
+The other unauthenticated path (D73). An admin creates the account and hands over
+an enrolment token; the PERSON chooses their own password here, so the admin never
+learns it. `yaadgaar` posts `{"secret", "password", "label"}` and reads
+`{"token", "username"}` back.
+
+`username` is returned and `credential_id` is dropped. The contract returns the
+username because a person enrolling on their first machine would otherwise have to
+be told it separately — "a second artefact to lose, which is the exact failure the
+token's design exists to remove". `LoginResponse` can omit it because its caller
+had to know it to call.
+
+**The same status rule as `/auth/login`, through the same function.**
+`http::opaque_status` is the rule — `UNAUTHENTICATED` is `401`, every other code is
+one opaque `503` — and all three paths that have one call it, because it is the
+security property rather than a mapping table. The **bodies** are per-endpoint:
+telling a person redeeming an enrolment that their "username or password" was
+invalid sends them looking for an account they do not have yet.
+
+The reason to collapse is sharper here than on login. The contract calls
+`RedeemEnrolment` "UNAUTHENTICATED BY CONSTRUCTION" and mandates **one failure, not
+three** — unknown, spent and expired are one answer, and "the server tells them
+apart and records which; the caller cannot". `InvalidArgument` is the code that
+looks safest to pass through, because VALIDATION BEFORE LOOKUP means a
+password-policy refusal arrives without the secret having been checked; it is also
+what a replayed idempotency key with a different password returns, and that check
+runs only once the store has confirmed the secret was good. One code, both sides of
+the lookup, nothing to tell them apart — `login`'s problem exactly.
+
+The idempotency key is **minted per inbound request**, which makes this gateway's
+own retry to `iam` safe and does **not** deduplicate a client's retry: a client
+that POSTs twice is two requests and two keys, so the second presents a spent
+secret and is refused. See `## Risk` on the pull request that added this, and
+`lib::idempotency_key`.
+
+No rate limit and no audit record, exactly as `/auth/login` — and this endpoint
+does Argon2id work for anyone who can reach the port.
+
 ## Configuration
 
 | Variable                               | Default          |                                                                                                           |
@@ -106,9 +184,8 @@ here; D74's buckets key on a user and a login has none yet.
 | `LISTEN`                               | `0.0.0.0:8080`   | MCP endpoint                                                                                              |
 | `METRICS_LISTEN`                       | `0.0.0.0:9090`   | Prometheus                                                                                                |
 | `TASK_HOST` / `TASK_PORT`              | `task` / `50052` | the upstream module                                                                                       |
-| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | where `POST /auth/login` is sent — **not** attestation, and not `YADGAR_IAM_ADDR`                         |
-| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only                                                             |
-| `YADGAR_IAM_ADDR`                      | unset            | real attestation, not yet implemented                                                                     |
+| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | the whole credential lifecycle: `/auth/login`, `/auth/enrol` and attestation                              |
+| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`              |
 | `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents |
 | `YADGAR_VALKEY_ADDR`                   | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                         |
 | `YADGAR_RATE_LIMITS`                   | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                |
@@ -159,11 +236,33 @@ it a hard dependency of every call at the one hop all traffic already passes
 through — while failing open with no floor at all would leave the number
 unenforced for the length of the outage.
 
-**Per-user overrides are not wired yet.** D74 puts them on
-`ResolveCredentialResponse`, which does not carry them and which this service does
-not call at all while `iam` attestation is unimplemented. `limit::Overrides` is
-the shape they will fill; it is empty on every call today, and empty means the
-configured default applies.
+**Per-user overrides are wired.** D74 puts them on `ResolveCredentialResponse`,
+`attest` maps them into `limit::Overrides`, and `Limits::effective` merges them
+over the configured defaults — one lookup answering both "who are you" and "what
+may you spend". On the trusted-header path they stay empty, because no credential
+is resolved and no header could carry a limit; empty means the configured default
+applies.
+
+An override this gateway **cannot enforce refuses the whole credential** rather
+than being dropped, because dropping it applies the default instead and silently
+undoes whoever set it. That includes the contract's DENY — an entry with
+`rate = 0, burst = 0`: `limit::Bucket` has no representation for a denial, and
+`validate` refuses a zero rate because the Lua script turns it into a permanent
+lockout with a 24-hour `Retry-After`.
+
+**Be clear about what that costs, because it is not a throttle.** A refused
+credential fails ATTESTATION, so the person loses reads as well as writes, on every
+call, until an admin clears the row — an admin who denied `task.write` takes away
+much more than they asked for. It answers `500` with its own body and its own
+`FAILED_PRECONDITION` metric label, deliberately distinct from the `503` and
+`UNAVAILABLE` of an `iam` outage: the two were byte-identical at first, which would
+have sent an operator hunting an outage that was not happening. A narrower answer
+needs a `Decision::Denied` in `limit.rs`.
+
+An entry with `limit` unset is skipped rather than read as a denial, on the
+contract's own instruction — and it is skipped **before** its `kind` or `module` is
+judged, so a cleared override carrying a nonsense kind stays "no override for that
+bucket" instead of becoming a refusal.
 
 ## Balancing
 

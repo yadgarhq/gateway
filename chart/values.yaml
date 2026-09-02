@@ -22,24 +22,29 @@ task:
   host: task
   port: 50052
 
-# The iam logic service, for POST /auth/login and NOTHING ELSE (D75).
+# The iam logic service. THE WHOLE CREDENTIAL LIFECYCLE now goes here: POST
+# /auth/login and POST /auth/enrol issue a token (D75, D73), and attestation
+# resolves one on every tools/call (ADR-0488).
 #
-# NOT ATTESTATION. This is where a login is sent, not where identity comes from —
-# gateway still trusts the caller's headers, and trustUnauthenticatedHeaders below
-# is still what decides that. The two are easy to conflate because both are "an
-# iam address", so: setting YADGAR_IAM_ADDR — a DIFFERENT variable, not this one —
-# is a boot-killer. `attest.rs` refuses it outright until iam-backed attestation
-# lands, and it is read before the listener binds, so a pod given it exits at
-# startup. This chart never sets it.
+# IT IS ATTESTATION NOW, and this comment used to say the opposite. It said
+# gateway "still trusts the caller's headers", and that the identity half lived
+# behind a DIFFERENT variable, YADGAR_IAM_ADDR, which was a boot-killer because
+# that half was unimplemented. The half is built, the variable is deleted, and this
+# is the one address for the one service. trustUnauthenticatedHeaders below is now
+# an explicit opt-OUT rather than the only implemented road.
 #
 # `iam`'s Service is a VIP rather than headless, so this pins to one connection
-# rather than balancing across replicas. Fine for the rate a person types a
-# password at, and left alone deliberately — see `upstream::connect_iam`.
+# rather than balancing across replicas. That was sized for the rate a person types
+# a password at, and attestation puts far more traffic through it — revisit when
+# the credential lookup gets its cache (D72: "on a cache miss, never per request"),
+# which is what should be reducing that traffic. See `upstream::connect_iam`.
 #
-# ORDERING-SAFE. The channel is lazy, so this name is not resolved at startup:
-# installing gateway before `iam` exists costs a 503 on /auth/login and nothing
-# on /. A pod that refused to serve MCP because a secondary upstream was missing
-# is the failure that shape avoids.
+# ORDERING-SAFE, and the cost of being out of order is higher than it was. The
+# channel is lazy, so this name is not resolved at startup and installing gateway
+# before `iam` exists still starts. It no longer costs "a 503 on /auth/login and
+# nothing on /": an `iam` that cannot answer stops MCP traffic too, because that is
+# where identity comes from. A pod that refused to BOOT would still be worse — D68's
+# autoscaler cannot help one stuck in startup.
 iam:
   host: iam
   port: 50052
@@ -83,15 +88,20 @@ rateLimit:
   # unreachable cache: the call proceeds, and the counter says it did.
   timeoutMs: 20
 
-# DEVELOPMENT ONLY. gateway refuses to boot unless EITHER this is true OR an
-# iam address is configured — there is no third, safer default, because a
-# gateway that boots with neither would accept every caller's self-asserted
-# identity silently rather than loudly. Setting this trusts identity the
-# caller attaches to its own request, with nothing behind it verifying that
-# claim. This value exists only because `iam` does not yet: the moment it
-# ships, this flag and the env var it drives are deleted, not merely defaulted
-# to false — a false default left in place is a setting someone can still
-# flip in a real deployment.
+# DEVELOPMENT ONLY, and now an explicit OPT-OUT rather than the only road.
+#
+# Setting this trusts the identity the caller attaches to its own request, with
+# nothing behind it verifying that claim. Unsetting it — `false` — makes gateway
+# resolve the request's bearer token through `iam.ResolveCredential` instead, which
+# is the shipped default in the binary and what every deployment should end up on.
+#
+# **STILL `true` HERE, DELIBERATELY, AND IT IS THE SWITCH TO THROW.** The running
+# cluster has it set; flipping it in the same change that implemented attestation
+# would have made one roll-out both a code change and a cut-over, with a single
+# lever to revert both. The comment that stood here said this flag would be
+# "deleted, not merely defaulted to false, the moment `iam` ships" — that moment is
+# a separate, revertible change, and see MIGRATION_NOTES.md for what to check
+# before it. Deleting the flag outright is the step after that one.
 trustUnauthenticatedHeaders: true
 
 # D68: scale on CONCURRENCY, not CPU. gateway is a synchronous, sync-gRPC-class

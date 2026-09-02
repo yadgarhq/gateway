@@ -67,10 +67,12 @@ spec:
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
               value: {{ .Values.task.port | quote }}
-            # Where POST /auth/login is sent (D75). The pair matches TASK_HOST /
-            # TASK_PORT deliberately, and is NOT YADGAR_IAM_ADDR: that variable
-            # means iam-backed attestation, which attest.rs refuses at boot, so
-            # setting it here would stop the pod starting. See values.yaml.
+            # The whole credential lifecycle: where POST /auth/login and POST
+            # /auth/enrol are sent (D75, D73), AND where attestation resolves a
+            # bearer token on every tools/call (ADR-0488). The pair matches
+            # TASK_HOST / TASK_PORT deliberately. There is no second variable for
+            # the identity half any more — YADGAR_IAM_ADDR reserved it while it was
+            # unimplemented, and is deleted. See values.yaml.
             - name: IAM_HOST
               value: {{ .Values.iam.host | quote }}
             - name: IAM_PORT
@@ -104,10 +106,10 @@ spec:
               value: "info"
             {{- if .Values.trustUnauthenticatedHeaders }}
             # DEVELOPMENT ONLY (see the comment on this value in values.yaml).
-            # gateway refuses to boot without this OR a configured iam address —
-            # setting it trusts identity the caller attaches to its own request,
-            # verified by nothing. Deleted, not defaulted to false, the moment
-            # `iam` ships.
+            # An explicit OPT-OUT: setting it trusts the identity the caller
+            # attaches to its own request, verified by nothing. Absent, gateway
+            # resolves the request's bearer token through iam.ResolveCredential,
+            # which is the binary's default and needs no variable at all.
             - name: YADGAR_TRUST_UNAUTHENTICATED_HEADERS
               value: "1"
             {{- end }}
