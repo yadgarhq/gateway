@@ -1,18 +1,20 @@
 # Migration notes
 
-## iam-backed attestation — the image changes nothing until the chart does
+## iam-backed attestation — DONE, and here is what it cost
 
+**The switch is thrown.** `trustUnauthenticatedHeaders` is `false` in the chart, so
 `gateway` resolves a caller's identity from the request's bearer token through
-`iam.ResolveCredential` now, instead of reading `x-yadgar-user`. **Deploying this
-image changes no runtime behaviour on its own**, and the reason is worth stating
-rather than assuming: every gateway currently running has
-`YADGAR_TRUST_UNAUTHENTICATED_HEADERS=1` set, because the alternatives all exited
-at boot. That setting still selects the header path, so a rolled pod attests
-exactly as it did.
+`iam.ResolveCredential` and ignores `x-yadgar-user`. Until this change the running
+cluster had `YADGAR_TRUST_UNAUTHENTICATED_HEADERS=1`, which meant any caller who
+wrote `x-yadgar-user: someone` was attested as that person with no credential at
+all. That is what ended here.
 
-**The cut-over is `trustUnauthenticatedHeaders: false` in the chart**, and it is a
-separate change on purpose — one lever, revertible on its own, not entangled with
-the code that made it possible. Before throwing it, check that:
+**Reverting is one value.** Setting it back to `true` restores the old behaviour
+without touching the image, which is the whole reason this was a separate change
+from the code that made it possible.
+
+The four preconditions below were the pre-flight, and all four were checked before
+the flip. They are kept because a revert has to re-check them:
 
 - `iam` is deployed and reachable at `iam.host` / `iam.port`. It is not a secondary
   upstream any more: **an `iam` outage degrades all MCP traffic**, not just

@@ -88,21 +88,24 @@ rateLimit:
   # unreachable cache: the call proceeds, and the counter says it did.
   timeoutMs: 20
 
-# DEVELOPMENT ONLY, and now an explicit OPT-OUT rather than the only road.
+# DEVELOPMENT ONLY, and the switch is now thrown.
 #
 # Setting this trusts the identity the caller attaches to its own request, with
-# nothing behind it verifying that claim. Unsetting it — `false` — makes gateway
-# resolve the request's bearer token through `iam.ResolveCredential` instead, which
-# is the shipped default in the binary and what every deployment should end up on.
+# nothing behind it verifying that claim. `false` makes gateway resolve the
+# request's bearer token through `iam.ResolveCredential` instead, which is the
+# shipped default in the binary and what every deployment should end up on.
 #
-# **STILL `true` HERE, DELIBERATELY, AND IT IS THE SWITCH TO THROW.** The running
-# cluster has it set; flipping it in the same change that implemented attestation
-# would have made one roll-out both a code change and a cut-over, with a single
-# lever to revert both. The comment that stood here said this flag would be
-# "deleted, not merely defaulted to false, the moment `iam` ships" — that moment is
-# a separate, revertible change, and see MIGRATION_NOTES.md for what to check
-# before it. Deleting the flag outright is the step after that one.
-trustUnauthenticatedHeaders: true
+# **`false`, WHICH IS THE CUT-OVER.** MIGRATION_NOTES.md set four preconditions
+# and all four now hold: `iam` is deployed and reachable, the running image
+# refuses an empty `user_id` (the guard shipped in v0.5.0), the client sends
+# `Authorization: Bearer` from an enrolment it completed itself, and it still
+# sends `x-yadgar-project` — a workspace fact no token can carry. It deliberately
+# sends no `x-yadgar-user`, which this value is what made safe to ignore.
+#
+# It stays as a value rather than being deleted, for one release, because the
+# whole point of a separate change is that it can be reverted on its own. Deleting
+# the flag outright is the step after this one.
+trustUnauthenticatedHeaders: false
 
 # D68: scale on CONCURRENCY, not CPU. gateway is a synchronous, sync-gRPC-class
 # service in D68's table — it waits on `task` for every call, so it saturates
