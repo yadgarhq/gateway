@@ -26,23 +26,30 @@ pub async fn connect_task(host: &str, port: u16) -> Result<Channel, yadgar_dial:
     yadgar_dial::connect(host, port).await
 }
 
-/// Connect to the `iam` logic service, for `POST /auth/login` (D75).
+/// Connect to the `iam` logic service.
+///
+/// It carries the whole credential lifecycle: `POST /auth/login` and
+/// `POST /auth/enrol` ISSUE a token over it (D75, D73), and `attest::attest`
+/// RESOLVES one over it on every `tools/call` (ADR-0488).
 ///
 /// **LAZY, and deliberately not `yadgar_dial::connect`.** `connect` resolves DNS eagerly
 /// and returns `Err` when the name does not resolve, and `main` propagates that
-/// with `?`, so an `iam` that is not deployed yet would crashloop the pod. The
-/// endpoint at risk would not be `/auth/login`: it would be **all MCP traffic on
-/// `/`**, taken down because a secondary upstream was missing. Rolling this
-/// gateway out before `iam`'s Service exists is an ordinary ordering, not an
-/// exotic one.
+/// with `?`, so an `iam` that is not deployed yet would crashloop the pod — and a
+/// pod stuck in startup is one D68's autoscaler cannot help. Rolling this gateway
+/// out before `iam`'s Service exists is an ordinary ordering, not an exotic one.
 ///
 /// A lazy channel connects on first use instead, so an absent `iam` degrades to a
-/// per-request failure that `http::login_answer` already collapses to an opaque
-/// 503 — the same answer it gives for every other upstream problem, by
-/// construction rather than by a second code path. `/` keeps serving throughout.
-/// The only way THIS call can fail is a host string that cannot form a URI, which
-/// is a configuration mistake rather than an outage, and D69's rule is the right
-/// one for those.
+/// per-request failure that `http::opaque_status` collapses to one opaque status —
+/// the same answer given for every other upstream problem, by construction rather
+/// than by a second code path. The only way THIS call can fail is a host string
+/// that cannot form a URI, which is a configuration mistake rather than an outage,
+/// and D69's rule is the right one for those.
+///
+/// **What that outage costs is larger than it was.** This comment used to say `/`
+/// kept serving throughout, which was true while identity came from headers. It is
+/// not true now: attestation goes through this channel, so an `iam` that cannot
+/// answer stops MCP traffic too. The mitigation D72 names is a cache in front of
+/// the lookup — "on a cache miss, never per request" — and it is not built yet.
 ///
 /// **It pins ONE connection, and does not balance.** `iam`'s Service is a VIP
 /// rather than headless, so there is one address to reach regardless; the

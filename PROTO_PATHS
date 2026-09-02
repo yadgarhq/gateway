@@ -11,9 +11,18 @@
 # exports.
 yadgar/taskapi/v1
 
-# Login (D75), and listed explicitly for the same reason task lists
-# yadgar/task/v1: gateway is a CLIENT of IamService, and an import closure brings
-# only the messages a proto references, never a service another proto declares.
-# Nothing here reaches yadgar/iamdb/v1 — that is iam's own upstream, not this
-# one's.
+# Login (D75), enrolment (D73) and attestation (ADR-0488), listed explicitly for
+# the same reason task lists yadgar/task/v1: gateway is a CLIENT of IamService, and
+# an import closure brings only the messages a proto references, never a service
+# another proto declares. Nothing here reaches yadgar/iamdb/v1 — that is iam's own
+# upstream, not this one's.
+#
+# AT v1.6.0 THIS PATH ALSO BRINGS yadgar/telemetry/v1, and no line was added for
+# it. iam.proto began importing telemetry.proto — D74 keys a per-user rate limit on
+# D67's Kind, and buf breaking's FILE rule means that enum cannot be lifted into
+# common.proto — so the closure vendors it. It is on the include path for protoc
+# and is deliberately NOT in build.rs's compile list: the reason is written there,
+# and the short form is that this crate already gets its Kind from
+# yadgar-telemetry, and a second generated copy would be a second type for one
+# concept.
 yadgar/iam/v1

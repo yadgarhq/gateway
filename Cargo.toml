@@ -86,6 +86,23 @@ tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `Server::add_service`, so a TEST can answer as `iam`. Without one the only
+# reachable outcomes on the attested path are "no credential" and "the transport
+# failed" — and the answer `iam` gives as `Ok` with an empty `user_id`, for a token
+# that is unknown or revoked, is unreachable. Reading that as a success is an
+# authentication bypass, so it has to be testable.
+#
+# **`router` IS THE ONLY FEATURE THIS ADDS, and `server` is not one of them.**
+# tonic defines `transport = ["server", "channel"]`, so the dependency above
+# already pulls the server machinery in; what it lacks is the routing layer
+# `add_service` lives on, which carries axum. Checked with
+# `cargo tree -e features,no-dev -i tonic` rather than assumed — the first version
+# of this comment claimed `server` was absent and was wrong.
+#
+# A DEV-DEPENDENCY rather than a feature on the real one: the v2 resolver keeps
+# dev-dependency features out of a normal build, so `cargo build` links no router.
+# Both entries resolve to one crate version.
+tonic = { version = "0.14", default-features = false, features = ["router"] }
 # `ServiceExt::oneshot`, to drive `router()` in-process. axum is built on tower
 # and already carries it transitively; naming it here is what makes the trait
 # importable from a test, and it adds nothing to the dependency tree.

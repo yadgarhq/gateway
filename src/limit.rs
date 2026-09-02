@@ -319,11 +319,13 @@ impl Limits {
 
     /// The bucket in force for one call.
     ///
-    /// **The override wins, and its absence is not an error.** `iam` will carry
-    /// the effective buckets on `ResolveCredentialResponse` (D74); until the
-    /// contract does, [`Overrides`] is empty on every call and this returns the
-    /// configured default — which is the degradation the field's absence should
-    /// produce, rather than a stub that has to be found and deleted later.
+    /// **The override wins, and its absence is not an error.** `iam` carries the
+    /// per-user overrides on `ResolveCredentialResponse` (D74), `attest` maps them
+    /// into [`Overrides`], and this merges them over the configured defaults —
+    /// which is what "effective" means, and why one lookup answers both questions.
+    /// Absence is the ordinary case rather than the only one: it is what a caller
+    /// with no override gets, and what EVERY caller gets on the trusted-header
+    /// path, where no credential is resolved.
     pub fn effective(&self, module: &str, kind: Kind, overrides: &Overrides) -> Bucket {
         let pair = format!("{module}.{}", kind_str(kind));
         overrides
@@ -337,14 +339,14 @@ impl Limits {
 
 /// The per-user buckets that travel with identity (D74).
 ///
-/// **Empty today, and deliberately not stubbed.** D74 puts the effective buckets
-/// on `ResolveCredentialResponse` so the gateway learns who you are and what you
-/// may spend in one lookup, cached together and invalidated together. That field
-/// does not exist on the contract yet, and the gateway has no `iam` path at all
-/// (`attest::Attestation::Iam` is refused at boot). So this type is the shape the
-/// field will fill, it is constructed empty, and the effect of empty is the
-/// configured default — the deployment behaves exactly as if no user had an
-/// override, which is true.
+/// **Filled from a resolved credential, and empty without one.** D74 puts the
+/// per-user overrides on `ResolveCredentialResponse` so the gateway learns who you
+/// are and what you may spend in one lookup, invalidated together;
+/// `attest::attest` is the call site, and it maps the repeated field into this
+/// type. On the trusted-header path it stays empty, which is the honest answer
+/// rather than a stub: no credential was resolved, and no header could carry a
+/// limit. Empty means the configured default applies — the deployment behaves
+/// exactly as if no user had an override, which is then true.
 #[derive(Debug, Clone, Default)]
 pub struct Overrides(HashMap<String, Bucket>);
 
@@ -352,13 +354,13 @@ impl Overrides {
     /// Build from what a resolved credential carried, refusing what cannot be
     /// enforced.
     ///
-    /// The call site is `attest`, and the input will be the repeated field D74
-    /// describes. Taking `(module.kind, rate, burst)` triples rather than a
-    /// generated protobuf type keeps this module off the contract's schedule:
-    /// when the proto lands, one `map` in `attest.rs` changes and nothing here
-    /// does.
+    /// The call site is `attest::overrides_from`, and the input is the repeated
+    /// field D74 describes. Taking `(module.kind, rate, burst)` pairs rather than
+    /// a generated protobuf type keeps this module off the contract's schedule —
+    /// which is what it bought: `iam.proto` gained the field and `attest.rs`
+    /// gained the mapping, and nothing here changed.
     ///
-    /// **Validated, because this is the path `iam` will drive and it was the
+    /// **Validated, because this is the path `iam` drives and it was the
     /// unvalidated one.** `Limits::parse` refuses a `rate` of zero and this did
     /// not; the effect was not a panic but a permanent lockout with a 24-hour
     /// `Retry-After` — see [`validate`].

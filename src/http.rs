@@ -1,9 +1,15 @@
 //! The HTTP surface: POST only, stateless.
 //!
-//! TWO paths, and the asymmetry is the thing to know. `/` is MCP and every call
-//! through it carries an identity. `/auth/login` is not MCP and carries none —
-//! it is where a client with no credential gets one (D75), so it is the only
-//! unauthenticated surface this server has.
+//! THREE paths, and the asymmetry is the thing to know. `/` is MCP and every call
+//! through it carries a credential the gateway resolves against `iam`.
+//! `/auth/login` and `/auth/enrol` are not MCP and carry none — they are where a
+//! client with no credential gets one (D75, D73), so they are the only
+//! unauthenticated surfaces this server has.
+//!
+//! **All three answer an upstream refusal by ONE rule** (ADR-0507, superseding
+//! ADR-0506): `UNAUTHENTICATED` is 401, and every other gRPC code is one opaque
+//! status indistinguishable from the rest. [`opaque_status`] IS that rule, in one
+//! function, because it is the security property rather than a mapping table.
 
 use std::sync::Arc;
 
@@ -23,7 +29,10 @@ use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 use crate::attest::{self, Attestation, Claimed};
 use crate::limit::{Decision, Limiter};
 use crate::mcp::{self, codes, headers, meta_keys};
-use crate::pb::yadgar::iam::v1::{iam_service_client::IamServiceClient, LoginRequest};
+use crate::pb::yadgar::common::v1::Idempotency;
+use crate::pb::yadgar::iam::v1::{
+    iam_service_client::IamServiceClient, LoginRequest, RedeemEnrolmentRequest,
+};
 use crate::tools;
 
 const SERVICE: &str = "gateway";
@@ -34,26 +43,39 @@ const SERVICE: &str = "gateway";
 /// exists: a metric label must come from a fixed range (D67).
 const DISCOVER: &str = "server/discover";
 const TOOLS_LIST: &str = "tools/list";
-/// The login endpoint's label. A PATH rather than an MCP method, because that is
-/// what it is — but bounded and `&'static` for the same D67 reason as the two
-/// above.
+/// The two credential endpoints' labels. PATHS rather than MCP methods, because
+/// that is what they are — but bounded and `&'static` for the same D67 reason as
+/// the two above.
 const AUTH_LOGIN: &str = "auth/login";
+const AUTH_ENROL: &str = "auth/enrol";
 
-/// How long `login` waits on `iam` before answering without it.
+/// How long an unauthenticated request waits on `iam` before being answered
+/// without it.
 ///
-/// A CONSTANT rather than a setting: it bounds an unauthenticated request, and a
-/// bound an operator can raise is one an operator can raise to something useless.
-/// Sized well above a healthy call — `iam` spends ~50ms on Argon2id for every
-/// attempt, including one for a username it has never seen — so this fires on a
-/// stall rather than on load.
-const LOGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// A CONSTANT rather than a setting: it bounds a request from a caller who does
+/// not have to be anyone, and a bound an operator can raise is one an operator can
+/// raise to something useless. Sized well above a healthy call — `iam` spends
+/// ~50ms on Argon2id for every attempt, including one for a username it has never
+/// seen, and `RedeemEnrolment` is required to pay the same cost for a secret it
+/// has never seen — so this fires on a stall rather than on load.
+///
+/// ONE constant for both paths, not two: they bound the same class of request for
+/// the same reason, and two numbers would be two things to keep in agreement.
+/// `attest`'s lookup has its OWN, much shorter, because that one sits on the hot
+/// path of every call rather than on a person typing a password.
+const AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct AppState {
     pub attestation: Attestation,
     pub task: Channel,
-    /// The `iam` logic service, for `POST /auth/login` and nothing else (D75).
-    /// Attestation still comes from headers — this channel issues credentials, it
-    /// does not verify them.
+    /// The `iam` logic service. ONE channel, and it now carries both halves of
+    /// the credential lifecycle: `/auth/login` and `/auth/enrol` ISSUE a token
+    /// through it, and `attest` RESOLVES one through it on every `tools/call`.
+    ///
+    /// It used to issue and nothing more, with identity coming from headers the
+    /// caller wrote. A second channel for the resolving half would have been a
+    /// second address for one service, which is the confusion the deleted
+    /// `YADGAR_IAM_ADDR` was.
     pub iam: Channel,
     /// D74's token buckets, in the shared cache. Held here rather than built per
     /// request so one connection manager serves the whole process.
@@ -84,6 +106,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         // so a route added after this line would be the one unauthenticated
         // endpoint on the server accepting a body of any size.
         .route("/auth/login", post(login).fallback(method_not_allowed))
+        // The OTHER unauthenticated path (D73), and above the layer for exactly
+        // the reason stated on the line above it. A person redeeming an enrolment
+        // has no credential either — that is the whole point of the endpoint — so
+        // it is reachable by anyone who can reach the port, and an unbounded body
+        // on it would be the same defect twice.
+        .route("/auth/enrol", post(enrol).fallback(method_not_allowed))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
         .with_state(state)
 }
@@ -165,7 +193,7 @@ async fn login(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
     // Generous rather than tight: Argon2id verification is deliberately expensive
     // (~50ms in `iam`, and it runs even for an unknown username), so a budget
     // sized for a healthy RPC would turn load into refusals.
-    let resp = match tokio::time::timeout(LOGIN_DEADLINE, rpc).await {
+    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
         Ok(Ok(r)) => r.into_inner(),
         Ok(Err(e)) => {
             // THE ONLY PLACE THE REAL CODE IS WRITTEN DOWN, and it goes to the
@@ -182,7 +210,7 @@ async fn login(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         }
         Err(_elapsed) => {
             tracing::warn!(
-                timeout_ms = LOGIN_DEADLINE.as_millis(),
+                timeout_ms = AUTH_DEADLINE.as_millis(),
                 "login timed out waiting for iam"
             );
             call.fail("UNAVAILABLE");
@@ -205,6 +233,129 @@ async fn login(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         // shown exactly once — copying the idiom from `measured` would write
         // every credential this system issues into the telemetry store. The byte
         // count above is the part that answers D67's question.
+        rows: 1,
+        ..Default::default()
+    });
+    text(StatusCode::OK, &rendered)
+}
+
+/// An enrolment secret and a chosen password to a token (D72, D73).
+///
+/// The SECOND endpoint on this server that takes no credential, and it is the one
+/// a person reaches before they have an account they can log in to: an admin
+/// creates the account and hands over an enrolment token, and the person chooses
+/// their own password here. The admin never learns it.
+///
+/// A thin translation of `iam.RedeemEnrolment`, built on the same three rules as
+/// [`login`] — the JSON field names are the proto's, the body is hand-parsed, and
+/// **every answer derived from the UPSTREAM is built by [`enrol_failure`] from a
+/// `tonic::Code` and nothing else**, so no upstream text is in scope where the
+/// status and body are chosen.
+///
+/// **ONE FAILURE, NOT THREE, and the contract says so in those words.** The RPC is
+/// "UNAUTHENTICATED BY CONSTRUCTION — the secret is all the caller has", and it
+/// requires that an unknown secret, a spent one and an expired one are one
+/// indistinguishable answer: "the server tells them apart and records which; the
+/// caller cannot". The gateway must not undo that by giving one of them a status
+/// of its own.
+///
+/// **`INVALID_ARGUMENT` IS COLLAPSED WITH THE REST, and it is the case worth
+/// stating.** It looks like the one code that is safe to pass through, because the
+/// contract runs VALIDATION BEFORE LOOKUP so that a password-policy refusal
+/// arrives without the secret having been checked. But it is ALSO what the RPC
+/// answers when an idempotency key is replayed with a different password — and
+/// that check runs only after the store has confirmed the secret was good. Two
+/// sides of the lookup, one code, nothing in the code to tell them apart: exactly
+/// the property that makes `login`'s codes uncollapsible, in the same shape. So
+/// the caller is told which of ITS OWN fields was absent (the 400s below, raised
+/// before anything is sent) and nothing about what `iam` made of them.
+///
+/// The `label` is optional here for the same reason it is on `login`, and
+/// `credential_id` is dropped for the same reason too. `username` is NOT dropped:
+/// the contract returns it because a person enrolling on their first machine
+/// otherwise has to be told their username separately — "a second artefact to
+/// lose, which is the exact failure the token's design exists to remove".
+async fn enrol(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    // NOT carrying an identity, for the same reason `login`'s does not: nothing
+    // has been attested, and the person does not have a user id yet at all.
+    let call = Call::start(SERVICE, AUTH_ENROL, Kind::Write, tel(crate::request_id()));
+
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);
+    };
+    let (Some(secret), Some(password)) = (
+        req.get("secret").and_then(Value::as_str),
+        req.get("password").and_then(Value::as_str),
+    ) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"`secret` and `password` are required"}"#,
+        );
+    };
+
+    let mut client = IamServiceClient::new(state.iam.clone());
+    let rpc = client.redeem_enrolment(RedeemEnrolmentRequest {
+        secret: secret.to_string(),
+        password: password.to_string(),
+        // OPTIONAL, exactly as on `login`: it only names the machine so a person
+        // can tell their credentials apart when revoking one.
+        label: req
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // MINTED HERE, PER INBOUND REQUEST, and that buys less than the field's
+        // name suggests. It makes THIS gateway's own retry to `iam` safe, which is
+        // what `crate::idempotency_key` documents and all it claims. It does NOT
+        // cover a CLIENT's retry: a client that POSTs here twice is two inbound
+        // requests and two keys, so the second presents a SPENT secret and is
+        // refused. Covering that needs a key the client supplies and keeps stable
+        // across its own retries, and the request shape has no place for one.
+        idempotency: Some(Idempotency {
+            key: crate::idempotency_key(),
+        }),
+    });
+    // A DEADLINE, for the reason on `login`'s: this is reachable with no
+    // credential, so a stalled `iam` would otherwise let an unauthenticated caller
+    // hold as many requests open as it liked.
+    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => {
+            // THE ONLY PLACE THE REAL CODE IS WRITTEN DOWN, and it goes to the
+            // log. Without it, an operator watching an enrolment fail sees an
+            // opaque status and no reason for it — and here the reason matters
+            // more than usual, because the person on the other end has one
+            // enrolment token and no way to diagnose it themselves.
+            tracing::warn!(code = ?e.code(), message = e.message(), "enrolment refused or failed");
+            call.fail(if e.code() == tonic::Code::Unauthenticated {
+                "UNAUTHENTICATED"
+            } else {
+                "UNAVAILABLE"
+            });
+            return enrol_failure(e.code());
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = AUTH_DEADLINE.as_millis(),
+                "enrolment timed out waiting for iam"
+            );
+            call.fail("UNAVAILABLE");
+            // Through the SAME builder as every other failure, so a stall is not a
+            // third answer somebody has to remember to keep opaque.
+            return enrol_failure(tonic::Code::DeadlineExceeded);
+        }
+    };
+
+    let rendered = json!({ "token": resp.token, "username": resp.username }).to_string();
+    call.finish(Outcome {
+        status: "OK",
+        encoded_bytes: Some(rendered.len() as u64),
+        // DELIBERATELY EMPTY, exactly as on `login` and unlike `measured` and
+        // `tools_call`. `payload` is stored in the wide event, and this payload is
+        // a bearer token shown once — copying the idiom from those two would write
+        // every credential this system issues into the telemetry store.
         rows: 1,
         ..Default::default()
     });
@@ -422,9 +573,12 @@ async fn tools_call(
     // invented name, which would be the same defect in the shared cache.
     //
     // These two are the only components of the bucket key that this bounds. The
-    // third, the user id, arrives as a header and is bounded where the key is
-    // built instead — see `limit::user_component`, which is where that half of
-    // the same argument now lives.
+    // third, the user id, is bounded where the key is built instead — see
+    // `limit::user_component`, which is where that half of the same argument
+    // lives. Where the id COMES FROM now depends on the identity source: `iam`
+    // returns it under `Attestation::Iam`, and only under `TrustedHeaders` is it a
+    // header the caller wrote. `user_component` is scoped to that path already and
+    // still earns its place there, because the chart still enables it.
     let (Some(label), Some(module)) = (tools::label_for(name), tools::module_for(name)) else {
         return reply(
             200,
@@ -439,34 +593,64 @@ async fn tools_call(
     // Minted here, never read from the request (D67). See `crate::request_id`.
     let request_id = crate::request_id();
 
+    // THE USER IS RESOLVED FROM THE CREDENTIAL AND THE OTHER TWO ARE CLAIMED, and
+    // the split is ADR-0488's rule applied field by field. `x-yadgar-user` is not
+    // passed on the `iam` path at all — a self-asserted username is forgeable by
+    // anyone holding any valid token, so it is the bearer token that names the
+    // caller. `x-yadgar-project` and `x-yadgar-instance` stay caller-supplied:
+    // they are workspace and session facts, and no token can carry them.
     let attested = match attest::attest(
         &state.attestation,
+        &state.iam,
+        header(headers, axum::http::header::AUTHORIZATION.as_str()),
         Claimed {
             user_id: header(headers, "x-yadgar-user"),
             project_id: header(headers, "x-yadgar-project"),
             instance_id: header(headers, "x-yadgar-instance"),
         },
         request_id.clone(),
-    ) {
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
+            // THE ONLY PLACE THE REAL REASON IS WRITTEN DOWN, and it goes to the
+            // log rather than to the caller — the same split `login` makes.
+            tracing::warn!(error = %e, "attestation failed");
+            let answer = attest_answer(&e);
             // A REFUSED call is still a call, and it is the one most worth
             // seeing. Recorded here because the `Call` for the success path
             // cannot be started until there is an attested scope to carry — so
             // without this, every authentication failure in the system is
             // invisible to D67 and a credential-stuffing run looks like silence.
-            Call::start(SERVICE, label, kind_of(name), tel(request_id)).fail("UNAUTHENTICATED");
+            //
+            // THREE LABELS, decided once in `attest_answer` beside the status they
+            // must agree with. A bad token is a refusal, an unreachable `iam` is
+            // an outage, and an override that cannot be applied is neither — a
+            // dashboard that showed any of the three as another would send an
+            // operator hunting the wrong thing.
+            Call::start(SERVICE, label, kind_of(name), tel(request_id)).fail(answer.label);
             return reply(
-                401,
-                mcp::error(Some(id), codes::INVALID_REQUEST, &e.to_string()),
+                answer.status.as_u16(),
+                mcp::error(Some(id), answer.code, &answer.message),
             );
         }
     };
     let scope = attested.scope;
 
-    // D74, and BEFORE any upstream work: refusing here means the loop this
-    // protects against costs `task` nothing at all. Enforcing per module would
-    // let it cost every service its work before the last one said no.
+    // D74, and before any TOOL work: refusing here means the loop this protects
+    // against costs `task` nothing at all. Enforcing per module would let it cost
+    // every service its work before the last one said no.
+    //
+    // **IT IS NO LONGER BEFORE ALL UPSTREAM WORK, and the comment here used to say
+    // it was.** Attestation runs above, and it has to: the bucket keys on the
+    // resolved user id, so there is nothing to spend from until the credential has
+    // been resolved. An authenticated caller in a loop therefore costs `iam` one
+    // unthrottled `ResolveCredential` per request, and this limiter cannot shield
+    // it. The bound is D72's cache — "on a cache miss, never per request" — which
+    // is not built yet, and the same absence the per-request lookup already costs.
+    // Throttling the lookup instead would need a bucket keyed on something known
+    // before the identity is, which is the caller's own claim.
     let kind = kind_of(name);
     if let Some(refusal) =
         throttled(&state, id, &scope, label, module, kind, &attested.limits).await
@@ -780,6 +964,67 @@ pub fn login_status(status: &tonic::Status) -> StatusCode {
     login_answer(status.code()).0
 }
 
+/// **THE STATUS RULE ITSELF, in one function, for all three paths that have one.**
+///
+/// `UNAUTHENTICATED` is 401. EVERY other code is one single 503, indistinguishable
+/// from every other. The long argument for it is on [`login_status`] above; this
+/// function is where it is decided, and it is one function rather than three
+/// because it is the security property. Three copies would be three places for the
+/// rule to drift, and the drift would be invisible — each copy would still look
+/// obviously correct on its own.
+///
+/// The three callers are `/auth/login`, `/auth/enrol` and the attested MCP path,
+/// and they arrived at it independently:
+///
+/// - `login` — `iam` raises the same `Unavailable` from `get_password_hash`, which
+///   runs BEFORE any password is checked, and from `create_credential`, which runs
+///   after one has verified. `upstream_failed` preserves the upstream code either
+///   way, so nothing in a code says which side it came from.
+/// - `enrol` — the contract calls `RedeemEnrolment` "UNAUTHENTICATED BY
+///   CONSTRUCTION" and mandates ONE FAILURE, NOT THREE. `InvalidArgument` there is
+///   the sharpest case: it is raised before the secret is looked up for a password
+///   the policy refuses, AND after the store has confirmed the secret for an
+///   idempotency key replayed with a different password. Same code, both sides of
+///   the lookup, again.
+/// - `attest` — a credential that does not resolve and an `iam` that cannot answer
+///   must not be told apart by a caller who is guessing tokens.
+///
+/// **The bodies are NOT shared, and that is deliberate.** "invalid username or
+/// password" is a wrong sentence on an enrolment, which checks neither. The
+/// STATUS is the property; the words are per-endpoint, and each set is a constant
+/// picked by [`opaque_answer`]'s callers rather than anything derived from `iam`.
+pub fn opaque_status(code: tonic::Code) -> StatusCode {
+    match code {
+        tonic::Code::Unauthenticated => StatusCode::UNAUTHORIZED,
+        // ONE ARM, and a catch-all on purpose. Adding a second here — a 404 for
+        // `NotFound`, a 400 for `InvalidArgument` — is the change that reopens the
+        // oracle on every path at once, so there is deliberately nowhere obvious
+        // to put one.
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+/// [`opaque_status`], with the two constant bodies one endpoint answers with.
+///
+/// **Takes a `tonic::Code`, not a `tonic::Status`, and the difference is the
+/// point.** A `Code` is a bare enum with no message attached, so there is no
+/// upstream text in scope here to interpolate into a body even by accident. Both
+/// bodies are `&'static str` for the same reason: the signature makes the property
+/// true rather than the author being careful.
+fn opaque_answer(
+    code: tonic::Code,
+    refused: &'static str,
+    unavailable: &'static str,
+) -> (StatusCode, &'static str) {
+    let status = opaque_status(code);
+    let body = if status == StatusCode::UNAUTHORIZED {
+        refused
+    } else {
+        unavailable
+    };
+    (status, body)
+}
+
 /// The status AND body for one gRPC code.
 ///
 /// **Takes a `tonic::Code`, not a `tonic::Status`, and the difference is the
@@ -793,20 +1038,118 @@ pub fn login_status(status: &tonic::Status) -> StatusCode {
 /// no client-side test could ever catch, sitting behind a status line that was
 /// carefully made opaque.
 fn login_answer(code: tonic::Code) -> (StatusCode, &'static str) {
-    match code {
-        tonic::Code::Unauthenticated => (
-            StatusCode::UNAUTHORIZED,
-            r#"{"error":"invalid username or password"}"#,
-        ),
-        // ONE ARM, and a catch-all on purpose. Adding a second arm here — a 404
-        // for `NotFound`, a 400 for `InvalidArgument` — is the change that
-        // reopens the oracle, so there is deliberately nowhere obvious to put
-        // one.
-        _ => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"error":"login is unavailable"}"#,
-        ),
+    opaque_answer(
+        code,
+        r#"{"error":"invalid username or password"}"#,
+        r#"{"error":"login is unavailable"}"#,
+    )
+}
+
+/// The status AND body for one gRPC code from `iam.RedeemEnrolment`.
+///
+/// The same rule as [`login_answer`], through the same [`opaque_status`], with its
+/// own two constants — because login's words are wrong here. Nothing on this path
+/// checks a username or a password against a store: what the caller presented is
+/// an enrolment secret, and telling a person their "username or password" was
+/// invalid would send them looking for an account they do not have yet.
+///
+/// **The refusal's wording carries the contract's ONE FAILURE, NOT THREE.** An
+/// unknown secret, a spent one and an expired one are one answer here, so the
+/// sentence names none of the three: any wording that fitted only one of them
+/// would be a hint about which it was.
+fn enrol_answer(code: tonic::Code) -> (StatusCode, &'static str) {
+    opaque_answer(
+        code,
+        r#"{"error":"this enrolment cannot be redeemed"}"#,
+        r#"{"error":"enrolment is unavailable"}"#,
+    )
+}
+
+/// What the CALLER is told when attestation fails, and the status it arrives with.
+///
+/// **Split in two by where the failure was decided**, which is the same split
+/// `login` makes between its 400s and everything after them:
+///
+/// - Decided HERE, before anything was sent — no `Authorization` header, no
+///   project. Safe to describe: it is this server's reading of the caller's own
+///   request, and no credential has been checked, so it discloses nothing.
+/// - Decided by `iam`, or by a limit it returned. Through [`opaque_status`] and a
+///   CONSTANT, never `e.to_string()`: a caller working through a list of stolen
+///   tokens must not learn from the answer whether one of them exists.
+///
+/// The real code and message go to the log, where an operator can read them and a
+/// caller cannot.
+fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
+    match e {
+        attest::AttestError::MissingIdentity(_) | attest::AttestError::MissingCredential => {
+            AttestAnswer {
+                status: StatusCode::UNAUTHORIZED,
+                code: codes::INVALID_REQUEST,
+                label: "UNAUTHENTICATED",
+                message: e.to_string(),
+            }
+        }
+        attest::AttestError::Upstream(code) => {
+            let status = opaque_status(*code);
+            let refused = status == StatusCode::UNAUTHORIZED;
+            AttestAnswer {
+                status,
+                // INTERNAL_ERROR rather than INVALID_REQUEST when the status is
+                // not a refusal: the request was well formed and it is this server
+                // that could not answer it, and a client told its request was
+                // invalid stops retrying something worth retrying.
+                code: if refused {
+                    codes::INVALID_REQUEST
+                } else {
+                    codes::INTERNAL_ERROR
+                },
+                label: if refused {
+                    "UNAUTHENTICATED"
+                } else {
+                    "UNAVAILABLE"
+                },
+                message: "the credential could not be verified".to_string(),
+            }
+        }
+        // **A THIRD ANSWER, AND IT IS NOT AN OUTAGE.** This used to be the same
+        // 503, the same body and the same `UNAVAILABLE` label as an unreachable
+        // `iam` — byte-identical, for a condition that is neither transient nor a
+        // failure of this service. The credential RESOLVED; what cannot be applied
+        // is a rate-limit override an admin set on it, so every call fails
+        // identically until somebody clears that row, and an operator reading the
+        // metric would hunt an `iam` outage that is not happening.
+        //
+        // That is the mirror of the argument `login_answer` uses to reject
+        // collapsing everything onto 401: an answer that lies about WHICH thing is
+        // broken costs more than the opacity buys — and here it buys nothing,
+        // because the caller is already authenticated and there is no oracle left
+        // to protect.
+        //
+        // 500 rather than 503, because retrying cannot help. The body names the
+        // class of problem and none of the numbers: those are one person's private
+        // limits, and they stay in the log.
+        attest::AttestError::Unenforceable(_) => AttestAnswer {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: codes::INTERNAL_ERROR,
+            label: "FAILED_PRECONDITION",
+            message: "a rate limit configured for this credential cannot be applied".to_string(),
+        },
     }
+}
+
+/// What one failed attestation becomes: a status, a JSON-RPC code, a BOUNDED
+/// telemetry label and the sentence the caller reads.
+///
+/// A struct rather than a tuple because the label is what went wrong while it was
+/// computed separately: two matches over one enum drift, and the drift made a
+/// permanent configuration failure indistinguishable from an outage in the metric
+/// an operator watches.
+struct AttestAnswer {
+    status: StatusCode,
+    code: i32,
+    /// `&'static str` from a closed set, for D67's cardinality rule.
+    label: &'static str,
+    message: String,
 }
 
 /// The whole failing response for one gRPC code: status, body and headers.
@@ -827,6 +1170,19 @@ fn login_answer(code: tonic::Code) -> (StatusCode, &'static str) {
 /// adding `WWW-Authenticate` to the refusal passed the entire suite.
 fn login_failure(code: tonic::Code) -> Response {
     let (status, body) = login_answer(code);
+    text(status, body)
+}
+
+/// The whole failing response for one gRPC code from `iam.RedeemEnrolment`.
+///
+/// [`login_failure`]'s twin, and separate for the one reason the two differ: the
+/// bodies. Everything the doc comment there argues holds here unchanged — one
+/// builder for every failure that involves `iam` so a test can cover it
+/// exhaustively, a `Code` rather than a `Status` so no upstream text is in scope,
+/// and no header beyond the content type, in particular **no `WWW-Authenticate` on
+/// the 401** (D72).
+fn enrol_failure(code: tonic::Code) -> Response {
+    let (status, body) = enrol_answer(code);
     text(status, body)
 }
 
