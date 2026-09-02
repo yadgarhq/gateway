@@ -144,10 +144,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "rate limiting enabled (D74)"
     );
 
+    // OPT-IN, OFF unless a deployment asks for it, and read PER UPSTREAM so the
+    // two can be cut over one at a time. Nothing configured means the cleartext
+    // dial this gateway has always done — no module serves TLS yet, so the
+    // cut-over is a later change that can be reverted on its own.
+    //
+    // `.to_string()` on the way out, for the reason `Limits::parse` above gives:
+    // `main` returns `Box<dyn Error>`, which Rust prints with DEBUG, so a bare
+    // `?` would put `NoCaFile("TASK")` on the operator's terminal instead of the
+    // sentence naming the missing variable and saying why cleartext is not the
+    // answer.
+    let task_tls = upstream::UpstreamTls::from_env(upstream::TASK).map_err(|e| e.to_string())?;
+    let iam_tls = upstream::UpstreamTls::from_env(upstream::IAM).map_err(|e| e.to_string())?;
+
     let task_host = env_or("TASK_HOST", "task");
     let task_port: u16 = env_or("TASK_PORT", "50052").parse()?;
-    let task = upstream::connect_task(&task_host, task_port).await?;
-    tracing::info!(host = %task_host, port = task_port, "connected to task");
+    let task = upstream::connect_task(&task_host, task_port, task_tls.as_ref())
+        .await
+        // Same reasoning: `BalanceError`'s messages are paragraphs explaining
+        // that an empty bundle trusts nobody and that a missing one is not a
+        // reason to connect in cleartext. Debug prints the struct and throws all
+        // of that away.
+        .map_err(|e| e.to_string())?;
+    tracing::info!(host = %task_host, port = task_port, tls = task_tls.is_some(), "connected to task");
 
     // The upstream for BOTH halves of the credential lifecycle: POST /auth/login
     // and POST /auth/enrol issue a token through this channel (D75, D73), and
@@ -180,13 +199,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every call in flight.
     //
     // `?` still stands on both lines, and what it now covers is configuration
-    // rather than reachability: a port that is not a number, and a host string
-    // that cannot form a URI. Those are deployment mistakes, which is exactly the
-    // class D69 says should fail boot.
+    // rather than reachability: a port that is not a number, a host string that
+    // cannot form a URI, and a CA bundle that cannot be used. Those are
+    // deployment mistakes, which is exactly the class D69 says should fail boot.
+    //
+    // **THE CA BUNDLE IS READ HERE even though the channel is lazy**, and the
+    // two are not in tension: what stays lazy is the part that depends on `iam`
+    // EXISTING. A bundle depends only on the deployment that wrote it, so
+    // deferring the read would turn an operator's mistake into a per-request
+    // failure found under traffic rather than a refusal to boot.
     let iam_host = env_or("IAM_HOST", "iam");
     let iam_port: u16 = env_or("IAM_PORT", "50052").parse()?;
-    let iam = upstream::connect_iam(&iam_host, iam_port)?;
-    tracing::info!(host = %iam_host, port = iam_port, "iam channel ready (connects on first use)");
+    let iam =
+        upstream::connect_iam(&iam_host, iam_port, iam_tls.as_ref()).map_err(|e| e.to_string())?;
+    tracing::info!(
+        host = %iam_host,
+        port = iam_port,
+        tls = iam_tls.is_some(),
+        "iam channel ready (connects on first use)"
+    );
 
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure is

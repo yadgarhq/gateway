@@ -25,10 +25,31 @@ tonic = { version = "0.14", default-features = false, features = [
   "codegen",
   "transport",
   "channel",
+  # `tls-ring`, NOT `tls-aws-lc`, and NAMED HERE rather than inherited. Feature
+  # unification would hand this crate `ClientTlsConfig` anyway, because
+  # yadgar-dial asks for it — but `upstream::connect_iam` builds one DIRECTLY,
+  # and a type that compiles only because a dependency happens to ask for a
+  # feature is one a dependency can also stop asking for.
+  #
+  # ring rather than aws-lc-rs for the reason dial gives: aws-lc-rs needs cmake
+  # and a C toolchain, and this builds for x86_64-unknown-linux-musl (D63).
+  #
+  # NEITHER `tls-native-roots` NOR `tls-webpki-roots`, deliberately. Those add
+  # the platform trust store, and a private CA that failed to load would then
+  # be silently replaced by public roots — the exact downgrade this change
+  # exists to remove.
+  "tls-ring",
 ] }
 tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
+# The SAME PEM parser tonic itself uses on a CA bundle, so "we found N
+# certificates" is exactly what tonic will find. Present in the tree already by
+# way of tokio-rustls; naming it directly costs nothing and buys the non-empty
+# assertion in `upstream::UpstreamTls::client_tls_config`, without which a
+# bundle that decodes to no certificate produces a trust store that trusts
+# nobody and fails much later, at the handshake.
+rustls-pki-types = { version = "1", features = ["std"] }
 
 # Client-side balancing over task's headless Service (D23). Shared rather than
 # copied from task, per the invariant that anything every service needs is
@@ -38,7 +59,7 @@ prost-types = "0.14"
 # abbreviation is a prefix match: it resolves today and can become ambiguous as
 # the upstream repository grows, and there is no version to fall back on for a
 # git dependency.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "abd9c3105f2a2746faa795c6d4936b0fb195f4a8" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "dd1de04aa0e9ec92a6efd74363e68c694fe6c0fa" }
 
 # The shared instrumentation seam (D67). Pinned by revision like every other
 # in-org crate — a branch is a moving target.
@@ -121,6 +142,23 @@ metrics = "0.24"
 metrics-util = { version = "0.20", default-features = false, features = [
   "debugging",
 ] }
+# A real TLS server for `connect_iam` to handshake against. A test that only
+# shows "TLS was configured" passes against the version of this change that
+# connects in cleartext — tonic decides TLS from the URI SCHEME, not from
+# whether a configuration is attached — so nothing about the transport can be
+# proved by inspection.
+#
+# CERTIFICATES ARE MINTED PER RUN rather than checked in: a fixture key in the
+# repository is a secret in the repository, and it expires on a date nobody is
+# watching. `ring` for the same reason the real dependency uses it.
+rcgen = { version = "0.14", default-features = false, features = [
+  "pem",
+  "ring",
+] }
+# `TcpListenerStream`, so the test server's listener is BOUND before it is
+# served — picking a port and reopening it leaves a window in which something
+# else can take it. Already in the lock file by way of tonic.
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints.rust]
 unsafe_code = "forbid"

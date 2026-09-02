@@ -22,6 +22,55 @@ task:
   host: task
   port: 50052
 
+  # The TRANSPORT to that service. Everything behind the TLS edge is cleartext
+  # today, so every task body and every tool argument crosses the pod network in
+  # the open; this is the seam that closes it, one hop at a time.
+  #
+  # PATHS AND A FLAG, NEVER AN ISSUER-SPECIFIC RESOURCE (D80). The chart names a
+  # Secret and a key inside it, and the binary is handed a file path. In the
+  # reference deployment cert-manager writes that Secret; on EKS a Secret
+  # assembled by hand produces something neither the chart nor the binary can
+  # tell apart. Nothing here requires a CRD, an issuer or a mesh.
+  #
+  # PER UPSTREAM, and `iam.tls` below is its twin. The two are cut over one at a
+  # time — a single flag would make that all-or-nothing, which is the opposite
+  # of a change that can be reverted on its own.
+  tls:
+    # OFF, and it stays off until the servers can answer. **task does not serve
+    # TLS yet**, so turning this on today breaks the hop rather than securing
+    # it. The code ships first and the cut-over is a separate, revertible change
+    # — the same discipline trustUnauthenticatedHeaders' cut-over used.
+    #
+    # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at
+    # boot naming the file; it never falls back to cleartext, and it never falls
+    # back to the platform trust store. `false` with a bundle still configured
+    # is the reverted state, and gateway logs a warning saying the hop is in
+    # cleartext so nobody has to infer it.
+    enabled: false
+    # The Secret holding the authority that signed task's certificate.
+    #
+    # A SECRET, THOUGH A CA IS PUBLIC — because that is where an issuer actually
+    # writes it. Reading it here claims no confidentiality the certificate does
+    # not have.
+    #
+    # NOT A PEM PASTED INTO THIS FILE. The authority rotates, and a copy in git
+    # is correct only until the rotation nobody remembered to follow.
+    caSecret: task-tls
+    # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
+    # Named rather than assumed: `ca.crt` is what cert-manager calls it, and a
+    # Secret assembled by hand for a deployment cert-manager does not run in is
+    # free to call it something else.
+    caSecretKey: ca.crt
+    # The name task's certificate is verified against, when it is NOT
+    # `task.host`.
+    #
+    # EMPTY IS THE RIGHT ANSWER ALMOST ALWAYS. Client-side balancing dials pod
+    # ADDRESSES, and a certificate names a HOST — so leaving this empty verifies
+    # against the Service name above, which is what lets one certificate issued
+    # for the Service work across every pod behind it. Set it only for a
+    # certificate issued for something else, such as a per-namespace FQDN.
+    domain: ""
+
 # The iam logic service. THE WHOLE CREDENTIAL LIFECYCLE now goes here: POST
 # /auth/login and POST /auth/enrol issue a token (D75, D73), and attestation
 # resolves one on every tools/call (ADR-0488).
@@ -49,6 +98,43 @@ task:
 iam:
   host: iam
   port: 50052
+
+  # The TRANSPORT to that service, and the hop with the most to lose: the bearer
+  # token itself goes down it, on `/auth/login`, on `/auth/enrol` and on every
+  # attested `tools/call`. On a flat pod network anyone on the network reads it.
+  #
+  # SAME SHAPE AS `task.tls` ABOVE, and configured independently of it, so the
+  # two can be cut over one at a time.
+  #
+  # **THIS CHANNEL DOES NOT GO THROUGH `yadgar-dial`**, because iam's Service is
+  # a VIP rather than headless (D23) — see `upstream::connect_iam`. It gets the
+  # same values and the same guarantees anyway: a second implementation, held to
+  # the same list, and proved by real handshakes in tests/iam_tls.rs rather than
+  # by showing that a configuration was attached.
+  tls:
+    # OFF, and it stays off until the servers can answer. **iam does not serve
+    # TLS yet**, so turning this on today breaks the hop rather than securing
+    # it. The code ships first and the cut-over is a separate, revertible
+    # change.
+    #
+    # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at
+    # boot naming the file — and it fails EAGERLY, even though the iam channel
+    # is otherwise lazy, because a bundle depends on the deployment that wrote
+    # it rather than on iam existing. `false` with a bundle still configured is
+    # the reverted state, and gateway logs a warning saying so.
+    enabled: false
+    # The Secret holding the authority that signed iam's certificate. A Secret
+    # though a CA is public, because that is where an issuer writes it; not a
+    # PEM pasted into this file, because the authority rotates.
+    caSecret: iam-tls
+    # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
+    # Named rather than assumed — `ca.crt` is cert-manager's name for it, and a
+    # hand-assembled Secret may use another.
+    caSecretKey: ca.crt
+    # The name iam's certificate is verified against, when it is NOT `iam.host`.
+    # Empty verifies against the Service name above, which is almost always
+    # right. Set it only for a certificate issued for something else.
+    domain: ""
 
 # D72's cache in front of `iam.ResolveCredential`, so identity is not a round trip
 # on every tools/call. Keyed on a hash of the bearer token, held IN EACH REPLICA'S
