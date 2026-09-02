@@ -46,6 +46,10 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         attestation,
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        // ONE CACHE PER STATE, for the same reason there is one limiter per state:
+        // a shared one would make what a test observes depend on which test ran
+        // first, which is the failure the comment above describes.
+        credentials: crate::attest::Credentials::new(std::time::Duration::from_secs(30)),
         limiter: crate::limit::Limiter::new(
             // Nothing listens on port 1, and the refusal is immediate.
             "127.0.0.1:1",
@@ -1054,6 +1058,11 @@ async fn a_user_header_attests_only_on_the_development_path() {
 /// one would be a test asserting something this stub was never built to say.
 struct StubIam {
     answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
+    /// **HOW MANY TIMES `ResolveCredential` WAS ACTUALLY CALLED.** Without it the
+    /// credential cache (D72) has no test that can fail: every assertion about the
+    /// answer passes identically whether the answer came from `iam` or from a
+    /// cache, and a cache that never caches would look exactly like this one.
+    resolves: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Write the stub's whole `IamService` impl: one real method and eleven refusals.
@@ -1076,6 +1085,8 @@ macro_rules! stub_iam_service {
                 tonic::Response<crate::pb::yadgar::iam::v1::ResolveCredentialResponse>,
                 tonic::Status,
             > {
+                self.resolves
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(tonic::Response::new(self.answer.clone()))
             }
 
@@ -1107,47 +1118,67 @@ stub_iam_service! {
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
 }
 
-/// Serve `answer` as `iam`, and return a channel pointed at it.
+/// Serve `answer` as `iam`, and return a channel pointed at it plus the counter of
+/// how many `ResolveCredential` calls actually arrived.
 ///
 /// `TcpIncoming::bind` on port 0 takes an ephemeral port and keeps the listener,
 /// so there is no window between discovering the port and serving on it.
-async fn stub_iam(answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse) -> Channel {
+async fn stub_iam(
+    answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
+) -> (Channel, Arc<std::sync::atomic::AtomicUsize>) {
+    let resolves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let incoming =
         tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
             .expect("the stub binds");
     let addr = incoming.local_addr().expect("a bound port");
+    let counted = Arc::clone(&resolves);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(
                 crate::pb::yadgar::iam::v1::iam_service_server::IamServiceServer::new(StubIam {
                     answer,
+                    resolves: counted,
                 }),
             )
             .serve_with_incoming(incoming)
             .await
     });
-    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("a URI")
-        .connect_lazy()
+        .connect_lazy();
+    (channel, resolves)
 }
 
-/// One `tools/call` with a bearer token, against an `iam` that answers `answer`.
-async fn tools_call_resolving_to(
+/// A gateway attesting against a stub `iam`, and that stub's call counter.
+async fn state_resolving_to(
     answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
-) -> StatusCode {
+    ttl: std::time::Duration,
+) -> (Arc<AppState>, Arc<std::sync::atomic::AtomicUsize>) {
+    let (iam, resolves) = stub_iam(answer).await;
     let state = Arc::new(AppState {
         attestation: Attestation::Iam,
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
-        iam: stub_iam(answer).await,
+        iam,
+        credentials: crate::attest::Credentials::new(ttl),
+        // GENEROUS, unlike the shared `state_with` above, and it is load-bearing.
+        // Valkey is unreachable here so D74 falls back to its local floor of
+        // `rate / maxReplicas`; at `1:1` that floor is one token, and the SECOND
+        // `tools/call` in a caching test would be a 429 rather than whatever the
+        // credential bought. The limiter is not what these tests are measuring.
         limiter: crate::limit::Limiter::new(
             "127.0.0.1:1",
-            crate::limit::Limits::parse("task.write=1:1", "1:1").expect("the limits parse"),
+            crate::limit::Limits::parse("task.read=600:600", "600:600").expect("the limits parse"),
             std::time::Duration::from_millis(200),
             6,
         )
         .expect("the limiter opens"),
         allowed_origins: Vec::new(),
     });
+    (state, resolves)
+}
+
+/// One `tools/call` carrying `token`, against `state`.
+async fn tools_call_with(state: Arc<AppState>, token: &str) -> StatusCode {
     let body = json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {
@@ -1163,10 +1194,22 @@ async fn tools_call_resolving_to(
         .header(headers::METHOD, "tools/call")
         .header(headers::NAME, "find_tasks")
         .header("x-yadgar-project", "acme/demo")
-        .header(axum::http::header::AUTHORIZATION, "Bearer some-token")
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
         .body(Body::from(body.to_string()))
         .expect("request");
     send(state, req).await.0
+}
+
+/// One `tools/call` with a bearer token, against an `iam` that answers `answer`.
+///
+/// A FRESH state each time, so the credential cache built into it is cold — these
+/// callers are asserting what `iam`'s answer buys, and a warm cache would make that
+/// depend on which test ran first.
+async fn tools_call_resolving_to(
+    answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
+) -> StatusCode {
+    let (state, _) = state_resolving_to(answer, std::time::Duration::from_secs(30)).await;
+    tools_call_with(state, "some-token").await
 }
 
 /// **A CREDENTIAL THAT DOES NOT RESOLVE IS A 401, AND `iam` REPORTS THAT AS `Ok`.**
@@ -1208,6 +1251,119 @@ async fn a_credential_that_iam_does_not_recognise_is_refused() {
     // here — a tool-level failure, which this server reports as 200 with `isError`.
     // The point is that it passed the boundary the other did not.
     assert_eq!(attested, StatusCode::OK);
+}
+
+/// **THE SECOND `tools/call` WITH THE SAME TOKEN REACHES `iam` ZERO TIMES.**
+///
+/// The end-to-end form of D72's cache, through the real handler, the real
+/// `attest`, a real gRPC channel and a real server — so it asserts that the
+/// gateway USES the cache, not merely that a cache exists. The unit tests in
+/// `attest` drive `resolve_through` directly and could all pass while nothing
+/// called it.
+///
+/// The assertion is the stub's own call counter. Asserting the status code
+/// instead would pass identically with no cache at all, which is the check that
+/// cannot fail.
+#[tokio::test]
+async fn a_repeated_token_is_resolved_once_and_a_different_one_is_not() {
+    let (state, resolves) = state_resolving_to(
+        crate::pb::yadgar::iam::v1::ResolveCredentialResponse {
+            user_id: "u-8823-only-iam-knows".to_string(),
+            valid_for_seconds: 300,
+            ..Default::default()
+        },
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let count = || resolves.load(std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(
+        tools_call_with(Arc::clone(&state), "tok-repeated").await,
+        StatusCode::OK
+    );
+    assert_eq!(count(), 1, "the first call resolves its credential");
+
+    assert_eq!(
+        tools_call_with(Arc::clone(&state), "tok-repeated").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        count(),
+        1,
+        "the second call must not reach iam — that hop is what this cache removes"
+    );
+
+    // AND THE CACHE IS NOT A BLANKET SKIP. A token this replica has not seen is
+    // still resolved, which is what separates a cache from an authentication hole.
+    assert_eq!(
+        tools_call_with(Arc::clone(&state), "tok-never-seen").await,
+        StatusCode::OK
+    );
+    assert_eq!(count(), 2, "an unseen token is resolved");
+}
+
+/// A junk token is refused ONCE and then refused from memory.
+///
+/// Attestation runs before D74's limiter — the bucket keys on the resolved user,
+/// so there is nothing to spend until the credential resolves — which makes an
+/// unauthenticated caller the only writer nothing throttles. Not caching the
+/// refusal would leave a token-guessing run as an unthrottled amplifier onto
+/// `iam`, which is the failure this cache exists to stop.
+///
+/// **AND THE REFUSAL MUST STAY A REFUSAL.** The second 401 is the assertion that a
+/// remembered negative answer never becomes an attestation.
+#[tokio::test]
+async fn a_refused_token_is_refused_from_memory_and_not_from_iam() {
+    let (state, resolves) = state_resolving_to(
+        // Exactly what `iam` sends for a token it does not recognise.
+        crate::pb::yadgar::iam::v1::ResolveCredentialResponse::default(),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let count = || resolves.load(std::sync::atomic::Ordering::SeqCst);
+
+    for _ in 0..3 {
+        assert_eq!(
+            tools_call_with(Arc::clone(&state), "definitely-not-a-real-token").await,
+            StatusCode::UNAUTHORIZED,
+            "a cached refusal is still a refusal"
+        );
+    }
+    assert_eq!(
+        count(),
+        1,
+        "three attempts with one junk token cost iam one lookup"
+    );
+}
+
+/// With the cache disabled, every call resolves again.
+///
+/// The revert path, asserted rather than assumed: `credentialCache.ttlSeconds: 0`
+/// is the way back to the pre-cache behaviour without a new image, and a value
+/// that quietly kept caching would be a revert that did not revert.
+#[tokio::test]
+async fn a_zero_ttl_puts_the_round_trip_back_on_every_call() {
+    let (state, resolves) = state_resolving_to(
+        crate::pb::yadgar::iam::v1::ResolveCredentialResponse {
+            user_id: "u-4402-only-iam-knows".to_string(),
+            valid_for_seconds: 300,
+            ..Default::default()
+        },
+        std::time::Duration::ZERO,
+    )
+    .await;
+
+    for _ in 0..3 {
+        assert_eq!(
+            tools_call_with(Arc::clone(&state), "tok-repeated").await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        resolves.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "a zero TTL means the cache is off, not that it never expires"
+    );
 }
 
 /// A zero lifetime is the same negative answer, from the other direction.

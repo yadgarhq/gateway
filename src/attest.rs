@@ -34,10 +34,35 @@
 //! development. There is no unconfigured state left to refuse — a stronger reading
 //! of D69 than the boot gate was, because a deployment can no longer reach the
 //! trusting path by forgetting something.
+//!
+//! **THE LOOKUP IS CACHED, AND THE CACHE IS WHERE THE REVOCATION WINDOW LIVES.**
+//! D72 and ADR-0491 both say the gateway reads a credential "through a cache keyed
+//! on the token hash and invalidated by a broker event, never by calling iam per
+//! request". Half of that is built here: the cache and the key. The broker event is
+//! NOT built — ADR-0491 records the gap itself, and it is ledger 457/467 in `iam`.
+//! Until it lands, [`Credentials::ttl`] is the ONLY thing that bounds how long a
+//! revoked credential keeps working, which makes it a security parameter and not a
+//! tuning knob. That is why the default is short, why a long one is refused at
+//! boot, and why [`Credentials::forget_credential`] and
+//! [`Credentials::forget_user`] exist and are called by nothing yet: the seam the
+//! consumer will attach to is named, tested and visible, rather than a shape
+//! somebody has to invent later.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+// TOKIO'S CLOCK, NOT `std`'s, and the difference is what makes expiry testable.
+// `tokio::time::Instant` reads the runtime's clock, so `#[tokio::test(start_paused
+// = true)]` plus `tokio::time::advance` can move a cached entry past its TTL
+// deterministically. With `std::time::Instant` the only way to observe an expiry
+// is to sleep for it, which is the flaky test this repository does not write. In a
+// build without tokio's `test-util` this is a thin wrapper over the same monotonic
+// clock, so it costs nothing.
+use tokio::time::Instant;
 use tonic::transport::Channel;
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
@@ -165,6 +190,17 @@ pub struct Claimed<'a> {
 /// gateway learns who you are and what you may spend in one lookup, invalidated
 /// together. Two lookups would mean two cache lifetimes and a window in which a
 /// tightened limit is not yet in force.
+///
+/// **THIS TYPE IS NOT WHAT [`Credentials`] HOLDS, and it must not be.** The
+/// requirement is that identity and spending limits share one entry and one
+/// lifetime, and they do — `ResolveCredentialResponse` carries both and is cached
+/// as one value. What this type ADDS is per-request: `scope.request_id` is minted
+/// per call (see [`crate::request_id`]), and `scope.project_id` and
+/// `scope.instance_id` are the caller's own headers on this request. Caching a
+/// composed `Attested` would serve one caller's correlation id and workspace to the
+/// next caller holding the same token — a D12 scoping defect and a broken D67
+/// join key, from a cache that looked like it was doing what it was asked. So the
+/// cached value is what `iam` ANSWERED and this is composed from it every time.
 #[derive(Debug)]
 pub struct Attested {
     pub scope: Scope,
@@ -178,6 +214,400 @@ pub struct Attested {
     pub limits: Overrides,
 }
 
+/// The environment variable holding the cached lifetime of one resolution.
+///
+/// Named for the thing whose lifetime it is, in seconds, the same shape as
+/// `YADGAR_RATE_LIMIT_TIMEOUT_MS` — the unit is in the name so a manifest cannot
+/// be off by a thousand.
+const CREDENTIAL_TTL: &str = "YADGAR_CREDENTIAL_TTL_SECONDS";
+
+/// The default lifetime of a cached resolution, in seconds.
+///
+/// **Short, because it is the whole revocation bound.** With the broker event
+/// unbuilt (ledger 457/467) a credential revoked in `iam` keeps working here for
+/// up to this long, so the number is chosen against that cost rather than against
+/// the hit rate. It buys almost all of the hit rate anyway: an agent making even
+/// one call a second serves thirty of them per lookup, and raising this to `iam`'s
+/// own 300 would multiply the revocation window by ten to buy the last few percent.
+const DEFAULT_TTL_SECONDS: u64 = 30;
+
+/// The largest lifetime this gateway will accept, in seconds.
+///
+/// **A refusal rather than a clamp**, for the reason `limit::validate` gives about
+/// a limit nobody notices is gone: silently shortening a number an operator wrote
+/// leaves them believing something that is not true. `iam` declares 300 as a live
+/// credential's own lifetime, and a cache entry may not outlive the thing it
+/// caches — so nothing above it could be honoured for a live entry in any case,
+/// and for a REFUSED one it would be a revocation window measured in minutes with
+/// no event able to close it.
+const MAX_TTL_SECONDS: u64 = 300;
+
+/// How many resolutions one replica holds, per outcome.
+///
+/// **Bounded, because the writer is UNAUTHENTICATED.** Attestation runs before
+/// D74's limiter — the bucket keys on the resolved user, so there is nothing to
+/// spend until the credential is resolved — which means a caller with no valid
+/// token still decides how many entries this map gains. `limit::Floor` accepts the
+/// same shape at the same size for the same reason. At roughly 400 bytes an entry
+/// (a `Scope`'s five strings, the team list and a 32-byte key) two full maps are
+/// about 3MB against the chart's 128Mi limit.
+const CAPACITY: usize = 4096;
+
+/// Whether the credential lookup was served from this replica's memory.
+///
+/// **Bounded labels only**: `outcome` is `hit` or `miss` and nothing else. The
+/// token never appears, hashed or otherwise, and neither does the user — D72 and
+/// D77 keep identities out of metrics, and this counter exists to answer one
+/// operational question, which is whether the hop this cache was built to remove
+/// is actually gone.
+pub const CACHE: &str = "yadgar_gateway_credential_cache_total";
+
+/// What `iam` answered for one token, and when this replica must ask again.
+struct Entry {
+    answer: ResolveCredentialResponse,
+    expires_at: Instant,
+}
+
+/// Whether `iam`'s answer names a LIVE credential.
+///
+/// **One predicate, two readers, and that is deliberate.** [`from_resolved`]
+/// refuses everything this rejects and [`Credentials`] files an answer by it, so a
+/// future change to what counts as "resolved" cannot make the cache and the
+/// security guard disagree — which would be a refusal filed as a success.
+fn is_live(answer: &ResolveCredentialResponse) -> bool {
+    !answer.user_id.is_empty() && answer.valid_for_seconds > 0
+}
+
+/// One replica's memory of what `iam` said about a token.
+///
+/// # Why in-process rather than in the shared cache
+///
+/// D21's Valkey is already a hard dependency of this service and would give one
+/// place to invalidate, so this is a real choice and not a default. It is NOT what
+/// D18 forbids: D18 governs cache-coherence MECHANISMS — "no invalidation signal
+/// may be delivered in-process" — and says in as many words that it is "not a
+/// standing ban on anything a replica holds alone". The invalidation signal here is
+/// D22's broker event, which crosses replicas by construction; the map it will
+/// evict from is local. Read wider than that, D18 would also forbid
+/// `limit::Floor`, which the same paragraph exists to permit.
+///
+/// **THE DECIDING ARGUMENT IS THAT VALKEY IS UNAUTHENTICATED.** Read out of
+/// `yadgarhq/deploy/infra/valkey/valkey.yaml`, which is the manifest that deploys
+/// it: the container's whole `args` list is `--maxmemory 512mb --maxmemory-policy
+/// allkeys-lru --save "" --appendonly no`, with **no `--requirepass`**, and
+/// `grep -rn 'requirepass\|NetworkPolicy'` over the `deploy` repository matches
+/// nothing at all. That is the declared state; no running cluster was inspected
+/// for it. Anything on the pod network can therefore write
+/// `valkey:6379`. For a rate-limit counter that costs a limit. For THIS cache the
+/// entry maps a token hash to a `user_id` and a `team_ids` list, so anyone who can
+/// write to that store can MINT AN IDENTITY — the same bypass class that was closed
+/// when the gateway stopped trusting `x-yadgar-user`, reopened through a different
+/// door. Nothing on this replica's own heap is reachable that way.
+///
+/// **The second argument is who writes the keys.** Attestation happens BEFORE
+/// D74's limiter, so every entry here is minted by a request that has not proved
+/// anything yet — a caller with no valid token chooses this keyspace's cardinality.
+/// `limit.rs` already records what evicting another tenant of the shared cache
+/// costs: "evicting D46's throttle counters is itself a limit bypass". Putting an
+/// anonymously-writable keyspace in there turns a token-guessing flood into an
+/// eviction attack on four other subsystems. A bounded map on this replica's own
+/// heap contains the same flood to this replica's own memory, and [`CAPACITY`] is
+/// the bound.
+///
+/// **What it costs, stated rather than discovered later, and sized against SIX
+/// replicas** — `autoscaling.maxReplicas` in this chart, which the reference
+/// deployment really does scale to. One token can miss once per replica, so `iam`
+/// sees up to six lookups per TTL for one caller instead of one, and the load falls
+/// by the request rate PER REPLICA rather than by the request rate overall. At the
+/// autoscaler's own threshold of ten calls a second per replica and a 30 second
+/// TTL, that is six lookups per 300 calls rather than 300 — the hop is gone in
+/// every sense that matters, and the residual is a constant multiple of the replica
+/// count rather than of the traffic.
+///
+/// And when the broker consumer is built it must run on EVERY replica — a fan-out
+/// subscription, not a work queue with one consumer — or an eviction reaches one
+/// pod and the others serve the revoked credential to its TTL. That requirement is
+/// the price of this choice and is written on [`Credentials::forget_credential`]
+/// where the consumer's author will read it.
+///
+/// **D80, applied to this decision.** Nothing here is a platform capability: no
+/// ingress feature, no cloud service, no CRD, no operator. A process-local
+/// `HashMap` behaves identically on EKS, AKS, GKE and kind, and the one setting an
+/// operator has to make is a chart value they write rather than an environment
+/// this code reads and trusts. The TTL default comes from the security argument —
+/// how long a revoked credential may survive — and not from latency measured on
+/// one cluster, because a number tuned against a single-node kind cluster with no
+/// network between its pods would be a number correct nowhere else.
+pub struct Credentials {
+    /// How long one answer is reused. Zero disables the cache entirely.
+    ttl: Duration,
+    /// Answers that ATTESTED. Keyed by the SHA-256 of the presented token.
+    live: Mutex<HashMap<[u8; 32], Entry>>,
+    /// Answers that REFUSED, in their own map so that a flood of junk tokens
+    /// cannot evict a single working identity. See [`Credentials::put`].
+    refused: Mutex<HashMap<[u8; 32], Entry>>,
+}
+
+impl Credentials {
+    /// The cache this process will use, from the environment.
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// The same decision over an injected lookup, for the reason
+    /// [`Attestation::from_lookup`] gives: a test that sets a real environment
+    /// variable steers every other test in the same binary.
+    ///
+    /// **An unparseable value fails boot rather than falling back to the
+    /// default.** That is D69 and it is `main.rs`'s existing rule for
+    /// `YADGAR_RATE_LIMIT_TIMEOUT_MS`: a number nobody can read is a deployment
+    /// mistake, and quietly substituting one leaves an operator believing a bound
+    /// that is not in force.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let seconds = match lookup(CREDENTIAL_TTL).filter(|v| !v.is_empty()) {
+            None => DEFAULT_TTL_SECONDS,
+            Some(v) => v.parse::<u64>().map_err(|e| {
+                format!(
+                    "{CREDENTIAL_TTL} is not a whole number of seconds: {e}. It is how long \
+                     one resolved credential is reused before iam is asked again, and 0 disables \
+                     the cache."
+                )
+            })?,
+        };
+        if seconds > MAX_TTL_SECONDS {
+            return Err(format!(
+                "{CREDENTIAL_TTL} is {seconds}, above the {MAX_TTL_SECONDS} second ceiling. \
+                 Nothing publishes the invalidation event this cache is supposed to be cleared \
+                 by yet (ADR-0491, ledger 457), so this value is the ONLY bound on how long a \
+                 revoked credential keeps working — and iam declares 300 seconds as a live \
+                 credential's own lifetime, which a cache of it may not outlive."
+            ));
+        }
+        Ok(Self::new(Duration::from_secs(seconds)))
+    }
+
+    /// A cache with an explicit lifetime. `Duration::ZERO` caches nothing.
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            live: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The configured lifetime, for the line `main.rs` logs at boot.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// Forget one credential, by the token itself.
+    ///
+    /// **NOTHING CALLS THIS YET, and that is the state of the world rather than an
+    /// oversight.** ADR-0491 decides that revocation publishes a broker event and
+    /// records in its own consequences that the publisher does not exist — filed as
+    /// ledger 457, with 467 as the `iam` side. This is the seam that consumer
+    /// attaches to, named and tested now so the shape is not invented under
+    /// pressure later.
+    ///
+    /// **THE CONSUMER MUST RUN ON EVERY REPLICA.** The map is this pod's own (see
+    /// the type comment), so a subscription that delivers each event to exactly one
+    /// consumer — a work queue, a shared consumer group — evicts one pod and leaves
+    /// every other one serving the revoked credential until its TTL. It needs
+    /// fan-out delivery, and that is a property of how the subscription is
+    /// declared, not of this function.
+    ///
+    /// It takes the TOKEN and not a hash, because the event will carry whatever
+    /// `iam` holds and the key derivation belongs on this side of the boundary —
+    /// the same argument `attest` already makes for not hashing before the RPC. If
+    /// the event turns out to carry `iam`'s own stored hash instead, this is where
+    /// that mismatch has to be resolved, and it is one function rather than a
+    /// convention.
+    pub fn forget_credential(&self, token: &str) {
+        let key = fingerprint(token);
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        self.refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+    }
+
+    /// Forget every credential resolved to one user.
+    ///
+    /// The second half of D72's invalidation: "revocation OR TEAM CHANGE". A team
+    /// change names a person, not a token, and this cache is keyed by token — so it
+    /// is a scan rather than a lookup. That is affordable precisely because it is
+    /// rare and [`CAPACITY`] is small; making it a lookup would need a second index
+    /// maintained on the hot path to serve an event that arrives a few times a day.
+    ///
+    /// Unwired, for the same reason [`Credentials::forget_credential`] is, and it
+    /// carries the same fan-out requirement.
+    ///
+    /// Only live answers are touched: a refusal carries no user to match.
+    pub fn forget_user(&self, user_id: &str) {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, entry| entry.answer.user_id != user_id);
+    }
+
+    /// What `iam` last said about this token, if it may still be believed.
+    fn get(&self, key: &[u8; 32], now: Instant) -> Option<ResolveCredentialResponse> {
+        for map in [&self.live, &self.refused] {
+            let mut entries = map.lock().unwrap_or_else(PoisonError::into_inner);
+            match entries.get(key) {
+                Some(entry) if entry.expires_at > now => return Some(entry.answer.clone()),
+                // EXPIRED ENTRIES ARE REMOVED ON THE WAY PAST, not merely ignored.
+                // Reading one as a miss and leaving it behind is how a map fills
+                // with answers nobody will ever believe again, and then refuses to
+                // cache the live ones because it is at capacity.
+                Some(_) => {
+                    entries.remove(key);
+                }
+                None => {}
+            }
+        }
+        None
+    }
+
+    /// File one answer, under the outcome it is.
+    ///
+    /// **Two maps, so that a refusal can never evict an identity.** A caller with
+    /// no credential at all can drive the refusal map to [`CAPACITY`] — it is
+    /// reached before D74's limiter — and if the two shared one map that flood
+    /// would push out every working session on the replica, turning a guessing run
+    /// into a load amplifier on `iam` for everybody else. Separate budgets make
+    /// that structurally impossible rather than unlikely.
+    ///
+    /// **At capacity, this answer is simply not cached.** Expired entries are swept
+    /// first; if the map is still full, the request has already been answered
+    /// correctly and the only thing lost is the next request's hit. The alternative
+    /// — evicting somebody else to make room — is what lets a flood displace live
+    /// entries, which is the property the split above exists to hold.
+    ///
+    /// **A live answer never outlives `iam`'s own declared lifetime.**
+    /// `valid_for_seconds` is what `iam` says the credential is good for, so the
+    /// entry expires at the sooner of that and the configured TTL. A refusal has no
+    /// such number to honour — `iam` sends `valid_for_seconds: 0` with it — so it
+    /// gets the configured TTL.
+    ///
+    /// **Why a refusal may hold the FULL TTL.** The error it could make is refusing
+    /// a caller whose credential has become valid, and that is unreachable: `iam`
+    /// mints the token string, so a given string cannot go from invalid to valid. A
+    /// re-issued credential is a different string and therefore a different key.
+    /// What remains is fail-CLOSED — a cached refusal refuses somebody who was
+    /// already being refused — which is the safe direction for the one entry an
+    /// unauthenticated caller can create.
+    fn put(&self, key: [u8; 32], answer: ResolveCredentialResponse, now: Instant) {
+        if self.ttl.is_zero() {
+            return;
+        }
+        let (map, ttl) = if is_live(&answer) {
+            let declared = Duration::from_secs(answer.valid_for_seconds.max(0) as u64);
+            (&self.live, self.ttl.min(declared))
+        } else {
+            (&self.refused, self.ttl)
+        };
+        let mut entries = map.lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.len() >= CAPACITY {
+            entries.retain(|_, entry| entry.expires_at > now);
+        }
+        if entries.len() >= CAPACITY {
+            return;
+        }
+        entries.insert(
+            key,
+            Entry {
+                answer,
+                expires_at: now + ttl,
+            },
+        );
+    }
+}
+
+/// **SIZES AND THE TTL, NEVER THE CONTENTS.**
+///
+/// A derived `Debug` would print every cached identity — user ids and team lists —
+/// the first time somebody put this struct in a `tracing` field or an `expect`
+/// message. D72 and D77 keep identities out of logs, and the way that rule gets
+/// broken is a derive nobody thought about rather than a deliberate line. The key
+/// is already only a digest; this keeps the value out too.
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("ttl", &self.ttl)
+            .field(
+                "live",
+                &self
+                    .live
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+            )
+            .field(
+                "refused",
+                &self
+                    .refused
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+            )
+            .finish()
+    }
+}
+
+/// The cache key: SHA-256 of the presented token.
+///
+/// **THE KEY IS THE HASH AND THE TOKEN IS NEVER STORED.** A map keyed on the token
+/// itself puts live credentials into a core dump, a heap inspection and anything
+/// that ever formats the key — and this is a process a debugger can attach to. The
+/// full 256 bits rather than `limit::user_component`'s truncated 128: this key
+/// decides WHO the caller is rather than which bucket they spend from, so a
+/// collision is an impersonation and there is no length pressure to trade against.
+fn fingerprint(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Resolve a token, through the cache.
+///
+/// `resolve` is the lookup itself, taken as a closure so this — the part that
+/// decides whether `iam` is called at all — can be exercised against a fake that
+/// COUNTS its calls. A test that only asserted the right identity came back would
+/// pass with no cache at all.
+///
+/// **A miss under concurrency is not collapsed**, and that is a stated residual
+/// rather than an oversight: two requests arriving with the same cold token both
+/// call `iam`. Single-flighting them needs a per-key waiter map, which is a lock
+/// held across an await on the hot path of every call — a worse risk than the
+/// duplicate lookup, which is bounded by the number of in-flight requests for one
+/// token and is a lookup this gateway made unconditionally until today.
+async fn resolve_through<F, Fut>(
+    cache: &Credentials,
+    token: &str,
+    resolve: F,
+) -> Result<ResolveCredentialResponse, AttestError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<ResolveCredentialResponse, AttestError>>,
+{
+    let key = fingerprint(token);
+    let now = Instant::now();
+    if let Some(answer) = cache.get(&key, now) {
+        metrics::counter!(CACHE, "outcome" => "hit").increment(1);
+        return Ok(answer);
+    }
+    metrics::counter!(CACHE, "outcome" => "miss").increment(1);
+    // ONLY AN ANSWER IS CACHED, never a failure to obtain one. An unreachable or
+    // stalled `iam` is an outage of the upstream, and remembering it would turn a
+    // transport blip into a bounded outage of its own — every caller refused until
+    // the entry expired, long after `iam` came back.
+    let answer = resolve().await?;
+    cache.put(key, answer.clone(), now);
+    Ok(answer)
+}
+
 /// Build the attested scope for one request.
 ///
 /// `credential` is the `Authorization` header verbatim, and `request_id` is passed
@@ -187,9 +617,14 @@ pub struct Attested {
 /// stays a decision and not a resource. It is the same lazy channel `/auth/login`
 /// uses; an `iam` that is not deployed yet costs a bounded failure per call rather
 /// than a boot that never completes.
+///
+/// **`cache` IS ONLY REACHED ON THE `Iam` PATH**, because it is the only path that
+/// resolves anything. A trusted header is not a credential and there is nothing to
+/// remember about it.
 pub async fn attest(
     how: &Attestation,
     iam: &Channel,
+    cache: &Credentials,
     credential: Option<&str>,
     claimed: Claimed<'_>,
     request_id: String,
@@ -218,26 +653,38 @@ pub async fn attest(
 
         Attestation::Iam => {
             let token = bearer(credential).ok_or(AttestError::MissingCredential)?;
-            let mut client = IamServiceClient::new(iam.clone());
-            let rpc = client.resolve_credential(ResolveCredentialRequest {
-                // As PRESENTED, never hashed here. The contract is explicit that
-                // hashing is `iam`'s job: a caller that hashed first would have to
-                // agree on the algorithm forever, and changing it would then be a
-                // breaking change to every caller rather than an implementation
-                // detail there.
-                token: token.to_string(),
-            });
-            let resolved = match tokio::time::timeout(RESOLVE_DEADLINE, rpc).await {
-                Ok(Ok(r)) => r.into_inner(),
-                // `e.code()` is kept and `e` is dropped. The message belongs in
-                // the log line `http` writes, not in an answer to a caller whose
-                // credential has just failed to resolve.
-                Ok(Err(e)) => return Err(AttestError::Upstream(e.code())),
-                // Through the SAME variant as any other upstream problem, so a
-                // stall is not a third answer somebody has to remember to keep
-                // opaque.
-                Err(_elapsed) => return Err(AttestError::Upstream(tonic::Code::DeadlineExceeded)),
-            };
+            // THROUGH THE CACHE, which is D72's "on a cache miss, never per
+            // request". Everything below the closure runs on a MISS only.
+            let resolved = resolve_through(cache, token, || async {
+                let mut client = IamServiceClient::new(iam.clone());
+                let rpc = client.resolve_credential(ResolveCredentialRequest {
+                    // As PRESENTED, never hashed here. The contract is explicit
+                    // that hashing is `iam`'s job: a caller that hashed first would
+                    // have to agree on the algorithm forever, and changing it would
+                    // then be a breaking change to every caller rather than an
+                    // implementation detail there. The CACHE key is a hash of the
+                    // same token and is unrelated to it — that one never leaves
+                    // this process, so nothing has to agree about it.
+                    token: token.to_string(),
+                });
+                match tokio::time::timeout(RESOLVE_DEADLINE, rpc).await {
+                    Ok(Ok(r)) => Ok(r.into_inner()),
+                    // `e.code()` is kept and `e` is dropped. The message belongs in
+                    // the log line `http` writes, not in an answer to a caller
+                    // whose credential has just failed to resolve.
+                    Ok(Err(e)) => Err(AttestError::Upstream(e.code())),
+                    // Through the SAME variant as any other upstream problem, so a
+                    // stall is not a third answer somebody has to remember to keep
+                    // opaque.
+                    Err(_elapsed) => Err(AttestError::Upstream(tonic::Code::DeadlineExceeded)),
+                }
+            })
+            .await?;
+            // ON EVERY REQUEST, hit or miss. The cache holds what `iam` ANSWERED,
+            // and this is what turns that answer into an attestation — including
+            // the refusal at the top of it. A cached refusal is re-refused here
+            // rather than being remembered as an error, so the guard cannot be
+            // skipped by a cache hit.
             from_resolved(
                 resolved,
                 claimed.project_id,
@@ -297,7 +744,7 @@ fn from_resolved(
     claimed_instance: Option<&str>,
     request_id: String,
 ) -> Result<Attested, AttestError> {
-    if resolved.user_id.is_empty() || resolved.valid_for_seconds <= 0 {
+    if !is_live(&resolved) {
         // THROUGH THE UPSTREAM VARIANT, carrying the code `iam` would have used
         // had this outcome been an error, so it reaches `opaque_status` and
         // becomes the same 401 as any other refusal — no new variant, and no
@@ -675,6 +1122,7 @@ mod tests {
         let attested = attest(
             &Attestation::TrustedHeaders,
             &nowhere(),
+            &Credentials::new(Duration::from_secs(30)),
             None,
             Claimed {
                 user_id: Some("max"),
@@ -700,6 +1148,7 @@ mod tests {
         let err = attest(
             &Attestation::TrustedHeaders,
             &nowhere(),
+            &Credentials::new(Duration::from_secs(30)),
             None,
             Claimed {
                 user_id: None,
@@ -734,6 +1183,7 @@ mod tests {
         let err = attest(
             &Attestation::Iam,
             &nowhere(),
+            &Credentials::new(Duration::from_secs(30)),
             None,
             Claimed {
                 user_id: Some("forged-by-the-caller"),
@@ -747,6 +1197,532 @@ mod tests {
         assert!(
             matches!(err, AttestError::MissingCredential),
             "a self-asserted user must not stand in for a token; got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The cache (D72, ADR-0491).
+    //
+    // **EVERY ONE OF THESE COUNTS LOOKUPS.** A test that only asserted the right
+    // identity came back would pass identically with no cache at all — it is a
+    // check that cannot fail, which is the antipattern this repository has now
+    // recorded five times. So the assertion is always on the COUNTER, and the
+    // fixtures use values no default and no constant in this module could have
+    // produced.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A lookup that counts, standing in for the RPC.
+    ///
+    /// It is the closure [`resolve_through`] takes, so the code under test is the
+    /// production path and only the transport is a fake.
+    async fn through(
+        cache: &Credentials,
+        token: &str,
+        calls: &AtomicUsize,
+        answer: &ResolveCredentialResponse,
+    ) -> ResolveCredentialResponse {
+        resolve_through(cache, token, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(answer.clone())
+        })
+        .await
+        .expect("the fake lookup answers")
+    }
+
+    /// A TTL long enough that nothing in a test expires by accident.
+    const TEST_TTL: Duration = Duration::from_secs(30);
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_request_with_the_same_token_costs_iam_nothing() {
+        // THE POINT OF THE WHOLE CHANGE, and the only assertion that can tell a
+        // cache from no cache: the count, not the answer.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        // A user id no header, no default and no constant in this module could
+        // have produced.
+        let answer = resolved("u-9137-known-only-to-iam");
+
+        let first = through(&cache, "tok-sentinel-alpha", &calls, &answer).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the first request must ask"
+        );
+
+        let second = through(&cache, "tok-sentinel-alpha", &calls, &answer).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second request must not reach iam at all"
+        );
+        assert_eq!(first.user_id, "u-9137-known-only-to-iam");
+        assert_eq!(second.user_id, first.user_id);
+        assert_eq!(second.team_ids, first.team_ids);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_tokens_are_two_entries_and_never_one() {
+        // MUTATION THIS CATCHES: keying on anything that is not the token — the
+        // claimed project, a constant, a truncation short enough to collide. Under
+        // it the second caller is served the FIRST caller's identity, which is an
+        // impersonation rather than a stale answer.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+
+        let a = through(&cache, "tok-alpha", &calls, &resolved("u-alpha-4471")).await;
+        let b = through(&cache, "tok-bravo", &calls, &resolved("u-bravo-8802")).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a different token is a different entry"
+        );
+        assert_eq!(a.user_id, "u-alpha-4471");
+        assert_eq!(b.user_id, "u-bravo-8802");
+
+        // AND EACH ONE STILL HITS ITS OWN. Two entries that both exist is not the
+        // same property as two entries that are both reachable.
+        assert_eq!(
+            through(&cache, "tok-alpha", &calls, &resolved("u-must-not-be-used"))
+                .await
+                .user_id,
+            "u-alpha-4471"
+        );
+        assert_eq!(
+            through(&cache, "tok-bravo", &calls, &resolved("u-must-not-be-used"))
+                .await
+                .user_id,
+            "u-bravo-8802"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "both were already known");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_entry_is_filed_under_the_tokens_hash_and_never_the_token() {
+        // A map keyed on the token itself puts a live credential into every heap
+        // dump of this process. Asserted against a digest computed HERE from the
+        // token, which is a value this module's own code did not choose.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        through(&cache, "tok-charlie", &calls, &resolved("u-charlie-2265")).await;
+
+        let expected: [u8; 32] = Sha256::digest(b"tok-charlie").into();
+        let live = cache.live.lock().expect("not poisoned");
+        assert_eq!(live.len(), 1);
+        assert!(
+            live.contains_key(&expected),
+            "the entry must be filed under the token's digest"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_credential_does_not_outlive_its_ttl() {
+        // BOTH SIDES OF THE BOUNDARY, because "it expires eventually" is satisfied
+        // by a cache that expires immediately, and that is not a cache. Paused time
+        // rather than a sleep: deterministic, sub-second, no CI-load dependence.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        let answer = resolved("u-delta-5518");
+
+        through(&cache, "tok-delta", &calls, &answer).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(TEST_TTL - Duration::from_millis(1)).await;
+        through(&cache, "tok-delta", &calls, &answer).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an entry inside its TTL is still served"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        through(&cache, "tok-delta", &calls, &answer).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "an entry at its TTL is gone, and the TTL is the whole revocation bound"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_credential_never_outlives_iams_own_declared_lifetime() {
+        // `valid_for_seconds` is what `iam` says the credential is good for, and a
+        // cache of a thing may not outlive the thing. Five seconds is far below
+        // TEST_TTL, so a cache that took its own TTL unconditionally would keep
+        // serving this for another twenty-five.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        let answer = ResolveCredentialResponse {
+            user_id: "u-echo-3390".to_string(),
+            valid_for_seconds: 5,
+            ..Default::default()
+        };
+
+        through(&cache, "tok-echo", &calls, &answer).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        through(&cache, "tok-echo", &calls, &answer).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "iam said five seconds; the configured thirty must not override it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_credential_is_remembered_and_is_still_a_refusal() {
+        // TWO PROPERTIES IN ONE TEST, because they are the same decision. Caching
+        // the negative is what stops a token-guessing flood being an unthrottled
+        // amplifier onto `iam` — attestation runs before D74's limiter, so nothing
+        // else throttles it. And a cached negative must NEVER become an
+        // attestation: it is re-refused by `from_resolved` on every request,
+        // whether it came from `iam` or from this map.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        // Exactly what `iam` sends for a token that is unknown, revoked or expired.
+        let refusal = ResolveCredentialResponse::default();
+
+        let first = through(&cache, "tok-guessed", &calls, &refusal).await;
+        let second = through(&cache, "tok-guessed", &calls, &refusal).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a repeated junk token must not be a repeated lookup"
+        );
+
+        for answer in [first, second] {
+            assert!(
+                matches!(
+                    from_resolved(answer, Some("acme/demo"), None, "REQ-8".to_string()),
+                    Err(AttestError::Upstream(tonic::Code::Unauthenticated))
+                ),
+                "a cached refusal is still a refusal"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cache_hit_composes_this_requests_workspace_and_correlation_id() {
+        // **THE INVARIANT THAT DECIDES WHAT MAY BE CACHED AT ALL.** The entry holds
+        // what `iam` ANSWERED — identity and spending limits, one value, one
+        // lifetime — and `from_resolved` composes the per-request half on top of it
+        // every time. Caching a composed `Attested` instead would serve the FIRST
+        // caller's `request_id` and `project_id` to the second: a broken D67 join
+        // key, and a D12 scoping widening into somebody else's workspace, from a
+        // cache that looked like it was doing exactly what it was asked.
+        //
+        // Nothing else in this file reaches composition — every other cache test
+        // stops at `resolve_through` — so without this the property is prose.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        let answer = resolved("u-november-6612");
+
+        let first = from_resolved(
+            through(&cache, "tok-shared", &calls, &answer).await,
+            Some("acme/first"),
+            Some("i-first"),
+            "REQ-FIRST".to_string(),
+        )
+        .expect("a resolved credential attests");
+        let second = from_resolved(
+            through(&cache, "tok-shared", &calls, &answer).await,
+            Some("zeta/second"),
+            Some("i-second"),
+            "REQ-SECOND".to_string(),
+        )
+        .expect("a cached credential attests too");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second request must be a hit, or this test proves nothing"
+        );
+        // SHARED, because it is what the credential resolved to.
+        assert_eq!(second.scope.user_id, "u-november-6612");
+        assert_eq!(second.scope.team_ids, first.scope.team_ids);
+        // NOT SHARED, because these are facts about THIS request.
+        assert_eq!(second.scope.project_id, "zeta/second");
+        assert_eq!(second.scope.instance_id, "i-second");
+        assert_eq!(second.scope.request_id, "REQ-SECOND");
+        assert_ne!(first.scope.request_id, second.scope.request_id);
+        assert_ne!(first.scope.project_id, second.scope.project_id);
+
+        // AND D74'S BUCKET IS UNMOVED BY THE CLAIMED WORKSPACE. `limit::check` keys
+        // on `scope.user_id`, which can only come from `resolved.user_id` — so a
+        // caller changing its project header mints no new bucket, cache hit or not.
+        assert_eq!(first.scope.user_id, second.scope.user_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_of_refusals_cannot_deny_the_cache_to_a_real_credential() {
+        // WHY THERE ARE TWO MAPS. The writer of a refusal is UNAUTHENTICATED —
+        // attestation runs before D74's limiter — so a caller with no credential
+        // chooses how many entries the refusal side gains. Sharing one map with the
+        // live answers would let that caller fill it, and then every real
+        // credential arriving afterwards would be uncacheable and would resolve
+        // against `iam` on EVERY request: a guessing run turned into a load
+        // amplifier on `iam` for everybody else, which is the failure this whole
+        // change exists to stop.
+        //
+        // **THE FLOOD RUNS FIRST, AND THAT ORDERING IS THE TEST.** Written the
+        // other way round — one live entry, then the flood — it passes under a
+        // single shared map too, because nothing here evicts: the early entry
+        // simply survives and the assertion holds for a reason that is not the
+        // property. Confirmed by mutation rather than by reading: collapsing the
+        // two maps into one left that ordering green, and leaves this one red.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        let refusal = ResolveCredentialResponse::default();
+        for n in 0..CAPACITY + 64 {
+            through(&cache, &format!("junk-{n}"), &calls, &refusal).await;
+        }
+
+        // A REAL CREDENTIAL, ARRIVING INTO THE FLOOD.
+        through(&cache, "tok-foxtrot", &calls, &resolved("u-foxtrot-7724")).await;
+        let after_first = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            through(
+                &cache,
+                "tok-foxtrot",
+                &calls,
+                &resolved("u-must-not-be-used")
+            )
+            .await
+            .user_id,
+            "u-foxtrot-7724"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_first,
+            "a real credential must still be cacheable while junk tokens flood in"
+        );
+
+        // AND THE FLOOD ITSELF IS BOUNDED. Past capacity the answer is simply not
+        // cached; nothing is evicted to make room for it, so the memory an
+        // unauthenticated caller can reach has a ceiling.
+        assert!(
+            cache.refused.lock().expect("not poisoned").len() <= CAPACITY,
+            "the refusal map must not grow past its bound"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgetting_one_credential_sends_the_next_request_back_to_iam() {
+        // THE INVALIDATION SEAM. Nothing calls it yet — ADR-0491 records that
+        // revocation publishes no event, filed as ledger 457/467 — so this test is
+        // what keeps it from rotting into a function that compiles and does
+        // nothing.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        through(&cache, "tok-golf", &calls, &resolved("u-golf-6103")).await;
+        through(&cache, "tok-hotel", &calls, &resolved("u-hotel-1547")).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        cache.forget_credential("tok-golf");
+
+        through(&cache, "tok-golf", &calls, &resolved("u-golf-6103")).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the forgotten credential is resolved again"
+        );
+        through(&cache, "tok-hotel", &calls, &resolved("u-hotel-1547")).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "and nothing else was forgotten with it"
+        );
+
+        // A REFUSAL IS FORGETTABLE TOO, and it is on the other map — one that
+        // cleared only the live side would leave a revocation half-applied.
+        let refusal = ResolveCredentialResponse::default();
+        through(&cache, "tok-india", &calls, &refusal).await;
+        cache.forget_credential("tok-india");
+        through(&cache, "tok-india", &calls, &refusal).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forgetting_a_user_evicts_every_token_that_resolved_to_them() {
+        // D72's other invalidation: "revocation OR TEAM CHANGE". A team change names
+        // a person and this cache is keyed by token, so one person's several tokens
+        // must all go — leaving one behind means the stale team list is still being
+        // served, which is the D12 read-scope defect the event exists to close.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        let same_person = resolved("u-juliet-2038");
+        through(&cache, "tok-laptop", &calls, &same_person).await;
+        through(&cache, "tok-desktop", &calls, &same_person).await;
+        through(&cache, "tok-other", &calls, &resolved("u-kilo-9911")).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        cache.forget_user("u-juliet-2038");
+
+        through(&cache, "tok-laptop", &calls, &same_person).await;
+        through(&cache, "tok-desktop", &calls, &same_person).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "both of that person's tokens are resolved again"
+        );
+        through(&cache, "tok-other", &calls, &resolved("u-kilo-9911")).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "somebody else's token was untouched"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_ttl_disables_the_cache_rather_than_caching_forever() {
+        // THE REVERT PATH, and the direction it fails in is the point. `0` must
+        // mean "ask every time", not "keep it until the process restarts".
+        let cache = Credentials::new(Duration::ZERO);
+        let calls = AtomicUsize::new(0);
+        let answer = resolved("u-lima-8471");
+        through(&cache, "tok-lima", &calls, &answer).await;
+        through(&cache, "tok-lima", &calls, &answer).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a zero TTL means every request resolves"
+        );
+        assert!(cache.live.lock().expect("not poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upstream_failure_is_never_cached() {
+        // A transport blip must not become a bounded outage of our own. If the
+        // error were remembered, every caller holding that token would be refused
+        // until the entry expired — long after `iam` came back.
+        let cache = Credentials::new(TEST_TTL);
+        let calls = AtomicUsize::new(0);
+        for _ in 0..2 {
+            let err = resolve_through(&cache, "tok-mike", || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(AttestError::Upstream(tonic::Code::Unavailable))
+            })
+            .await
+            .expect_err("the fake lookup fails");
+            assert!(matches!(
+                err,
+                AttestError::Upstream(tonic::Code::Unavailable)
+            ));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "an outage is retried, not remembered"
+        );
+    }
+
+    #[test]
+    fn the_cache_counter_reports_a_miss_and_then_a_hit() {
+        // [`CACHE`] is the only way an operator can tell whether the hop this
+        // change removed is actually gone, and a counter emitted under one label
+        // only would show a permanent 100% miss rate — indistinguishable from a
+        // cache that does not work. Asserted against a recorder rather than against
+        // the call site, the way `DEGRADED`'s bounded labels already are.
+        //
+        // A LOCAL recorder rather than `install()`: a global one is process-wide
+        // and this binary runs its tests in parallel, so installing here would race
+        // every other test that emits a metric.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let cache = Credentials::new(TEST_TTL);
+                let calls = AtomicUsize::new(0);
+                let answer = resolved("u-oscar-1180");
+                through(&cache, "tok-oscar", &calls, &answer).await;
+                through(&cache, "tok-oscar", &calls, &answer).await;
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            });
+        });
+
+        // ONE SNAPSHOT, READ TWICE. `Snapshotter::snapshot` DRAINS the registry, so
+        // taking one per label leaves the second looking at nothing — and the
+        // assertion for whichever label was checked second fails while the counter
+        // is being emitted perfectly well. Found by printing the snapshot rather
+        // than by assuming the counter was wrong.
+        let emitted = snapshotter.snapshot().into_vec();
+        let counted = |want: &str| {
+            emitted.iter().any(|(key, _, _, value)| {
+                key.key().name() == CACHE
+                    && key
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == want)
+                    && matches!(
+                        value,
+                        metrics_util::debugging::DebugValue::Counter(n) if *n >= 1
+                    )
+            })
+        };
+        assert!(counted("miss"), "the cold lookup must be counted as a miss");
+        assert!(counted("hit"), "the served lookup must be counted as a hit");
+    }
+
+    #[test]
+    fn the_ttl_is_read_from_the_environment_and_a_bad_one_fails_boot() {
+        assert_eq!(
+            Credentials::from_lookup(env(&[]))
+                .expect("an unset environment takes the default")
+                .ttl(),
+            Duration::from_secs(DEFAULT_TTL_SECONDS)
+        );
+        assert_eq!(
+            Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "7")]))
+                .expect("seven seconds is usable")
+                .ttl(),
+            Duration::from_secs(7)
+        );
+        assert!(Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "0")]))
+            .expect("zero is the documented way to disable the cache")
+            .ttl()
+            .is_zero());
+
+        // AN EMPTY VALUE IS SET-BUT-USELESS, which a manifest reaches by
+        // `value: ""`. It reads as unset rather than as an error — the same rule
+        // `main.rs` applies to YADGAR_VALKEY_ADDR.
+        assert_eq!(
+            Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "")]))
+                .expect("an empty value is unset")
+                .ttl(),
+            Duration::from_secs(DEFAULT_TTL_SECONDS)
+        );
+
+        // A NUMBER NOBODY CAN READ MUST NOT BECOME THE DEFAULT. Substituting one
+        // leaves an operator believing a bound that is not in force — `main.rs`
+        // already applies this rule to YADGAR_RATE_LIMIT_TIMEOUT_MS.
+        for bad in ["30s", "thirty", "-1", "1.5"] {
+            assert!(
+                Credentials::from_lookup(env(&[(CREDENTIAL_TTL, bad)])).is_err(),
+                "{bad:?} must not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ttl_above_the_ceiling_is_refused_because_nothing_else_bounds_revocation() {
+        // MUTATION THIS CATCHES: clamping instead of refusing. A clamp reads as
+        // accepted, so an operator who wrote 3600 believes they got it — and the
+        // one number that decides how long a revoked credential keeps working is
+        // then a number nobody agreed on.
+        assert!(
+            Credentials::from_lookup(env(&[(CREDENTIAL_TTL, &MAX_TTL_SECONDS.to_string())]))
+                .is_ok(),
+            "the ceiling itself is usable"
+        );
+        let err = Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "3600")]))
+            .expect_err("an hour-long revocation window must not be accepted silently");
+        assert!(
+            err.contains("457"),
+            "the message must name the ledger task that closes the gap: {err}"
         );
     }
 }

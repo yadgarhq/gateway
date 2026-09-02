@@ -77,6 +77,15 @@ spec:
               value: {{ .Values.iam.host | quote }}
             - name: IAM_PORT
               value: {{ .Values.iam.port | quote }}
+            # D72. How long one resolved credential is reused before iam is asked
+            # again. SET UNCONDITIONALLY rather than only when it differs from the
+            # binary's default: this is the only bound on how long a revoked
+            # credential keeps working while nothing publishes the invalidation
+            # event (ADR-0491, ledger 457), and a security bound that is present in
+            # the manifest can be read off the running pod. Set it to 0 to disable
+            # the cache and go back to a round trip per call. See values.yaml.
+            - name: YADGAR_CREDENTIAL_TTL_SECONDS
+              value: {{ .Values.credentialCache.ttlSeconds | quote }}
             # D74. The ADDRESS is required and gateway exits without it: a
             # gateway with nowhere to keep its buckets enforces no capacity
             # limit at all, and that is a deployment mistake rather than an

@@ -85,7 +85,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` is what `#[tokio::test(start_paused = true)]` and
+# `tokio::time::advance` need, and it is the only way to prove a cached credential
+# EXPIRES without a test that sleeps for the TTL. A DEV-dependency rather than a
+# feature on the real one, for the same reason `router` below is: the v2 resolver
+# keeps dev-dependency features out of a normal build, so the shipped binary
+# carries no test clock. Both entries resolve to one crate version.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 # `Server::add_service`, so a TEST can answer as `iam`. Without one the only
 # reachable outcomes on the attested path are "no credential" and "the transport
 # failed" — and the answer `iam` gives as `Ok` with an empty `user_id`, for a token
