@@ -19,7 +19,7 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use yadgar_gateway::attest::Attestation;
-use yadgar_gateway::http::{router, AppState};
+use yadgar_gateway::http::{router, AppState, CredentialLimits};
 use yadgar_gateway::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 
 fn state() -> Arc<AppState> {
@@ -44,6 +44,21 @@ fn state() -> Arc<AppState> {
         )
         .expect("limiter"),
         allowed_origins: Vec::new(),
+        // UNDECLARED, the shipped default. Nothing here posts to a credential
+        // endpoint, and `oneshot` supplies no peer address anyway, so the guard
+        // finds no key and spends nothing — which is what keeps this file
+        // measuring instrumentation.
+        trust: yadgar_gateway::source::TrustBoundary::Undeclared,
+        credential_limits: CredentialLimits {
+            attributed: yadgar_gateway::limit::Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+            unattributed: yadgar_gateway::limit::Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
     })
 }
 

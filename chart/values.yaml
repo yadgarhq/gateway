@@ -342,3 +342,92 @@ gateway:
   name: edge
   listener: https
   hostname: gateway.yadgar.internal
+
+# WHERE A REQUEST CAME FROM, and whether this deployment can vouch for it
+# (ADR-0491, D80).
+#
+# ADR-0491 requires a source address on every authentication event including
+# failures, "read from X-Forwarded-For and trusted only from the known proxy".
+# This block is where the known proxy is declared, and it is the only place.
+sourceAddress:
+  # HOW MANY PROXIES APPEND TO `X-Forwarded-For` between a client and this
+  # gateway. The gateway reads the entry that many places from the RIGHT — each
+  # proxy appends the address it saw, so the rightmost entry is the one the hop
+  # nearest this gateway wrote, and everything to the left of the declared depth
+  # is text the caller could have sent.
+  #
+  #   ""  unknown; the shipped default. See below.
+  #   "0" this gateway is exposed directly, so the peer address IS the client's.
+  #   "1" one ingress in front. This is the usual answer.
+  #   "2" an ingress behind a cloud load balancer that also appends.
+  #
+  # THE DEFAULT REFUSES, and this is the one place where the safe default and the
+  # convenient default point opposite ways. Unset means UNKNOWN, and an unknown
+  # address is recorded as NOTHING rather than guessed from the header — because
+  # the naive guess is the LEFTMOST entry, and that is precisely the entry the
+  # caller controls. An audit record carrying a forged address is worse than one
+  # carrying none: the empty field is honestly empty, the forged one reads as
+  # evidence.
+  #
+  # WHAT LEAVING IT UNSET COSTS, stated plainly rather than left to be
+  # discovered. Two things, and neither is an outage:
+  #   1. Authentication events carry no source address at all.
+  #   2. /auth/login and /auth/enrol are bounded per OBSERVED HOP instead of per
+  #      client — behind an ingress that is ONE bucket shared by everybody, so
+  #      credentialLimits.unattributed below applies rather than
+  #      credentialLimits.attributed.
+  #
+  # A HOP COUNT AND NOT AN INGRESS RESOURCE (D80). An earlier revision of this
+  # work prescribed an Envoy Gateway ClientTrafficPolicy and was retracted: it
+  # would make the integrity of an audit record a property of running Envoy, and
+  # yadgar must run on EKS, AKS, GKE and behind NGINX, Traefik, HAProxy, an ALB
+  # or an Application Gateway. Every ingress worth deploying behind appends to
+  # this header; what differs is only how many entries it adds. That difference
+  # is the number here, declared once for whichever ingress you run.
+  #
+  # TRUSTED RANGES ARE NOT AN OPTION HERE, deliberately. A CIDR list answers the
+  # same question this number answers, at the cost of a parser and a second way
+  # to configure one property. If a deployment appears whose chain depth is not
+  # constant, that is when to add it — and not before.
+  #
+  # A VALUE THAT IS NOT A WHOLE NUMBER IS A BOOT FAILURE, not a fall back to the
+  # default. The default refuses, so a typo silently taken would look exactly
+  # like a deployment that never configured this, and the operator who set it
+  # would never learn their audit records carry no address.
+  trustedProxyHops: ""
+
+# WHAT BOUNDS THE TWO UNAUTHENTICATED ENDPOINTS (ledger 497).
+#
+# /auth/login and /auth/enrol are the only surfaces a stranger reaches with no
+# credential, and each costs `iam` a full Argon2id verification whether or not
+# the username exists — it is required to, so that timing cannot enumerate
+# accounts. So they are a password-guessing surface AND a CPU amplifier.
+#
+# D74'S BUCKETS CANNOT COVER THEM. Those key on (user, module, kind), and a login
+# has no user until it succeeds. These bucket on the SOURCE ADDRESS instead, in
+# their own key space, with their own rates — the numbers below.
+#
+# `<rate>:<burst>`, the same spelling rateLimit above uses: `rate` is the
+# sustained refill per second and `burst` is the bucket's size.
+credentialLimits:
+  # PER CLIENT, and only reachable once sourceAddress.trustedProxyHops is set.
+  # This is the GUESS-PREVENTION number, sized for a person typing a password: a
+  # handful of attempts at once, then one every five seconds. Nobody types faster
+  # than this; a guesser is held to about 17,000 attempts a day from one address,
+  # each against an Argon2id hash.
+  attributed: "0.2:10"
+  # PER OBSERVED HOP, which is what applies while no trust boundary is declared.
+  # Behind an ingress that is ONE address for every caller in the installation,
+  # so this bucket is shared by everybody.
+  #
+  # DELIBERATELY LOOSE, AND IT IS A DIFFERENT CONTROL RATHER THAN A WEAKER ONE.
+  # Putting the guess-prevention number above on a shared key would let one
+  # attacker at that rate refuse every login for everybody — a limiter that is
+  # itself the outage. So this one bounds the OTHER half of the exposure: the
+  # Argon2id CPU an unauthenticated stranger can spend. At ~50ms per attempt in
+  # `iam`, 10/s is about half a core's worth of hashing, which is a bound rather
+  # than a barrier.
+  #
+  # GUESS PREVENTION ARRIVES WHEN YOU DECLARE THE BOUNDARY. If that matters to
+  # your deployment, set sourceAddress.trustedProxyHops.
+  unattributed: "10:100"

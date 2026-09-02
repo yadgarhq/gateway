@@ -11,6 +11,7 @@
 //! status indistinguishable from the rest. [`opaque_status`] IS that rule, in one
 //! function, because it is the security property rather than a mapping table.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::{
@@ -27,12 +28,13 @@ use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::attest::{self, Attestation, Claimed, Credentials};
-use crate::limit::{Decision, Limiter};
+use crate::limit::{Bucket, Decision, Limiter};
 use crate::mcp::{self, codes, headers, meta_keys};
 use crate::pb::yadgar::common::v1::Idempotency;
 use crate::pb::yadgar::iam::v1::{
     iam_service_client::IamServiceClient, LoginRequest, RedeemEnrolmentRequest,
 };
+use crate::source::{PeerAddr, Source, TrustBoundary};
 use crate::tools;
 
 const SERVICE: &str = "gateway";
@@ -48,6 +50,14 @@ const TOOLS_LIST: &str = "tools/list";
 /// the two above.
 const AUTH_LOGIN: &str = "auth/login";
 const AUTH_ENROL: &str = "auth/enrol";
+/// The `module` dimension the credential endpoints report under.
+///
+/// A FOURTH VALUE in an existing closed set rather than a new series: `degraded`
+/// is already labelled `(service, tool, reason, outcome)` plus a module, and these
+/// two paths degrade for exactly the reasons a `tools/call` does. One value for
+/// both, because the operator's question — "is the cache answering?" — is the
+/// same for both and splitting it would halve every count.
+const AUTH_MODULE: &str = "auth";
 
 /// How long an unauthenticated request waits on `iam` before being answered
 /// without it.
@@ -88,6 +98,71 @@ pub struct AppState {
     /// browser origin is accepted at all, which is the correct default for a
     /// server whose clients are agents.
     pub allowed_origins: Vec<String>,
+    /// How many proxies stand in front, as this deployment declares it (D80,
+    /// ADR-0491). `Undeclared` is the default and it REFUSES — see
+    /// [`crate::source`].
+    pub trust: TrustBoundary,
+    /// What bounds the two unauthenticated endpoints (task 497). See
+    /// [`CredentialLimits`].
+    pub credential_limits: CredentialLimits,
+}
+
+/// The two buckets that bound `/auth/login` and `/auth/enrol` (task 497).
+///
+/// # Why TWO numbers rather than one
+///
+/// The bucket is keyed on a source address, and how much that address is WORTH
+/// depends on whether this deployment can attribute it. Those are two different
+/// controls wearing one mechanism, and giving them one rate makes whichever
+/// deployment you did not think about wrong:
+///
+/// - **Attributed** — the trust boundary is declared and was met, so the key
+///   names one client. The bucket's job is GUESS PREVENTION, and it is sized
+///   for a person typing a password: a handful at once and then slowly.
+/// - **Unattributed** — the boundary is undeclared, or a request did not arrive
+///   through the declared chain, so the key names the nearest hop this process
+///   saw. Behind an ingress that is ONE address for every caller in the
+///   installation. A guess-prevention rate here would let one attacker at that
+///   rate refuse every login for everybody — a limiter that is itself the
+///   outage. So this bucket's job is the OTHER half of 497: bounding the
+///   Argon2id CPU an unauthenticated stranger can spend, which `iam` pays per
+///   attempt whether or not the username exists. It is sized against a core, not
+///   against a guesser.
+///
+/// **Guess prevention arrives when the operator declares the boundary**, and that
+/// is the honest statement of what an undeclared deployment gets. It is not a
+/// weaker version of the same control; it is the other control. Saying so here
+/// rather than letting a reader infer it from two numbers is the point of this
+/// type existing at all.
+#[derive(Debug, Clone, Copy)]
+pub struct CredentialLimits {
+    /// Per attributable CLIENT address.
+    pub attributed: Bucket,
+    /// Per OBSERVED hop, which behind a proxy is shared by everyone.
+    pub unattributed: Bucket,
+}
+
+impl CredentialLimits {
+    /// The shipped default for [`Self::attributed`].
+    ///
+    /// Sized for a person typing a password: ten at once, then one every five
+    /// seconds. Nobody types faster; a guesser is held to roughly 17,000 attempts
+    /// a day from one address, each against an Argon2id hash.
+    ///
+    /// **A CONSTANT RATHER THAN A LITERAL IN `main`, so a test can reach it.** A
+    /// shipped default that fails `Bucket::parse` is a pod that exits at boot for
+    /// a value nobody chose — the exact failure this whole configuration story
+    /// exists to prevent, in the one place no test would otherwise look, because
+    /// `cargo test` never calls `main`.
+    pub const DEFAULT_ATTRIBUTED: &'static str = "0.2:10";
+
+    /// The shipped default for [`Self::unattributed`], reachable for
+    /// [`Self::DEFAULT_ATTRIBUTED`]'s reason.
+    ///
+    /// Sized against a core rather than against a guesser — see this type's own
+    /// comment. `iam` spends ~50ms on Argon2id per attempt, so 10/s is about half
+    /// a core's worth of hashing.
+    pub const DEFAULT_UNATTRIBUTED: &'static str = "10:100";
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -150,7 +225,15 @@ async fn method_not_allowed() -> Response {
 /// raised before the request is sent, so they describe THIS server's reading of
 /// the caller's own JSON and can disclose nothing about a password nobody has
 /// checked yet.
-async fn login(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn login(
+    State(state): State<Arc<AppState>>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = guard(&state, AUTH_LOGIN, peer, &headers).await {
+        return refusal;
+    }
     // Started before the work, and NOT carrying an identity: nothing has been
     // attested on this path — the caller is proving who it is, which is the
     // request rather than a fact about it. Putting the submitted username in the
@@ -279,7 +362,19 @@ async fn login(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
 /// the contract returns it because a person enrolling on their first machine
 /// otherwise has to be told their username separately — "a second artefact to
 /// lose, which is the exact failure the token's design exists to remove".
-async fn enrol(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+async fn enrol(
+    State(state): State<Arc<AppState>>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // THE SAME GUARD AS `login`, and for a stronger reason than symmetry: this
+    // path pays TWO Argon2id operations per attempt rather than one — the
+    // contract requires the refusal to cost what the success costs — so it is the
+    // cheaper of the two surfaces to amplify with.
+    if let Some(refusal) = guard(&state, AUTH_ENROL, peer, &headers).await {
+        return refusal;
+    }
     // NOT carrying an identity, for the same reason `login`'s does not: nothing
     // has been attested, and the person does not have a user id yet at all.
     let call = Call::start(SERVICE, AUTH_ENROL, Kind::Write, tel(crate::request_id()));
@@ -413,6 +508,153 @@ fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
     // plausible-looking "fix" that would accept every origin in the default
     // configuration, and it would pass a suite that only tested a populated list.
     state.allowed_origins.iter().any(|a| a == origin)
+}
+
+/// What both unauthenticated endpoints pass before they read a body (task 497).
+///
+/// `Some` is a response the caller must be sent; `None` means carry on.
+///
+/// # Everything decided here is decided WITHOUT the body, and that is the point
+///
+/// **The response-time floor in `iam` must survive this, and it does.** `iam`
+/// holds `Login` and `RedeemEnrolment` to `LOGIN_RESPONSE_FLOOR_MS` and
+/// `REDEEM_RESPONSE_FLOOR_MS` so a failure and a success take the same time. A
+/// gateway refusal that returned EARLY would reintroduce exactly the timing
+/// oracle that floor removes — IF what it varied with were a credential.
+///
+/// It is not, and the ordering is what makes that structural rather than argued.
+/// This runs before `serde_json::from_slice`, so where the decision is made the
+/// username and the password are still unparsed bytes: there is no credential in
+/// scope that the outcome COULD depend on. That is why this is a function called
+/// first rather than a check folded into the handler once the fields are read —
+/// the property survives a later rewrite of either handler, because a rewrite
+/// would have to move this call to break it.
+///
+/// So a throttled request is fast, a real attempt is floored, and the difference
+/// between them names an ADDRESS's budget rather than an account's existence. An
+/// attacker who learns they are throttled learns only what they already knew.
+///
+/// **A per-username lockout would NOT have this property**, which is one of the
+/// two reasons there is not one here: its answer is a function of the username,
+/// so returning early on a locked account tells a stranger which usernames exist
+/// — the oracle the floor exists to close, reopened one layer up. Any lockout has
+/// to be paid BEHIND the floor, inside `iam`.
+async fn guard(
+    state: &AppState,
+    endpoint: &'static str,
+    peer: Option<IpAddr>,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    // FIRST, because it is a header comparison and the throttle is a round trip
+    // to the shared cache — and because it is the check that closes the cheapest
+    // way to get address diversity.
+    //
+    // **THIS ROUTE DID NOT RUN IT, AND THAT MATTERED MORE THAN IT LOOKED.**
+    // `origin_ok` lives inside `handle`, not in a layer, so `/auth/login` and
+    // `/auth/enrol` never inherited it. The omission was justified with "yaadgaar
+    // is not a browser", which answers the wrong threat: the page driving the
+    // browser is the ATTACKER's, not the client's. `axum-core`'s
+    // `impl FromRequest for Bytes` performs no `Content-Type` check, so a
+    // cross-origin CORS SIMPLE request carrying `text/plain` and a JSON body is
+    // delivered and processed with no preflight. The attacker cannot read the
+    // response — no CORS headers come back — but the RPC fires and `iam` spends a
+    // full Argon2id verification.
+    //
+    // **It is the throttle below that this actually protects.** What the browser
+    // vector buys an attacker is not volume, which curl gives them anyway; it is
+    // SOURCE-ADDRESS DIVERSITY — every visitor to their page becomes a distinct
+    // address, and a limiter keyed on an address is defeated by a mechanism that
+    // costs them nothing. Closing the browser path is what lets the bucket below
+    // be worth having.
+    //
+    // Legitimate clients pay nothing: a non-browser client sends no `Origin`, and
+    // `origin_ok` allows an absent one.
+    if !origin_ok(state, headers) {
+        Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id())).fail("FORBIDDEN");
+        return Some(text(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"origin not allowed"}"#,
+        ));
+    }
+
+    let source = Source::resolve(state.trust, peer, headers);
+    // NO ADDRESS AT ALL, so there is no key and nothing to spend. In this binary
+    // that is reachable only where the server was not wired with `ConnectInfo` —
+    // a test driving `router` directly — because `main` always wires it. It is
+    // `None` rather than a refusal so the absence stays visible as absence: an
+    // address this process never had is not a caller's doing.
+    let addr = source.key()?;
+    let bucket = match source {
+        // See `CredentialLimits`: which of the two applies is decided by whether
+        // the address names a client or the hop in front of everybody.
+        Source::Attributed(_) => state.credential_limits.attributed,
+        Source::Observed(_) | Source::Unknown => state.credential_limits.unattributed,
+    };
+
+    match state.limiter.check_source(addr, endpoint, bucket).await {
+        Decision::Allowed => None,
+        Decision::Throttled { retry_after } => Some(too_many(endpoint, retry_after)),
+        Decision::Degraded(why) => {
+            degraded(endpoint, AUTH_MODULE, why, "allowed");
+            None
+        }
+        Decision::DegradedThrottled {
+            reason,
+            retry_after,
+        } => {
+            degraded(endpoint, AUTH_MODULE, reason, "throttled");
+            Some(too_many(endpoint, retry_after))
+        }
+        // A 503 AND NOT A 429, for `throttled`'s reason: nothing the caller does
+        // changes it. The message says nothing an unauthenticated stranger could
+        // use — the operator-facing detail is in the counter and the log line
+        // `degraded` writes.
+        Decision::Unauthenticated => {
+            degraded(
+                endpoint,
+                AUTH_MODULE,
+                crate::limit::Degrade::Unauthenticated,
+                "refused",
+            );
+            Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id())).fail("INTERNAL");
+            Some(text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"login is unavailable"}"#,
+            ))
+        }
+    }
+}
+
+/// The 429 both credential endpoints answer with.
+///
+/// **OPAQUE, and deliberately more so than [`refusal`].** That one names the
+/// module and the kind because it answers an ATTESTED caller who is entitled to
+/// know which of their own budgets is empty. This one answers a stranger: naming
+/// the address, the bucket or which endpoint's budget ran out would tell them
+/// how the limiter is keyed, which is the first thing anyone trying to evade it
+/// wants. The `Retry-After` is the whole of the useful content.
+fn too_many(endpoint: &'static str, retry_after: std::time::Duration) -> Response {
+    // A throttled call is a call, for the reason `tools_call` gives: without a
+    // record a throttling storm is indistinguishable from silence. NO ADDRESS
+    // rides on it — ADR-0491 puts a source address in the audit store and only
+    // there, and this is the telemetry store.
+    Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id()))
+        .fail("RESOURCE_EXHAUSTED");
+    // WHOLE SECONDS (RFC 9110) and never zero, for `refusal`'s reason: `0` reads
+    // as "retry immediately", which is the herd this exists to avoid.
+    let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json"),
+            (
+                axum::http::header::RETRY_AFTER,
+                seconds.to_string().as_str(),
+            ),
+        ],
+        r#"{"error":"too many attempts"}"#.to_string(),
+    )
+        .into_response()
 }
 
 /// A header as text, with ABSENT AND UNREADABLE COLLAPSED INTO ONE ANSWER.

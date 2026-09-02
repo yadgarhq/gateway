@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -143,6 +144,30 @@ const KEY_TTL_SECONDS: f64 = 3600.0;
 /// accepted posture — "capacity protection, not authorisation" — and
 /// `tests/rate_limit.rs` asserts it so it stays a decision rather than an
 /// assumption.
+/// The same digest, over a source address (task 497, ADR-0491).
+///
+/// **THROUGH [`user_component`] DELIBERATELY, RATHER THAN A SECOND HASH.** One
+/// digest means one place the truncation width is chosen, and the collision
+/// argument on that function — 128 bits leaves collision by accident out of
+/// reach — is the argument this needs too.
+///
+/// The SIZE half of that comment does not apply: an `IpAddr` renders to at most
+/// 45 characters, so nothing here needs bounding. The reason to hash anyway is
+/// the other half. ADR-0491 records a source address in the audit store and only
+/// there, and D21 puts one Valkey behind the whole system: a plaintext address in
+/// a key would put it somewhere ADR-0491 does not allow it, readable by every
+/// other tenant of that cache.
+///
+/// **The rotation residual on [`user_component`] does NOT carry over, which is
+/// the point of keying here at all.** A caller rotating a user id mints a bucket
+/// per id and escapes. It cannot rotate this: the value comes from the socket, or
+/// from the entry a TRUSTED hop appended — `source::Source` never derives it from
+/// text the caller wrote. That is what makes an address a usable key where an id
+/// is not.
+fn address_component(addr: IpAddr) -> String {
+    user_component(&addr.to_string())
+}
+
 fn user_component(user_id: &str) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(user_id.as_bytes());
@@ -165,6 +190,18 @@ pub struct Bucket {
 }
 
 impl Bucket {
+    /// Read one `<rate>:<burst>` on its own.
+    ///
+    /// [`Limits::parse`] reads the same spelling inside a `<module>.<kind>=` list;
+    /// this is the bare form, for a bucket that is not keyed on `(module, kind)`
+    /// at all — see [`Limiter::check_source`]. It goes through the SAME
+    /// [`parse_bucket`], so a rate of zero, a negative burst and a window longer
+    /// than a key's life are refused here exactly as they are there, rather than
+    /// through a second set of rules that could drift.
+    pub fn parse(spec: &str) -> Result<Self, ConfigError> {
+        parse_bucket(spec, spec)
+    }
+
     /// How long this bucket takes to refill from empty.
     ///
     /// **This used to be the key's TTL, and that was wrong.** The reasoning is on
@@ -851,7 +888,52 @@ impl Limiter {
             user_component(user_id),
             kind_str(kind)
         );
-        let reason = match tokio::time::timeout(self.timeout, self.spend(&key, bucket)).await {
+        self.decide(&key, bucket).await
+    }
+
+    /// Spend one token from a bucket keyed on a SOURCE ADDRESS rather than on a
+    /// user (task 497).
+    ///
+    /// # Why this is not [`Self::check`] with an address in the id slot
+    ///
+    /// [`user_component`] takes an arbitrary `&str`, so an address would hash
+    /// through it without complaint — and the result would not be a fix. Two
+    /// things make this a different mechanism rather than a different argument:
+    ///
+    /// 1. **[`Limits::effective`] draws the bucket from `(module, kind)` only.**
+    ///    An address-keyed bucket routed through it would inherit a rate designed
+    ///    for a user's tool calls, which is a number chosen for a different
+    ///    question. So `bucket` is a PARAMETER here: the caller states the rate
+    ///    belonging to the thing it is bounding, and `http` picks it from whether
+    ///    the address is attributable at all.
+    /// 2. **The key space is separate.** `PREFIX:{user}:...` and
+    ///    `PREFIX:src:{addr}:...` cannot collide, so a person's tool-call budget
+    ///    and an address's login budget are never the same bucket.
+    ///
+    /// `endpoint` is `&'static str` and a closed set, for [`kind_str`]'s reason: a
+    /// key component a caller could choose is a bucket a caller can mint.
+    ///
+    /// **The address reaches the KEY and nothing else — hashed, and never a log
+    /// line or a metric label.** ADR-0491 puts a source address in the audit store
+    /// and ONLY there; the shared cache is neither, and D21 puts four other
+    /// subsystems in it. See [`address_component`].
+    pub async fn check_source(
+        &self,
+        addr: IpAddr,
+        endpoint: &'static str,
+        bucket: Bucket,
+    ) -> Decision {
+        let key = format!("{PREFIX}:src:{}:{endpoint}", address_component(addr));
+        self.decide(&key, bucket).await
+    }
+
+    /// Everything both entry points do once the key and the bucket are known.
+    ///
+    /// Split out so the degrade taxonomy, the [`Decision::Unauthenticated`] short
+    /// circuit and the floor are decided in ONE place. Two copies would be two
+    /// places for the ordering that decision depends on to drift apart.
+    async fn decide(&self, key: &str, bucket: Bucket) -> Decision {
+        let reason = match tokio::time::timeout(self.timeout, self.spend(key, bucket)).await {
             Ok(Ok(decision)) => return decision,
             Ok(Err(degrade)) => degrade,
             // TIMED OUT, and the reason it timed out decides the label. A Valkey
@@ -872,7 +954,7 @@ impl Limiter {
         }
         // DEGRADED, AND FLOORED. The call proceeds on this replica's own share
         // rather than unlimited — the argument is on `Decision::Degraded`.
-        match self.floor.check(&key, bucket, Instant::now()) {
+        match self.floor.check(key, bucket, Instant::now()) {
             Ok(()) => Decision::Degraded(reason),
             Err(retry_after) => Decision::DegradedThrottled {
                 reason,

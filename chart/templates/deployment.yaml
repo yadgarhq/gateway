@@ -182,6 +182,23 @@ spec:
             # them gets edited.
             - name: YADGAR_MAX_REPLICAS
               value: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas | quote }}{{ else }}{{ .Values.replicaCount | quote }}{{ end }}
+            # HOW MANY PROXIES STAND IN FRONT (ADR-0491, D80). ALWAYS RENDERED,
+            # even when empty — unlike the optional Secrets above, and for the
+            # opposite reason. An empty value is a real instruction here: it says
+            # nobody knows, and gateway then records no source address at all and
+            # bounds the credential endpoints per observed hop. Rendering it
+            # unconditionally means `kubectl describe pod` answers the question
+            # "does this deployment attribute addresses?" without anyone having to
+            # know which branch of a template ran.
+            - name: YADGAR_TRUSTED_PROXY_HOPS
+              value: {{ .Values.sourceAddress.trustedProxyHops | quote }}
+            # The two buckets bounding /auth/login and /auth/enrol (ledger 497).
+            # SEPARATE FROM YADGAR_RATE_LIMITS above, because D74's buckets key on
+            # a user and a login has none yet — see values.yaml.
+            - name: YADGAR_LOGIN_RATE_LIMIT
+              value: {{ .Values.credentialLimits.attributed | quote }}
+            - name: YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT
+              value: {{ .Values.credentialLimits.unattributed | quote }}
             # No default here (see main.rs / from_default_env): unset means
             # silent, which is the exact failure this line exists to prevent.
             - name: RUST_LOG
