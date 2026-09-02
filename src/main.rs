@@ -136,13 +136,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              floor this gateway falls back to while the shared cache cannot answer (D74). The \
              chart wires it from autoscaling.maxReplicas.",
         )?;
-    let limiter = Limiter::new(&valkey_addr, limits, limit_timeout, max_replicas)?;
+    // The cache's `requirepass`, as a PATH rather than a value — the same shape
+    // every other credential in this chart uses, and for the same reason: a
+    // deployment that is not the reference one assembles the Secret by hand and
+    // neither the chart nor this binary can tell the difference (D80).
+    //
+    // ABSENCE IS THE DEFAULT, AND IT IS A REAL STATE. Unset means the cache asks
+    // for no password, which is what every deployment of this before today was,
+    // and it dials exactly as it always did. That is what lets this image be
+    // rolled BEFORE the cache gains a password rather than in lockstep with it.
+    //
+    // SET-BUT-UNUSABLE IS A BOOT FAILURE, naming the path. It is the same rule
+    // TASK_TLS_CA_FILE and iam's LISTEN_TLS_CERT_FILE already apply: a deployment
+    // that asked for a credential and cannot produce one has a mistake in it, and
+    // continuing without the credential would be the silent fall back to an
+    // unauthenticated connection this whole change exists to remove. An EMPTY
+    // file counts as unusable — a Secret whose key is present and blank is the
+    // ordinary way this goes wrong, and `AUTH ""` is not authentication.
+    //
+    // **The other half of "never falls back" is at runtime and not here**, because
+    // it cannot be here: this process does no I/O to the cache at boot, on purpose
+    // (`Limiter::conn`), so nothing at boot can know whether the cache demands a
+    // password. A cache that demands one this process cannot satisfy is refused at
+    // the first call instead — see `limit::Decision::Unauthenticated`, which
+    // deliberately does NOT take the fail-open floor an unreachable cache takes.
+    let valkey_password = match std::env::var("YADGAR_VALKEY_PASSWORD_FILE") {
+        Err(_) => None,
+        Ok(path) if path.is_empty() => None,
+        Ok(path) => {
+            let raw = std::fs::read_to_string(&path).map_err(|e| {
+                format!(
+                    "YADGAR_VALKEY_PASSWORD_FILE names {path}, which cannot be read: {e}. It is \
+                     the password this gateway presents to the shared cache (D21/D74). Refusing \
+                     to start rather than dialling the cache without one."
+                )
+            })?;
+            // TRAILING NEWLINE ONLY, and this is not tidiness. `kubectl create
+            // secret --from-file` of a file a person edited keeps the newline
+            // their editor added, and a password with a `\n` on the end is a
+            // different password — one that fails against a `requirepass` set
+            // from the same 1Password item, as a WRONGPASS nobody can see. Inner
+            // whitespace is left alone: it is a legitimate part of a password.
+            let password = raw.trim_end_matches(['\n', '\r']).to_string();
+            if password.is_empty() {
+                return Err(format!(
+                    "YADGAR_VALKEY_PASSWORD_FILE names {path}, which is empty. A blank password \
+                     is not one, and `AUTH \"\"` is not authentication. Either put the cache's \
+                     requirepass in that file or unset the variable, which is how a deployment \
+                     says the cache asks for none."
+                )
+                .into());
+            }
+            Some(password)
+        }
+    };
+    let limiter = Limiter::new(
+        &valkey_addr,
+        valkey_password.as_deref(),
+        limits,
+        limit_timeout,
+        max_replicas,
+    )?;
     tracing::info!(
         addr = %valkey_addr,
         timeout_ms = limit_timeout.as_millis(),
         max_replicas,
+        // WHETHER, never WHAT. The value is a credential and this log is shipped.
+        authenticated = valkey_password.is_some(),
         "rate limiting enabled (D74)"
     );
+    if valkey_password.is_none() {
+        // A WARNING RATHER THAN A REFUSAL, because it is the state every
+        // deployment is in until the cache gains a password, and refusing here
+        // would make this image unrollable before the manifest that gives the
+        // cache one. It is loud because the property it names is one somebody
+        // must positively choose to leave off.
+        tracing::warn!(
+            "the connection to the shared cache is UNAUTHENTICATED: no \
+             YADGAR_VALKEY_PASSWORD_FILE is configured, so anything on the pod network can read \
+             and rewrite D74's token buckets. Set requirepass on the cache and mount its Secret."
+        );
+    }
 
     // OPT-IN, OFF unless a deployment asks for it, and read PER UPSTREAM so the
     // two can be cut over one at a time. Nothing configured means the cleartext

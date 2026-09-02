@@ -1,4 +1,4 @@
-//! Shared by the two test binaries that need a real Valkey.
+//! Shared by the test binaries that need a real Valkey.
 //!
 //! `tests/common/` rather than a third `tests/*.rs`: cargo compiles every file
 //! directly under `tests/` into its own binary, and a subdirectory module is the
@@ -72,9 +72,9 @@ pub fn skipped(what: &str) {
     let _ = err.flush();
 }
 
-/// These run in BOTH test binaries, because this module is compiled into each.
-/// That is the cost of `tests/common/`, and it is two duplicated test names
-/// rather than two duplicated behaviours.
+/// These run in EVERY test binary that includes this module, because it is
+/// compiled into each. That is the cost of `tests/common/`, and it is a repeated
+/// test name rather than a repeated behaviour.
 mod gate {
     use super::resolve;
 

@@ -20,6 +20,19 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
     spec:
+      # ITS OWN, rather than the namespace's `default` (ledger 511). Every pod
+      # gets a ServiceAccount whether or not anybody names one, so the choice is
+      # never "an identity or none" — it is "an identity this workload owns, or
+      # the one every unnamed workload in the namespace shares". A shared identity
+      # cannot be granted a permission without granting it to all of them.
+      serviceAccountName: {{ .Chart.Name }}
+      # NO KUBERNETES API TOKEN IN THE POD. `gateway` never calls the API server:
+      # it serves MCP over HTTP and dials `task` and `iam` over gRPC. Mounting a
+      # token it does not use hands a credential to anything that reaches the
+      # filesystem — including the audience-bound token an SSRF can be pointed at.
+      # Set here as well as on the ServiceAccount because the pod spec wins, and
+      # the pod spec is what a reader of this file sees.
+      automountServiceAccountToken: false
       # POD-level, and distinct from the container block below. Setting only the
       # container context leaves the pod admitting root — runAsNonRoot is the
       # assertion that actually refuses an image which would run as one, rather
@@ -140,6 +153,25 @@ spec:
               value: {{ .Values.rateLimit.default | quote }}
             - name: YADGAR_RATE_LIMIT_TIMEOUT_MS
               value: {{ .Values.rateLimit.timeoutMs | quote }}
+            {{- if .Values.rateLimit.passwordSecret }}
+            # RENDERED ONLY WHEN THE CACHE ASKS FOR A PASSWORD, so a deployment
+            # that has not cut over sends the binary nothing at all and dials the
+            # cache exactly as it always did. The same shape as `task.tls` above:
+            # absence is the default and the Secret is the whole of the lever.
+            #
+            # A PATH, never the value (D80). A password in the environment is a
+            # password in `kubectl describe pod`; a file is readable only inside
+            # the container.
+            #
+            # THERE IS NO SILENT MIDDLE STATE. A path that names no readable,
+            # non-empty file fails the pod at boot naming the path — gateway never
+            # falls back to an unauthenticated connection. If the cache demands a
+            # password this pod cannot produce, the first call is REFUSED with a
+            # 503 rather than proceeding on the degraded floor an unreachable
+            # cache gets; see `limit::Decision::Unauthenticated`.
+            - name: YADGAR_VALKEY_PASSWORD_FILE
+              value: /var/run/secrets/valkey/password
+            {{- end }}
             # The DIVISOR of the degraded-mode floor, and required for the same
             # reason the address is. While Valkey cannot answer, each replica
             # holds callers to rate/this on its own; the aggregate bound that
@@ -180,8 +212,17 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled }}
+          {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret }}
           volumeMounts:
+            {{- if .Values.rateLimit.passwordSecret }}
+            # A DIRECTORY MOUNT, never subPath — the same rule the CA mounts
+            # below state. A subPath mount is a one-time copy kubelet never
+            # refreshes, so a rotated cache password would never reach this
+            # process and the pod would keep presenting the old one.
+            - name: valkey-password
+              mountPath: /var/run/secrets/valkey
+              readOnly: true
+            {{- end }}
             {{- if .Values.task.tls.enabled }}
             # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
             # copy that kubelet never refreshes, so the bundle would freeze at
@@ -200,8 +241,29 @@ spec:
               readOnly: true
             {{- end }}
           {{- end }}
-      {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled }}
+      {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret }}
       volumes:
+        {{- if .Values.rateLimit.passwordSecret }}
+        - name: valkey-password
+          secret:
+            secretName: {{ .Values.rateLimit.passwordSecret }}
+            # OPTIONAL, and it means what it means on the CA mounts below: the
+            # process MUST NOT START without the password, and optional is simply
+            # which error says so. A required mount that cannot be satisfied
+            # leaves the pod in ContainerCreating with a FailedMount event about a
+            # volume. An optional one mounts an empty directory, the binary finds
+            # no file at YADGAR_VALKEY_PASSWORD_FILE, and it exits naming THAT
+            # PATH. Neither starts; only one of them explains itself. There is no
+            # third outcome in which this pod dials the cache without a password
+            # it was told to present.
+            optional: true
+            # ONE KEY, renamed to the `password` the environment names above, so
+            # whatever the Secret's author called it does not have to travel into
+            # the binary's configuration.
+            items:
+              - key: {{ required "rateLimit.passwordSecretKey names the key inside rateLimit.passwordSecret that holds the cache password and must be set whenever rateLimit.passwordSecret is; see the chart's values.yaml" .Values.rateLimit.passwordSecretKey | quote }}
+                path: password
+        {{- end }}
         {{- if .Values.task.tls.enabled }}
         - name: task-ca
           secret:

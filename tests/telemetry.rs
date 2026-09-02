@@ -37,6 +37,7 @@ fn state() -> Arc<AppState> {
         // and the UNAUTHENTICATED record it asserts would never be emitted.
         limiter: yadgar_gateway::limit::Limiter::new(
             "127.0.0.1:1",
+            None,
             yadgar_gateway::limit::Limits::parse("task.write=1:1", "1:1").expect("limits"),
             std::time::Duration::from_millis(200),
             6,

@@ -179,20 +179,21 @@ does Argon2id work for anyone who can reach the port.
 
 ## Configuration
 
-| Variable                               | Default          |                                                                                                           |
-| -------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------- |
-| `LISTEN`                               | `0.0.0.0:8080`   | MCP endpoint                                                                                              |
-| `METRICS_LISTEN`                       | `0.0.0.0:9090`   | Prometheus                                                                                                |
-| `TASK_HOST` / `TASK_PORT`              | `task` / `50052` | the upstream module                                                                                       |
-| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | the whole credential lifecycle: `/auth/login`, `/auth/enrol` and attestation                              |
-| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`              |
-| `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents |
-| `YADGAR_VALKEY_ADDR`                   | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                         |
-| `YADGAR_RATE_LIMITS`                   | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                |
-| `YADGAR_RATE_LIMIT_DEFAULT`            | `10:100`         | the bucket for a `(module, kind)` nobody named                                                            |
-| `YADGAR_RATE_LIMIT_TIMEOUT_MS`         | `20`             | how long one bucket lookup may take before the call falls back to the local floor                         |
-| `YADGAR_MAX_REPLICAS`                  | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                      |
-| `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                             |
+| Variable                               | Default          |                                                                                                                                      |
+| -------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `LISTEN`                               | `0.0.0.0:8080`   | MCP endpoint                                                                                                                         |
+| `METRICS_LISTEN`                       | `0.0.0.0:9090`   | Prometheus                                                                                                                           |
+| `TASK_HOST` / `TASK_PORT`              | `task` / `50052` | the upstream module                                                                                                                  |
+| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | the whole credential lifecycle: `/auth/login`, `/auth/enrol` and attestation                                                         |
+| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`                                         |
+| `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents                            |
+| `YADGAR_VALKEY_ADDR`                   | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                                                    |
+| `YADGAR_RATE_LIMITS`                   | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                                           |
+| `YADGAR_RATE_LIMIT_DEFAULT`            | `10:100`         | the bucket for a `(module, kind)` nobody named                                                                                       |
+| `YADGAR_RATE_LIMIT_TIMEOUT_MS`         | `20`             | how long one bucket lookup may take before the call falls back to the local floor                                                    |
+| `YADGAR_MAX_REPLICAS`                  | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                                                 |
+| `YADGAR_VALKEY_PASSWORD_FILE`          | unset            | a FILE holding the cache's `requirepass`. Unset dials the cache unauthenticated and WARNs; set-but-unreadable or empty EXITS at boot |
+| `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                                                        |
 
 ## Rate limiting
 
@@ -228,13 +229,29 @@ posture — capacity protection, not authorisation.
 holds callers to `rate / YADGAR_MAX_REPLICAS` in process, so six replicas sum to
 the configured rate and never more. It is loud:
 `yadgar_gateway_rate_limit_degraded_total` counts every degraded call under
-`unreachable`, `timeout` or `error` and under whether the floor allowed or refused
-it, and a warning is logged. The argument is on `limit::Decision::Degraded`; the
+`unreachable`, `timeout`, `error` or `unauthenticated`, and under whether the
+outcome was `allowed`, `throttled` or `refused`, and a warning is logged. The argument is on `limit::Decision::Degraded`; the
 short form is that D74 calls this capacity protection rather than authorisation,
 and this Valkey is one replica with no persistence, so failing closed would make
 it a hard dependency of every call at the one hop all traffic already passes
 through — while failing open with no floor at all would leave the number
 unenforced for the length of the outage.
+
+**A cache that REFUSES this gateway's credential is the one case that does not
+proceed.** `YADGAR_VALKEY_PASSWORD_FILE` names a file holding the cache's
+`requirepass`; unset means the cache asks for none, and gateway warns at every
+boot that the hop is unauthenticated. Set with nothing readable behind it, the
+pod exits at boot naming the path — it never falls back to an unauthenticated
+connection. And if the cache demands a password this process cannot satisfy, the
+call is REFUSED with a `503`, counted under `unauthenticated` / `refused`, rather
+than held to the floor above.
+
+The floor is for an OUTAGE, and every clause of the argument for it depends on
+the failure being transient. A rejected credential is not: it is a deployment
+somebody assembled wrong, it will still be wrong on the next call, and failing
+open onto the floor for ever would be a rate limiter that reads healthy while
+enforcing a sixth of what it says. Nothing dials the cache at boot, deliberately,
+so this cannot be caught earlier than the first call.
 
 **Per-user overrides are wired.** D74 puts them on `ResolveCredentialResponse`,
 `attest` maps them into `limit::Overrides`, and `Limits::effective` merges them

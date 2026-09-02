@@ -840,14 +840,53 @@ async fn throttled(
                  {module} {kind} bucket is empty",
             ))
         }
+
+        // A 503, AND NOT A 429, because nothing the client does changes it. The
+        // two arms above tell a caller to come back later and mean it; this one
+        // is a deployment that was assembled wrong, and telling a caller to retry
+        // would be telling it to retry for ever. The argument for refusing rather
+        // than proceeding on the floor is on `Decision::Unauthenticated`.
+        //
+        // Counted under the same `degraded` series as the others, with
+        // `outcome = "refused"` — a third value, and the set stays closed. It is
+        // the one an alert should fire on: `unreachable` ends by itself and this
+        // does not.
+        Decision::Unauthenticated => {
+            degraded(
+                label,
+                module,
+                crate::limit::Degrade::Unauthenticated,
+                "refused",
+            );
+            // NO USER, NO ADDRESS AND NO CREDENTIAL in the message. It reaches an
+            // unauthenticated caller, so it says what is wrong in terms only
+            // somebody holding this deployment's manifests can act on.
+            Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    mcp::error(
+                        Some(id),
+                        codes::INTERNAL_ERROR,
+                        "the shared cache refused this gateway's credential, so no capacity \
+                         limit can be enforced (D74). This is a deployment error rather than \
+                         an outage: check YADGAR_VALKEY_PASSWORD_FILE against the cache's \
+                         requirepass.",
+                    )
+                    .to_string(),
+                )
+                    .into_response(),
+            )
+        }
     }
 }
 
 /// Count and log one degraded call.
 ///
-/// `outcome` is `allowed` or `throttled` — two values, so the series stays inside
-/// D67's cardinality rule, and the distinction is the one an operator needs:
-/// whether the floor is merely in force or is turning traffic away.
+/// `outcome` is `allowed`, `throttled` or `refused` — three values, so the series
+/// stays inside D67's cardinality rule, and the distinctions are the ones an
+/// operator needs: whether the floor is merely in force, is turning traffic away,
+/// or was never reached because the cache refused this gateway's credential.
 fn degraded(
     label: &'static str,
     module: &'static str,
@@ -862,6 +901,23 @@ fn degraded(
         "outcome" => outcome,
     )
     .increment(1);
+    // TWO MESSAGES, because the two situations are not the same one and an
+    // operator greps the text. The floor line describes a cache that could not
+    // answer; saying that about a cache which answered "no" would send somebody
+    // to look for an outage that is not happening.
+    if outcome == "refused" {
+        tracing::error!(
+            reason = %why,
+            tool = label,
+            module,
+            outcome,
+            "rate limiting is UNAUTHENTICATED: the shared cache refused this gateway's \
+             credential, so this call was refused rather than held to a floor (D74). This does \
+             not recover on its own — check YADGAR_VALKEY_PASSWORD_FILE against the cache's \
+             requirepass."
+        );
+        return;
+    }
     tracing::warn!(
         reason = %why,
         tool = label,
