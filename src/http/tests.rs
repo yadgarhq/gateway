@@ -280,6 +280,99 @@ async fn an_empty_allowlist_denies_every_origin() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The MCP header cross-check, when a header cannot be read.
+// ---------------------------------------------------------------------------
+
+/// Bytes that `HeaderValue` accepts and `to_str` refuses.
+///
+/// `HeaderValue::is_valid` is `b >= 32 && b != 127 || b == b'\t'`, so every byte
+/// of a UTF-8 multibyte sequence is >= 0x80 and PASSES — the value travels as
+/// obs-text and arrives intact. `\r`, `\n`, `\0` and `\x7F` are rejected
+/// outright, so this is not request splitting; it is a header the server holds
+/// and cannot decode.
+///
+/// **INVALID UTF-8 THAT SPELLS NOTHING, deliberately.** A fixture built out of
+/// `tools/list` or a real tool name with a stray byte on the end would be a value
+/// the implementation plausibly contains, and a test asserting on one would be
+/// asserting the code's own output back at itself. Nothing in this repository
+/// produces these four bytes.
+const UNREADABLE: &[u8] = &[0xC3, 0x28, 0xA0, 0xA1];
+
+/// POST `body`, with one extra header carrying raw bytes.
+async fn with_raw_header(name: &str, value: &[u8], body: Value) -> (StatusCode, Value) {
+    let req = post()
+        .header(
+            name,
+            axum::http::HeaderValue::from_bytes(value).expect("a header value"),
+        )
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    send(state(Vec::new()), req).await
+}
+
+#[tokio::test]
+async fn an_mcp_method_header_that_cannot_be_read_is_refused() {
+    // MUTATION THIS CATCHES — and the bug this test was written for:
+    // `h.get(name).and_then(|v| v.to_str().ok())`, which collapses a header of
+    // non-ASCII bytes into `None`. `None` at the cross-check means "the header is
+    // absent, so there is nothing to compare" — so the ONE `Mcp-Method` the
+    // server could not read was the one it never checked, and a validation that
+    // does not validate answers 200. The same shape `origin_ok` carried until
+    // `an_origin_that_cannot_be_read_is_forbidden` pinned it shut.
+    let (status, answer) =
+        with_raw_header(headers::METHOD, UNREADABLE, envelope("tools/list", Some(1))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unreadable Mcp-Method must be refused, not skipped"
+    );
+    // THE ASSERTION THAT CARRIES THIS TEST. A lossy implementation that decoded
+    // the bytes rather than refusing them would ALSO answer 400 — via
+    // HEADER_MISMATCH, because the mangled string cannot equal `tools/list`. Only
+    // the code tells a refusal apart from a mismatch.
+    assert_eq!(answer["error"]["code"], codes::INVALID_PARAMS);
+
+    // THE CONTROL: the same header, readable and agreeing, still passes. Without
+    // it this test would also pass for "refuse every request carrying an
+    // Mcp-Method header at all".
+    let (ok_status, _) = send(
+        state(Vec::new()),
+        post()
+            .header(headers::METHOD, "tools/list")
+            .body(Body::from(envelope("tools/list", Some(1)).to_string()))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_mcp_name_header_that_cannot_be_read_is_refused() {
+    // The `Mcp-Name` arm is the one that was newly reachable: it is cross-checked
+    // only when BOTH sides are present, so an undecodable header took the
+    // absent arm and the check evaporated silently.
+    //
+    // MUTATION THIS CATCHES, beyond the skip itself: answering the 401 this
+    // request would otherwise reach. The cross-check runs BEFORE attestation, so
+    // a refusal here preempts the missing-credential answer — asserting
+    // UNAUTHORIZED/INVALID_REQUEST is what an unfixed server does.
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "_meta": {
+                meta_keys::PROTOCOL_VERSION: PROTOCOL_VERSION,
+                meta_keys::CLIENT_CAPABILITIES: {},
+            },
+            "name": "find_tasks",
+            "arguments": {},
+        }
+    });
+    let (status, answer) = with_raw_header(headers::NAME, UNREADABLE, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer["error"]["code"], codes::INVALID_PARAMS);
+}
+
 /// The five codes `iam.Login` can actually return, from `iam/src/service.rs`.
 ///
 /// `UNAUTHENTICATED` is the refusal it raises itself. The other four arrive from
