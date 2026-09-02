@@ -24,8 +24,8 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use yadgar_gateway::attest::{Attestation, Credentials};
-use yadgar_gateway::http::{router, AppState};
-use yadgar_gateway::limit::{Limiter, Limits};
+use yadgar_gateway::http::{router, AppState, CredentialLimits};
+use yadgar_gateway::limit::{Bucket, Limiter, Limits};
 use yadgar_gateway::mcp::{codes, headers, meta_keys, PROTOCOL_VERSION};
 
 fn envelope(tool: &str) -> Value {
@@ -102,8 +102,10 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // enforces at the gateway precisely so a refused call costs `task`
         // nothing.
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
-        // Never reached. /auth/login spends no token at all — D74's buckets key
-        // on a user, and a login has none yet.
+        // Never reached. /auth/login IS bounded now, but by its own bucket keyed
+        // on a source address (task 497) rather than by D74's `(user, module,
+        // kind)` one — and nothing in this file posts to it. This comment used to
+        // say login spent no token at all, which was true when it was written.
         iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         // Never reached either: the trusted-header path resolves no credential, so
         // there is nothing to cache. Present because AppState holds it, not because
@@ -111,6 +113,17 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         credentials: Credentials::new(Duration::from_secs(30)),
         limiter: Limiter::new(&addr, None, limits, Duration::from_millis(500), 6).expect("limiter"),
         allowed_origins: Vec::new(),
+        trust: yadgar_gateway::source::TrustBoundary::Undeclared,
+        credential_limits: CredentialLimits {
+            attributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
     });
 
     let (first, _, _) = call(Arc::clone(&state), &user).await;

@@ -193,7 +193,57 @@ does Argon2id work for anyone who can reach the port.
 | `YADGAR_RATE_LIMIT_TIMEOUT_MS`         | `20`             | how long one bucket lookup may take before the call falls back to the local floor                                                    |
 | `YADGAR_MAX_REPLICAS`                  | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                                                 |
 | `YADGAR_VALKEY_PASSWORD_FILE`          | unset            | a FILE holding the cache's `requirepass`. Unset dials the cache unauthenticated and WARNs; set-but-unreadable or empty EXITS at boot |
+| `YADGAR_TRUSTED_PROXY_HOPS`            | unset            | how many proxies append to `X-Forwarded-For` in front. Unset RECORDS NO SOURCE ADDRESS; a non-number EXITS at boot                   |
+| `YADGAR_LOGIN_RATE_LIMIT`              | `0.2:10`         | `<rate>:<burst>` for `/auth/login` and `/auth/enrol`, per ATTRIBUTABLE client address                                                |
+| `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT` | `10:100`         | the same, per OBSERVED HOP, which is what applies while no trust boundary is declared                                                |
 | `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                                                        |
+
+## The source address, and what bounds login
+
+`POST /auth/login` and `POST /auth/enrol` are the only surfaces a stranger
+reaches with no credential, and each costs `iam` a full Argon2id verification
+whether or not the username exists. D74's buckets cannot cover them: those key on
+`(user, module, kind)`, and a login has no user until it succeeds. So they bucket
+on the SOURCE ADDRESS instead, in their own key space, at their own rates.
+
+Which needs an address the caller cannot choose, and that is what
+`YADGAR_TRUSTED_PROXY_HOPS` declares. Each proxy APPENDS the address it saw to
+`X-Forwarded-For`, so the gateway reads the entry that many places from the
+RIGHT. Everything to the left of that index is text the caller could have written.
+
+**The default refuses.** Unset means unknown, and an unknown address is recorded
+as nothing rather than guessed — because the naive guess is the LEFTMOST entry,
+which is exactly the one the caller controls. An audit record carrying a forged
+address is worse than one carrying none: the empty field is honestly empty, the
+forged one reads as evidence (ADR-0491).
+
+A hop count rather than an ingress-specific resource, per D80: yadgar runs on
+EKS, AKS and GKE and behind NGINX, Traefik, HAProxy, an ALB or an Application
+Gateway. Every one of them appends to this header; only the depth differs, and
+the depth is what an operator declares once.
+
+Leaving it unset costs two things and neither is an outage. Authentication events
+carry no source address. And the two endpoints are bounded per OBSERVED HOP —
+behind an ingress, one bucket for everybody — so `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT`
+applies rather than `YADGAR_LOGIN_RATE_LIMIT`. Those two numbers are different
+CONTROLS rather than two strengths of one. The attributable one prevents guessing.
+The shared one bounds the Argon2id CPU a stranger can spend, and is deliberately
+loose: a guess-prevention rate on a key everybody shares would let one attacker
+refuse every login in the installation.
+
+**There is no lockout.** A per-username lockout answers a question about a
+USERNAME, so refusing early on a locked account tells a stranger which usernames
+exist — reopening the timing oracle `iam`'s `LOGIN_RESPONSE_FLOOR_MS` exists to
+close. It is also an availability weapon: anyone who can guess at a name can lock
+the person behind it out. Any lockout has to be paid BEHIND the floor, inside
+`iam`, and it needs a durable failed-attempt counter that the contract has no
+field for.
+
+The throttle above does not have that problem, and the reason is structural
+rather than argued: it runs BEFORE the request body is parsed, so at the point the
+decision is made no username is in scope that the outcome could depend on. A 429
+is fast, a real attempt is floored, and the difference names an address's budget
+rather than an account's existence.
 
 ## Rate limiting
 

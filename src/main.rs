@@ -20,12 +20,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use yadgar_gateway::attest::{Attestation, Credentials};
-use yadgar_gateway::http::{router, AppState};
-use yadgar_gateway::limit::{Limiter, Limits};
+use yadgar_gateway::http::{router, AppState, CredentialLimits};
+use yadgar_gateway::limit::{Bucket, Limiter, Limits};
+use yadgar_gateway::source::TrustBoundary;
 use yadgar_gateway::upstream;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// One `<rate>:<burst>` from the environment, naming the variable when it is
+/// wrong.
+///
+/// The error is stringified for the reason `Limits::parse`'s is: `main` returns
+/// `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
+/// `NotPositive("0", "0:10")` on the operator's terminal instead of the sentence
+/// saying which variable is unusable and why.
+fn parse_bucket_env(key: &str, default: &str) -> Result<Bucket, String> {
+    Bucket::parse(&env_or(key, default)).map_err(|e| format!("{key} is not usable: {e}"))
 }
 
 #[tokio::main]
@@ -312,12 +324,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(str::to_string)
         .collect();
 
+    // HOW MANY PROXIES STAND IN FRONT (D80, ADR-0491), and UNSET IS A REAL
+    // ANSWER: it says nobody knows, and an unknown source address is recorded as
+    // nothing rather than guessed from a header the caller can write.
+    //
+    // **A boot failure when it is set to something unreadable, and not a fall
+    // back to the default.** The default REFUSES, so a typo that quietly took it
+    // would look exactly like a deployment that never configured this — the
+    // operator who set the variable would never learn their audit records carry
+    // no address. That is D69's rule: a capability that cannot be configured
+    // correctly fails startup.
+    //
+    // `.to_string()` on the way out, for the reason `Limits::parse` gives above.
+    let trust = TrustBoundary::parse(&env_or("YADGAR_TRUSTED_PROXY_HOPS", ""))
+        .map_err(|e| format!("YADGAR_TRUSTED_PROXY_HOPS is not usable: {e}"))?;
+    // The two buckets that bound the unauthenticated endpoints (task 497). Read
+    // as `<rate>:<burst>` through the SAME parser D74's limits use, so one syntax
+    // and one set of refusals covers every bucket this binary configures.
+    let credential_limits = CredentialLimits {
+        attributed: parse_bucket_env(
+            "YADGAR_LOGIN_RATE_LIMIT",
+            CredentialLimits::DEFAULT_ATTRIBUTED,
+        )?,
+        unattributed: parse_bucket_env(
+            "YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT",
+            CredentialLimits::DEFAULT_UNATTRIBUTED,
+        )?,
+    };
+    match trust {
+        TrustBoundary::Undeclared => tracing::warn!(
+            "NO TRUST BOUNDARY IS DECLARED: YADGAR_TRUSTED_PROXY_HOPS is unset, so this \
+             gateway cannot tell which X-Forwarded-For entry is the client and which the \
+             caller wrote. Two consequences, both deliberate (ADR-0491, D80). Authentication \
+             events record NO source address, because a forged one is worse than none. And \
+             /auth/login and /auth/enrol are bounded per OBSERVED HOP rather than per client \
+             — behind an ingress that is one bucket for everybody, sized to bound Argon2id \
+             cost rather than to stop guessing. Set the variable to the number of proxies in \
+             front (0 if this gateway is exposed directly) to get per-client limits and an \
+             attributable audit record."
+        ),
+        TrustBoundary::Hops(hops) => tracing::info!(
+            hops,
+            "trust boundary declared; the source address is read from X-Forwarded-For counting \
+             from the right (ADR-0491)"
+        ),
+    }
+
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:8080").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, protocol = yadgar_gateway::mcp::PROTOCOL_VERSION, "gateway listening");
 
     axum::serve(
         listener,
+        // `into_make_service_with_connect_info`, WHICH THIS CALL DID NOT HAVE.
+        // Without it nothing populates `ConnectInfo`, so the peer address is not
+        // extractable at all and every request resolves to `Source::Unknown` —
+        // an unthrottleable, unattributable request, which is the state this
+        // whole change exists to leave. It is the one line that makes the rest
+        // reachable in the shipped binary.
         router(Arc::new(AppState {
             attestation,
             task,
@@ -325,7 +389,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             credentials,
             limiter,
             allowed_origins,
-        })),
+            trust,
+            credential_limits,
+        }))
+        .into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async {
         let _ = tokio::signal::ctrl_c().await;
