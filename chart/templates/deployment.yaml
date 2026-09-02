@@ -67,6 +67,29 @@ spec:
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
               value: {{ .Values.task.port | quote }}
+            {{- if .Values.task.tls.enabled }}
+            # RENDERED ONLY WHEN TLS IS ASKED FOR, so a deployment that has not
+            # cut over sends the binary nothing at all and takes the cleartext
+            # path it always took. The same shape as
+            # YADGAR_TRUST_UNAUTHENTICATED_HEADERS below: absence is the
+            # default, and the flag is the whole of the lever.
+            - name: TASK_TLS_ENABLED
+              value: "1"
+            # A PATH, never an issuer-specific resource (D80). cert-manager
+            # writes this file in the reference deployment and a hand-assembled
+            # Secret writes it anywhere else; neither the chart nor the binary
+            # can tell the difference, which is the point.
+            - name: TASK_TLS_CA_FILE
+              value: /var/run/config/task-ca/ca.pem
+            {{- if .Values.task.tls.domain }}
+            # Only when the certificate names something other than the Service.
+            # Unset means "verify against task.host", which is what makes a
+            # certificate issued for the Service name work while the balancer
+            # dials pod addresses.
+            - name: TASK_TLS_DOMAIN
+              value: {{ .Values.task.tls.domain | quote }}
+            {{- end }}
+            {{- end }}
             # The whole credential lifecycle: where POST /auth/login and POST
             # /auth/enrol are sent (D75, D73), AND where attestation resolves a
             # bearer token on every tools/call (ADR-0488). The pair matches
@@ -77,6 +100,24 @@ spec:
               value: {{ .Values.iam.host | quote }}
             - name: IAM_PORT
               value: {{ .Values.iam.port | quote }}
+            {{- if .Values.iam.tls.enabled }}
+            # The hop the BEARER TOKEN itself goes down. Rendered only when TLS
+            # is asked for, and configured independently of task's above so the
+            # two can be cut over one at a time.
+            - name: IAM_TLS_ENABLED
+              value: "1"
+            # A PATH, never an issuer-specific resource (D80). This channel does
+            # not go through yadgar-dial — iam's Service is a VIP rather than
+            # headless (D23) — but it takes the same values and gets the same
+            # checks; see `upstream::connect_iam`.
+            - name: IAM_TLS_CA_FILE
+              value: /var/run/config/iam-ca/ca.pem
+            {{- if .Values.iam.tls.domain }}
+            # Only when the certificate names something other than the Service.
+            - name: IAM_TLS_DOMAIN
+              value: {{ .Values.iam.tls.domain | quote }}
+            {{- end }}
+            {{- end }}
             # D72. How long one resolved credential is reused before iam is asked
             # again. SET UNCONDITIONALLY rather than only when it differs from the
             # binary's default: this is the only bound on how long a revoked
@@ -139,3 +180,59 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+          {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled }}
+          volumeMounts:
+            {{- if .Values.task.tls.enabled }}
+            # A DIRECTORY MOUNT, never subPath. A subPath mount is a one-time
+            # copy that kubelet never refreshes, so the bundle would freeze at
+            # whatever it was when the pod started and a rotated authority would
+            # never reach this process.
+            - name: task-ca
+              mountPath: /var/run/config/task-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.iam.tls.enabled }}
+            # SEPARATE FROM task's, and not a shared bundle. The two upstreams
+            # may be issued by different authorities, and one that trusts both
+            # would make each hop's trust depend on the other's rotation.
+            - name: iam-ca
+              mountPath: /var/run/config/iam-ca
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled }}
+      volumes:
+        {{- if .Values.task.tls.enabled }}
+        - name: task-ca
+          secret:
+            secretName: {{ required "task.tls.caSecret holds the CA bundle task is verified against and must be set whenever task.tls.enabled is; see the chart's values.yaml" .Values.task.tls.caSecret }}
+            # OPTIONAL, and that is not laxity — it is which error the operator
+            # gets. A required mount that cannot be satisfied leaves the pod in
+            # ContainerCreating with a FailedMount event about a volume. An
+            # optional one mounts an empty directory, the binary finds no file
+            # at TASK_TLS_CA_FILE, and it exits at boot naming THAT PATH and
+            # saying that TLS was asked for so cleartext is not the answer.
+            # Neither starts; only one of them explains itself. There is no
+            # third outcome in which this pod serves traffic over an
+            # unencrypted connection it was told to encrypt.
+            optional: true
+            # ONE KEY, not the whole Secret. A certificate Secret also holds a
+            # PRIVATE KEY, and the gateway has no business being able to read
+            # task's. Selecting a single key is what keeps it out of the pod,
+            # and it is also what renames whatever the issuer called it to the
+            # `ca.pem` that TASK_TLS_CA_FILE names.
+            items:
+              - key: {{ required "task.tls.caSecretKey names the key inside task.tls.caSecret that holds the CA bundle and must be set whenever task.tls.enabled is; see the chart's values.yaml" .Values.task.tls.caSecretKey | quote }}
+                path: ca.pem
+        {{- end }}
+        {{- if .Values.iam.tls.enabled }}
+        - name: iam-ca
+          secret:
+            secretName: {{ required "iam.tls.caSecret holds the CA bundle iam is verified against and must be set whenever iam.tls.enabled is; see the chart's values.yaml" .Values.iam.tls.caSecret }}
+            # Optional and single-key for the same two reasons as task's above.
+            optional: true
+            items:
+              - key: {{ required "iam.tls.caSecretKey names the key inside iam.tls.caSecret that holds the CA bundle and must be set whenever iam.tls.enabled is; see the chart's values.yaml" .Values.iam.tls.caSecretKey | quote }}
+                path: ca.pem
+        {{- end }}
+      {{- end }}
