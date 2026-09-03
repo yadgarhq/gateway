@@ -851,7 +851,10 @@ fn discover(id: &Value) -> Value {
             "_meta": {
                 meta_keys::SERVER_INFO: {
                     "name": "yadgar-gateway",
-                    "version": env!("CARGO_PKG_VERSION"),
+                    // `crate::VERSION`, NOT `CARGO_PKG_VERSION`. The manifest is a
+                    // placeholder nothing writes to; the number here is stamped
+                    // from the release tag at build time. See `crate::VERSION`.
+                    "version": crate::VERSION,
                 },
             },
             "instructions": "yadgar: durable memory, wiki and tasks for coding agents.",

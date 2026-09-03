@@ -1,6 +1,16 @@
 [package]
 name = "yadgar-gateway"
-version = "0.1.0"
+# A PLACEHOLDER, and deliberately one nobody could mistake for a release. Nothing
+# has ever written a version into this file: a module's version in this
+# organisation is its release tag (D65), derived at merge from the `## Changelog`
+# bullets. This said `0.1.0` while the tags ran to `v0.8.1`, and `server/discover`
+# served that number to every MCP client.
+#
+# Bumping it per pull request was considered and rejected — it puts a conflict on
+# one line in every concurrent branch, and a human asserting a number does not make
+# it true. The real number is stamped by `build.rs` from `YADGAR_GATEWAY_VERSION`
+# and read as `crate::VERSION`; see both for the rest of the reasoning.
+version = "0.0.0"
 edition = "2021"
 rust-version = "1.90"
 license = "Apache-2.0"

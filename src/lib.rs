@@ -20,6 +20,22 @@ pub mod source;
 pub mod tools;
 pub mod upstream;
 
+/// What this binary answers `server/discover` with, stamped at build time.
+///
+/// **NOT `CARGO_PKG_VERSION`.** Nothing has ever written a version into
+/// `Cargo.toml` — a module's version in this organisation is its release tag
+/// (D65), derived at merge from the `## Changelog` bullets and never typed into a
+/// manifest. So the manifest said `0.1.0` while the tags ran to `v0.8.1`, and the
+/// handshake every MCP client reads to learn what it is talking to answered
+/// `0.1.0`. That is a wrong answer in a protocol response, not untidiness.
+///
+/// The manifest now says `0.0.0`, so anything still reading it gets an obviously
+/// wrong answer rather than a plausible one. `build.rs` resolves the real number
+/// from `YADGAR_GATEWAY_VERSION`, which the `Containerfile` sets from the release
+/// tag; the reasoning for why the resolution lives in the image build rather than
+/// in the build script is in `build.rs`.
+pub const VERSION: &str = env!("YADGAR_GATEWAY_VERSION");
+
 /// Generated from the vendored contract (D16, D70).
 pub mod pb {
     pub mod yadgar {

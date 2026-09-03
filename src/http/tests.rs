@@ -1466,3 +1466,52 @@ async fn a_credential_that_cannot_be_resolved_is_an_outage_and_not_a_refusal() {
         StatusCode::SERVICE_UNAVAILABLE,
     );
 }
+
+// ---------------------------------------------------------------------------
+// What the handshake says this server IS.
+// ---------------------------------------------------------------------------
+
+/// `server/discover` reports the version the BUILD was stamped with.
+///
+/// **This handshake is the only thing an MCP client reads to learn what it is
+/// talking to**, so a wrong number here is a wrong answer in a protocol response.
+/// It served `env!("CARGO_PKG_VERSION")` — the manifest — and nothing has ever
+/// written a version into that manifest: it said `0.1.0` while the tags ran to
+/// `v0.8.1`. Every client was told `0.1.0` by a `v0.8.0` binary.
+///
+/// **BOTH ASSERTIONS ARE MUTATIONS THIS CATCHES**, which is the point of writing
+/// two:
+///
+/// * Reverting the call site to `CARGO_PKG_VERSION` makes the first fail — the
+///   stamped value and the manifest placeholder are different strings by
+///   construction, in a release build and in a local one alike.
+/// * Deleting the `cargo:rustc-env` line from `build.rs` makes `crate::VERSION`
+///   fail to compile, so this file goes red rather than quietly asserting a
+///   tautology. Verified by doing exactly that, not by reasoning about it.
+///
+/// The second assertion names the placeholder as a LITERAL rather than reading
+/// `CARGO_PKG_VERSION`, so it keeps biting if somebody later writes a
+/// plausible-looking number back into the manifest.
+///
+/// **`YADGAR_GATEWAY_VERSION=9.9.9 cargo test` is the end-to-end proof** that the
+/// number travels from the environment through `build.rs` into the JSON, and it
+/// needs no image build to run.
+#[tokio::test]
+async fn discover_reports_the_stamped_version_rather_than_the_manifest() {
+    let (status, body) = rpc(DISCOVER, Some(1)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reported = body["result"]["_meta"][meta_keys::SERVER_INFO]["version"]
+        .as_str()
+        .expect("serverInfo carries a version");
+
+    assert_eq!(
+        reported,
+        crate::VERSION,
+        "the handshake must report the stamped version"
+    );
+    assert_ne!(
+        reported, "0.0.0",
+        "the manifest placeholder must never reach a client"
+    );
+}
