@@ -50,6 +50,23 @@ prost-types = "0.14"
 # bundle that decodes to no certificate produces a trust store that trusts
 # nobody and fails much later, at the handshake.
 rustls-pki-types = { version = "1", features = ["std"] }
+# For `RootCertStore::add_parsable_certificates` ALONE, so the CA bundle can be
+# asserted non-empty the way tonic will actually build it. Counting PEM sections
+# is NOT counting trust anchors: tonic feeds the DERs into
+# `add_parsable_certificates` and DISCARDS the `(accepted, rejected)` return with
+# no check after it
+# (`tonic-0.14.6/src/transport/channel/service/tls.rs:104`), so a bundle whose
+# sections decode as PEM and parse as no trust anchor yields the empty root store
+# with no error — the exact thing the section count exists to prevent.
+#
+# `default-features = false` with `std` alone: NO crypto provider is pulled in
+# here. tonic already chooses `ring` through `tls-ring`, and a second provider in
+# the tree is how a build acquires an ambiguous default. CHECKED rather than
+# assumed: `cargo tree -e normal -i aws-lc-rs` still matches no package.
+#
+# Already in the lock file by way of tokio-rustls, so this adds nothing to the
+# build — the same reasoning `rustls-pki-types` above is here for.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 
 # Client-side balancing over task's headless Service (D23). Shared rather than
 # copied from task, per the invariant that anything every service needs is

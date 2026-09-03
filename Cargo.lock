@@ -2679,6 +2679,7 @@ dependencies = [
  "prost-types",
  "rcgen",
  "redis",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
