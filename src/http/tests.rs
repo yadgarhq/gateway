@@ -1121,7 +1121,7 @@ struct StubIam {
     resolves: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Write the stub's whole `IamService` impl: one real method and eleven refusals.
+/// Write the stub's whole `IamService` impl: one real method and twelve refusals.
 ///
 /// **THE MACRO EMITS THE `#[tonic::async_trait]` ATTRIBUTE TOO, and it has to.**
 /// That attribute is a proc macro that rewrites every `async fn` in the block into
@@ -1172,6 +1172,7 @@ stub_iam_service! {
     set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
+    set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
 }
 
 /// Serve `answer` as `iam`, and return a channel pointed at it plus the counter of

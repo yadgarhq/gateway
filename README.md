@@ -56,12 +56,13 @@ identity sources did not become two literals: both call that one function.
 requires a scope to be minted here and never supplied, and the three fields are
 not alike:
 
-| field         | where it comes from                            | why                                                                                                                        |
-| ------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `user_id`     | `iam.ResolveCredential`, from the bearer token | a self-asserted username is forgeable by anyone holding any valid token                                                    |
-| `project_id`  | `X-Yadgar-Project`                             | a workspace fact. It changes as a person moves between checkouts, and a token cannot carry it                              |
-| `instance_id` | `X-Yadgar-Instance`                            | a session marker rather than an identity (D46 throttles on it, D39 addresses notices with it)                              |
-| `team_ids`    | `iam.ResolveCredential`                        | teams decide what a TEAM-visible record is readable by (D12), so a caller naming its own would read other people's records |
+| field                    | where it comes from                            | why                                                                                                                                                                                                                                      |
+| ------------------------ | ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `user_id`                | `iam.ResolveCredential`, from the bearer token | a self-asserted username is forgeable by anyone holding any valid token                                                                                                                                                                  |
+| `project_id`             | `X-Yadgar-Project`                             | a workspace fact. It changes as a person moves between checkouts, and a token cannot carry it                                                                                                                                            |
+| `instance_id`            | `X-Yadgar-Instance`                            | a session marker rather than an identity (D46 throttles on it, D39 addresses notices with it)                                                                                                                                            |
+| `team_ids`               | `iam.ResolveCredential`                        | teams decide what a TEAM-visible record is readable by (D12), so a caller naming its own would read other people's records                                                                                                               |
+| `owner_reads_own_record` | `iam.ResolveCredential`                        | ADR-0522's inheritable setting. The gateway carries it and resolves NONE of it — the answer depends on the team of the ROW being read, so it is resolved where the reach is computed. An absent one is forwarded absent, never defaulted |
 
 `X-Yadgar-User` is **ignored** on the `iam` path rather than refused: clients
 already in flight send it, an ignored forged header is inert, and refusing one
