@@ -202,28 +202,32 @@ does Argon2id work for anyone who can reach the port.
 
 ## Configuration
 
-| Variable                               | Default          |                                                                                                                                                        |
-| -------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `LISTEN`                               | `0.0.0.0:8080`   | MCP endpoint                                                                                                                                           |
-| `METRICS_LISTEN`                       | `0.0.0.0:9090`   | Prometheus                                                                                                                                             |
-| `TASK_HOST` / `TASK_PORT`              | `task` / `50052` | the upstream module                                                                                                                                    |
-| `IAM_HOST` / `IAM_PORT`                | `iam` / `50052`  | the whole credential lifecycle: `/auth/login`, `/auth/enrol` and attestation                                                                           |
-| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` | unset            | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`                                                           |
-| `YADGAR_ALLOWED_ORIGINS`               | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents                                              |
-| `YADGAR_VALKEY_ADDR`                   | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                                                                      |
-| `YADGAR_RATE_LIMITS`                   | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                                                             |
-| `YADGAR_RATE_LIMIT_DEFAULT`            | `10:100`         | the bucket for a `(module, kind)` nobody named                                                                                                         |
-| `YADGAR_RATE_LIMIT_TIMEOUT_MS`         | `20`             | how long one bucket lookup may take before the call falls back to the local floor                                                                      |
-| `YADGAR_MAX_REPLICAS`                  | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                                                                   |
-| `YADGAR_VALKEY_PASSWORD_FILE`          | unset            | a FILE holding the cache's `requirepass`. Unset dials the cache unauthenticated and WARNs; set-but-unreadable or empty EXITS at boot                   |
-| `YADGAR_CREDENTIAL_TTL_SECONDS`        | `30`             | how long one resolved credential is reused. The backstop for a missed invalidation event; `0` disables the cache; above `300` EXITS at boot            |
-| `NATS_URL`                             | unset            | the broker carrying D72's cache invalidation. Unset consumes NOTHING and WARNs at every boot; unreachable or REFUSED is loud and retried               |
-| `NATS_USER`                            | unset            | the broker account this gateway authenticates as. It is NOT `iam`'s. Set without `NATS_PASSWORD_FILE` EXITS at boot                                    |
-| `NATS_PASSWORD_FILE`                   | unset            | a FILE holding that account's password. Unset is REFUSED by a broker that demands one, and says so; set-but-unreadable, empty, or without a user EXITS |
-| `YADGAR_TRUSTED_PROXY_HOPS`            | unset            | how many proxies append to `X-Forwarded-For` in front. Unset RECORDS NO SOURCE ADDRESS; a non-number EXITS at boot                                     |
-| `YADGAR_LOGIN_RATE_LIMIT`              | `0.2:10`         | `<rate>:<burst>` for `/auth/login` and `/auth/enrol`, per ATTRIBUTABLE client address                                                                  |
-| `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT` | `10:100`         | the same, per OBSERVED HOP, which is what applies while no trust boundary is declared                                                                  |
-| `RUST_LOG`                             | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                                                                          |
+| Variable                                                 | Default          |                                                                                                                                                                                                                                                           |
+| -------------------------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LISTEN`                                                 | `0.0.0.0:8080`   | MCP endpoint                                                                                                                                                                                                                                              |
+| `METRICS_LISTEN`                                         | `0.0.0.0:9090`   | Prometheus                                                                                                                                                                                                                                                |
+| `TASK_HOST` / `TASK_PORT`                                | `task` / `50052` | the upstream module                                                                                                                                                                                                                                       |
+| `IAM_HOST` / `IAM_PORT`                                  | `iam` / `50052`  | the whole credential lifecycle: `/auth/login`, `/auth/enrol` and attestation                                                                                                                                                                              |
+| `YADGAR_TRUST_UNAUTHENTICATED_HEADERS`                   | unset            | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`                                                                                                                                                              |
+| `YADGAR_ALLOWED_ORIGINS`                                 | empty            | comma-separated. Empty rejects every browser origin, which is right for a server whose clients are agents                                                                                                                                                 |
+| `YADGAR_VALKEY_ADDR`                                     | **required**     | the shared cache holding D74's token buckets. Unset EXITS at boot                                                                                                                                                                                         |
+| `YADGAR_RATE_LIMITS`                                     | empty            | `<module>.<kind>=<rate>:<burst>`, comma-separated. e.g. `task.write=2:120`                                                                                                                                                                                |
+| `YADGAR_RATE_LIMIT_DEFAULT`                              | `10:100`         | the bucket for a `(module, kind)` nobody named                                                                                                                                                                                                            |
+| `YADGAR_RATE_LIMIT_TIMEOUT_MS`                           | `20`             | how long one bucket lookup may take before the call falls back to the local floor                                                                                                                                                                         |
+| `YADGAR_MAX_REPLICAS`                                    | **required**     | the autoscaler's ceiling, and the divisor of the degraded floor. Unset EXITS at boot                                                                                                                                                                      |
+| `YADGAR_VALKEY_PASSWORD_FILE`                            | unset            | a FILE holding the cache's `requirepass`. Unset dials the cache unauthenticated and WARNs; set-but-unreadable or empty EXITS at boot                                                                                                                      |
+| `YADGAR_CREDENTIAL_TTL_SECONDS`                          | `30`             | how long one resolved credential is reused. The backstop for a missed invalidation event; `0` disables the cache; above `300` EXITS at boot                                                                                                               |
+| `NATS_URL`                                               | unset            | the broker carrying D72's cache invalidation. Unset consumes NOTHING and WARNs at every boot; unreachable or REFUSED is loud and retried                                                                                                                  |
+| `NATS_USER`                                              | unset            | the broker account this gateway authenticates as. It is NOT `iam`'s. Set without `NATS_PASSWORD_FILE` EXITS at boot                                                                                                                                       |
+| `NATS_PASSWORD_FILE`                                     | unset            | a FILE holding that account's password. Unset is REFUSED by a broker that demands one, and says so; set-but-unreadable, empty, or without a user EXITS                                                                                                    |
+| `YADGAR_TRUSTED_PROXY_HOPS`                              | unset            | how many proxies append to `X-Forwarded-For` in front. Unset RECORDS NO SOURCE ADDRESS; a non-number EXITS at boot                                                                                                                                        |
+| `YADGAR_LOGIN_RATE_LIMIT`                                | `0.2:10`         | `<rate>:<burst>` for `/auth/login` and `/auth/enrol`, per ATTRIBUTABLE client address                                                                                                                                                                     |
+| `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT`                   | `10:100`         | the same, per OBSERVED HOP, which is what applies while no trust boundary is declared                                                                                                                                                                     |
+| `RUST_LOG`                                               | `info`           | a default, because an unset `RUST_LOG` enables nothing at all                                                                                                                                                                                             |
+| `TASK_TLS_CLIENT_CERT_FILE` / `TASK_TLS_CLIENT_KEY_FILE` | unset            | the certificate this gateway PRESENTS to `task`, and its key — mutual TLS (ADR-0516). Off by default even when `TASK_TLS_ENABLED` is `1`. Both or neither: half an identity EXITS at boot naming the variable                                             |
+| `IAM_TLS_CLIENT_CERT_FILE` / `IAM_TLS_CLIENT_KEY_FILE`   | unset            | the same for the `iam` hop. The chart points both prefixes at ONE mounted leaf; the prefixes exist so one hop can be cut over before the other                                                                                                            |
+| `TLS_ROTATION_POLL_SECS`                                 | `60`             | how often the TLS files read at boot are re-hashed. A CHANGE ends the serve: the process drains and exits 0 so kubelet restarts it onto the new material. `0` is REFUSED at boot — a hot loop, not an off switch. Parsed at boot whether or not TLS is on |
+| `TLS_ROTATION_SPLAY_MAX_SECS`                            | `300`            | the longest this pod waits before that exit, drawn per pod inside the range. Both replicas see the same rotation at once and a PDB does not govern a self-exit, so this is the only thing keeping them apart. `0` exits at once                           |
 
 ## The source address, and what bounds login
 
@@ -357,6 +361,49 @@ An entry with `limit` unset is skipped rather than read as a denial, on the
 contract's own instruction — and it is skipped **before** its `kind` or `module` is
 judged, so a cleared override carrying a nonsense kind stays "no override for that
 bucket" instead of becoming a refusal.
+
+## Mutual TLS, and a renewed certificate arriving by restart
+
+**This gateway serves no certificate**, so unlike every other module the material
+it holds is entirely inbound-facing: the CA bundles it verifies `iam` and `task`
+against, and — once ADR-0516's cut-over runs — the client certificate it presents
+to both. TLS at the edge is terminated by the ingress in front of it (D71, D80),
+and `gateway-tls` is never read by this process.
+
+**One leaf, two upstreams.** `gateway-client-tls` is this process's identity
+rather than a property of a hop, so the chart mounts it once at
+`/var/run/secrets/client-cert` and points both prefixes at the same two files.
+The prefixes still keep the hops apart, so `task` can be cut over before `iam`.
+
+**Both files are read ONCE**, and nothing re-reads a dialled channel's material.
+cert-manager renews 30 days before expiry and kubelet refreshes the mount — a
+DIRECTORY, never `subPath`, precisely so it does — but the process would go on
+presenting its day-0 leaf until something restarted it. So `rotate` hashes what
+`main` opened, and on a change logs which file and the old and new fingerprint,
+waits out this pod's splay, drains, and returns 0 (ADR-0523).
+
+**That is not a nicety here, it is the deadline.** ADR-0516 records that an
+expired CLIENT leaf STOPS a hop rather than weakening it, so an unwatched gateway
+would keep answering `/` and stop being able to reach `iam` or `task`, on a date,
+with nothing having warned. `yadgar_tls_certificate_not_after_seconds` carries the
+expiry of the leaf actually loaded — one series, `kind="client"`, because that is
+the only certificate this process holds.
+
+**The drain is bounded now, and it had to become so in the same change.**
+`terminationGracePeriodSeconds` bounds a drain kubelet started; the watcher ends
+the serve itself, so kubelet's clock never runs — and tokio never unregisters a
+libc signal handler, so once the rotation arm wins the `select!` a later SIGTERM
+is swallowed and only SIGKILL is left. `serve::DRAIN_BUDGET` is 25s against the
+default 30s grace period, and its clock starts when shutdown is REQUESTED.
+`tests/drain.rs` is the regression that keeps a budget measuring the server's
+whole life from coming back.
+
+**`src/rotate.rs` is the THIRD copy of `iam`'s**, and its header enumerates the
+four places they differ. ADR-0523 asks for the core to be lifted into shared code
+before a third copy exists; this change defers that deliberately, because shared
+crates here are separate repositories consumed by git tag and a lift needs a
+fourth repository merged and tagged before this one could compile. The lift is
+its own change, and it carries the five copies of `serve::shutdown` with it.
 
 ## Balancing
 

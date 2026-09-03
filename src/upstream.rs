@@ -38,6 +38,40 @@
 //! — because a copy that only a paragraph holds together is a copy that drifts
 //! again.
 //!
+//! # Mutual TLS
+//!
+//! **The CA bundles above are one direction; this is the other.** A bundle
+//! authenticates the upstream to this gateway. A client certificate
+//! authenticates THIS GATEWAY to the upstream — ADR-0516, which chose mutual TLS
+//! over a NetworkPolicy because a control the CNI enforces protects an EKS
+//! deployment and protects nothing on kind (D80).
+//!
+//! **ONE LEAF, TWO UPSTREAMS.** `gateway-client-tls` is this process's identity
+//! rather than a property of a hop, so the chart mounts it once and points both
+//! prefixes at the same two files. The prefixes still keep the hops apart: a
+//! deployment can present an identity to `task` before it does to `iam`.
+//!
+//! **A SEPARATE LEVER FROM THE ENCRYPTED TRANSPORT, deliberately.**
+//! `<PREFIX>_TLS_CLIENT_CERT_FILE` and `<PREFIX>_TLS_CLIENT_KEY_FILE` are unset
+//! by default, so a deployment that turns TLS on verifies the upstream and
+//! presents no identity — exactly as it did before.
+//!
+//! **THE CLIENT CERTIFICATE IS LOAD-BEARING FOR AVAILABILITY**, in a way the CA
+//! bundles are not. ADR-0516 says it plainly: an expired client certificate
+//! STOPS a hop rather than weakening it. That is why both files join
+//! [`crate::rotate`]'s watch set in the same change that mounts them — and why,
+//! in a process that serves no certificate of its own, they are the only
+//! material whose expiry the gauge can report.
+//!
+//! **BOTH IMPLEMENTATIONS TAKE THEM, AND A TEST HOLDS THAT.** `options()` hands
+//! them to `yadgar_dial` for the `task` hop; [`UpstreamTls::client_tls_config`]
+//! reads them itself for the `iam` hop, which cannot go through `dial` at all.
+//! `tests/iam_tls.rs::both_implementations_refuse_the_same_client_identity`
+//! feeds one table of bad material to both and requires both to refuse.
+//!
+//! **NOTHING HERE CHECKS WHAT THE CERTIFICATE SAYS THE CALLER IS.** The upstream
+//! learns that this deployment issued the leaf, not which service presented it.
+//!
 //! **Configuration is file paths and a flag, never an issuer-specific resource**
 //! (D80). A CA bundle on disk is written by cert-manager in the reference
 //! deployment and by a hand-assembled Secret anywhere else, and nothing here can
@@ -48,13 +82,14 @@ use std::time::Duration;
 
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::CertificateDer;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// The environment variables one upstream's transport is configured from.
 ///
-/// Built from a PREFIX rather than written out six times, so the naming stays
-/// mechanical: `<PREFIX>_TLS_ENABLED`, `<PREFIX>_TLS_CA_FILE` and
-/// `<PREFIX>_TLS_DOMAIN`. The two prefixes match the `TASK_HOST` / `IAM_HOST`
+/// Built from a PREFIX rather than written out ten times, so the naming stays
+/// mechanical: `<PREFIX>_TLS_ENABLED`, `<PREFIX>_TLS_CA_FILE`,
+/// `<PREFIX>_TLS_DOMAIN`, `<PREFIX>_TLS_CLIENT_CERT_FILE` and
+/// `<PREFIX>_TLS_CLIENT_KEY_FILE`. The two prefixes match the `TASK_HOST` / `IAM_HOST`
 /// pair `main` already reads, and `task` and `iam` use the identical shape for
 /// their own upstreams.
 pub const TASK: &str = "TASK";
@@ -81,6 +116,25 @@ pub enum TlsConfigError {
          holding the authority that signed the upstream's certificate."
     )]
     NoCaFile(&'static str),
+
+    #[error(
+        "{0}_TLS_CLIENT_CERT_FILE names a client certificate but {0}_TLS_CLIENT_KEY_FILE \
+         names no private key. A certificate cannot be presented without the key that \
+         proves it, so this is a deployment mistake rather than a reason to dial with no \
+         identity at all — dialling without one is what leaving BOTH unset means, and it \
+         is the default. Point {0}_TLS_CLIENT_KEY_FILE at the private key belonging to \
+         that certificate."
+    )]
+    ClientCertificateWithoutKey(&'static str),
+
+    #[error(
+        "{0}_TLS_CLIENT_KEY_FILE names a private key but {0}_TLS_CLIENT_CERT_FILE names no \
+         certificate. A key proves a certificate and is worth nothing on its own, so this \
+         is a deployment mistake rather than a reason to dial with no identity at all — \
+         dialling without one is what leaving BOTH unset means, and it is the default. \
+         Point {0}_TLS_CLIENT_CERT_FILE at the certificate that key belongs to."
+    )]
+    ClientKeyWithoutCertificate(&'static str),
 }
 
 /// Why the `iam` channel could not be built.
@@ -129,6 +183,28 @@ pub enum IamChannelError {
     )]
     CaNoTrustAnchor { path: PathBuf, sections: usize },
 
+    #[error(
+        "could not read the client certificate at {path}: {source}. A client \
+         certificate was configured, so this is an error rather than a reason \
+         to connect without presenting one."
+    )]
+    ClientCertificateUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "could not read the client private key at {path}: {source}. A client \
+         certificate without its key proves nothing, so this is an error rather \
+         than a reason to connect without presenting one."
+    )]
+    ClientKeyUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("iam's address is not a usable URI: {source}")]
     Uri {
         #[source]
@@ -154,6 +230,31 @@ pub enum IamChannelError {
 pub struct UpstreamTls {
     ca_file: PathBuf,
     domain: Option<String>,
+    client: Option<ClientIdentity>,
+}
+
+/// The certificate this gateway PRESENTS to an upstream, and the private key
+/// that proves it — mutual TLS (ADR-0516).
+///
+/// **ONE LEAF, TWO UPSTREAMS.** `gateway-client-tls` is what this process shows
+/// both `task` and `iam`; the chart mounts it once and points both prefixes at
+/// the same two paths. That is why `rotate::Inputs::also` de-duplicates — the
+/// same pair arrives twice.
+///
+/// **THIS GATEWAY SERVES NO CERTIFICATE OF ITS OWN**, so unlike `iam` and `task`
+/// there is no serving leaf to confuse this with. `gateway-tls` is the EDGE
+/// certificate, terminated by the ingress in front, and this process never reads
+/// it. What it does read is this one, which makes the client leaf the only
+/// certificate whose expiry this process can report.
+///
+/// **The two paths live together rather than as two `Option`s**, the same shape
+/// `yadgar_dial::TlsOptions` uses: one without the other is not a configuration,
+/// it is a mistake, and it is caught in [`UpstreamTls::from_lookup`] rather than
+/// at the handshake.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClientIdentity {
+    certificate: PathBuf,
+    key: PathBuf,
 }
 
 impl UpstreamTls {
@@ -188,7 +289,12 @@ impl UpstreamTls {
         // here: this flag is the revert lever for the cut-over, and a lever that
         // does not move is not one.
         if get("TLS_ENABLED").as_deref() != Some("1") {
-            if get("TLS_CA_FILE").is_some() {
+            // THE CLIENT CERTIFICATE IS NAMED HERE TOO, and leaving it out was
+            // the silent case: an operator who mounts a client leaf and forgets
+            // the flag gets a cleartext hop presenting no identity, and nothing
+            // says so. Mutual TLS is meaningless without the encrypted transport
+            // it runs inside, so this one flag turns both off.
+            if get("TLS_CA_FILE").is_some() || get("TLS_CLIENT_CERT_FILE").is_some() {
                 // NOT an error. Leaving the bundle in place while the flag is
                 // off is exactly how the cut-over gets reverted, so refusing it
                 // would make the lever unusable. It is still worth a line: a
@@ -196,16 +302,32 @@ impl UpstreamTls {
                 // able to see that from the boot log.
                 tracing::warn!(
                     prefix,
-                    "a CA bundle is configured but {prefix}_TLS_ENABLED is not \"1\", so this \
-                     upstream is dialled in CLEARTEXT"
+                    "a CA bundle or a client certificate is configured but \
+                     {prefix}_TLS_ENABLED is not \"1\", so this upstream is dialled in \
+                     CLEARTEXT and presents no identity"
                 );
             }
             return Ok(None);
         }
 
+        // BOTH, OR NEITHER. A certificate with no key cannot be presented and a
+        // key with no certificate proves nothing, so each half alone is a
+        // deployment mistake — and it is refused here rather than left to fail
+        // at a handshake, where the message names neither variable.
+        let client = match (get("TLS_CLIENT_CERT_FILE"), get("TLS_CLIENT_KEY_FILE")) {
+            (None, None) => None,
+            (Some(certificate), Some(key)) => Some(ClientIdentity {
+                certificate: PathBuf::from(certificate),
+                key: PathBuf::from(key),
+            }),
+            (Some(_), None) => return Err(TlsConfigError::ClientCertificateWithoutKey(prefix)),
+            (None, Some(_)) => return Err(TlsConfigError::ClientKeyWithoutCertificate(prefix)),
+        };
+
         Ok(Some(Self {
             ca_file: PathBuf::from(get("TLS_CA_FILE").ok_or(TlsConfigError::NoCaFile(prefix))?),
             domain: get("TLS_DOMAIN"),
+            client,
         }))
     }
 
@@ -220,12 +342,32 @@ impl UpstreamTls {
         self.domain.as_deref()
     }
 
+    /// The certificate this gateway presents to this upstream, when it presents
+    /// one.
+    ///
+    /// **`None` is the default and is not a degraded state**: mutual TLS is a
+    /// separate lever from the encrypted transport, so a deployment can verify
+    /// the upstream without identifying itself to it.
+    pub fn client_certificate_file(&self) -> Option<&Path> {
+        self.client.as_ref().map(|c| c.certificate.as_path())
+    }
+
+    /// The private key belonging to that certificate. Present exactly when
+    /// [`Self::client_certificate_file`] is.
+    pub fn client_key_file(&self) -> Option<&Path> {
+        self.client.as_ref().map(|c| c.key.as_path())
+    }
+
     /// The same settings as `yadgar_dial` takes them, for [`connect_task`].
     pub fn options(&self) -> yadgar_dial::TlsOptions {
         let options = yadgar_dial::TlsOptions::new(&self.ca_file);
-        match &self.domain {
+        let options = match &self.domain {
             None => options,
             Some(domain) => options.domain_name(domain),
+        };
+        match &self.client {
+            None => options,
+            Some(client) => options.identity(&client.certificate, &client.key),
         }
     }
 
@@ -318,7 +460,7 @@ impl UpstreamTls {
             });
         }
 
-        Ok(ClientTlsConfig::new()
+        let mut configured = ClientTlsConfig::new()
             // The host, NOT an address. `iam` is reached by its Service name so
             // the two coincide today; naming it anyway keeps this arm the same
             // shape as dial's, where they do not.
@@ -327,7 +469,44 @@ impl UpstreamTls {
             // The handshake needs its own bound: `connect_timeout` below covers
             // the TCP connect alone, so a peer that accepts the connection and
             // then stalls the handshake would otherwise be unbounded.
-            .timeout(CONNECT_TIMEOUT))
+            .timeout(CONNECT_TIMEOUT);
+
+        // THE CLIENT IDENTITY, READ HERE AND EAGERLY, with the bundle and for
+        // the same reason: a mount that did not happen is the operator's mistake
+        // and is reported as itself, naming the file, rather than as a
+        // connection the peer closed without saying why. `connect_iam` is lazy
+        // about the NAME RESOLUTION, never about the material.
+        //
+        // THIS IS THE FIFTH ITEM ON THE LIST THIS FUNCTION'S DOC KEEPS, and it
+        // is the one most likely to drift: `yadgar_dial::TlsOptions::prepare`
+        // does exactly this, in the same order, with error sentences copied
+        // word for word. `tests/iam_tls.rs::both_implementations_refuse_the_same_bundles`
+        // feeds one table of bad material to BOTH paths and requires both to
+        // refuse, so deleting either read goes red rather than quiet.
+        //
+        // THERE IS NO EMPTY-FILE CHECK TO MATCH `CaEmpty`, and the asymmetry is
+        // deliberate rather than an omission — dial says the same. An empty CA
+        // bundle parses to a trust store with no roots and fails much later; an
+        // empty client chain is refused where rustls builds the configuration
+        // and reaches the caller as `Tls` from `iam_endpoint`, before any
+        // channel exists. Neither dials.
+        if let Some(identity) = &self.client {
+            let certificate = std::fs::read(&identity.certificate).map_err(|source| {
+                IamChannelError::ClientCertificateUnreadable {
+                    path: identity.certificate.clone(),
+                    source,
+                }
+            })?;
+            let key = std::fs::read(&identity.key).map_err(|source| {
+                IamChannelError::ClientKeyUnreadable {
+                    path: identity.key.clone(),
+                    source,
+                }
+            })?;
+            configured = configured.identity(Identity::from_pem(certificate, key));
+        }
+
+        Ok(configured)
         // NOTE the two methods NOT called here: `with_native_roots` and
         // `with_webpki_roots`. Either would add the platform's trust store
         // alongside the bundle, so a CA that failed to load would leave `iam`
@@ -467,6 +646,8 @@ mod tests {
     /// The values below are SENTINELS: nothing in `upstream.rs` could produce
     /// either of them, so a test that sees one saw it travel from the lookup.
     const SENTINEL_CA: &str = "/etc/yadgar/aardvark-9f3c/bundle.pem";
+    const SENTINEL_CLIENT_CERT: &str = "/etc/yadgar/aardvark-9f3c/gateway-caller.pem";
+    const SENTINEL_CLIENT_KEY: &str = "/etc/yadgar/aardvark-9f3c/gateway-caller-key.pem";
     const SENTINEL_DOMAIN: &str = "iam.verified-as-this.invalid";
 
     fn lookup<'a>(
@@ -587,5 +768,121 @@ mod tests {
             iam_endpoint("iam", 50052, Some(&tls)),
             Err(IamChannelError::Tls { .. })
         ));
+    }
+
+    /// THE DEFAULT: no client certificate, so the dial presents no identity and
+    /// behaves exactly as it did before ADR-0516.
+    #[test]
+    fn no_client_certificate_is_the_default() {
+        let vars = [("IAM_TLS_ENABLED", "1"), ("IAM_TLS_CA_FILE", SENTINEL_CA)];
+        let tls = UpstreamTls::from_lookup(IAM, lookup(&vars))
+            .unwrap()
+            .expect("a flag and a bundle enable TLS");
+        assert_eq!(tls.client_certificate_file(), None);
+        assert_eq!(tls.client_key_file(), None);
+    }
+
+    /// BOTH PATHS ARRIVE, proved with names the module could not have chosen for
+    /// itself. This is what `rotate::Inputs::upstream` reads to put them in the
+    /// watch set, so a value that stopped travelling here would silently empty
+    /// half the set.
+    #[test]
+    fn the_client_certificate_and_its_key_both_arrive() {
+        let vars = [
+            ("IAM_TLS_ENABLED", "1"),
+            ("IAM_TLS_CA_FILE", SENTINEL_CA),
+            ("IAM_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+            ("IAM_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+        ];
+        let tls = UpstreamTls::from_lookup(IAM, lookup(&vars))
+            .unwrap()
+            .expect("a flag and a bundle enable TLS");
+        assert_eq!(
+            tls.client_certificate_file(),
+            Some(Path::new(SENTINEL_CLIENT_CERT))
+        );
+        assert_eq!(tls.client_key_file(), Some(Path::new(SENTINEL_CLIENT_KEY)));
+    }
+
+    /// HALF AN IDENTITY IS A DEPLOYMENT MISTAKE, refused at boot naming the
+    /// variable rather than at a handshake naming neither.
+    #[test]
+    fn half_a_client_identity_is_refused() {
+        let cert_only = [
+            ("IAM_TLS_ENABLED", "1"),
+            ("IAM_TLS_CA_FILE", SENTINEL_CA),
+            ("IAM_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+        ];
+        assert!(matches!(
+            UpstreamTls::from_lookup(IAM, lookup(&cert_only)),
+            Err(TlsConfigError::ClientCertificateWithoutKey("IAM"))
+        ));
+
+        let key_only = [
+            ("IAM_TLS_ENABLED", "1"),
+            ("IAM_TLS_CA_FILE", SENTINEL_CA),
+            ("IAM_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+        ];
+        assert!(matches!(
+            UpstreamTls::from_lookup(IAM, lookup(&key_only)),
+            Err(TlsConfigError::ClientKeyWithoutCertificate("IAM"))
+        ));
+    }
+
+    /// AN EMPTY VALUE IS AN UNSET ONE, the same rule the CA bundle already gets.
+    /// A values override that nulls the Secret name renders an empty string, and
+    /// treating that as a configured path would fail the boot over a deployment
+    /// that simply asked for no identity.
+    #[test]
+    fn an_empty_client_path_is_the_same_as_an_unset_one() {
+        let vars = [
+            ("IAM_TLS_ENABLED", "1"),
+            ("IAM_TLS_CA_FILE", SENTINEL_CA),
+            ("IAM_TLS_CLIENT_CERT_FILE", "  "),
+            ("IAM_TLS_CLIENT_KEY_FILE", ""),
+        ];
+        let tls = UpstreamTls::from_lookup(IAM, lookup(&vars))
+            .unwrap()
+            .expect("a flag and a bundle enable TLS");
+        assert_eq!(tls.client_certificate_file(), None);
+    }
+
+    /// A CLIENT CERTIFICATE WITHOUT THE FLAG IS THE REVERTED STATE, not an
+    /// error. Mutual TLS runs inside the encrypted transport, so the one flag
+    /// turns both off, and leaving the paths in place is how the cut-over gets
+    /// pulled back.
+    #[test]
+    fn a_client_certificate_alone_does_not_enable_tls() {
+        let vars = [
+            ("IAM_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+            ("IAM_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+        ];
+        assert_eq!(UpstreamTls::from_lookup(IAM, lookup(&vars)).unwrap(), None);
+    }
+
+    /// ONE LEAF, TWO UPSTREAMS, and the prefixes still have to keep them apart.
+    /// The chart points both at the same mounted pair, but a deployment cutting
+    /// one hop over before the other must be able to.
+    #[test]
+    fn one_upstream_can_present_an_identity_while_the_other_does_not() {
+        let vars = [
+            ("TASK_TLS_ENABLED", "1"),
+            ("TASK_TLS_CA_FILE", SENTINEL_CA),
+            ("TASK_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+            ("TASK_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+            ("IAM_TLS_ENABLED", "1"),
+            ("IAM_TLS_CA_FILE", SENTINEL_CA),
+        ];
+        let task = UpstreamTls::from_lookup(TASK, lookup(&vars))
+            .unwrap()
+            .expect("task is configured");
+        let iam = UpstreamTls::from_lookup(IAM, lookup(&vars))
+            .unwrap()
+            .expect("iam is configured");
+        assert_eq!(
+            task.client_certificate_file(),
+            Some(Path::new(SENTINEL_CLIENT_CERT))
+        );
+        assert_eq!(iam.client_certificate_file(), None);
     }
 }

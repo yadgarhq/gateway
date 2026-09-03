@@ -130,6 +130,48 @@ fn settings(ca: &TempPem, domain: Option<&str>) -> UpstreamTls {
     .expect("the flag is set, so TLS is on")
 }
 
+/// The same, with a CLIENT IDENTITY configured — the ADR-0516 half.
+///
+/// Assembled through `from_lookup` for the reason above: what is under test is
+/// what a DEPLOYMENT produces, and a hand-built `UpstreamTls` would prove only
+/// that the struct holds what it was handed.
+fn settings_with_identity(ca: &TempPem, certificate: &Path, key: &Path) -> UpstreamTls {
+    let vars: Vec<(String, String)> = vec![
+        ("IAM_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "IAM_TLS_CA_FILE".to_string(),
+            ca.path().display().to_string(),
+        ),
+        (
+            "IAM_TLS_CLIENT_CERT_FILE".to_string(),
+            certificate.display().to_string(),
+        ),
+        (
+            "IAM_TLS_CLIENT_KEY_FILE".to_string(),
+            key.display().to_string(),
+        ),
+    ];
+    UpstreamTls::from_lookup(IAM, |key| {
+        vars.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.to_string())
+    })
+    .expect("a flag, a bundle and a complete identity are a valid configuration")
+    .expect("the flag is set, so TLS is on")
+}
+
+/// A path under the temporary directory that is guaranteed not to exist.
+fn absent(what: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "yadgar-gateway-no-such-{what}-{}-{}.pem",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
 /// Serve gRPC over TLS on every address `SERVED_NAME` resolves to, and return
 /// the shared port. `Routes::default()` answers every method with
 /// `Unimplemented`, which is all that is needed: the question each test asks is
@@ -419,18 +461,11 @@ async fn a_ca_bundle_whose_sections_are_not_trust_anchors_is_an_error() {
 /// port and no DNS. The two implementations can therefore be handed the same
 /// file in the same process.
 ///
-/// **WHAT IS MISSING FROM THIS TABLE AND WHY.**
-/// [`one_section_that_is_not_a_certificate`] belongs here and cannot join yet:
-/// `dial`'s half of the fix is `yadgarhq/dial` PR #9, still open, and `Cargo.toml`
-/// pins `yadgar-dial` by `rev` to a commit before it. Against that pin `dial`
-/// answers `Ok(Channel)` for that bundle, which is the defect, not a property to
-/// assert. When the pin advances past #9, add the row:
-///
-/// ```text
-/// (one_section_that_is_not_a_certificate(), "one PEM section, no trust anchor"),
-/// ```
-///
-/// and widen both `matches!` arms to accept the `CaNoTrustAnchor` variants.
+/// **THE ROW THIS COMMENT USED TO PROMISE IS HERE NOW.**
+/// [`one_section_that_is_not_a_certificate`] was excluded while `Cargo.toml`
+/// pinned `yadgar-dial` to a commit before its trust-anchor check. The pin is
+/// `v0.1.3` and the check is in it, so the case is in the table and both arms
+/// accept `CaNoTrustAnchor`.
 #[tokio::test]
 async fn both_implementations_refuse_the_same_bundles() {
     for contents in ["", "   ", "\n", "there is no certificate in this file\n"] {
@@ -452,6 +487,146 @@ async fn both_implementations_refuse_the_same_bundles() {
             "yadgar_dial must refuse {contents:?} for the same reason: {theirs:?}"
         );
     }
+
+    // THE CASE A SECTION COUNT CANNOT SEE, on both sides.
+    let ca = one_section_that_is_not_a_certificate();
+    let mine = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)));
+    assert!(
+        matches!(
+            mine,
+            Err(IamChannelError::CaNoTrustAnchor { sections: 1, .. })
+        ),
+        "the gateway must refuse a bundle with one section and no trust anchor: {mine:?}"
+    );
+    let theirs =
+        yadgar_dial::connect_tls(SERVED_NAME, 50052, &yadgar_dial::TlsOptions::new(ca.path()))
+            .await;
+    assert!(
+        matches!(
+            theirs,
+            Err(yadgar_dial::BalanceError::CaNoTrustAnchor { sections: 1, .. })
+        ),
+        "yadgar_dial must refuse it for the same reason: {theirs:?}"
+    );
+}
+
+/// THE SAME DIVERGENCE DETECTOR, EXTENDED TO THE CLIENT IDENTITY (ADR-0516).
+///
+/// **Without this, adding `identity` to two implementations would leave the
+/// parity test covering half the code while still passing.** The identity is
+/// read in `UpstreamTls::client_tls_config` for the `iam` hop and in
+/// `yadgar_dial::TlsOptions::prepare` for the `task` hop, and those are the two
+/// spellings that already drifted once over the CA list. Delete either read and
+/// this goes red.
+///
+/// **IT ALSO PROVES THE READ IS EAGER**, which is the property `connect_iam`'s
+/// doc commits to: the channel is lazy about DNS and the connection, never about
+/// the material, so a mount that did not happen is a boot refusal naming the
+/// file rather than a per-request mystery under traffic.
+///
+/// **WHAT IS DELIBERATELY NOT HERE.** There is no empty-file row to match
+/// `CaEmpty`: an empty client chain is refused where rustls builds the
+/// configuration and surfaces as `Tls`, not as a distinct read error, and `dial`
+/// records the same asymmetry. Asserting a shared variant that neither side has
+/// would be a test of nothing.
+#[tokio::test]
+async fn both_implementations_refuse_the_same_client_identity() {
+    let good = pki(SERVED_NAME);
+    let ca = TempPem::with(&good.ca_pem);
+    let certificate = TempPem::with(&good.cert_pem);
+    let key = TempPem::with(&good.key_pem);
+
+    // A CLIENT CERTIFICATE THAT IS NOT THERE.
+    let missing_cert = absent("client-cert");
+    let mine = upstream::connect_iam(
+        SERVED_NAME,
+        50052,
+        Some(&settings_with_identity(&ca, &missing_cert, key.path())),
+    );
+    assert!(
+        matches!(
+            mine,
+            Err(IamChannelError::ClientCertificateUnreadable { .. })
+        ),
+        "the gateway must refuse a client certificate that cannot be read: {mine:?}"
+    );
+    let theirs = yadgar_dial::connect_tls(
+        SERVED_NAME,
+        50052,
+        &yadgar_dial::TlsOptions::new(ca.path()).identity(&missing_cert, key.path()),
+    )
+    .await;
+    assert!(
+        matches!(
+            theirs,
+            Err(yadgar_dial::BalanceError::ClientCertificateUnreadable { .. })
+        ),
+        "yadgar_dial must refuse it for the same reason: {theirs:?}"
+    );
+
+    // AND A PRIVATE KEY THAT IS NOT THERE. A certificate without its key proves
+    // nothing, so this is an error rather than a reason to connect anonymously.
+    let missing_key = absent("client-key");
+    let mine = upstream::connect_iam(
+        SERVED_NAME,
+        50052,
+        Some(&settings_with_identity(
+            &ca,
+            certificate.path(),
+            &missing_key,
+        )),
+    );
+    assert!(
+        matches!(mine, Err(IamChannelError::ClientKeyUnreadable { .. })),
+        "the gateway must refuse a client key that cannot be read: {mine:?}"
+    );
+    let theirs = yadgar_dial::connect_tls(
+        SERVED_NAME,
+        50052,
+        &yadgar_dial::TlsOptions::new(ca.path()).identity(certificate.path(), &missing_key),
+    )
+    .await;
+    assert!(
+        matches!(
+            theirs,
+            Err(yadgar_dial::BalanceError::ClientKeyUnreadable { .. })
+        ),
+        "yadgar_dial must refuse it for the same reason: {theirs:?}"
+    );
+}
+
+/// PRESENTING AN IDENTITY MUST NOT BREAK A HOP WHOSE SERVER ASKS FOR NONE, and
+/// that is the whole safety of shipping this before the servers require it.
+///
+/// The cut-over turns the client half on first, against `iam` and `task` as they
+/// are today: neither sets `client_ca_root`, so neither requests a certificate,
+/// and TLS 1.3 simply never sends one. This is a REAL handshake against a real
+/// server rather than an inspection of configuration — the difference the rest
+/// of this file exists to make.
+#[tokio::test]
+async fn a_client_identity_does_not_break_a_hop_whose_server_asks_for_none() {
+    let p = pki(SERVED_NAME);
+    let port = serve(&p).await;
+    let ca = TempPem::with(&p.ca_pem);
+
+    // A SECOND certificate, so this is an identity rather than the server's own
+    // material handed back to it.
+    let caller = pki("gateway-caller");
+    let certificate = TempPem::with(&caller.cert_pem);
+    let key = TempPem::with(&caller.key_pem);
+
+    let channel = upstream::connect_iam(
+        SERVED_NAME,
+        port,
+        Some(&settings_with_identity(&ca, certificate.path(), key.path())),
+    )
+    .expect("a complete identity is a usable configuration");
+    assert_eq!(
+        request(channel).await,
+        Ok(()),
+        "a server that requests no client certificate must still be reachable by a client \
+         configured to present one"
+    );
 }
 
 /// A path that is not there at all. The mistake an operator actually makes is a

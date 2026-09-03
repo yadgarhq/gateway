@@ -6,25 +6,105 @@
 //! process is exactly the kind that fails silently. It listened for SIGINT
 //! alone while Kubernetes sends SIGTERM.
 //!
-//! **No drain budget here, deliberately.** `iam`'s `serve` module pairs
-//! `shutdown` with `DRAIN_BUDGET`/`drain_within` because `iam::rotate` can end
-//! the serving future on its own, outside any signal, and nothing else would
-//! ever bound that self-initiated drain. This gateway has no such watcher —
-//! it holds nothing (D47), and nothing here can end the listener except a
-//! signal — so the only drain that ever happens is the one
-//! `terminationGracePeriodSeconds` already bounds, and `axum::serve` is wired
-//! to [`shutdown`] directly through `with_graceful_shutdown`. `task` and
-//! `task-db` reached the identical conclusion for the identical reason.
-//!
-//! **That reasoning has a known expiry date, so read it as dated rather than
-//! settled.** ADR-0523 requires an exit-on-rotation watcher in every process
-//! that reads security material once at boot, and this one does — `upstream`
-//! reads the CA bundles it verifies `iam` and `task` against. When that watcher
-//! lands here it brings a self-initiated drain with it, and the budget comes
-//! back with it: tokio never unregisters a libc signal handler, so once a
-//! non-signal arm wins the `select!` a later SIGTERM is swallowed and only
-//! SIGKILL remains. Whoever adds the watcher adds `drain_within` in the same
-//! change; the two are one decision, not two.
+//! **The drain budget is here now, and it arrived with the watcher.** This
+//! module used to say there was none, because nothing but a signal could end
+//! this listener. That reasoning carried its own expiry date and it has been
+//! reached: [`crate::rotate`] ends the serving future on its own, outside any
+//! signal, and `terminationGracePeriodSeconds` never runs for a drain kubelet
+//! did not start. Worse, tokio never unregisters a libc signal handler, so once
+//! the rotation arm wins the `select!` and [`shutdown`]'s receivers drop, a
+//! later SIGTERM is SWALLOWED and only SIGKILL remains. So [`DRAIN_BUDGET`] and
+//! [`drain_within`] came in the same change, which is what the note this
+//! replaces asked for: the two are one decision, not two.
+
+use std::time::Duration;
+
+/// The longest a drain may take before the process gives up and ends anyway.
+///
+/// **NOTHING OUTSIDE THIS PROCESS WILL END A SELF-INITIATED DRAIN, and that is
+/// what makes this necessary rather than tidy.** `terminationGracePeriodSeconds`
+/// bounds a drain KUBELET started; when [`crate::rotate`] ends the serve,
+/// kubelet started nothing and its clock never runs. There is no
+/// `Server::timeout`, no deadline on the an upstream channel, and no liveness
+/// probe. One request blocked on a responsive-but-slow upstream would otherwise
+/// leave this process alive with its listener already released — NotReady,
+/// serving nothing, still holding the certificate the exit existed to replace,
+/// and never restarted. That is strictly worse than not exiting at all.
+///
+/// **A SECOND SIGTERM WOULD NOT SAVE IT EITHER.** Tokio never unregisters a
+/// libc signal handler once installed (`tokio/src/signal/unix.rs`), so after
+/// [`shutdown`] loses the `select!` and its receivers drop, SIGTERM is swallowed
+/// rather than taking its default disposition. Only SIGKILL would end the
+/// process. This budget is what makes that impossible to reach.
+///
+/// **A CONSTANT rather than a setting**, deliberately. It is pinned between two
+/// numbers it must sit between, and a configurable value invites one that does
+/// not.
+///
+/// Above: it must outlast the slowest legitimate call by an order of magnitude,
+/// or it cuts off requests it was supposed to let finish. **This repository
+/// holds no response-time floor to anchor that against**, unlike `iam`, whose
+/// `DEFAULT_REDEEM_RESPONSE_FLOOR` gives it a real lower bound and a test
+/// comparing two production constants. The closest thing here is a `/auth/login`
+/// that goes through to `iam` and pays that floor in ANOTHER process, which is
+/// not a constant this crate holds. Saying so is better than writing a test that
+/// compares this literal to another literal and calls it a relationship. The
+/// number is `iam`'s, for `iam`'s reason, and the same 30s grace period bounds it
+/// from below.
+///
+/// Below: it must expire before the SIGKILL on the SIGTERM path, or it bounds
+/// nothing there. Kubernetes defaults `terminationGracePeriodSeconds` to 30s and
+/// this chart neither sets nor exposes it — a recursive grep for
+/// `terminationGracePeriod` under `chart/` returns nothing — so there is no
+/// rendered value to assert against and the relationship is stated here rather
+/// than faked as a test. 25s leaves five
+/// seconds to log and exit. **A deployment that lowers the grace period below
+/// 25s must lower this with it**, which is the one thing a reader has to carry
+/// away from this paragraph.
+pub const DRAIN_BUDGET: Duration = Duration::from_secs(25);
+
+/// What became of a drain.
+#[derive(Debug)]
+pub enum Drain<T> {
+    /// The server stopped within its budget. Carries whatever it returned.
+    Finished(T),
+    /// The budget expired with work still in flight, and the caller should end
+    /// the process anyway.
+    Overran,
+}
+
+/// Wait for `stop`, ask the server to shut down, and give it `budget` to finish.
+///
+/// **THE CLOCK STARTS WHEN SHUTDOWN IS REQUESTED, AND THAT IS THE WHOLE POINT OF
+/// THIS FUNCTION EXISTING.** `tokio::time::timeout` fixes its deadline when it is
+/// CALLED, so wrapping the serving future itself bounds the SERVER'S WHOLE LIFE
+/// rather than its drain: the process then ends `budget` after boot, on every
+/// boot, with nothing having asked it to stop. That defect shipped on this
+/// branch and `tests/drain.rs` exists to keep it dead.
+///
+/// The server is handed a [`tokio::sync::oneshot::Receiver`] as its shutdown
+/// future — `axum::serve`'s `with_graceful_shutdown` here, where `iam` and `task`
+/// pass it to tonic's `serve_with_shutdown` — and spawned by the caller; this
+/// holds the sender. A send that fails
+/// means the server already ended on its own, which is not an error.
+///
+/// **`Overran` is not a reason to fail.** The caller logs and exits 0: the
+/// restart is the point, and a CrashLoopBackOff on top of a slow drain helps
+/// nobody. See [`DRAIN_BUDGET`] for why anything at all bounds a drain that this
+/// process, rather than kubelet, began.
+pub async fn drain_within<T>(
+    server: tokio::task::JoinHandle<T>,
+    ask_to_stop: tokio::sync::oneshot::Sender<()>,
+    stop: impl std::future::Future<Output = ()>,
+    budget: Duration,
+) -> Drain<T> {
+    stop.await;
+    let _ = ask_to_stop.send(());
+    match tokio::time::timeout(budget, server).await {
+        Ok(joined) => Drain::Finished(joined.expect("the serving task panicked")),
+        Err(_) => Drain::Overran,
+    }
+}
 
 /// The future `axum::serve`'s `with_graceful_shutdown` drains on: SIGTERM, and
 /// SIGINT beside it.
