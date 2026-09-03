@@ -261,7 +261,7 @@ That was added by `yadgarhq/actions#30` and proved on a real runner before it
 merged, by pointing this repository's caller at the branch and watching the
 eight live-Valkey tests go from failing to passing.
 
-## ADR-0522's setting — nothing to run, but the DEPLOY ORDER is part of the contract
+## ADR-0522's setting — no manual step, but the DEPLOY ORDER is part of the contract
 
 This image populates `Scope.owner_reads_own_record` from what `iam` answers. It
 resolves none of it: the answer depends on the team of the ROW being read, which
@@ -269,14 +269,49 @@ this hop does not know, so a `-db` computes it where it computes the reach.
 
 **Populate, deploy, then enforce, and the order is not a preference.** A `-db`
 that reads the field REFUSES an unset `org_value` rather than choosing a value —
-so a `-db` rolled out ahead of this image refuses every read. That is an outage
-rather than a wrong answer, which is the better failure of the two and is still
-one. The order is: `iam` at v0.7.2 or later, then this image, then any `-db` that
-enforces.
+`task-db`'s `src/setting.rs:113` answers `INVALID_ARGUMENT` with "a store may not
+choose one on its behalf". So a `-db` that read the field ahead of the modules
+supplying it would refuse every read. That is an outage rather than a wrong
+answer, which is the better failure of the two and is still one.
 
-**Nothing to run against the cluster.** No new variable, no new secret, no chart
-change. `iam` v0.7.2 already serves the field and already stores ADR-0522's
-shipped default.
+**No `-db` reads the field today, and that is what makes the order achievable.**
+`task-db` v0.4.1 adds `resolve()` and calls it from nowhere: on v0.4.2
+`grep -rn 'setting::' src/ tests/` outside `src/setting.rs` returns nothing, and
+so does `owner_reads_own_record`. `task-db#28` says so in as many words —
+"IT IS DELIBERATELY NOT CALLED FROM THE REQUEST PATH, AND THAT IS THE WHOLE
+POINT OF THIS CAR" — and names the wiring as the next car, a change to
+`src/sql.rs`. Until that change is made and released, `task-db` is in the
+pre-enforcement state and behaves exactly as it always has. **Do not read a
+`task-db` version number, or the presence of `setting.rs`, as enforcement.**
+
+**The chain has five links, not three, and the store is the first of them.**
+
+| link      | version  | what it does                                                                                     |
+| --------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `iam-db`  | ≥ v0.5.1 | creates `iam_org_setting` and `iam_team_setting_override`, and seeds the shipped default         |
+| `iam`     | ≥ v0.7.2 | validates `SetInheritedSetting` and forwards it, and carries the setting out beside the identity |
+| `gateway` | ≥ v0.8.3 | populates `Scope.owner_reads_own_record` from what `iam` answers                                 |
+| `task`    | ≥ v0.4.3 | takes proto v1.9.0, so the field survives the hop to `task-db`                                   |
+| `task-db` | ≥ v0.4.1 | CARRIES the resolver (`src/setting.rs`), deliberately unwired — enforcement is a later change    |
+
+**An earlier revision of this note said `iam` v0.7.2 already stores ADR-0522's
+shipped default. It does not, and the enforcement car is the one that would pay
+for it.** `iam` commit `1b21bcc`, first tagged v0.7.2, validates and forwards; it
+stores nothing. The tables and the seed row are in `iam-db` commit `13f997f`,
+first tagged **v0.5.1** — migrations 10, 11 and 12 of its `src/schema.rs`. An
+operator who confirmed `iam` alone, concluded the chain was populated, and then
+released and rolled the wiring change would find `iam_org_setting` absent and
+every read refused. That is why the store is named here as the first link.
+
+**Nothing to run BY HAND against the cluster — but there is a rollout.** No new
+variable, no new secret, no chart change, and no manual SQL. The seed is a
+migration, not an operator step: `seed_owner_reads_own_record()` inserts
+`owner_reads_own_record` as `SETTING_VALUE_ON` with the lock engaged, and it
+applies at `iam-db` boot like every other migration. **Nobody has to call
+`SetInheritedSetting` to get the shipped default.** An operator who wants a value
+other than ON does call it, under the TTL bound described below. So the
+prerequisite is a rollout list — and the next section is how to check it, because
+a merge does not deploy.
 
 **A change to the setting binds by the credential cache's TTL, and nothing
 shortens that.** `YADGAR_CREDENTIAL_TTL_SECONDS` defaults to 30, and the setting
@@ -287,3 +322,129 @@ publish are keyed on a `user_id` — which an organisation-level write does not
 have. So after changing the policy, expect up to the TTL before every replica
 honours it, and treat that as the bound rather than watching for an event that
 is not coming.
+
+## A merge is not a deploy — every Deployment pins `latest`
+
+Measured read-only against the kind cluster on 2026-09-03.
+
+Every yadgar Deployment sets `image: ghcr.io/yadgarhq/<module>:latest` with
+`imagePullPolicy: Always`. Merging moves the `latest` tag and publishes an image.
+It restarts nothing. A running pod keeps the digest it started with until
+something unrelated restarts it, so a merged and published change is not a
+deployed change.
+
+**Two things that look like evidence and are not.** Argo CD's `Synced/Healthy` is
+not evidence: every Application reported Synced and Healthy while four of the
+five modules ran stale binaries. The pod's image TAG is not evidence either,
+because every one of them reads `latest`. What is evidence is the pod's
+`imageID` DIGEST, compared against the GHCR version list.
+
+### How to check what is actually running
+
+**Both flags are mandatory, on every command in this section and the next.**
+`$CLAUDE_JOB_DIR` below is an agent-session path and will be unset for you:
+substitute the path to your own kubeconfig. What must not change is that the
+kubeconfig holds the kind cluster ONLY and that the context is `kind-yadgar`.
+Those two together are what stop a copy-paste reaching production, because the
+default context on a workstation here is production.
+
+```bash
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar get pods -o custom-columns='POD:.metadata.name,DIGEST:.status.containerStatuses[*].imageID'
+```
+
+Then name the digest. GHCR holds the tag the digest was published under:
+
+```bash
+gh api --paginate /orgs/yadgarhq/packages/container/iam-db/versions \
+  --jq '.[] | select(.name == "sha256:<digest from above>") | .metadata.container.tags'
+```
+
+For a `-db` there is a second, independent check that needs no database session:
+the module logs its schema position at boot.
+
+```bash
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar logs deployment/iam-db | grep 'schema at migration'
+```
+
+`iam-db` v0.5.1 carries twelve migrations. A line reading `schema at migration 9`
+means migrations 10, 11 and 12 have not run, so `iam_org_setting` does not exist
+and the seed row is absent.
+
+### What was running on 2026-09-03
+
+| module    | running | `latest` published | ADR-0522 needs |
+| --------- | ------- | ------------------ | -------------- |
+| `iam-db`  | 0.5.0   | 0.6.0              | ≥ 0.5.1        |
+| `iam`     | 0.7.0   | 0.7.3              | ≥ 0.7.2        |
+| `gateway` | 0.8.4   | 0.8.4              | ≥ 0.8.3        |
+| `task`    | 0.4.2   | 0.4.3              | ≥ 0.4.3        |
+| `task-db` | 0.3.0   | 0.4.2              | ≥ 0.4.1        |
+
+`gateway` already satisfies its link, and only because an unrelated pod-spec
+change restarted it. The other four are behind.
+
+**There is no armed outage here, and the last row is why.** `task-db:latest`
+resolves to 0.4.2, which carries `setting.rs` and calls it from nowhere, so a
+`task-db` restart today changes no behaviour. Roll `iam-db` first all the same:
+it is the prerequisite the enforcement car will need in place before it can be
+released, and `iam-db` is the link furthest behind. The order below is what makes
+that car safe to cut later, not a response to a hazard running now.
+
+### Rolling the stale modules, in prerequisite order
+
+**Check the preconditions first. They hold as of 2026-09-03.** The only boot
+gate any of these jumps crosses is `fix!: refuse DB_SSL_MODE=verify_ca`, which
+arrives in `iam-db` v0.6.0 and `task-db` v0.4.2. Both Deployments set
+`DB_SSL_MODE=required`, so neither refusal fires — but re-read the value before
+rolling, because a `-db` that refuses at boot turns this runbook into the outage
+it exists to prevent:
+
+```bash
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar get deploy iam-db task-db \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.template.spec.containers[*].env}{"\n"}{end}'
+```
+
+Nothing else across `iam-db` v0.5.0..v0.6.0, `iam` v0.7.0..v0.7.3, `task`
+v0.4.2..v0.4.3 or `task-db` v0.3.0..v0.4.2 adds a required variable. `iam`
+v0.7.3 mounts a client certificate for `iam-db`, and that is opt-in rather than
+a gate: `clientCertSecret` defaults to empty and is empty here.
+
+Then run these yourself, in this order, and wait for each before starting the
+next.
+
+```bash
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout restart deployment/iam-db
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout status deployment/iam-db
+
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout restart deployment/iam
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout status deployment/iam
+
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout restart deployment/task
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout status deployment/task
+
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout restart deployment/task-db
+kubectl --kubeconfig "$CLAUDE_JOB_DIR/tmp/kubeconfig-kind-only.yaml" --context kind-yadgar \
+  -n yadgar rollout status deployment/task-db
+```
+
+After `iam-db` reports ready, confirm the migration line reads `schema at
+migration 12` before starting `iam`. That is the check that the seed row now
+exists, and it is the one the rest of the chain depends on.
+
+`gateway` needs no restart today: it is already at 0.8.4.
+
+**Expect a second rollout of each Deployment.** All four Applications set
+`syncPolicy.automated.selfHeal: true` and none sets `ignoreDifferences`, so Argo
+reverts the `kubectl.kubernetes.io/restartedAt` annotation that
+`rollout restart` writes into the pod template. Both rollouts pull the same
+`latest` digest, so the result is the same either way.

@@ -87,8 +87,19 @@
 //! exactly the silent TTL-only fall back this module says is not permitted.
 //!
 //! - **An [`async_nats::ConnectOptions::event_callback`]**, because that `-ERR`
-//!   arrives as an [`async_nats::Event::ServerError`] and `async-nats` logs those
-//!   at `debug!` — below the `info` these pods run at, so it vanishes.
+//!   arrives as an [`async_nats::Event::ServerError`] and nothing else in this
+//!   process ACTS on it. An earlier revision of this comment said `async-nats`
+//!   logs those at `debug!`, below the `info` these pods run at, so they vanish.
+//!   It does not. `async-nats` 0.50 dispatches every event through one loop that
+//!   writes `tracing::info!("event: {}", event)` BEFORE calling the callback
+//!   (`src/lib.rs:1105`), and `main` builds `EnvFilter::new("info")` with no
+//!   per-target restriction — so the line does reach the log. It is still not
+//!   the control, and the callback stays. That line is INFO among INFO, worded
+//!   as an event rather than as a fault, and it names neither which subject was
+//!   refused nor any remedy. It also sets nothing: [`start`] answers off a flag
+//!   only `on_event` can raise, so without the callback a forbidden replica
+//!   would still report itself as consuming. What the callback adds is the ERROR
+//!   level, the permission to check, and the refusal the next bullet acts on.
 //! - **A refusal ENDS the subscription**, wherever in its life it turns up. The
 //!   message loop in [`drain`] selects against the refusal as well as against the
 //!   stream, so a late `-ERR` returns from `drain` and [`run`] redials.
