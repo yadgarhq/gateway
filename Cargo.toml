@@ -72,15 +72,17 @@ rustls = { version = "0.23", default-features = false, features = ["std"] }
 # copied from task, per the invariant that anything every service needs is
 # implemented once.
 #
-# The FULL 40-character revision, like every other in-org pin in this file. An
-# abbreviation is a prefix match: it resolves today and can become ambiguous as
-# the upstream repository grows, and there is no version to fall back on for a
-# git dependency.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", rev = "dd1de04aa0e9ec92a6efd74363e68c694fe6c0fa" }
+# The RELEASE TAG, like every other in-org pin in this file. A published tag
+# never moves in this organisation — a correction is a new tag, never a moved
+# one — so `v0.1.0` names one commit for as long as it exists, and Cargo.lock
+# records the full 40-character revision it resolved to. The pin stays exact and
+# auditable, and the git dependency finally states a version it had no way to
+# state before.
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.1.0" }
 
-# The shared instrumentation seam (D67). Pinned by revision like every other
-# in-org crate — a branch is a moving target.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", rev = "1694475a7eab9a8332f2955671987c57bf3234e8", features = [
+# The shared instrumentation seam (D67). Pinned by release tag like every other
+# in-org crate — a branch is a moving target, a published tag is not.
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.0", features = [
   "grpc",
 ] }
 
