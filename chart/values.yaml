@@ -158,6 +158,127 @@ iam:
 #
 # `0` disables the cache and restores the per-request round trip. It is the revert,
 # and it needs no new image — the same shape as trustUnauthenticatedHeaders below.
+# WHO THIS GATEWAY SAYS IT IS WHEN IT DIALS ITS UPSTREAMS — mutual TLS
+# (ADR-0516).
+#
+# A THIRD DIRECTION, and it is not either of the two above. `task.tls.caSecret`
+# and `iam.tls.caSecret` are how this gateway VERIFIES the servers it reaches.
+# This is what it PRESENTS to them, so they can authenticate the caller rather
+# than accepting anything that reaches the port.
+#
+# ONE LEAF FOR BOTH UPSTREAMS, and that is why it lives here rather than inside
+# each `tls` block. `gateway-client-tls` is this process's identity, not a
+# property of the hop, so it is mounted once and both hops are pointed at the
+# same two files. The per-upstream flags still decide WHICH hops present it —
+# rendering is guarded on that upstream's `tls.enabled` — so a deployment can cut
+# one hop over before the other.
+#
+# WHY A CERTIFICATE RATHER THAN A NetworkPolicy: ADR-0516. A NetworkPolicy is
+# enforced by the CNI, so the same manifest protects an EKS deployment and
+# protects nothing on kind — a control that keeps working while it stops
+# protecting, which is D80's second and worse failure. A certificate check is
+# enforced by the services themselves and holds identically everywhere. The
+# NetworkPolicy still ships, as a second layer rather than as the choice.
+#
+# EMPTY, AND THAT IS ITS OWN LEVER. Turning either upstream's `tls.enabled` on
+# encrypts that hop and presents NO identity, exactly as before. Naming a Secret
+# here is a separate change that can be reverted on its own, which is the
+# discipline this cut-over is being done under.
+#
+# NOT `gateway-tls`, WHICH IS A DIFFERENT CERTIFICATE ENTIRELY. That one is the
+# EDGE leaf, terminated by the ingress in front of this pod (D71), and this
+# process never reads it — `iam` mounts its `ca.crt` for D73 enrolment tokens,
+# which is a third use again. This value is a `client auth` leaf issued for
+# `gateway-caller`, and a server verifying a client chain refuses a `server auth`
+# leaf even though it trusts the issuer perfectly well.
+#
+# IT ROTATES, AND IT IS WATCHED. The mount is a DIRECTORY, never subPath, and
+# both files join the rotation watch set described under `tlsRotation` below.
+# That matters more here than anywhere else in this chart: this process serves no
+# certificate at all, so the client leaf is the ONLY certificate it holds — and
+# ADR-0516 records that an expired client leaf STOPS a hop rather than degrading
+# it. A gateway that read it once and never again would keep answering `/` and
+# stop being able to reach `iam` or `task`.
+#
+# THE NAME IN THE CERTIFICATE IS `gateway-caller`, WHICH IS NOT A SERVICE NAME
+# and is not meant to resolve. Nothing checks it today: an upstream's
+# `client_ca_root` authenticates the DEPLOYMENT that issued the leaf, not which
+# service presented it. Distinguishing callers is a later change.
+clientCertificate:
+  # The Secret holding the certificate this gateway presents AND its private key.
+  #
+  # BOTH KEYS ARE MOUNTED, which is correct here for the reason it is correct in
+  # every other chart's serving block: a certificate cannot be presented without
+  # the key that proves it, and this key is this pod's own. The CA mounts above
+  # select a single key precisely to keep somebody else's private key out of this
+  # pod; this one is not somebody else's.
+  #
+  # NOT A PEM PASTED INTO THIS FILE. The certificate rotates, and a copy in git
+  # is correct only until the rotation nobody remembered to follow.
+  #
+  # NAMING IT WITH BOTH UPSTREAMS CLEARTEXT RENDERS NOTHING, deliberately. A
+  # client certificate is presented only inside an encrypted transport, so a pod
+  # with nowhere to present it would otherwise carry a PRIVATE KEY it never
+  # reads, behind a volume no environment variable names.
+  secret: ""
+  # The key inside that Secret holding the certificate, mounted as `client.crt`.
+  # Named rather than assumed: `tls.crt` is what cert-manager calls it, and a
+  # Secret assembled by hand for a deployment cert-manager does not run in is
+  # free to call it something else.
+  certSecretKey: tls.crt
+  # The key inside that Secret holding the private key, mounted as `client.key`.
+  # Named for the same reason.
+  keySecretKey: tls.key
+
+# HOW A RENEWED CERTIFICATE ACTUALLY REACHES THE PROCESS.
+#
+# Every file above is read ONCE, when the upstream channels are built, and
+# nothing re-reads a dialled channel's material afterwards. cert-manager renews
+# 30 days before expiry and kubelet refreshes the mounted files — each Secret is
+# mounted as a DIRECTORY rather than with subPath precisely so it does — but the
+# process would go on using its day-0 material until something restarted it
+# (ADR-0523).
+#
+# So the gateway hashes the TLS files it read at boot — the two CA bundles, and
+# the client certificate and key it presents to both upstreams — and when one of
+# them changes it logs which, and the old and new fingerprint, waits out this
+# pod's splay, drains, and exits 0. Kubelet restarts the container and the new
+# process reads the fresh files.
+#
+# THIS PROCESS SERVES NO CERTIFICATE, so the client leaf is the only one it
+# holds, and the only one it can gauge. ADR-0516 records that an expired client
+# leaf STOPS a hop rather than weakening it, so it is also the only DATED failure
+# this gateway has.
+#
+# A HASH RATHER THAN A MODIFICATION TIME, and that is not a detail. Kubelet
+# rotates a mounted Secret by renaming a new `..data` symlink over the old one,
+# so every path resolves to a new inode with a new mtime on EVERY resync, changed
+# or not. An mtime check restarts both replicas for nothing.
+#
+# THE FAILURE MODE IS THE POINT: if the watcher dies you get the old behaviour,
+# never worse. `yadgar_tls_certificate_not_after_seconds` is the other half — it
+# reports the expiry of the certificates this process actually loaded, told apart
+# by a `kind` label. Here that is one series, `kind="client"`.
+#
+# THE WATCHER IDLES ON A DEFAULT INSTALL. With both upstreams cleartext the watch
+# set is empty and nothing is polled. The schedule below is still parsed at boot
+# in that case: a value an operator set and the binary cannot use is an error
+# whether or not the watcher would have run.
+tlsRotation:
+  # How often the files are re-hashed. Reading a handful of small files a minute
+  # costs nothing, and the deadline this protects is 30 days wide.
+  pollSeconds: 60
+  # THE LONGEST A POD WAITS BEFORE EXITING, drawn per pod inside that range.
+  #
+  # Both replicas see the refreshed file inside the same kubelet sync window, so
+  # an unsplayed exit can drop both at once — and the PodDisruptionBudget does
+  # NOT govern a self-exit, it constrains eviction. This is the only control
+  # there is. Five minutes against 30 days of slack is free.
+  #
+  # `0` exits immediately, which is what a single-replica or a development
+  # deployment wants.
+  splayMaxSeconds: 300
+
 credentialCache:
   ttlSeconds: 30
 

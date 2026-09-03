@@ -15,6 +15,7 @@
 //! recoverable where refusing to start is not. Under D68 a pod stuck in startup
 //! is one the autoscaler cannot help.
 
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use std::time::Duration;
 use yadgar_gateway::attest::{Attestation, Credentials};
 use yadgar_gateway::http::{router, AppState, CredentialLimits};
 use yadgar_gateway::limit::{Bucket, Limiter, Limits};
+use yadgar_gateway::rotate;
 use yadgar_gateway::source::TrustBoundary;
 use yadgar_gateway::upstream;
 
@@ -239,6 +241,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task_tls = upstream::UpstreamTls::from_env(upstream::TASK).map_err(|e| e.to_string())?;
     let iam_tls = upstream::UpstreamTls::from_env(upstream::IAM).map_err(|e| e.to_string())?;
 
+    // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION AND BEFORE THE
+    // DIALS (ADR-0523). The baseline is the bytes each file held when this
+    // process read them; deferring the first reading to the watcher's first poll
+    // would put the rest of boot inside a window where a kubelet swap quietly
+    // becomes the baseline, and the real rotation would never be noticed.
+    //
+    // BOTH UPSTREAMS, AND ONE CLIENT LEAF BETWEEN THEM. `gateway-client-tls` is
+    // presented to `task` and to `iam`, so the same two paths arrive twice;
+    // `Inputs::also` de-duplicates, so the pair is hashed once and named once in
+    // the line that reports a change.
+    let tls_inputs = rotate::Inputs::default()
+        .upstream(task_tls.as_ref())
+        .upstream(iam_tls.as_ref());
+
+    // PARSED AT BOOT WHETHER OR NOT ANY TLS IS CONFIGURED. A value an operator
+    // set and this binary cannot use is a mistake to refuse, not one to paper
+    // over with a default nobody chose — and refusing it here means it is
+    // refused on a cleartext deployment too, which is where it would otherwise
+    // sit unnoticed until the cut-over.
+    let schedule = rotate::Schedule::from_env().map_err(|e| e.to_string())?;
+
     let task_host = env_or("TASK_HOST", "task");
     let task_port: u16 = env_or("TASK_PORT", "50052").parse()?;
     let task = upstream::connect_task(&task_host, task_port, task_tls.as_ref())
@@ -309,6 +332,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
+
+    // AFTER THE EXPORTER, NEVER BEFORE IT. A value recorded before there is a
+    // recorder is a value nobody ever sees. This process serves no certificate,
+    // so the only series it publishes is the CLIENT leaf's — which under
+    // ADR-0516 is the one whose expiry stops a hop.
+    tls_inputs.export_not_after();
 
     // Comma-separated, and EMPTY BY DEFAULT. An empty list rejects every browser
     // origin, which is right for a server whose clients are agents: a default
@@ -426,32 +455,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:8080").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, protocol = yadgar_gateway::mcp::PROTOCOL_VERSION, "gateway listening");
-
     // ARMED BEFORE THE LISTENER IS SERVED, and that ordering is the fix rather
     // than an accident of where the line sits. `serve::shutdown` installs both
     // signal handlers when it is CALLED — a SIGTERM arriving between here and
     // the first poll of the future would otherwise take the process's default
     // disposition and kill it outright.
-    let shutdown = yadgar_gateway::serve::shutdown().map_err(|e| {
+    let signals = yadgar_gateway::serve::shutdown().map_err(|e| {
         format!(
             "the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a \
              server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one"
         )
     })?;
 
-    axum::serve(
-        listener,
-        // `into_make_service_with_connect_info`, WHICH THIS CALL DID NOT HAVE.
-        // Without it nothing populates `ConnectInfo`, so the peer address is not
-        // extractable at all and every request resolves to `Source::Unknown` —
-        // an unthrottleable, unattributable request, which is the state this
-        // whole change exists to leave. It is the one line that makes the rest
-        // reachable in the shipped binary.
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    tracing::info!(
+        %addr,
+        protocol = yadgar_gateway::mcp::PROTOCOL_VERSION,
+        watching = tls_inputs.watched().len(),
+        rotation_poll_secs = schedule.poll().as_secs(),
+        rotation_splay_max_secs = schedule.splay_max().as_secs(),
+        drain_budget_secs = yadgar_gateway::serve::DRAIN_BUDGET.as_secs(),
+        "gateway listening"
+    );
+
+    // THE SERVER IS SPAWNED AND ASKED TO STOP THROUGH A CHANNEL, rather than
+    // handed the shutdown future directly, because the drain has to be BOUNDED
+    // once something other than a signal can start one, and a budget's clock
+    // must start when shutdown is REQUESTED. A `timeout` around the serving
+    // future itself would bound the server's whole life instead, and end the
+    // process one budget after boot, on every boot — the defect `iam` shipped
+    // and `tests/drain.rs` keeps dead.
+    let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(
+        axum::serve(
+            listener,
+            // `into_make_service_with_connect_info`, WHICH THIS CALL DID NOT
+            // HAVE. Without it nothing populates `ConnectInfo`, so the peer
+            // address is not extractable at all and every request resolves to
+            // `Source::Unknown` — an unthrottleable, unattributable request. It
+            // is the one line that makes the rest reachable in the shipped
+            // binary.
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stop_requested.await;
+        })
+        .into_future(),
+    );
+
+    // TWO WAYS THIS PROCESS STOPS, and only one of them is a signal. The other
+    // is a rotated TLS file (ADR-0523), which is why the drain below is bounded
+    // at all: kubelet's grace period never runs for a drain kubelet did not
+    // start, and tokio has already swallowed the SIGTERM that would otherwise
+    // save it.
+    let stop = async {
+        tokio::select! {
+            () = signals => {}
+            () = rotate::watch(tls_inputs, schedule) => {}
+        }
+    };
+
+    match yadgar_gateway::serve::drain_within(
+        serving,
+        ask_to_stop,
+        stop,
+        yadgar_gateway::serve::DRAIN_BUDGET,
     )
-    .with_graceful_shutdown(shutdown)
-    .await?;
+    .await
+    {
+        yadgar_gateway::serve::Drain::Finished(result) => result?,
+        yadgar_gateway::serve::Drain::Overran => tracing::error!(
+            budget_secs = yadgar_gateway::serve::DRAIN_BUDGET.as_secs(),
+            "the drain did not finish within its budget; ending anyway with calls still in \
+             flight. A request blocked this long is the thing to look at"
+        ),
+    }
 
     Ok(())
 }

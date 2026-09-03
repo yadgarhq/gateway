@@ -1,3 +1,29 @@
+{{/*
+  WHETHER THIS POD PRESENTS A CLIENT CERTIFICATE AT ALL (ADR-0516).
+
+  Computed ONCE, here, because it is asked six times below — twice for the
+  environment, once for the mount, once for the volume, and twice more inside the
+  `or` guards those two live under. Those guards are the reason this is not
+  inlined: this chart wraps `volumeMounts:` and `volumes:` in an `or` over every
+  optional mount, so a client-certificate mount added without widening BOTH would
+  render a mount with no volume behind it, or nothing at all.
+
+  ONE LEAF, TWO UPSTREAMS, so the per-upstream environment blocks still guard on
+  their own `tls.enabled` beside this: a deployment can cut `task` over before
+  `iam`. What this value decides is whether the identity exists to be presented.
+*/}}
+{{- $clientCert := .Values.clientCertificate.secret -}}
+{{/*
+  WHETHER THE MOUNT IS WORTH MAKING AT ALL.
+
+  A client certificate is presented only INSIDE an encrypted transport, so a pod
+  with the Secret named and both upstreams cleartext has nothing to present it
+  on. Mounting it anyway would put a PRIVATE KEY in a pod that reads no part of
+  it — and it would render a volume no environment variable names, which reads
+  as a mistake to anyone diffing the manifest. Both halves are guarded, so the
+  reverted state leaves nothing behind.
+*/}}
+{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled) -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -108,6 +134,25 @@ spec:
             # can tell the difference, which is the point.
             - name: TASK_TLS_CA_FILE
               value: /var/run/config/task-ca/ca.pem
+            {{- if $clientCert }}
+            # WHO THIS GATEWAY SAYS IT IS ON THAT HOP — mutual TLS (ADR-0516).
+            #
+            # THE SAME TWO PATHS FOR BOTH UPSTREAMS, because there is ONE client
+            # leaf: `gateway-client-tls` is this process's identity rather than a
+            # property of a hop. One volume below, two prefixes here.
+            #
+            # RENDERED PER UPSTREAM, so a deployment can cut one hop over before
+            # the other: this pair appears only when THAT upstream's TLS is on
+            # AND `clientCertificate.secret` is named. Both are off by default,
+            # so turning an upstream's transport on encrypts the hop and presents
+            # no identity, exactly as before.
+            #
+            # PATHS, never an issuer-specific resource (D80).
+            - name: TASK_TLS_CLIENT_CERT_FILE
+              value: /var/run/secrets/client-cert/client.crt
+            - name: TASK_TLS_CLIENT_KEY_FILE
+              value: /var/run/secrets/client-cert/client.key
+            {{- end }}
             {{- if .Values.task.tls.domain }}
             # Only when the certificate names something other than the Service.
             # Unset means "verify against task.host", which is what makes a
@@ -139,6 +184,24 @@ spec:
             # checks; see `upstream::connect_iam`.
             - name: IAM_TLS_CA_FILE
               value: /var/run/config/iam-ca/ca.pem
+            {{- if $clientCert }}
+            # WHO THIS GATEWAY SAYS IT IS ON THAT HOP — mutual TLS (ADR-0516).
+            #
+            # The same two paths the `task` block above names, and deliberately:
+            # one leaf, one mount, two upstreams.
+            #
+            # RENDERED PER UPSTREAM, so a deployment can cut one hop over before
+            # the other: this pair appears only when THAT upstream's TLS is on
+            # AND `clientCertificate.secret` is named. Both are off by default,
+            # so turning an upstream's transport on encrypts the hop and presents
+            # no identity, exactly as before.
+            #
+            # PATHS, never an issuer-specific resource (D80).
+            - name: IAM_TLS_CLIENT_CERT_FILE
+              value: /var/run/secrets/client-cert/client.crt
+            - name: IAM_TLS_CLIENT_KEY_FILE
+              value: /var/run/secrets/client-cert/client.key
+            {{- end }}
             {{- if .Values.iam.tls.domain }}
             # Only when the certificate names something other than the Service.
             - name: IAM_TLS_DOMAIN
@@ -275,6 +338,40 @@ spec:
               value: {{ .Values.credentialLimits.unattributed | quote }}
             # No default here (see main.rs / from_default_env): unset means
             # silent, which is the exact failure this line exists to prevent.
+            # HOW OFTEN THE TLS FILES ABOVE ARE RE-HASHED, and how long this pod
+            # waits before acting on a change (ADR-0523).
+            #
+            # Nothing re-reads a dialled channel's material, so the gateway
+            # re-reads nothing: it notices the files changed, drains, and exits
+            # 0, and kubelet restarts the container onto the new material. The
+            # Secrets are mounted as DIRECTORIES below, never with subPath, which
+            # is what makes kubelet refresh them inside the pod at all.
+            #
+            # THIS PROCESS SERVES NO CERTIFICATE, so the client leaf is the only
+            # one it holds — and an expired client leaf STOPS the hop to `iam` or
+            # `task` rather than degrading it. That is the whole of the deadline
+            # this watcher exists to move.
+            #
+            # THE SPLAY IS THE ONLY THING SEPARATING THE TWO REPLICAS. Both see
+            # the refreshed file inside the same kubelet sync window, and the
+            # PodDisruptionBudget does NOT govern a self-exit — it constrains
+            # eviction, and nothing here is evicting anything.
+            #
+            # RENDERED WHETHER OR NOT ANY TLS IS ON, and parsed at boot either
+            # way. With both upstreams cleartext the watch set is empty and the
+            # watcher idles; a value an operator set and the binary cannot use is
+            # still an error, which is the point of parsing it regardless.
+            #
+            # `required` rather than `| default`: an override that nulls or
+            # empties the block becomes a template-time error naming the value,
+            # instead of an interval nobody chose or a CrashLoop three layers
+            # from its message. `0` reaches the binary and is refused there BY
+            # NAME, because sleeping for no time at all is a hot loop rather than
+            # a way of turning the watcher off.
+            - name: TLS_ROTATION_POLL_SECS
+              value: {{ required "tlsRotation.pollSeconds is how often the gateway re-hashes the TLS files it read at boot and must be set; see the chart's values.yaml" .Values.tlsRotation.pollSeconds | quote }}
+            - name: TLS_ROTATION_SPLAY_MAX_SECS
+              value: {{ required "tlsRotation.splayMaxSeconds is the longest a pod waits before exiting on a rotated certificate and must be set; see the chart's values.yaml" .Values.tlsRotation.splayMaxSeconds | quote }}
             - name: RUST_LOG
               value: "info"
             {{- if .Values.trustUnauthenticatedHeaders }}
@@ -303,7 +400,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
+          {{- if or $presentsIdentity .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
           volumeMounts:
             {{- if .Values.rateLimit.passwordSecret }}
             # A DIRECTORY MOUNT, never subPath — the same rule the CA mounts
@@ -340,8 +437,22 @@ spec:
               mountPath: /var/run/config/iam-ca
               readOnly: true
             {{- end }}
+            {{- if $presentsIdentity }}
+            # A DIRECTORY MOUNT, never subPath — and here the rule is at its most
+            # expensive to break. A subPath mount is a one-time copy kubelet
+            # never refreshes, so a renewed CLIENT certificate would never reach
+            # this process; ADR-0516 makes that an expired leaf that STOPS the
+            # hop to `iam` or `task` rather than one that merely weakens it. The
+            # rotation watcher only works because this is a directory.
+            #
+            # ONE MOUNT FOR BOTH UPSTREAMS. Both prefixes' variables above name
+            # these same two files.
+            - name: client-cert
+              mountPath: /var/run/secrets/client-cert
+              readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
+      {{- if or $presentsIdentity .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
       volumes:
         {{- if .Values.rateLimit.passwordSecret }}
         - name: valkey-password
@@ -406,6 +517,32 @@ spec:
             items:
               - key: {{ required "task.tls.caSecretKey names the key inside task.tls.caSecret that holds the CA bundle and must be set whenever task.tls.enabled is; see the chart's values.yaml" .Values.task.tls.caSecretKey | quote }}
                 path: ca.pem
+        {{- end }}
+        {{- if $presentsIdentity }}
+        - name: client-cert
+          secret:
+            secretName: {{ .Values.clientCertificate.secret }}
+            # OPTIONAL, and it means what it means on the CA mounts either side:
+            # the process MUST NOT START without a usable identity once one has
+            # been asked for, and optional is simply which error says so. A
+            # required mount that cannot be satisfied leaves the pod in
+            # ContainerCreating with a FailedMount event about a volume; an
+            # optional one mounts an empty directory, the binary finds no file at
+            # the path it was given, and `connect_iam` or
+            # `yadgar_dial::connect_tls` refuses naming THAT PATH. Neither
+            # starts; only one of them explains itself. There is no third outcome
+            # in which this pod dials an upstream without the identity it was
+            # told to present.
+            optional: true
+            # BOTH KEYS, because a certificate cannot be presented without the
+            # key that proves it — the one mount in this file meant to carry a
+            # private key, and it is this pod's own. The CA mounts select a
+            # single key precisely to keep somebody else's out.
+            items:
+              - key: {{ required "clientCertificate.certSecretKey names the key inside clientCertificate.secret that holds the client certificate and must be set whenever clientCertificate.secret is; see the chart's values.yaml" .Values.clientCertificate.certSecretKey | quote }}
+                path: client.crt
+              - key: {{ required "clientCertificate.keySecretKey names the key inside clientCertificate.secret that holds the client private key and must be set whenever clientCertificate.secret is; see the chart's values.yaml" .Values.clientCertificate.keySecretKey | quote }}
+                path: client.key
         {{- end }}
         {{- if .Values.iam.tls.enabled }}
         - name: iam-ca

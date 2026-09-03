@@ -15,6 +15,7 @@ pub mod http;
 pub mod invalidate;
 pub mod limit;
 pub mod mcp;
+pub mod rotate;
 pub mod serve;
 pub mod source;
 pub mod tools;
