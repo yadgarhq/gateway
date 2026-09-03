@@ -27,9 +27,16 @@
 //! `yadgar_dial` would change the balancing decision D23 made. The cost is that
 //! the CA bundle checks exist twice — once inside `yadgar_dial`, once in
 //! [`UpstreamTls::client_tls_config`] — and the two can drift. They are written
-//! to the same list on purpose: read, decode, ASSERT NON-EMPTY, pin the
-//! verification domain to the host, bound the handshake, and add no platform
-//! trust store.
+//! to the same list on purpose: read, decode, ASSERT THE SECTIONS ARE NOT EMPTY,
+//! ASSERT THE ROOT STORE IS NOT EMPTY, pin the verification domain to the host,
+//! bound the handshake, and add no platform trust store.
+//!
+//! **THE TWO DID DRIFT, which is why the fourth item is spelled out.** A count of
+//! PEM sections is not a count of trust anchors, and this copy made only the
+//! first check for as long as the comment claimed the lists were identical. The
+//! claim is a test now — `tests/iam_tls.rs::both_implementations_refuse_the_same_bundles`
+//! — because a copy that only a paragraph holds together is a copy that drifts
+//! again.
 //!
 //! **Configuration is file paths and a flag, never an issuer-specific resource**
 //! (D80). A CA bundle on disk is written by cert-manager in the reference
@@ -109,6 +116,18 @@ pub enum IamChannelError {
          no roots — which trusts nobody and fails much later, at the handshake."
     )]
     CaEmpty { path: PathBuf },
+
+    #[error(
+        "the CA certificate bundle at {path} holds {sections} PEM certificate \
+         section(s) and NONE of them is a usable trust anchor. That is not the \
+         same as an empty bundle: the sections are present and they decode as \
+         PEM, so counting them says the file is fine. tonic builds its root \
+         store with `add_parsable_certificates`, which reports how many it \
+         accepted and how many it threw away, and discards that report — so a \
+         bundle like this one produces a trust store with no roots and no error, \
+         and fails much later, at the handshake."
+    )]
+    CaNoTrustAnchor { path: PathBuf, sections: usize },
 
     #[error("iam's address is not a usable URI: {source}")]
     Uri {
@@ -219,6 +238,30 @@ impl UpstreamTls {
     /// and its own preparation cannot be reached. The list is kept identical on
     /// purpose; every line below has a counterpart there.
     ///
+    /// **THAT SENTENCE WAS FALSE FOR AS LONG AS IT TOOK TO NOTICE, and saying so
+    /// is the point.** `dial` grew the trust-anchor check first; this copy kept
+    /// counting PEM sections, so the two disagreed about what "the bundle is
+    /// usable" means while the comment went on asserting they agreed. A claim of
+    /// sameness that nothing checks is how the copy drifts, so the claim is now
+    /// backed by a TEST rather than by this paragraph:
+    /// `tests/iam_tls.rs::both_implementations_refuse_the_same_bundles` feeds one
+    /// table of bad bundles to BOTH paths and requires both to refuse. Delete a
+    /// check on either side and it goes red.
+    ///
+    /// **What still differs, enumerated rather than waved at.** The CA list
+    /// itself is identical: read, decode, non-empty sections, non-empty root
+    /// store. The error TYPE differs — `IamChannelError` here,
+    /// `yadgar_dial::BalanceError` there — because each names what its own caller
+    /// can get wrong: this one adds `Uri`, and `dial`'s adds `Dns`, `DnsTimedOut`
+    /// and `NoEndpoints`, none of which can happen on a channel that resolves no
+    /// name. All four CA arms are one-for-one and their sentences are
+    /// word-for-word — CHECKED against
+    /// `yadgar_dial::BalanceError`, not assumed. Two wordings stay deliberately
+    /// apart, and neither is a CA arm: the `Tls` arm names the upstream here
+    /// ("for iam") because this module knows which one it is, and the comment on
+    /// `.domain_name` differs because `dial` verifies a Service name against pod
+    /// ADDRESSES while `iam` is reached by the name itself.
+    ///
     /// Everything that can be wrong about the configuration is wrong here, once,
     /// before a channel exists — so a bad path is a startup error rather than an
     /// unexplained handshake failure much later, and never a quiet downgrade.
@@ -243,6 +286,35 @@ impl UpstreamTls {
         if certificates.is_empty() {
             return Err(IamChannelError::CaEmpty {
                 path: self.ca_file.clone(),
+            });
+        }
+
+        // AND THE ASSERTION A SECTION COUNT CANNOT MAKE. The check above counts
+        // PEM SECTIONS. What has to be non-empty is the ROOT STORE, and the two
+        // part company for a bundle whose sections decode as PEM and then fail
+        // to parse as a trust anchor — a key pasted under a CERTIFICATE header,
+        // a truncated DER body. tonic hands exactly these DERs to
+        // `add_parsable_certificates` and DISCARDS its `(accepted, rejected)`
+        // return with no check after it
+        // (`tonic-0.14.6/src/transport/channel/service/tls.rs:104`), so such a
+        // bundle yields precisely the rootless trust store this function exists
+        // to prevent, and the section count sees a healthy `1`.
+        //
+        // The store is built HERE, the way tonic will build it, and then
+        // dropped: tonic accepts a PEM bundle rather than a store, so what this
+        // buys is the answer to "how many roots will that produce", asked before
+        // a channel exists instead of never.
+        //
+        // ORDER MATTERS. `CaEmpty` stays above: `accepted == 0` is also true of a
+        // bundle with no sections at all, and that one has its own name and its
+        // own sentence for the operator.
+        let sections = certificates.len();
+        let mut roots = rustls::RootCertStore::empty();
+        let (accepted, _rejected) = roots.add_parsable_certificates(certificates);
+        if accepted == 0 {
+            return Err(IamChannelError::CaNoTrustAnchor {
+                path: self.ca_file.clone(),
+                sections,
             });
         }
 

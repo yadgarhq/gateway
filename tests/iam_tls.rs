@@ -358,6 +358,102 @@ async fn a_ca_bundle_with_no_certificate_in_it_is_an_error() {
     }
 }
 
+/// A bundle whose framing and base64 are valid and whose DER is not a
+/// certificate.
+///
+/// A real private key's body under CERTIFICATE headers. `CertificateDer`'s PEM
+/// reader decodes bytes and does not look at them, so it hands this over without
+/// complaint and a section count sees a healthy `1`.
+fn one_section_that_is_not_a_certificate() -> TempPem {
+    let body = pki(SERVED_NAME)
+        .key_pem
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    TempPem::with(&format!(
+        "-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n"
+    ))
+}
+
+/// THE CASE A SECTION COUNT CANNOT SEE: a bundle that decodes as PEM and yields
+/// no trust anchor at all.
+///
+/// tonic feeds those DERs to `add_parsable_certificates`, which throws away what
+/// it cannot parse and reports how much — and tonic discards the report with no
+/// check after it. The result is the empty root store `CaEmpty` exists to
+/// prevent, reached by a path `CaEmpty` never covered.
+///
+/// **THE MUTATION THIS IS WRITTEN AGAINST** is deleting the `accepted == 0` arm
+/// in `UpstreamTls::client_tls_config` and leaving the section count alone.
+/// Measured against that mutant, `connect_iam` returns `Ok(Channel)` — a channel
+/// that trusts nobody while looking configured, on the hop that carries the
+/// bearer token.
+///
+/// The section count is asserted too, not only the variant: `sections: 1` is what
+/// makes it this case rather than the empty-file one.
+#[tokio::test]
+async fn a_ca_bundle_whose_sections_are_not_trust_anchors_is_an_error() {
+    let ca = one_section_that_is_not_a_certificate();
+    let outcome = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)));
+    assert!(
+        matches!(
+            outcome,
+            Err(IamChannelError::CaNoTrustAnchor { sections: 1, .. })
+        ),
+        "a bundle holding one PEM section and no trust anchor must be rejected, not connected: \
+         {outcome:?}"
+    );
+}
+
+/// THE DIVERGENCE DETECTOR, and the reason it is a test rather than a paragraph.
+///
+/// `client_tls_config` and `yadgar_dial::TlsOptions::prepare` are two spellings
+/// of one list, kept in step by a doc comment asserting they were identical —
+/// which stopped being true the moment one side grew a check the other lacked,
+/// and nothing noticed because nothing was checking. This is what checks.
+///
+/// **A CROSS-CRATE test IS possible, and the reason is worth recording**: `dial`
+/// is a DEPENDENCY of this crate, and `connect_tls` calls `TlsOptions::prepare`
+/// BEFORE it resolves anything, so a bad bundle is refused with no server, no
+/// port and no DNS. The two implementations can therefore be handed the same
+/// file in the same process.
+///
+/// **WHAT IS MISSING FROM THIS TABLE AND WHY.**
+/// [`one_section_that_is_not_a_certificate`] belongs here and cannot join yet:
+/// `dial`'s half of the fix is `yadgarhq/dial` PR #9, still open, and `Cargo.toml`
+/// pins `yadgar-dial` by `rev` to a commit before it. Against that pin `dial`
+/// answers `Ok(Channel)` for that bundle, which is the defect, not a property to
+/// assert. When the pin advances past #9, add the row:
+///
+/// ```text
+/// (one_section_that_is_not_a_certificate(), "one PEM section, no trust anchor"),
+/// ```
+///
+/// and widen both `matches!` arms to accept the `CaNoTrustAnchor` variants.
+#[tokio::test]
+async fn both_implementations_refuse_the_same_bundles() {
+    for contents in ["", "   ", "\n", "there is no certificate in this file\n"] {
+        let ca = TempPem::with(contents);
+
+        // The gateway's own copy, reached the way `main` reaches it.
+        let mine = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)));
+        assert!(
+            matches!(mine, Err(IamChannelError::CaEmpty { .. })),
+            "the gateway must refuse {contents:?}: {mine:?}"
+        );
+
+        // And the crate this one is a copy of, given the identical file.
+        let theirs =
+            yadgar_dial::connect_tls(SERVED_NAME, 50052, &yadgar_dial::TlsOptions::new(ca.path()))
+                .await;
+        assert!(
+            matches!(theirs, Err(yadgar_dial::BalanceError::CaEmpty { .. })),
+            "yadgar_dial must refuse {contents:?} for the same reason: {theirs:?}"
+        );
+    }
+}
+
 /// A path that is not there at all. The mistake an operator actually makes is a
 /// mount that did not happen, and the answer to it must not be a cleartext
 /// channel.
