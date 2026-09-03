@@ -49,6 +49,39 @@ message UpdateTaskRequest {
 }
 message UpdateTaskResponse {
   yadgar.common.v1.Meta meta = 1;
+
+  // The status the row held BEFORE this update was applied, RECORDED AT THE
+  // TIME OF THE WRITE and returned unchanged on every replay of the same
+  // idempotency key (D9).
+  //
+  // WHY THE STORE HAS TO CARRY IT. yadgar.taskapi.v1.TransitionTaskResponse.from
+  // reports what a task moved FROM, so that a caller who raced another writer
+  // sees what actually happened rather than assuming its own read was current.
+  // On a replayed transition nothing else in the system still holds that value:
+  // the logic service reads the task first and gets the status the FIRST attempt
+  // already wrote, an identity transition passes the rules unchanged, and D4
+  // forbids the logic service a store of its own to remember it in. The
+  // idempotency row is the only thing that survives the first attempt, so the
+  // prior status must be recorded there rather than recomputed. RETURNING THE
+  // ROW'S CURRENT STATUS ON A REPLAY IS THE DEFECT THIS FIELD EXISTS TO CLOSE,
+  // and it is the exact assumption `from` was added to break.
+  //
+  // RECORDED ON EVERY UPDATE, not only on a status change. An `update_mask`
+  // that does not touch `status` still leaves a status the row held beforehand,
+  // and this field carries it — equal to the status the row holds afterwards,
+  // which is the truth rather than an omission. The one thing that makes the
+  // field absent is a store that has not implemented it.
+  //
+  // TASK_STATUS_UNSPECIFIED IS THE NEGATIVE ANSWER, AND IT ARRIVES AS `Ok`. It
+  // means the prior status was not recorded, and after this field ships that is
+  // one condition only: an idempotency row written before it existed. It is NOT
+  // a transition out of "unspecified", and a consumer must not report it as one
+  // — carry it through, or say the prior status is unknown. It must never be
+  // replaced with a guess, and a read of the task is the wrong guess, because
+  // that read is what returns the post-transition status in the first place.
+  // Stated here because a zero-valued enum needs no handling to compile and
+  // reads as an ordinary status to anyone not told otherwise (ADR-0512).
+  TaskStatus previous_status = 2;
 }
 
 message GetTaskRequest {

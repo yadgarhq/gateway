@@ -438,7 +438,7 @@ struct StubIam {
     resolves: Arc<AtomicUsize>,
 }
 
-/// One real method and eleven refusals.
+/// One real method and twelve refusals.
 ///
 /// **THE MACRO EMITS `#[tonic::async_trait]` ITSELF, and it has to.** That
 /// attribute rewrites every `async fn` in the block into the boxed future the
@@ -460,6 +460,11 @@ macro_rules! stub_iam_service {
                     valid_for_seconds: TTL.as_secs() as i64,
                     rate_limit_overrides: Vec::new(),
                     is_admin: false,
+                    // ABSENT, because this suite is about eviction and states no
+                    // policy. It is also the honest shape for the property the
+                    // file records: no invalidation subject carries a setting
+                    // change, so nothing here could evict one.
+                    owner_reads_own_record: None,
                 }))
             }
 
@@ -489,6 +494,7 @@ stub_iam_service! {
     set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
+    set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
 }
 
 async fn stub_iam() -> (Channel, Arc<AtomicUsize>) {
