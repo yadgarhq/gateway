@@ -260,3 +260,30 @@ here.
 That was added by `yadgarhq/actions#30` and proved on a real runner before it
 merged, by pointing this repository's caller at the branch and watching the
 eight live-Valkey tests go from failing to passing.
+
+## ADR-0522's setting — nothing to run, but the DEPLOY ORDER is part of the contract
+
+This image populates `Scope.owner_reads_own_record` from what `iam` answers. It
+resolves none of it: the answer depends on the team of the ROW being read, which
+this hop does not know, so a `-db` computes it where it computes the reach.
+
+**Populate, deploy, then enforce, and the order is not a preference.** A `-db`
+that reads the field REFUSES an unset `org_value` rather than choosing a value —
+so a `-db` rolled out ahead of this image refuses every read. That is an outage
+rather than a wrong answer, which is the better failure of the two and is still
+one. The order is: `iam` at v0.7.2 or later, then this image, then any `-db` that
+enforces.
+
+**Nothing to run against the cluster.** No new variable, no new secret, no chart
+change. `iam` v0.7.2 already serves the field and already stores ADR-0522's
+shipped default.
+
+**A change to the setting binds by the credential cache's TTL, and nothing
+shortens that.** `YADGAR_CREDENTIAL_TTL_SECONDS` defaults to 30, and the setting
+rides the cached credential because it arrives on the same response as the
+identity. No invalidation event closes the window at either level:
+`SetInheritedSetting` publishes nothing at all, and the two subjects `iam` does
+publish are keyed on a `user_id` — which an organisation-level write does not
+have. So after changing the policy, expect up to the TTL before every replica
+honours it, and treat that as the bound rather than watching for an event that
+is not coming.

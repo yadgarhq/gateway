@@ -66,6 +66,23 @@ message ResolveCredentialResponse {
   // personal data; they are facts about what this caller may do, and D74
   // requires them to travel with identity so that one lookup answers both and
   // one invalidation withdraws both.
+  //
+  // AN EMPTY user_id IS THE NEGATIVE ANSWER, AND IT ARRIVES AS `Ok`. It means no
+  // live credential matched — unknown, revoked, expired, or belonging to a
+  // soft-deleted person. It is NOT an error: "no such credential" and "the store
+  // is broken" are different outcomes and a caller must be able to tell them
+  // apart — one is a 401, the other is a 503. Stated HERE, and not only on
+  // `yadgar.iamdb.v1.ResolveCredentialResponse` where the sentinel is produced,
+  // because this is the file a gateway-side consumer compiles against and it
+  // deliberately does not vendor that one (ADR-0512).
+  //
+  // WHAT THE CONSUMER OWES. An empty user_id is a REFUSAL: answer 401, and never
+  // carry the empty string into a scope, a cache key, or an audit record as if it
+  // were an identity. A transport failure on this RPC is the other outcome and
+  // answers 503. The sentinel needs no handling to COMPILE and reads as success
+  // to anyone who has not been told it exists, so an unhandled one fails OPEN on
+  // the authentication path — which is what happened the first time this
+  // response was consumed.
   string user_id = 1;
   repeated string team_ids = 2;
 
@@ -73,6 +90,15 @@ message ResolveCredentialResponse {
   // TTL is a BACKSTOP, not the invalidation mechanism — revocation and team
   // changes arrive as broker events (D72). A caller that treats this as the only
   // signal keeps honouring a revoked credential until it expires.
+  //
+  // ZERO SAYS WHAT AN EMPTY user_id SAYS. `iam` sets this to zero exactly when
+  // `user_id` is empty, because a negative answer is cacheable for no interval at
+  // all: there is nothing worth remembering about a token that belongs to nobody,
+  // and a revoked credential's refusal is the one answer that must never be
+  // served from a cache. It is a SECOND, INDEPENDENT signal of the one condition,
+  // published so that a consumer checking both is harder to get wrong than one
+  // checking neither — but the empty `user_id` is the check that carries the
+  // refusal, and this one does not replace it.
   int64 valid_for_seconds = 3;
 
   // D73's admin flag. The gateway needs it on every request: it gates the
@@ -108,6 +134,21 @@ message ResolveCredentialResponse {
   // unset has met a server bug, and must read it as no override for that
   // bucket rather than as a denial.
   repeated RateLimitOverride rate_limit_overrides = 5;
+
+  // ADR-0522's inheritable setting, travelling with identity for the reason
+  // `is_admin` and the limits above do: one lookup answers everything the
+  // gateway needs to build a Scope, and one invalidation withdraws all of it.
+  //
+  // THE INPUTS, NOT THE ANSWER. `iam` returns the organisation's value, its lock
+  // and every team override, and resolves NONE of it. The resolution depends on
+  // the team of the ROW being read, which neither `iam` nor the gateway knows —
+  // it is evaluated where the reach is computed. See
+  // `yadgar.common.v1.InheritedSetting`, which states the rule once.
+  //
+  // AN `iam` TOO OLD TO SET THIS LEAVES org_value UNSPECIFIED, which a -db
+  // refuses rather than reading as OFF. That is why the gateway and `iam` are
+  // deployed ahead of any -db that enforces it.
+  yadgar.common.v1.InheritedSetting owner_reads_own_record = 6;
 }
 
 // Exchange a username and password for a long-lived token.
@@ -500,11 +541,48 @@ message ListCredentialsResponse {
 // An account is created once and an enrolment expires in 24 hours, so a
 // combined RPC would give an admin no way to ask for a fresh enrolment without
 // also asking for another account. One idempotency key would then cover two
-// acts with two lifetimes: replaying it must return the original outcome, and
-// the original outcome of "create this account" is not a single-use secret to
-// be handed over again. Here the mint IS the operation, so a replay returning
-// the same token is correct idempotent behaviour — which is exactly why
-// IssueCredential is already shaped this way.
+// acts with two lifetimes, AND THE TWO ANSWER A REPLAY DIFFERENTLY: "create
+// this account" replays, because the account is still there to describe, and
+// this mint refuses, for the reason stated next. A single key meaning "replay
+// one half and refuse the other" is not a key any caller can use.
+//
+// A REPLAYED KEY IS REFUSED HERE, with INVALID_ARGUMENT. It is never answered
+// with the token the first attempt minted. THE GENERAL RULE, stated so that a
+// caller meeting it on some later RPC is not meeting it for the first time: AN
+// RPC WHOSE SUCCESSFUL OUTCOME IS A SINGLE-USE SECRET REFUSES A REPLAY RATHER
+// THAN ANSWERING WITH A SPENT ONE (ADR-0519). D9's replay rule still holds for
+// every RPC whose outcome can be re-derived from what the store kept; this is
+// the carve-out for an outcome that cannot, and the boundary is whether the
+// answer is reconstructible without persisting the secret itself.
+// yadgar.common.v1.Idempotency states the rule beside D9's and enumerates
+// which RPCs it covers.
+//
+// WHAT MAKES THE REPLAY UNANSWERABLE RATHER THAN MERELY UNWISE. The token is
+// shown once and only a hash is kept (D72), so nothing anywhere still holds
+// the first secret: `iam` keeps no store at all (D4), and
+// yadgar.iamdb.v1.CreateEnrolmentRequest carries `secret_hash` rather than the
+// secret. A replay answered with the original `enrolment_id` therefore hands
+// back a token whose secret matches no live enrolment. It looks valid, it
+// cannot be redeemed, and it fails in front of the person holding it rather
+// than in front of the admin who asked for it.
+//
+// THE REFUSAL NEEDS NO MECHANISM OF ITS OWN, which is why the status code is
+// the one already in use rather than a new one. `iam` mints a FRESH secret on
+// every attempt, so a retry reaches yadgar.iamdb.v1.CreateEnrolment as the
+// same key carrying a DIFFERENT `secret_hash`. That is a repeated key with a
+// different request, which yadgar.common.v1.Idempotency already refuses
+// org-wide with INVALID_ARGUMENT, and yadgar.iamdb.v1.CreateEnrolmentRequest
+// names `secret_hash` as one of the fields that request is compared by. `iam`
+// passes that refusal through rather than translating it, so one code carries
+// one meaning: this idempotency key cannot be honoured.
+//
+// THE RESIDUAL OF THE REFUSAL, STATED RATHER THAN LEFT TO BE NOTICED: an admin
+// whose response is genuinely lost does not retry, they mint a fresh
+// enrolment. The first one is then live and nobody holds it, and no RPC on
+// this service withdraws an enrolment, so it stands until it expires —
+// bounded by the enrolment lifetime, 24 hours. That is accepted (ADR-0519):
+// an unused enrolment expiring quietly is a smaller harm than handing somebody
+// a token that cannot be redeemed and gives no reason why.
 //
 // D73 puts token RESEND outside the first cut: handing the same secret over
 // again, which this store cannot do in any case because it keeps only a hash.
@@ -530,6 +608,13 @@ message ListCredentialsResponse {
 // admin-sets-initial-password and it is why this shape stands; it is not the
 // same thing as the property being gone.
 message IssueEnrolmentRequest {
+  // COVERS A RETRY BY REFUSING IT, not by replaying it — the block above this
+  // message carries the reasoning and ADR-0519 carries the decision. A key
+  // this service has already minted against is answered with
+  // INVALID_ARGUMENT, and the recovery is a fresh call under a fresh key.
+  // Stated on the field as well as above it because a caller writes the retry
+  // loop here: a loop that reuses the key on a timeout gets a refusal rather
+  // than the token it is waiting for.
   yadgar.common.v1.Idempotency idempotency = 1;
   string user_id = 2;
 }
@@ -579,6 +664,209 @@ message SetRateLimitOverrideRequest {
 }
 message SetRateLimitOverrideResponse {}
 
+// Write ONE LEVEL of an inheritable setting (ADR-0522). The same verb
+// CLEARS a team's override, by setting `clear` and sending no `value` — an
+// absent value ALONE is refused, so a deletion always costs a deliberate byte.
+//
+// **WHY THIS EXISTS HERE AS WELL AS ON THE STORE.** `iam-db` owns the rows and
+// only `iam` calls it (D4), so without this arm the setting is READ by every
+// request and WRITABLE by nobody — the gateway reaches `iam`, never the store.
+// The pattern is already the file's: every ADMINISTRATIVE setter on
+// `IamDbService` is mirrored here — SetUserAdmin, SetRateLimitOverride,
+// AddTeamMember, RemoveTeamMember, CreateUser — while the arms that stay
+// db-only are internal mechanics with no operator behind them
+// (GetPasswordHash, SetPassword, CreateEnrolment, CreateCredential).
+//
+// ONE RPC WITH THE LEVEL IN THE REQUEST, rather than an organisation verb and a
+// team verb: one authorisation site, one audit point, and the next inheritable
+// setting reuses this arm unchanged.
+//
+// **WHO MAY CALL IT — an administrator, and nobody else.** This setting governs
+// who may read which records, so whoever changes it changes what everyone sees.
+// That is a WIDER authority than SetUserAdmin, which changes what one person
+// may do, and it is why the sentence is here rather than left to be inferred
+// from the neighbours. THE CHECK IS AT THE GATEWAY, on D73's admin flag,
+// through the administrative path — this RPC carries no credential, because
+// `iam` is not reachable from outside and the gateway is the one place identity
+// is attested (ADR-0488). NEVER AN MCP TOOL, on the same grounds as
+// SetRateLimitOverride.
+//
+// **D73's BOOTSTRAP TOKEN DOES NOT REACH THIS VERB.** It reaches CreateUser and
+// SetUserAdmin and nothing else. Extending the bootstrap path here would let a
+// token that exists to create the FIRST admin rewrite the read policy for the
+// whole deployment before an admin exists to notice.
+//
+// **THE GAP, STATED RATHER THAN LEFT TO BE FOUND.** The request carries no
+// attested identity, in common with every administrative RPC on this service.
+// So `iam` can neither VERIFY that the caller is an administrator nor RECORD
+// which one changed the policy. The authorisation site exists and is the
+// gateway; the audit point cannot attribute. That is a property of the contract
+// as it stands, and a second authentication mechanism invented for this one
+// verb would be a second place for it to be wrong, holding the same secret
+// twice.
+//
+// **VALIDATION IS STATED ONCE, ON `yadgar.common.v1.SettingScope`**, and is
+// binding here rather than summarised — this service refuses these itself
+// rather than forwarding them — every clause of it is
+// `INVALID_ARGUMENT`. It is not restated in this file on purpose: two normative
+// copies in two files must stay in step for ever, and the copy that drifts is
+// the one a reader happens to open. The short of it, so a reader knows whether
+// they need to go and look: the scope must be a member this contract names,
+// the team id must be present exactly at team scope and absent at
+// organisation scope, the lock is required at organisation scope and refused at
+// team scope, the name must be the one member of the vocabulary, and DELETING
+// AN OVERRIDE TAKES `clear` — an absent `value` on its own is refused rather
+// than read as a deletion.
+//
+// **THE WRITE DOES NOT TAKE EFFECT INSTANTLY**, and a caller must not expect it
+// to. The setting travels on the credential a gateway holds in its cache
+// (ADR-0491), so a changed policy binds only once that cached entry is gone.
+//
+// **AN ORGANISATION-LEVEL CHANGE BINDS BY EXPIRY ALONE.** It shares a cache
+// LIFETIME with D73's admin flag and D74's overrides but not their blast
+// radius, and the difference is the whole point: those are PER-USER, and
+// RevokeCredential hands `user_id` back to its caller precisely so ONE
+// credential's entry can be invalidated by an event. An organisation-level
+// write touches every cached credential in the deployment, and no event on this
+// contract says so. A deployment that tightens this policy therefore WAITS THE
+// CACHE OUT rather than cutting it short. Stated because "invalidated or
+// expires" would otherwise name a path that does not exist at this level.
+message SetInheritedSettingRequest {
+  // D9's key, under the ORDINARY replay rule: the same key replayed returns the
+  // original outcome, and the same key carrying a DIFFERENT request is refused
+  // with INVALID_ARGUMENT. The request, for that comparison, is `scope`,
+  // `team_id`, `name`, `value`, `locked` and `clear` — all of it.
+  //
+  // NOT A MEMBER OF ADR-0519's SINGLE-USE-SECRET CARVE-OUT. The outcome is the
+  // stored setting, which the store keeps and can re-derive, so nothing is
+  // spent and the carve-out has nothing to say. A retry on a timeout is
+  // answered, not refused.
+  //
+  // STATED VOLUNTARILY RATHER THAN BECAUSE THIS RPC OWED IT.
+  // `yadgar.common.v1.Idempotency` obliges an RPC MINTING A SINGLE-USE SECRET
+  // to classify itself, and fixes membership as an ENUMERATION rather than a
+  // test a reader applies — this RPC mints nothing, so neither reaches it.
+  //
+  // THE VERB IS A STATE-SETTER BESIDES: it states what the level should BE
+  // rather than how to change it, so a repeat under a FRESH key converges on
+  // the same state.
+  yadgar.common.v1.Idempotency idempotency = 1;
+
+  // Which level this writes.
+  yadgar.common.v1.SettingScope scope = 2;
+
+  // REQUIRED when `scope` is TEAM, ABSENT otherwise. Explicit presence rather
+  // than a bare string, so "no team was named" and "a team was named and its id
+  // is empty" are two cases rather than one.
+  optional string team_id = 3;
+
+  // Which setting.
+  //
+  // THE VOCABULARY IS CLOSED AND HOLDS EXACTLY ONE MEMBER TODAY,
+  // "owner_reads_own_record". ANY OTHER VALUE IS REFUSED RATHER THAN STORED: a
+  // store that accepted free text would accrete settings nothing reads, and a
+  // typo would be persisted as a new setting instead of being refused at the
+  // call that made it. Adding a member is a change to this comment and a
+  // contract release — never a data change.
+  string name = 4;
+
+  // ON or OFF. ABSENT ONLY EVER ACCOMPANIES `clear` — on its own it is refused,
+  // at either scope, so an omitted value can never be read as a deletion.
+  //
+  // `optional` SO "REMOVE THIS" AND "STATE THIS" ARE DIFFERENT MESSAGES rather
+  // than the same zero. SetRateLimitOverrideRequest.limit above is the
+  // precedent, AND IT CARRIES LESS THAN AN APPEAL TO IT SUGGESTS: that field is
+  // a MESSAGE, where presence is native to proto3 and the `optional` keyword is
+  // a no-op restating what was already true. This one is an ENUM, where
+  // presence is a SYNTHETIC oneof the compiler generates, and a scalar's
+  // absence is a thing the wire format has to be asked for rather than a thing
+  // it naturally has. So the precedent underwrites the FIELD MODIFIER — it is
+  // the shape this estate reaches for when a value can be withdrawn — and it
+  // does not by itself make absence a safe default here. The `clear` field
+  // below is what makes it safe.
+  //
+  // **SETTING_VALUE_UNSPECIFIED, SENT EXPLICITLY, IS STILL A REFUSAL AND NEVER
+  // A CLEAR** — at either scope. The zero is what a caller that populated
+  // nothing sends. Reading it as "remove this team's override" would let an
+  // unpopulated field destroy configuration silently, which is ADR-0522's own
+  // failure mode pointed at a write instead of at a read, and it would falsify
+  // `yadgar.common.v1.SettingValue`'s own declaration — "never sent; refused at
+  // validation" — in the one place the enum is written directly. PRESENCE is
+  // what separates "I said nothing" from "I said clear it", and it is the only
+  // thing that can: one zero cannot carry both meanings.
+  //
+  // THE ORGANISATION'S VALUE CANNOT BE CLEARED AT ALL, by absence or by `clear`.
+  // There is no state in which the organisation holds no value — the
+  // resolution's FIRST step refuses an unset org_value — so "clear the
+  // organisation's value" names a state this setting does not have. A
+  // deployment changes it by stating the other value.
+  //
+  // CLEARING AN OVERRIDE THAT IS NOT THERE SUCCEEDS AND CHANGES NOTHING, rather
+  // than answering NOT_FOUND. The verb states a wanted RESULT rather than a
+  // change, and the wanted result is already the state — a refusal here would
+  // make the retry of a lost-but-successful clear look like a failure.
+  optional yadgar.common.v1.SettingValue value = 5;
+
+  // Whether a team may override the organisation's value. MEANINGFUL AT
+  // ORGANISATION SCOPE ONLY: required there, refused at team scope.
+  //
+  // `optional` SO THE REFUSAL AT TEAM SCOPE CAN BE EXACT. A bare bool could
+  // only ever refuse a team request carrying `true`, because `false` is
+  // indistinguishable from unset — and a team sending `locked: false` would
+  // have its instruction silently discarded, which is the case the refusal
+  // exists for.
+  //
+  // ABSENT AT ORGANISATION SCOPE IS REFUSED RATHER THAN DEFAULTED, because
+  // every default is wrong here. `false` is the unsafe direction and is the
+  // hole the resolution's validation-first order closes at the read end; `true`
+  // locks a deployment that never asked; and reading the stored lock and
+  // keeping it would stop this verb from stating the wanted result.
+  optional bool locked = 6;
+
+  // AFFIRMATIVE CONSENT TO DELETE. Set it, with `value` absent and `scope`
+  // TEAM, to remove that team's override so the organisation's value governs
+  // the team again. Every other combination WITH `clear` SET is refused — see
+  // `yadgar.common.v1.SettingScope`.
+  //
+  // **IT EXISTS BECAUSE THE WIRE DEFAULT WOULD OTHERWISE BE THE DESTRUCTIVE
+  // ACTION.** With `value` optional and nothing else, a request that simply
+  // OMITS the value deletes an override, so the most likely accident — a
+  // generated client that leaves an unset optional alone, a field dropped in a
+  // hand-built message — destroys configuration. That inverts what this
+  // contract states twice elsewhere: org_locked's zero is named the unsafe
+  // direction, and an absent `value` at organisation scope is refused precisely
+  // so absence cannot destroy. Deletion now costs a non-default byte.
+  //
+  // A BARE `bool`, DELIBERATELY, and it is the ONE field here that should be
+  // one. Everywhere else in this message the falsy zero is the unsafe
+  // direction, which is why `value`, `locked` and `team_id` all carry presence.
+  // Here false means "delete nothing", so the zero IS the safe state and
+  // presence would add a third case that means the same as the first.
+  //
+  // IT NARROWS A READ-BY-WRITE PATH RATHER THAN CLOSING IT. No read arm is
+  // reachable by OMISSION any more — a caller sending neither `value` nor
+  // `clear` is refused. But the response carries the setting whole, and a no-op
+  // clear succeeds, so team scope with `clear` set and no `value` is still a
+  // zero-mutation read. That is the response's shape, not this field's, and it
+  // is left open deliberately: see SettingScope in yadgar.common.v1.
+  bool clear = 7;
+}
+
+// The setting as it now stands, WHOLE — both levels and every team's override.
+//
+// NOT THE ECHO D48 REFUSES. The caller sent ONE level; what comes back is the
+// other level and every OTHER team's override, which the caller did not send
+// and cannot otherwise read — the setting reaches a gateway only on
+// `ResolveCredentialResponse`, and there is no administrative read of it.
+// `yadgar.common.v1.InheritedSetting` carries no `Meta` either, being a setting
+// rather than an entity, so `Meta` is not the available answer.
+//
+// STILL THE INPUTS, NEVER THE ANSWER. `iam` resolves none of it; resolution
+// happens where the reach is computed, against the team of the ROW being read.
+message SetInheritedSettingResponse {
+  yadgar.common.v1.InheritedSetting setting = 1;
+}
+
 message CreateUserRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string external_id = 2; // how an operator names this person
@@ -622,4 +910,5 @@ service IamService {
   rpc SetRateLimitOverride(SetRateLimitOverrideRequest) returns (SetRateLimitOverrideResponse);
   rpc AddTeamMember(AddTeamMemberRequest) returns (AddTeamMemberResponse);
   rpc RemoveTeamMember(RemoveTeamMemberRequest) returns (RemoveTeamMemberResponse);
+  rpc SetInheritedSetting(SetInheritedSettingRequest) returns (SetInheritedSettingResponse);
 }

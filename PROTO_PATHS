@@ -17,7 +17,7 @@ yadgar/taskapi/v1
 # another proto declares. Nothing here reaches yadgar/iamdb/v1 — that is iam's own
 # upstream, not this one's.
 #
-# AT v1.6.0 THIS PATH ALSO BRINGS yadgar/telemetry/v1, and no line was added for
+# AT v1.9.0 THIS PATH ALSO BRINGS yadgar/telemetry/v1, and no line was added for
 # it. iam.proto began importing telemetry.proto — D74 keys a per-user rate limit on
 # D67's Kind, and buf breaking's FILE rule means that enum cannot be lifted into
 # common.proto — so the closure vendors it. It is on the include path for protoc

@@ -46,6 +46,24 @@
 //! the mechanism — but it is still what bounds a revoked credential whenever the
 //! broker is unreachable, so it stays a security parameter and not a tuning knob.
 //! That is why the default is short and why a long one is refused at boot.
+//!
+//! **FOR ADR-0522'S SETTING THE TTL IS THE ONLY BOUND, NOT THE BACKSTOP, AND
+//! THAT IS A PROPERTY OF THE DESIGN RATHER THAN A DEFECT HERE.** The setting
+//! arrives on `ResolveCredentialResponse` and is therefore cached with the rest
+//! of it, so a change to it binds when the entry expires. No event closes that
+//! window sooner, at either level:
+//!
+//!   - `iam`'s `SetInheritedSetting` publishes NOTHING. Neither level has a
+//!     subject, so a team override changes with no notification either.
+//!   - Both subjects `iam` does publish carry a `user_id` payload and
+//!     [`crate::invalidate`] evicts a PERSON. An organisation-level write names
+//!     no person, so there is no payload it could even be published under —
+//!     the gap is in the subject's shape, not in a missing call.
+//!
+//! Closing it needs a subject keyed on something other than a user, which is a
+//! contract change in `iam` rather than an edit here. Until then the bound is
+//! [`DEFAULT_TTL_SECONDS`], and the direction of the stale answer is whichever
+//! way the policy moved — a tightened policy stays loose for up to that long.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -66,7 +84,7 @@ use tonic::transport::Channel;
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::limit::{kind_str, Bucket, ConfigError, Overrides};
-use crate::pb::yadgar::common::v1::Scope;
+use crate::pb::yadgar::common::v1::{InheritedSetting, Scope};
 use crate::pb::yadgar::iam::v1::{
     iam_service_client::IamServiceClient, RateLimitOverride, ResolveCredentialRequest,
     ResolveCredentialResponse,
@@ -190,6 +208,12 @@ pub struct Claimed<'a> {
 /// together. Two lookups would mean two cache lifetimes and a window in which a
 /// tightened limit is not yet in force.
 ///
+/// **ADR-0522'S SETTING IS ON THE CACHED HALF, AND IT BELONGS THERE.** It arrives
+/// on the same response for the same reason the limits do — one lookup answers
+/// everything needed to build a `Scope` — so it is a credential fact and not a
+/// per-request one. What follows from that is stated in this module's header: it
+/// binds by TTL, and no invalidation event exists that could shorten the wait.
+///
 /// **THIS TYPE IS NOT WHAT [`Credentials`] HOLDS, and it must not be.** The
 /// requirement is that identity and spending limits share one entry and one
 /// lifetime, and they do — `ResolveCredentialResponse` carries both and is cached
@@ -250,7 +274,11 @@ const MAX_TTL_SECONDS: u64 = 300;
 /// token still decides how many entries this map gains. `limit::Floor` accepts the
 /// same shape at the same size for the same reason. At roughly 400 bytes an entry
 /// (a `Scope`'s five strings, the team list and a 32-byte key) two full maps are
-/// about 3MB against the chart's 128Mi limit.
+/// about 3MB against the chart's 128Mi limit. ADR-0522's setting adds a third
+/// level to that estimate whose `team_override` map `common.proto` calls unbounded
+/// in the team count — it is sparse by construction and, unlike the entry COUNT
+/// above, it comes from `iam` rather than from the unauthenticated writer, so it
+/// widens the figure without widening who decides it.
 const CAPACITY: usize = 4096;
 
 /// Whether the credential lookup was served from this replica's memory.
@@ -639,6 +667,14 @@ pub async fn attest(
                 // wrote.
                 Vec::new(),
                 request_id,
+                // ABSENT, for the reason the two lines above are what they are:
+                // nothing was resolved, and no header can carry ADR-0522's
+                // setting. A development gateway inventing one would be stating an
+                // organisation's read policy from a process that has never spoken
+                // to `iam` — and an enforcing -db REFUSES an absent setting, so
+                // this fails loudly instead of quietly applying a policy nobody
+                // wrote.
+                None,
             ),
         }),
 
@@ -756,6 +792,10 @@ fn from_resolved(
             // name its own teams could read other people's records.
             resolved.team_ids,
             request_id,
+            // FROM THE RESPONSE for the same reason, and unexamined: it is a
+            // policy an organisation states, so a caller able to name its own
+            // would name the permissive one.
+            resolved.owner_reads_own_record,
         ),
     })
 }
@@ -828,12 +868,18 @@ fn overrides_from(list: Vec<RateLimitOverride>) -> Result<Overrides, ConfigError
 /// reaches here, so this function cannot be the place a claim is mistaken for a
 /// fact. `grep 'Scope {' src/` returning one hit is what makes the contract's
 /// claim checkable, and that grep points at this body.
+///
+/// **THE SETTING IS TAKEN AS AN `Option` AND WRITTEN AS ONE.** Every other
+/// parameter here is already the value it becomes, and this one is too: absence
+/// is a state the contract gives a meaning to, so there is nothing for this
+/// function to decide about it.
 fn scope(
     user_id: String,
     project_id: String,
     instance_id: String,
     team_ids: Vec<String>,
     request_id: String,
+    owner_reads_own_record: Option<InheritedSetting>,
 ) -> Scope {
     Scope {
         user_id,
@@ -844,6 +890,21 @@ fn scope(
         instance_id,
         team_ids,
         request_id,
+        // MOVED WHOLE, AND RESOLVED NOWHERE ON THIS HOP (ADR-0522). These are the
+        // INPUTS to the resolution — an organisation's value, its lock, and every
+        // team's override — and the answer depends on the team of the ROW being
+        // read, which no caller upstream of the query knows. `common.proto` states
+        // the rule once and says where it runs: where the reach is computed, in a
+        // -db. A gateway that resolved it here would hand down a decision made
+        // against the wrong team, and nothing about the answer would look wrong.
+        //
+        // NO DEFAULT IS SUPPLIED FOR AN ABSENT ONE, and that is the whole of this
+        // field's contribution. An absent message and a present one holding
+        // SETTING_VALUE_UNSPECIFIED mean the same thing to a reader — "the sender
+        // named no policy" — and an enforcing -db REFUSES both. Substituting
+        // ADR-0522's shipped default here would state a policy the deployment
+        // never wrote, in a message that looks exactly like one it did.
+        owner_reads_own_record,
     }
 }
 
@@ -864,6 +925,7 @@ fn bearer(header: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pb::yadgar::common::v1::SettingValue;
     use crate::pb::yadgar::iam::v1::RateLimit;
 
     /// A lookup over a fixed table, standing in for the process environment.
@@ -1006,6 +1068,143 @@ mod tests {
                 "half a negative answer is still a negative answer"
             );
         }
+    }
+
+    /// ADR-0522's setting as an organisation that has actually stated one sends
+    /// it: a value, an ENGAGED lock, and one team holding a contradicting
+    /// override. Every field differs from its `Default`, so a handler that
+    /// rebuilt the message instead of moving it cannot produce this by accident.
+    fn stated() -> InheritedSetting {
+        InheritedSetting {
+            org_value: SettingValue::On as i32,
+            org_locked: true,
+            team_override: HashMap::from([(
+                "team-zulu-4417".to_string(),
+                SettingValue::Off as i32,
+            )]),
+        }
+    }
+
+    #[test]
+    fn the_setting_travels_from_iam_onto_the_scope_whole() {
+        // ADR-0522's setting reaches a -db on `Scope` and nowhere else, so this
+        // move is the entire contribution the gateway makes to it. `tools::call`
+        // takes the `Scope` by value and puts it on every TaskService request, so
+        // populating it here is what puts it on all of them.
+        //
+        // MUTATION THIS CATCHES: rebuilding the message field by field instead of
+        // moving it. Dropping `team_override` and flipping either scalar are each
+        // caught, because no field here holds its `Default`.
+        let answer = ResolveCredentialResponse {
+            owner_reads_own_record: Some(stated()),
+            ..resolved("u-whiskey-2085")
+        };
+        let attested = from_resolved(answer, Some("acme/demo"), None, "REQ-8".to_string())
+            .expect("a resolved credential attests");
+        assert_eq!(
+            attested.scope.owner_reads_own_record,
+            Some(stated()),
+            "the setting must arrive exactly as `iam` sent it"
+        );
+    }
+
+    #[test]
+    fn an_iam_that_states_no_setting_leaves_it_absent_rather_than_defaulted() {
+        // MUTATION THIS CATCHES, AND IT IS THE ONE THE WHOLE FIELD EXISTS TO
+        // SURVIVE: `resolved.owner_reads_own_record.unwrap_or_default()`. That
+        // substitutes `InheritedSetting { org_value: UNSPECIFIED, org_locked:
+        // false, team_override: {} }` for absence — and `common.proto` says an
+        // absent message and a present one holding UNSPECIFIED are ONE case that
+        // an enforcing -db must REFUSE. Under the mutant a gateway too old to be
+        // talking to a setting-aware `iam` would hand down a present message
+        // stating nothing, and the refusal that makes the whole setting safe
+        // becomes unreachable.
+        //
+        // THE ASSERTION IS ON PRESENCE, NOT ON A FIELD. Every field of the
+        // substituted default equals the field of an absent message read through
+        // prost, so `org_value == UNSPECIFIED` would pass against the mutant and
+        // the test would be green for the wrong reason.
+        let attested = from_resolved(
+            resolved("u-xray-3390"),
+            Some("acme/demo"),
+            None,
+            "REQ-9".to_string(),
+        )
+        .expect("a resolved credential attests");
+        assert!(
+            attested.scope.owner_reads_own_record.is_none(),
+            "an unset setting is absence, never a default"
+        );
+    }
+
+    #[test]
+    fn an_unstated_organisation_row_travels_as_sent_rather_than_being_filled_in() {
+        // `iam-db` encodes an ABSENT organisation row as `org_value` UNSPECIFIED
+        // with `org_locked` FALSE — and false is the PERMISSIVE half of a policy
+        // nobody stated. `common.proto` calls org_locked's zero the unsafe
+        // direction for exactly this reason.
+        //
+        // MUTATION THIS CATCHES: any line that reads an UNSPECIFIED org_value as a
+        // signal to supply ADR-0522's shipped default — `org_value: ON,
+        // org_locked: true`. That default belongs in the STORE, where an operator
+        // can see and change it; minted here it is a value the deployment never
+        // stated, travelling as though it had, and the refusal a -db owes on it
+        // never fires.
+        //
+        // PAIRED WITH THE TEST ABOVE, AND THEY DIFFER ONLY IN PRESENCE. The
+        // contract says these two mean the same thing to a reader; on this hop
+        // they are still two distinct wire states, and the gateway's job is to
+        // forward whichever one it got rather than to collapse them.
+        let empty = InheritedSetting {
+            org_value: SettingValue::Unspecified as i32,
+            org_locked: false,
+            team_override: HashMap::new(),
+        };
+        let answer = ResolveCredentialResponse {
+            owner_reads_own_record: Some(empty.clone()),
+            ..resolved("u-yankee-7724")
+        };
+        let attested = from_resolved(answer, Some("acme/demo"), None, "REQ-10".to_string())
+            .expect("a resolved credential attests");
+        assert_eq!(
+            attested.scope.owner_reads_own_record,
+            Some(empty),
+            "an organisation that stated nothing must not be made to have stated something"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_trusted_header_path_states_no_policy_rather_than_inventing_one() {
+        // THE OTHER ARM, AND IT IS HERE BECAUSE ONE-ARM COVERAGE IS THIS ESTATE'S
+        // STANDING FAILURE. `attest` branches on `Attestation`, and a suite whose
+        // cases all resolve a credential leaves a mutant in the header arm alive:
+        // that arm could mint `Some(InheritedSetting::default())`, or ADR-0522's
+        // shipped default, and every test above would still pass.
+        //
+        // ABSENCE IS THE HONEST ANSWER, for the reason `team_ids: Vec::new()` and
+        // `Overrides::default()` are on this same arm: nothing was resolved, and
+        // no header can carry a policy — a caller who could name its own would
+        // name the permissive one. An enforcing -db REFUSES an absent setting, so
+        // a development gateway pointed at one fails loudly rather than reading
+        // its own invention as an organisation's policy.
+        let attested = attest(
+            &Attestation::TrustedHeaders,
+            &nowhere(),
+            &Credentials::new(TEST_TTL),
+            None,
+            Claimed {
+                user_id: Some("max"),
+                project_id: Some("acme/demo"),
+                instance_id: None,
+            },
+            "REQ-11".to_string(),
+        )
+        .await
+        .expect("complete claim attests");
+        assert!(
+            attested.scope.owner_reads_own_record.is_none(),
+            "a path with no policy source states no policy"
+        );
     }
 
     #[test]
@@ -1406,7 +1605,11 @@ mod tests {
         // stops at `resolve_through` — so without this the property is prose.
         let cache = Credentials::new(TEST_TTL);
         let calls = AtomicUsize::new(0);
-        let answer = resolved("u-november-6612");
+        // CARRYING ADR-0522'S SETTING, so this test also pins WHICH HALF it is on.
+        let answer = ResolveCredentialResponse {
+            owner_reads_own_record: Some(stated()),
+            ..resolved("u-november-6612")
+        };
 
         let first = from_resolved(
             through(&cache, "tok-shared", &calls, &answer).await,
@@ -1442,6 +1645,18 @@ mod tests {
         // on `scope.user_id`, which can only come from `resolved.user_id` — so a
         // caller changing its project header mints no new bucket, cache hit or not.
         assert_eq!(first.scope.user_id, second.scope.user_id);
+
+        // SHARED, BECAUSE IT IS A CREDENTIAL FACT — and this assertion is what
+        // makes the module header's claim a checked one rather than prose. The
+        // setting rides the CACHED half, so a policy change binds when the entry
+        // expires; no invalidation subject exists that could evict it sooner, at
+        // either level. Stated here rather than fixed here: the subject that would
+        // close it is `iam`'s to publish.
+        assert_eq!(second.scope.owner_reads_own_record, Some(stated()));
+        assert_eq!(
+            first.scope.owner_reads_own_record,
+            second.scope.owner_reads_own_record
+        );
     }
 
     #[tokio::test(start_paused = true)]
