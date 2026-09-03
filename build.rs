@@ -24,9 +24,56 @@ fn well_known_include() -> Option<String> {
         .then(|| "/usr/include".to_string())
 }
 
+/// What a build with no version reports, and it is deliberately not a number
+/// anyone could mistake for a release.
+///
+/// `Cargo.toml` says `0.0.0` for the same reason: nothing has ever written a
+/// version into that manifest, so any plausible-looking number in it is a lie a
+/// client would believe. A placeholder that is obviously a placeholder is the
+/// whole point — `0.1.0` sat there while the tags ran to `v0.8.1`, and every MCP
+/// client was told `0.1.0` over `server/discover`.
+const DEV_VERSION: &str = "0.0.0-dev";
+
+/// The version this binary reports in `server/discover`.
+///
+/// **The tag is the version (D65), and this build script is told it rather than
+/// deriving it.** `YADGAR_GATEWAY_VERSION` is the whole input; the `Containerfile`
+/// resolves it from the release tag immediately before `cargo build` and FAILS the
+/// build if it cannot. That split is not tidiness:
+///
+/// * A build script cannot tell a release build from a local one, so it can only
+///   ever fall back silently. The `Containerfile` knows, so it can refuse — and a
+///   release that reports a placeholder over a protocol is exactly the silent
+///   wrong state D81 describes.
+/// * `cargo:rerun-if-env-changed` is EXACT. Reading git here instead would mean
+///   naming the files a tag can arrive in — `HEAD`, the ref HEAD points at,
+///   `packed-refs`, `refs/tags` — and a missed one caches a stale version into the
+///   binary, which is the same defect as the one this fixes.
+///
+/// A leading `v` is stripped so a caller may pass a tag name unchanged, exactly as
+/// `ci-release.yaml` already normalises `github.ref_name` for the image tag.
+fn version() -> String {
+    match std::env::var("YADGAR_GATEWAY_VERSION") {
+        Ok(v) if !v.trim().is_empty() => v.trim().trim_start_matches('v').to_string(),
+        _ => DEV_VERSION.to_string(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-env-changed=PROTOC_INCLUDE");
+
+    // BOTH LINES ARE LOAD-BEARING, and the first one is the easy half to forget.
+    // This script already emits `rerun-if-changed`, which switches OFF cargo's
+    // default "re-run when anything in the package changes" — so without an
+    // explicit declaration a changed version would never re-run this script and
+    // the previous number would stay compiled into the binary.
+    //
+    // `CARGO_PKG_VERSION` is NOT usable at the call site: `env!` reads the
+    // manifest's value and cargo does not let a build script override it, which is
+    // why this emits a differently named variable.
+    println!("cargo:rerun-if-env-changed=YADGAR_GATEWAY_VERSION");
+    println!("cargo:rustc-env=YADGAR_GATEWAY_VERSION={}", version());
 
     let mut includes = vec!["proto".to_string()];
     includes.extend(well_known_include());
