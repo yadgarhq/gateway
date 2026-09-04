@@ -393,10 +393,24 @@ impl UpstreamTls {
     /// **What still differs, enumerated rather than waved at.** The CA list
     /// itself is identical: read, decode, non-empty sections, non-empty root
     /// store. The error TYPE differs — `IamChannelError` here,
-    /// `yadgar_dial::BalanceError` there — because each names what its own caller
-    /// can get wrong: this one adds `Uri`, and `dial`'s adds `Dns`, `DnsTimedOut`
-    /// and `NoEndpoints`, none of which can happen on a channel that resolves no
-    /// name. All four CA arms are one-for-one and their sentences are
+    /// `yadgar_dial::BalanceError` there — because each names what its own
+    /// caller can get wrong: this one adds `Uri`, and `dial`'s adds
+    /// `InvalidHost`, which is the same mistake under the other name.
+    ///
+    /// **THAT SENTENCE USED TO NAME `Dns`, `DnsTimedOut` AND `NoEndpoints` as
+    /// what `dial` adds, and v0.2.0 emptied the list.** `NoEndpoints` is
+    /// DELETED — an empty resolution is no longer a failure — and `InvalidHost`
+    /// replaces it. `Dns` and `DnsTimedOut` are still variants, and as far as
+    /// this repository can tell no public entry point of that crate returns
+    /// either one now: `resolve` is private, `connect_with` warns and continues
+    /// with an empty set, and the refresh loop reports through `still_absent`
+    /// and continues. That is a READING of another crate rather than a property
+    /// anything here tests, and it is written as one. So the two error
+    /// sets differ in naming alone, and what is CHECKED rather than asserted
+    /// here is that neither implementation fails a dial because its upstream is
+    /// absent —
+    /// `tests/iam_tls.rs::both_implementations_survive_an_absent_upstream`.
+    /// All four CA arms are one-for-one and their sentences are
     /// word-for-word — CHECKED against
     /// `yadgar_dial::BalanceError`, not assumed. Two wordings stay deliberately
     /// apart, and neither is a CA arm: the `Tls` arm names the upstream here
@@ -537,6 +551,20 @@ impl UpstreamTls {
 /// cleartext path this gateway has always taken; `Some` is the same balancing
 /// with the connection encrypted and `task` verified, and it returns an error
 /// rather than a cleartext channel if the bundle is unusable.
+///
+/// **A `task` THAT IS NOT THERE YET IS NO LONGER AN ERROR HERE**, as of `dial`
+/// v0.2.0 (ADR-0532). This used to resolve DNS before it built anything and
+/// propagate the resolver's error, which `main` turned into a failed boot with
+/// `?` — the behaviour that crash-looped this gateway six times on a rebuilt
+/// cluster before `task`'s Service existed. The variant was
+/// `BalanceError::Dns` rather than `NoEndpoints`: a Service that does not exist
+/// answers NXDOMAIN, and the `?` on the resolution came before the
+/// empty-answer branch that built `NoEndpoints`. The dial is lazy now: it
+/// seeds the balancer with the name and returns a channel, so an absent `task`
+/// costs a failed request rather than a pod that never starts, exactly as
+/// [`connect_iam`] has always cost one. A CONFIGURATION mistake still fails
+/// here — an unusable bundle, a missing client certificate, a host that is not a
+/// URI authority.
 pub async fn connect_task(
     host: &str,
     port: u16,
@@ -589,11 +617,22 @@ fn iam_endpoint(
 /// `POST /auth/enrol` ISSUE a token over it (D75, D73), and `attest::attest`
 /// RESOLVES one over it on every `tools/call` (ADR-0488).
 ///
-/// **LAZY, and deliberately not `yadgar_dial::connect`.** `connect` resolves DNS eagerly
-/// and returns `Err` when the name does not resolve, and `main` propagates that
-/// with `?`, so an `iam` that is not deployed yet would crashloop the pod — and a
-/// pod stuck in startup is one D68's autoscaler cannot help. Rolling this gateway
-/// out before `iam`'s Service exists is an ordinary ordering, not an exotic one.
+/// **LAZY — and no longer the only lazy dial in this module.** `connect` used to
+/// resolve DNS eagerly and return `Err` when the name did not resolve, and
+/// `main` propagated that with `?`, so an `iam` that was not deployed yet would
+/// have crashlooped the pod — and a pod stuck in startup is one D68's autoscaler
+/// cannot help. Rolling this gateway out before `iam`'s Service exists is an
+/// ordinary ordering, not an exotic one.
+///
+/// **`dial` v0.2.0 ADOPTED THIS SHAPE, which is why the paragraph above is in
+/// the past tense.** ADR-0532 seeds `yadgar_dial`'s balancer with the NAME —
+/// `Peer::Unresolved`, dialled the way `connect_lazy` dials it here — and
+/// withdraws it once an address answers. So [`connect_task`] and this function
+/// now AGREE about an absent upstream where they used to disagree: both hand
+/// back a channel and defer the failure to the request.
+/// `tests/iam_tls.rs::both_implementations_survive_an_absent_upstream` holds
+/// that, because an agreement only a comment asserts is one that drifts — which
+/// this module has already watched happen once, on the CA checks below.
 ///
 /// A lazy channel connects on first use instead, so an absent `iam` degrades to a
 /// per-request failure that `http::opaque_status` collapses to one opaque status —

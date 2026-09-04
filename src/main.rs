@@ -14,6 +14,39 @@
 //! means no endpoint, and failing a request with an upstream error is
 //! recoverable where refusing to start is not. Under D68 a pod stuck in startup
 //! is one the autoscaler cannot help.
+//!
+//! **THAT HELD FOR `iam` AND NOT FOR `task` UNTIL `dial` v0.2.0.**
+//! `upstream::connect_iam` has always been lazy; `upstream::connect_task` went
+//! through `yadgar_dial::connect`, which resolved DNS eagerly and returned an
+//! error for an empty answer, and the `?` on it made a `task` Service that did
+//! not exist yet a failed boot. ADR-0532 made that dial lazy as well, so the
+//! paragraph above now describes both upstreams rather than one.
+//!
+//! **WHAT IT COSTS, stated rather than left to be found.** The readiness probe
+//! is a `tcpSocket` on the HTTP port, so this pod reports Ready as soon as it is
+//! listening: with `task` absent it serves an opaque failure for every task
+//! tool, and with `iam` absent it cannot attest at all, which is every
+//! `tools/call`. The probe is deliberately NOT changed to gate on an upstream,
+//! and the reason is D69's own scope rather than a preference: **D69's
+//! boot-failure rule is about a capability of an engine the module OWNS**, which
+//! is why the sequence it names is probe, migrate, then listen and why the `-db`
+//! services are where that sequence lives. This gateway owns no engine, so the
+//! only thing it could gate on is an RPC asking an upstream whether the upstream
+//! is up — inference by proxy, which D69's first rule refuses by name, and the
+//! cascade this paragraph rejects, moved one layer up.
+//!
+//! **The discriminator that generalises is whether a RESTART could change the
+//! outcome.** An unusable CA bundle, a client certificate that is not mounted, a
+//! host that is not a URI authority: a permanent gap, identical after a restart,
+//! so fail boot — and all of those still do. An upstream that has not appeared
+//! yet: transient, and a restart only costs backoff, so dial lazily.
+//!
+//! What makes the absent state visible instead is `yadgar_dial`'s refresh loop,
+//! which logs at ERROR on every tick while a host has never resolved, distinctly
+//! from the warning a blip gets. **That line reaches `kubectl logs` and nothing
+//! else today**: `dial` exports no metric for the never-resolved state, no chart
+//! here ships a `PrometheusRule`, and nothing ships logs off the node. The
+//! signal exists and is not yet alertable.
 
 use std::future::IntoFuture;
 use std::net::SocketAddr;
@@ -284,12 +317,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // settings that both read as "where iam is" is one too many, and the one that
     // named a service nothing could reach is the one to lose.
     //
-    // LAZY, and the one place this file's opening claim is actually true.
-    // `connect_task` above resolves DNS eagerly and `?` turns a name that does not
-    // resolve into a failed boot — so the module comment's "the upstream
-    // connection is NOT gated" does not hold for `task` today. `connect_iam` does
-    // not repeat that: no name is resolved here, so an `iam` that is not deployed
-    // yet costs a bounded failure per request rather than a pod that never starts.
+    // LAZY — and no longer the ONLY place this file's opening claim is true.
+    // `connect_task` above used to resolve DNS eagerly, with `?` turning a name
+    // that did not resolve into a failed boot, so the module comment's "the
+    // upstream connection is NOT gated" did not hold for `task`. `dial` v0.2.0
+    // makes that dial lazy too (ADR-0532), so BOTH upstreams now cost a bounded
+    // failure per request rather than a pod that never starts, and the claim
+    // holds for the first time since it was written.
     //
     // **`iam` IS NO LONGER A SECONDARY UPSTREAM, and this comment used to say it
     // was.** It said an absent `iam` cost "a 503 on /auth/login and nothing at all
