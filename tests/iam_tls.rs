@@ -464,7 +464,7 @@ async fn a_ca_bundle_whose_sections_are_not_trust_anchors_is_an_error() {
 /// **THE ROW THIS COMMENT USED TO PROMISE IS HERE NOW.**
 /// [`one_section_that_is_not_a_certificate`] was excluded while `Cargo.toml`
 /// pinned `yadgar-dial` to a commit before its trust-anchor check. The pin is
-/// `v0.1.3` and the check is in it, so the case is in the table and both arms
+/// `v0.2.0` and the check is in it, so the case is in the table and both arms
 /// accept `CaNoTrustAnchor`.
 #[tokio::test]
 async fn both_implementations_refuse_the_same_bundles() {
@@ -683,4 +683,58 @@ async fn the_cleartext_path_cannot_reach_a_tls_server() {
         request(channel).await.is_err(),
         "cleartext against a TLS listener must fail"
     );
+}
+
+/// THE PARITY ROW `dial` v0.2.0 ADDED, and one this repository could not have
+/// written before it.
+///
+/// `connect_iam` dials `iam` directly with `Endpoint::connect_lazy`, because
+/// `iam`'s Service is a VIP (D23); `connect_task` goes through
+/// `yadgar_dial::connect`, because `task`'s is headless. Until v0.2.0 the two
+/// DISAGREED about an upstream that is not there yet: the lazy one handed back a
+/// channel, and the balanced one returned `BalanceError::Dns` — a Service that
+/// does not exist answers NXDOMAIN, so the resolution failed before the
+/// empty-answer branch — which `main` turned into a failed boot with `?`. ADR-0532 made the balanced dial
+/// seed itself with the name instead, so the two now agree — and two
+/// implementations that agree only by coincidence are two that stop agreeing.
+///
+/// **THE ASSERTION IS NOT `is_ok()`.** A channel handed back holding NO endpoint
+/// is `Ok` too, and it is a worse failure than the crash loop it replaced:
+/// `tower`'s `p2c::Balance::poll_ready` returns `Pending` on an empty ready set,
+/// and nothing in `dial` bounds that, so every caller would wait for ever. Each
+/// channel is therefore DRIVEN — `request` polls readiness and then calls — and
+/// the whole of that is bounded here. A request that completed and FAILED is the
+/// pass. The outer timeout elapsing is the empty-balancer hang, which is the
+/// failure this case exists to catch and the reason it is not one line.
+///
+/// The host is under `.invalid`, reserved by RFC 6761, so the case needs no rig
+/// and no wildcard in a search domain can make it resolve.
+///
+/// **IT IS NOT STRONGER THAN IT LOOKS, and the limit is worth naming.** Under a
+/// resolver that answered `.invalid` anyway, the seed would be withdrawn and the
+/// request would reach a real address — and still fail, so this would still
+/// pass, for a different reason. That is acceptable because the assertion is
+/// "the request ENDS rather than hanging on balancer readiness", which holds on
+/// both routes. It is not a test that the seed was used.
+///
+/// **REVERT THE PIN TO `v0.1.3` AND THIS GOES RED** on the `connect_task`
+/// expectation, which is the mutation that matters for a change whose whole
+/// diff is a version number.
+#[tokio::test]
+async fn both_implementations_survive_an_absent_upstream() {
+    const ABSENT: &str = "gateway-no-such-upstream-6d1a04.invalid";
+
+    let balanced = upstream::connect_task(ABSENT, 50052, None)
+        .await
+        .expect("an absent task must not fail the dial (ADR-0532)");
+    let lazy =
+        upstream::connect_iam(ABSENT, 50052, None).expect("an absent iam never failed the dial");
+
+    for (which, channel) in [("connect_task", balanced), ("connect_iam", lazy)] {
+        let outcome = tokio::time::timeout(Duration::from_secs(20), request(channel)).await;
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "{which} must END a request to an absent upstream rather than hang on balancer              readiness: {outcome:?}"
+        );
+    }
 }
