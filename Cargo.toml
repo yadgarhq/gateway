@@ -67,7 +67,7 @@ rustls-pki-types = { version = "1", features = ["std"] }
 # here; `rustls-pki-types` stays because `upstream` reads a bundle of its own.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.0" }
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.2" }
 # For `RootCertStore::add_parsable_certificates` ALONE, so the CA bundle can be
 # asserted non-empty the way tonic will actually build it. Counting PEM sections
 # is NOT counting trust anchors: tonic feeds the DERs into
