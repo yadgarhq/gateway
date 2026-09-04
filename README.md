@@ -393,17 +393,23 @@ the only certificate this process holds.
 `terminationGracePeriodSeconds` bounds a drain kubelet started; the watcher ends
 the serve itself, so kubelet's clock never runs — and tokio never unregisters a
 libc signal handler, so once the rotation arm wins the `select!` a later SIGTERM
-is swallowed and only SIGKILL is left. `serve::DRAIN_BUDGET` is 25s against the
-default 30s grace period, and its clock starts when shutdown is REQUESTED.
-`tests/drain.rs` is the regression that keeps a budget measuring the server's
-whole life from coming back.
+is swallowed and only SIGKILL is left. `yadgar_lifecycle::DRAIN_BUDGET` is 25s
+against the default 30s grace period, and its clock starts when shutdown is
+REQUESTED. The crate's `tests/drain.rs` is the regression that keeps a budget
+measuring the server's whole life from coming back.
 
-**`src/rotate.rs` is the THIRD copy of `iam`'s**, and its header enumerates the
-four places they differ. ADR-0523 asks for the core to be lifted into shared code
-before a third copy exists; this change defers that deliberately, because shared
-crates here are separate repositories consumed by git tag and a lift needs a
-fourth repository merged and tagged before this one could compile. The lift is
-its own change, and it carries the five copies of `serve::shutdown` with it.
+**The watcher itself is `yadgar-lifecycle`'s now**, pinned by tag per ADR-0526.
+`src/rotate.rs` was the THIRD copy of `iam`'s and `src/serve.rs` held one of five
+copies of `shutdown`, which is the state ADR-0523 asked to be ended before it
+arrived. What is left in this repository is `rotate::watch_set` — the one
+expression naming what a `gateway` reads at boot — and the `Material`
+implementation that says which files an upstream's configuration read.
+
+**That function is the point of the lift, not the de-duplication.** The set used
+to be two chained builder calls in `main.rs`, and no test here spawns the binary:
+either could be deleted and every test still passed. `main.rs` calls `watch_set`
+now and `tests/assembly.rs` calls the same function, so that edit turns a test
+red.
 
 ## Balancing
 
