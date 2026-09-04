@@ -60,11 +60,14 @@ prost-types = "0.14"
 # bundle that decodes to no certificate produces a trust store that trusts
 # nobody and fails much later, at the handshake.
 rustls-pki-types = { version = "1", features = ["std"] }
-# The rotation watcher (ADR-0523) parses the leaf it loaded to gauge its expiry.
-# The same crate `iam` and `task` use for the same module — this is a copy of it,
-# and a copy that drifted on an X.509 parser would be one that disagreed about
-# when a certificate expires.
-x509-parser = "0.18"
+# How this process starts, stops and restarts: ADR-0523's exit-on-change rotation
+# watcher, the SIGTERM drain, and the budget that bounds it. This repository held
+# the THIRD copy of the watcher and one of five copies of `shutdown`. The X.509
+# parser that read a leaf's expiry is ITS dependency now, so it is gone from
+# here; `rustls-pki-types` stays because `upstream` reads a bundle of its own.
+#
+# Pinned by a published tag per ADR-0526, like every other in-org crate.
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.0" }
 # For `RootCertStore::add_parsable_certificates` ALONE, so the CA bundle can be
 # asserted non-empty the way tonic will actually build it. Counting PEM sections
 # is NOT counting trust anchors: tonic feeds the DERs into

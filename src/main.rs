@@ -53,6 +53,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
+
 use yadgar_gateway::attest::{Attestation, Credentials};
 use yadgar_gateway::http::{router, AppState, CredentialLimits};
 use yadgar_gateway::limit::{Bucket, Limiter, Limits};
@@ -281,12 +283,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // becomes the baseline, and the real rotation would never be noticed.
     //
     // BOTH UPSTREAMS, AND ONE CLIENT LEAF BETWEEN THEM. `gateway-client-tls` is
-    // presented to `task` and to `iam`, so the same two paths arrive twice;
-    // `Inputs::also` de-duplicates, so the pair is hashed once and named once in
-    // the line that reports a change.
-    let tls_inputs = rotate::Inputs::default()
-        .upstream(task_tls.as_ref())
-        .upstream(iam_tls.as_ref());
+    // presented to `task` and to `iam`, so the same two paths arrive twice; the
+    // fold de-duplicates, so the pair is hashed once and named once in the line
+    // that reports a change.
+    //
+    // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be two chained
+    // builder calls here, where nothing could reach them: no test spawns this
+    // binary, so deleting either compiled and passed everything. The list lives
+    // in `rotate::watch_set` now and `tests/assembly.rs` calls it.
+    let tls_inputs = rotate::watch_set(task_tls.as_ref(), iam_tls.as_ref());
 
     // PARSED AT BOOT WHETHER OR NOT ANY TLS IS CONFIGURED. A value an operator
     // set and this binary cannot use is a mistake to refuse, not one to paper
@@ -490,11 +495,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:8080").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // ARMED BEFORE THE LISTENER IS SERVED, and that ordering is the fix rather
-    // than an accident of where the line sits. `serve::shutdown` installs both
-    // signal handlers when it is CALLED — a SIGTERM arriving between here and
+    // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
+    // installs both signal handlers when it is CALLED — a SIGTERM arriving between here and
     // the first poll of the future would otherwise take the process's default
     // disposition and kill it outright.
-    let signals = yadgar_gateway::serve::shutdown().map_err(|e| {
+    let signals = shutdown().map_err(|e| {
         format!(
             "the SIGTERM and SIGINT handlers could not be installed: {e}. Refusing to start: a \
              server that cannot hear SIGTERM cannot drain, and Kubernetes ends every pod with one"
@@ -507,7 +512,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         watching = tls_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
-        drain_budget_secs = yadgar_gateway::serve::DRAIN_BUDGET.as_secs(),
+        drain_budget_secs = DRAIN_BUDGET.as_secs(),
         "gateway listening"
     );
 
@@ -517,7 +522,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // must start when shutdown is REQUESTED. A `timeout` around the serving
     // future itself would bound the server's whole life instead, and end the
     // process one budget after boot, on every boot — the defect `iam` shipped
-    // and `tests/drain.rs` keeps dead.
+    // and `yadgar-lifecycle`'s own `tests/drain.rs` keeps dead.
     let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
     let serving = tokio::spawn(
         axum::serve(
@@ -548,17 +553,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    match yadgar_gateway::serve::drain_within(
-        serving,
-        ask_to_stop,
-        stop,
-        yadgar_gateway::serve::DRAIN_BUDGET,
-    )
-    .await
-    {
-        yadgar_gateway::serve::Drain::Finished(result) => result?,
-        yadgar_gateway::serve::Drain::Overran => tracing::error!(
-            budget_secs = yadgar_gateway::serve::DRAIN_BUDGET.as_secs(),
+    match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
+        Drain::Finished(result) => result?,
+        Drain::Overran => tracing::error!(
+            budget_secs = DRAIN_BUDGET.as_secs(),
             "the drain did not finish within its budget; ending anyway with calls still in \
              flight. A request blocked this long is the thing to look at"
         ),

@@ -238,8 +238,8 @@ pub struct UpstreamTls {
 ///
 /// **ONE LEAF, TWO UPSTREAMS.** `gateway-client-tls` is what this process shows
 /// both `task` and `iam`; the chart mounts it once and points both prefixes at
-/// the same two paths. That is why `rotate::Inputs::also` de-duplicates — the
-/// same pair arrives twice.
+/// the same two paths. That is why the watch set de-duplicates a path it already
+/// holds — the same pair arrives twice.
 ///
 /// **THIS GATEWAY SERVES NO CERTIFICATE OF ITS OWN**, so unlike `iam` and `task`
 /// there is no serving leaf to confuse this with. `gateway-tls` is the EDGE
@@ -822,9 +822,9 @@ mod tests {
     }
 
     /// BOTH PATHS ARRIVE, proved with names the module could not have chosen for
-    /// itself. This is what `rotate::Inputs::upstream` reads to put them in the
-    /// watch set, so a value that stopped travelling here would silently empty
-    /// half the set.
+    /// itself. This is what `UpstreamTls`'s `Material` implementation reads to
+    /// put them in the watch set, so a value that stopped travelling here would
+    /// silently empty half the set.
     #[test]
     fn the_client_certificate_and_its_key_both_arrive() {
         let vars = [
