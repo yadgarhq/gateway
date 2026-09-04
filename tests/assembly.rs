@@ -29,6 +29,7 @@
 //! a date nobody is watching.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use rcgen::{
@@ -367,4 +368,91 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
         ),
         other => panic!("expected a gauge, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// THE TWO NAMES THE CHART RENDERS, AND THE TWO NAMES THIS BINARY READS.
+//
+// `Schedule::from_lookup` answers an unmatched key with a DEFAULT rather than an
+// error, so a variable nobody reads is silent in both directions: the chart goes
+// on rendering it and the process goes on polling every 60s. `yadgar-lifecycle`
+// pins both spellings in its own unit tests, so a rename inside the crate breaks
+// the crate loudly — what is left uncovered is narrower and lives HERE: a
+// spelling in THIS chart that no longer matches the one the crate reads.
+//
+// The names are taken OUT OF THE TEMPLATE rather than written down again,
+// anchored on the `values.yaml` key, because the variable's spelling is the
+// thing under test and a copy of it here would agree with itself for ever.
+//
+// WHAT THIS DOES NOT COVER, stated rather than implied: the anchor is the
+// `.Values` key as the TEMPLATE spells it. A `values.yaml` renamed out from
+// under an unchanged template is a different defect, and `helm` catches that one
+// itself — `required` fails the render.
+// ---------------------------------------------------------------------------
+
+/// The template this service is deployed from, read at COMPILE TIME so this can
+/// never pass against a chart that is not in the tree.
+const DEPLOYMENT: &str = include_str!("../chart/templates/deployment.yaml");
+
+/// The environment variable name the chart renders for one `values.yaml` key.
+///
+/// EXACTLY ONE reference is required rather than assumed. "The nearest preceding
+/// `- name:`" silently picks the wrong entry if a second reference to the same
+/// key is ever added, and a rig that picks the wrong entry reports on a variable
+/// nobody asked about.
+fn rendered_env_name(values_key: &str) -> String {
+    let lines: Vec<&str> = DEPLOYMENT.lines().collect();
+    let referencing: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(values_key))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        referencing.len(),
+        1,
+        "the rig expects exactly one reference to {values_key} in the deployment template and \
+         found {}; it cannot say which environment variable that key names",
+        referencing.len()
+    );
+
+    lines[..=referencing[0]]
+        .iter()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("- name: "))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            panic!("no `- name:` line precedes the reference to {values_key} in the template")
+        })
+}
+
+/// The schedule an operator sets through this chart is the schedule this process
+/// runs on.
+#[test]
+fn the_chart_renders_the_schedule_variables_this_binary_reads() {
+    let poll_key = rendered_env_name(".Values.tlsRotation.pollSeconds");
+    let splay_key = rendered_env_name(".Values.tlsRotation.splayMaxSeconds");
+
+    // NEITHER SENTINEL IS A DEFAULT — `from_lookup` falls back to 60s and 300s,
+    // so a sentinel equal to either would pass against a name nothing reads.
+    let schedule = rotate::Schedule::from_lookup(|key| match key {
+        _ if key == poll_key => Some("17".to_owned()),
+        _ if key == splay_key => Some("941".to_owned()),
+        _ => None,
+    })
+    .expect("a schedule of two whole numbers of seconds");
+
+    assert_eq!(
+        schedule.poll(),
+        Duration::from_secs(17),
+        "the chart renders {poll_key} and the watcher reads something else, so the poll interval \
+         an operator sets through this chart never reaches the process"
+    );
+    assert_eq!(
+        schedule.splay_max(),
+        Duration::from_secs(941),
+        "the chart renders {splay_key} and the watcher reads something else, so every pod would \
+         exit on a rotated certificate inside the default window rather than the one this \
+         deployment states"
+    );
 }
