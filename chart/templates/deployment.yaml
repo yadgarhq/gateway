@@ -337,42 +337,6 @@ spec:
               value: {{ .Values.credentialLimits.attributed | quote }}
             - name: YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT
               value: {{ .Values.credentialLimits.unattributed | quote }}
-            # No default here (see main.rs / from_default_env): unset means
-            # silent, which is the exact failure this line exists to prevent.
-            # HOW OFTEN THE TLS FILES ABOVE ARE RE-HASHED, and how long this pod
-            # waits before acting on a change (ADR-0523).
-            #
-            # Nothing re-reads a dialled channel's material, so the gateway
-            # re-reads nothing: it notices the files changed, drains, and exits
-            # 0, and kubelet restarts the container onto the new material. The
-            # Secrets are mounted as DIRECTORIES below, never with subPath, which
-            # is what makes kubelet refresh them inside the pod at all.
-            #
-            # THIS PROCESS SERVES NO CERTIFICATE, so the client leaf is the only
-            # one it holds — and an expired client leaf STOPS the hop to `iam` or
-            # `task` rather than degrading it. That is the whole of the deadline
-            # this watcher exists to move.
-            #
-            # THE SPLAY IS THE ONLY THING SEPARATING THE TWO REPLICAS. Both see
-            # the refreshed file inside the same kubelet sync window, and the
-            # PodDisruptionBudget does NOT govern a self-exit — it constrains
-            # eviction, and nothing here is evicting anything.
-            #
-            # RENDERED WHETHER OR NOT ANY TLS IS ON, and parsed at boot either
-            # way. With both upstreams cleartext the watch set is empty and the
-            # watcher idles; a value an operator set and the binary cannot use is
-            # still an error, which is the point of parsing it regardless.
-            #
-            # `required` rather than `| default`: an override that nulls or
-            # empties the block becomes a template-time error naming the value,
-            # instead of an interval nobody chose or a CrashLoop three layers
-            # from its message. `0` reaches the binary and is refused there BY
-            # NAME, because sleeping for no time at all is a hot loop rather than
-            # a way of turning the watcher off.
-            - name: TLS_ROTATION_POLL_SECS
-              value: {{ required "tlsRotation.pollSeconds is how often the gateway re-hashes the TLS files it read at boot and must be set; see the chart's values.yaml" .Values.tlsRotation.pollSeconds | quote }}
-            - name: TLS_ROTATION_SPLAY_MAX_SECS
-              value: {{ required "tlsRotation.splayMaxSeconds is the longest a pod waits before exiting on a rotated certificate and must be set; see the chart's values.yaml" .Values.tlsRotation.splayMaxSeconds | quote }}
             - name: RUST_LOG
               value: "info"
             {{- if .Values.trustUnauthenticatedHeaders }}

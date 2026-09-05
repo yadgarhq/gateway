@@ -477,7 +477,7 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
 }
 
 // ---------------------------------------------------------------------------
-// THE CHART STILL SPEAKS TWO LANGUAGES TO THE ROTATION WATCHER (STEP 2A).
+// THE CHART'S mountPath MUST AGREE WITH WHAT THE BINARY READS.
 //
 // Before v0.2.0, `Schedule::from_lookup` answered an unmatched key with a
 // DEFAULT rather than an error, so a variable nobody read was silent in both
@@ -487,86 +487,23 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
 // this binary reads `rotate::Configuration::mounted()` instead (`main.rs`), so
 // that particular coupling has nothing left to assert.
 //
-// TWO THINGS STILL HAVE TO HOLD, ONE PER SOURCE. The chart must keep rendering
-// the two environment variables the OLD binary reads — asserted below as
-// literal strings, which is the honest form now that no reader in THIS binary
-// exists to derive them from. And the chart's `mountPath` must keep agreeing
-// with the path the NEW binary reads, which `yadgarhq/config`'s README calls
-// out by name ("The mount path and that constant must agree. They disagree
-// LOUDLY") — asserted below by deriving the expected path from
-// `Configuration::mounted()` itself, so a rename in `yadgar-lifecycle` turns
-// this red rather than agreeing with a copy of itself.
+// STEP 2B (MIGRATION_NOTES.md, ADR-0569/ADR-0570) deleted the chart's two
+// TLS_ROTATION_* environment variables, and with them the guard test that kept
+// the chart rendering both for the OLD binary while this release's digest was
+// still in flight to `yadgarhq/argocd`. That guard's job ended the moment the
+// digest landed; it is not a coupling this binary needs to keep passing.
 //
-// WHAT NEITHER COVERS, stated rather than implied: the anchor for the first is
-// the `.Values` key as the TEMPLATE spells it, and a `values.yaml` renamed out
-// from under an unchanged template is a different defect that `helm` itself
-// catches — `required` fails the render.
+// WHAT STILL HAS TO HOLD: the chart's `mountPath` must keep agreeing with the
+// path the binary reads, which `yadgarhq/config`'s README calls out by name
+// ("The mount path and that constant must agree. They disagree LOUDLY") —
+// asserted below by deriving the expected path from `Configuration::mounted()`
+// itself, so a rename in `yadgar-lifecycle` turns this red rather than
+// agreeing with a copy of itself.
 // ---------------------------------------------------------------------------
 
 /// The template this service is deployed from, read at COMPILE TIME so this can
 /// never pass against a chart that is not in the tree.
 const DEPLOYMENT: &str = include_str!("../chart/templates/deployment.yaml");
-
-/// The environment variable name the chart renders for one `values.yaml` key.
-///
-/// EXACTLY ONE reference is required rather than assumed. "The nearest preceding
-/// `- name:`" silently picks the wrong entry if a second reference to the same
-/// key is ever added, and a rig that picks the wrong entry reports on a variable
-/// nobody asked about.
-fn rendered_env_name(values_key: &str) -> String {
-    let lines: Vec<&str> = DEPLOYMENT.lines().collect();
-    let referencing: Vec<usize> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.contains(values_key))
-        .map(|(at, _)| at)
-        .collect();
-    assert_eq!(
-        referencing.len(),
-        1,
-        "the rig expects exactly one reference to {values_key} in the deployment template and \
-         found {}; it cannot say which environment variable that key names",
-        referencing.len()
-    );
-
-    lines[..=referencing[0]]
-        .iter()
-        .rev()
-        .find_map(|line| line.trim().strip_prefix("- name: "))
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            panic!("no `- name:` line precedes the reference to {values_key} in the template")
-        })
-}
-
-/// STEP 2A KEEPS BOTH SOURCES LIVE (MIGRATION_NOTES.md, ADR-0569/ADR-0570).
-///
-/// `rotate::Schedule::from_env` and `from_lookup` are gone from
-/// `yadgar-lifecycle` v0.2.0, and this binary now reads its schedule from
-/// `rotate::Configuration::mounted()` instead — so the coupling this test used
-/// to assert (the chart's rendered variable feeds `Schedule::from_lookup`) no
-/// longer exists to test. What still has to hold, and what this asserts
-/// instead, is that the chart goes on rendering BOTH variables under their
-/// established names: Argo takes this chart from HEAD the moment this pull
-/// request merges, while the image is pinned by digest minutes later from a
-/// separate pipeline, so a pod can roll onto the OLD binary — which still
-/// reads these two variables and has no other source. Deleting either is step
-/// 2b, and only after that digest has landed in `yadgarhq/argocd`.
-#[test]
-fn the_chart_still_renders_the_tls_rotation_variables_for_the_old_binary() {
-    assert_eq!(
-        rendered_env_name(".Values.tlsRotation.pollSeconds"),
-        "TLS_ROTATION_POLL_SECS",
-        "a pod that rolls onto the old binary before this release's digest reaches \
-         yadgarhq/argocd reads its poll interval from this variable and no other source"
-    );
-    assert_eq!(
-        rendered_env_name(".Values.tlsRotation.splayMaxSeconds"),
-        "TLS_ROTATION_SPLAY_MAX_SECS",
-        "a pod that rolls onto the old binary before this release's digest reaches \
-         yadgarhq/argocd reads its splay ceiling from this variable and no other source"
-    );
-}
 
 /// THE CHART'S `mountPath` AND THE PATH THIS BINARY ACTUALLY READS MUST AGREE.
 ///
