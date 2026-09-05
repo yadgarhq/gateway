@@ -8,15 +8,20 @@
 //! inspects configuration for that reason: every case stands up a real gRPC
 //! server and asserts on whether a request survived.
 //!
-//! THE MUTATION THESE ARE WRITTEN AGAINST is forcing the scheme to `http` in
-//! `upstream::iam_endpoint` while leaving the TLS configuration attached. Two
-//! shapes below catch it, and they catch it from opposite directions: a TLS
-//! server stops answering, and a CLEARTEXT server starts.
+//! **WHAT THESE TEST NOW IS THE WIRING, not a second implementation.**
+//! `connect_iam` used to build its own `Endpoint`, and this file existed
+//! because that was a second spelling of `yadgar_dial::endpoint` — a second
+//! thing that could be wrong, and one that had already drifted once. That
+//! spelling is deleted: the `iam` hop goes through `yadgar_dial` like every
+//! other hop, so ADR-0514's coupling of scheme and configuration is held in
+//! one implementation and `dial`'s own mutation tests hold it there.
 //!
-//! `iam` is dialled directly rather than through `yadgar_dial` because its
-//! Service is a VIP rather than headless (D23). That is why these handshakes are
-//! tested here as well as in `dial`: it is a second implementation, and a second
-//! implementation is a second thing that can be wrong.
+//! What is left here is the half `dial` cannot see: that `UpstreamTls`, built
+//! from the `IAM_TLS_*` environment through the same `from_lookup` `main`
+//! uses, actually reaches those checks and produces a channel that completes a
+//! real handshake. A `connect_iam` that dropped `options()` on the floor, or
+//! that read the `TASK_` prefix, would satisfy every one of `dial`'s tests and
+//! fail every one of these.
 //!
 //! CERTIFICATES ARE MINTED PER RUN. A fixture key committed to the repository is
 //! a secret committed to the repository, and it expires on a date nobody is
@@ -40,7 +45,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::{http, Service};
 use tonic::transport::{Channel, Identity, Server, ServerTlsConfig};
 
-use yadgar_gateway::upstream::{self, IamChannelError, UpstreamTls, IAM};
+use yadgar_dial::BalanceError;
+use yadgar_gateway::upstream::{self, UpstreamTls, IAM};
 
 /// The name the test certificates are issued for, and the name the test rig
 /// listens on.
@@ -292,9 +298,10 @@ async fn request(mut channel: Channel) -> Result<(), String> {
 /// complete a TLS handshake against a server presenting a certificate from the
 /// configured authority.
 ///
-/// **Force the scheme to `http` in `iam_endpoint` and this fails**: the client
-/// speaks cleartext at a TLS listener and never gets an answer. That is the
-/// mutation, and this is the first of the three tests it turns red.
+/// **Force the scheme to `http` in `yadgar_dial::endpoint` and this fails**:
+/// the client speaks cleartext at a TLS listener and never gets an answer. That
+/// mutation is `dial`'s to guard now, and `dial`'s tests do. What this one adds
+/// is that the `IAM_TLS_*` settings reach it at all.
 #[tokio::test]
 async fn a_configured_channel_reaches_a_tls_server() {
     let p = pki(SERVED_NAME);
@@ -302,6 +309,7 @@ async fn a_configured_channel_reaches_a_tls_server() {
     let ca = TempPem::with(&p.ca_pem);
 
     let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+        .await
         .expect("a valid CA bundle and a host that forms a URI");
 
     assert_eq!(request(channel).await, Ok(()));
@@ -324,6 +332,7 @@ async fn a_configured_channel_refuses_to_talk_to_a_cleartext_server() {
     let ca = TempPem::with(&p.ca_pem);
 
     let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+        .await
         .expect("a valid CA bundle and a host that forms a URI");
 
     let outcome = request(channel).await;
@@ -348,13 +357,16 @@ async fn the_verification_domain_can_be_overridden() {
     let port = serve(&p).await;
     let ca = TempPem::with(&p.ca_pem);
 
-    let channel =
-        upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, Some(SENTINEL)))).unwrap();
+    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, Some(SENTINEL))))
+        .await
+        .unwrap();
     assert_eq!(request(channel).await, Ok(()));
 
     // And without the override the same server is correctly refused: the
     // certificate does not name the host.
-    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None))).unwrap();
+    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+        .await
+        .unwrap();
     assert!(
         request(channel).await.is_err(),
         "a certificate for {SENTINEL} must not satisfy a connection to {SERVED_NAME}"
@@ -363,8 +375,8 @@ async fn the_verification_domain_can_be_overridden() {
 
 /// Verification has to be REAL. A certificate from an authority the caller does
 /// not trust is what an impostor presents, and the bearer token must not go to
-/// it. Drop `ca_certificate` from `client_tls_config`, or add the platform trust
-/// store beside it, and this is the test that notices.
+/// it. Drop the CA from `UpstreamTls::options`, or add the platform trust store
+/// beside it, and this is the test that notices.
 #[tokio::test]
 async fn a_certificate_from_an_untrusted_authority_is_refused() {
     let served = pki(SERVED_NAME);
@@ -374,7 +386,9 @@ async fn a_certificate_from_an_untrusted_authority_is_refused() {
     let stranger = pki(SERVED_NAME);
     let ca = TempPem::with(&stranger.ca_pem);
 
-    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None))).unwrap();
+    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+        .await
+        .unwrap();
     assert!(
         request(channel).await.is_err(),
         "a certificate signed by an authority that is not trusted must be refused"
@@ -392,9 +406,9 @@ async fn a_certificate_from_an_untrusted_authority_is_refused() {
 async fn a_ca_bundle_with_no_certificate_in_it_is_an_error() {
     for contents in ["", "   ", "\n", "there is no certificate in this file\n"] {
         let ca = TempPem::with(contents);
-        let outcome = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)));
+        let outcome = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None))).await;
         assert!(
-            matches!(outcome, Err(IamChannelError::CaEmpty { .. })),
+            matches!(outcome, Err(BalanceError::CaEmpty { .. })),
             "a bundle containing {contents:?} must be rejected, not connected"
         );
     }
@@ -427,110 +441,49 @@ fn one_section_that_is_not_a_certificate() -> TempPem {
 /// prevent, reached by a path `CaEmpty` never covered.
 ///
 /// **THE MUTATION THIS IS WRITTEN AGAINST** is deleting the `accepted == 0` arm
-/// in `UpstreamTls::client_tls_config` and leaving the section count alone.
+/// in `yadgar_dial::TlsOptions::prepare` and leaving the section count alone.
 /// Measured against that mutant, `connect_iam` returns `Ok(Channel)` — a channel
 /// that trusts nobody while looking configured, on the hop that carries the
-/// bearer token.
+/// bearer token. The arm lives in `dial` now rather than here; what this asserts
+/// is that the `iam` hop is behind it.
 ///
 /// The section count is asserted too, not only the variant: `sections: 1` is what
 /// makes it this case rather than the empty-file one.
 #[tokio::test]
 async fn a_ca_bundle_whose_sections_are_not_trust_anchors_is_an_error() {
     let ca = one_section_that_is_not_a_certificate();
-    let outcome = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)));
+    let outcome = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None))).await;
     assert!(
         matches!(
             outcome,
-            Err(IamChannelError::CaNoTrustAnchor { sections: 1, .. })
+            Err(BalanceError::CaNoTrustAnchor { sections: 1, .. })
         ),
         "a bundle holding one PEM section and no trust anchor must be rejected, not connected: \
          {outcome:?}"
     );
 }
 
-/// THE DIVERGENCE DETECTOR, and the reason it is a test rather than a paragraph.
+/// A CLIENT IDENTITY THAT CANNOT BE READ IS A REFUSAL, before any channel
+/// exists (ADR-0516).
 ///
-/// `client_tls_config` and `yadgar_dial::TlsOptions::prepare` are two spellings
-/// of one list, kept in step by a doc comment asserting they were identical —
-/// which stopped being true the moment one side grew a check the other lacked,
-/// and nothing noticed because nothing was checking. This is what checks.
+/// **THIS USED TO BE A PARITY TEST AND IS NOT ONE ANY MORE.** It fed the same
+/// bad material to `UpstreamTls::client_tls_config` and to
+/// `yadgar_dial::TlsOptions::prepare` and required both to refuse, because the
+/// two were separate spellings of one list that had already drifted once. The
+/// gateway's spelling is deleted, so there is nothing left to compare against
+/// and a version that fed the table to `dial` alone would be `dial`'s own test
+/// wearing this one's name.
 ///
-/// **A CROSS-CRATE test IS possible, and the reason is worth recording**: `dial`
-/// is a DEPENDENCY of this crate, and `connect_tls` calls `TlsOptions::prepare`
-/// BEFORE it resolves anything, so a bad bundle is refused with no server, no
-/// port and no DNS. The two implementations can therefore be handed the same
-/// file in the same process.
-///
-/// **THE ROW THIS COMMENT USED TO PROMISE IS HERE NOW.**
-/// [`one_section_that_is_not_a_certificate`] was excluded while `Cargo.toml`
-/// pinned `yadgar-dial` to a commit before its trust-anchor check. The pin is
-/// `v0.2.0` and the check is in it, so the case is in the table and both arms
-/// accept `CaNoTrustAnchor`.
+/// **WHAT IS STILL WORTH ASSERTING is the wiring and the EAGERNESS.**
+/// `IAM_TLS_CLIENT_CERT_FILE` and `IAM_TLS_CLIENT_KEY_FILE` have to travel from
+/// the environment through `from_lookup`, through `options()`, and into the
+/// read `dial` performs before it resolves anything — and the mistake an
+/// operator actually makes is a mount that did not happen. The channel is lazy,
+/// so a `connect_iam` that deferred the read would hand back `Ok` here and fail
+/// per request under traffic instead of at boot. Drop `identity()` from
+/// `options()` and both halves go red.
 #[tokio::test]
-async fn both_implementations_refuse_the_same_bundles() {
-    for contents in ["", "   ", "\n", "there is no certificate in this file\n"] {
-        let ca = TempPem::with(contents);
-
-        // The gateway's own copy, reached the way `main` reaches it.
-        let mine = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)));
-        assert!(
-            matches!(mine, Err(IamChannelError::CaEmpty { .. })),
-            "the gateway must refuse {contents:?}: {mine:?}"
-        );
-
-        // And the crate this one is a copy of, given the identical file.
-        let theirs =
-            yadgar_dial::connect_tls(SERVED_NAME, 50052, &yadgar_dial::TlsOptions::new(ca.path()))
-                .await;
-        assert!(
-            matches!(theirs, Err(yadgar_dial::BalanceError::CaEmpty { .. })),
-            "yadgar_dial must refuse {contents:?} for the same reason: {theirs:?}"
-        );
-    }
-
-    // THE CASE A SECTION COUNT CANNOT SEE, on both sides.
-    let ca = one_section_that_is_not_a_certificate();
-    let mine = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)));
-    assert!(
-        matches!(
-            mine,
-            Err(IamChannelError::CaNoTrustAnchor { sections: 1, .. })
-        ),
-        "the gateway must refuse a bundle with one section and no trust anchor: {mine:?}"
-    );
-    let theirs =
-        yadgar_dial::connect_tls(SERVED_NAME, 50052, &yadgar_dial::TlsOptions::new(ca.path()))
-            .await;
-    assert!(
-        matches!(
-            theirs,
-            Err(yadgar_dial::BalanceError::CaNoTrustAnchor { sections: 1, .. })
-        ),
-        "yadgar_dial must refuse it for the same reason: {theirs:?}"
-    );
-}
-
-/// THE SAME DIVERGENCE DETECTOR, EXTENDED TO THE CLIENT IDENTITY (ADR-0516).
-///
-/// **Without this, adding `identity` to two implementations would leave the
-/// parity test covering half the code while still passing.** The identity is
-/// read in `UpstreamTls::client_tls_config` for the `iam` hop and in
-/// `yadgar_dial::TlsOptions::prepare` for the `task` hop, and those are the two
-/// spellings that already drifted once over the CA list. Delete either read and
-/// this goes red.
-///
-/// **IT ALSO PROVES THE READ IS EAGER**, which is the property `connect_iam`'s
-/// doc commits to: the channel is lazy about DNS and the connection, never about
-/// the material, so a mount that did not happen is a boot refusal naming the
-/// file rather than a per-request mystery under traffic.
-///
-/// **WHAT IS DELIBERATELY NOT HERE.** There is no empty-file row to match
-/// `CaEmpty`: an empty client chain is refused where rustls builds the
-/// configuration and surfaces as `Tls`, not as a distinct read error, and `dial`
-/// records the same asymmetry. Asserting a shared variant that neither side has
-/// would be a test of nothing.
-#[tokio::test]
-async fn both_implementations_refuse_the_same_client_identity() {
+async fn a_client_identity_that_cannot_be_read_is_an_error_before_any_channel_exists() {
     let good = pki(SERVED_NAME);
     let ca = TempPem::with(&good.ca_pem);
     let certificate = TempPem::with(&good.cert_pem);
@@ -538,36 +491,24 @@ async fn both_implementations_refuse_the_same_client_identity() {
 
     // A CLIENT CERTIFICATE THAT IS NOT THERE.
     let missing_cert = absent("client-cert");
-    let mine = upstream::connect_iam(
+    let outcome = upstream::connect_iam(
         SERVED_NAME,
         50052,
         Some(&settings_with_identity(&ca, &missing_cert, key.path())),
-    );
-    assert!(
-        matches!(
-            mine,
-            Err(IamChannelError::ClientCertificateUnreadable { .. })
-        ),
-        "the gateway must refuse a client certificate that cannot be read: {mine:?}"
-    );
-    let theirs = yadgar_dial::connect_tls(
-        SERVED_NAME,
-        50052,
-        &yadgar_dial::TlsOptions::new(ca.path()).identity(&missing_cert, key.path()),
     )
     .await;
     assert!(
         matches!(
-            theirs,
-            Err(yadgar_dial::BalanceError::ClientCertificateUnreadable { .. })
+            outcome,
+            Err(BalanceError::ClientCertificateUnreadable { .. })
         ),
-        "yadgar_dial must refuse it for the same reason: {theirs:?}"
+        "a client certificate that cannot be read must be refused, not dialled around: {outcome:?}"
     );
 
     // AND A PRIVATE KEY THAT IS NOT THERE. A certificate without its key proves
     // nothing, so this is an error rather than a reason to connect anonymously.
     let missing_key = absent("client-key");
-    let mine = upstream::connect_iam(
+    let outcome = upstream::connect_iam(
         SERVED_NAME,
         50052,
         Some(&settings_with_identity(
@@ -575,23 +516,11 @@ async fn both_implementations_refuse_the_same_client_identity() {
             certificate.path(),
             &missing_key,
         )),
-    );
-    assert!(
-        matches!(mine, Err(IamChannelError::ClientKeyUnreadable { .. })),
-        "the gateway must refuse a client key that cannot be read: {mine:?}"
-    );
-    let theirs = yadgar_dial::connect_tls(
-        SERVED_NAME,
-        50052,
-        &yadgar_dial::TlsOptions::new(ca.path()).identity(certificate.path(), &missing_key),
     )
     .await;
     assert!(
-        matches!(
-            theirs,
-            Err(yadgar_dial::BalanceError::ClientKeyUnreadable { .. })
-        ),
-        "yadgar_dial must refuse it for the same reason: {theirs:?}"
+        matches!(outcome, Err(BalanceError::ClientKeyUnreadable { .. })),
+        "a client key that cannot be read must be refused, not dialled around: {outcome:?}"
     );
 }
 
@@ -620,6 +549,7 @@ async fn a_client_identity_does_not_break_a_hop_whose_server_asks_for_none() {
         port,
         Some(&settings_with_identity(&ca, certificate.path(), key.path())),
     )
+    .await
     .expect("a complete identity is a usable configuration");
     assert_eq!(
         request(channel).await,
@@ -653,8 +583,8 @@ async fn a_ca_bundle_that_cannot_be_read_is_an_error_before_any_channel_exists()
 
     assert!(
         matches!(
-            upstream::connect_iam(SERVED_NAME, 50052, Some(&tls)),
-            Err(IamChannelError::CaUnreadable { .. })
+            upstream::connect_iam(SERVED_NAME, 50052, Some(&tls)).await,
+            Err(BalanceError::CaUnreadable { .. })
         ),
         "a CA path that does not exist must be rejected"
     );
@@ -666,7 +596,9 @@ async fn a_ca_bundle_that_cannot_be_read_is_an_error_before_any_channel_exists()
 #[tokio::test]
 async fn the_cleartext_path_still_reaches_a_cleartext_server() {
     let port = serve_cleartext().await;
-    let channel = upstream::connect_iam(SERVED_NAME, port, None).unwrap();
+    let channel = upstream::connect_iam(SERVED_NAME, port, None)
+        .await
+        .unwrap();
     assert_eq!(request(channel).await, Ok(()));
 }
 
@@ -678,34 +610,41 @@ async fn the_cleartext_path_still_reaches_a_cleartext_server() {
 async fn the_cleartext_path_cannot_reach_a_tls_server() {
     let p = pki(SERVED_NAME);
     let port = serve(&p).await;
-    let channel = upstream::connect_iam(SERVED_NAME, port, None).unwrap();
+    let channel = upstream::connect_iam(SERVED_NAME, port, None)
+        .await
+        .unwrap();
     assert!(
         request(channel).await.is_err(),
         "cleartext against a TLS listener must fail"
     );
 }
 
-/// THE PARITY ROW `dial` v0.2.0 ADDED, and one this repository could not have
-/// written before it.
+/// AN ABSENT UPSTREAM ENDS A REQUEST RATHER THAN HANGING ON BALANCER
+/// READINESS — on BOTH hops, which are one code path now.
 ///
-/// `connect_iam` dials `iam` directly with `Endpoint::connect_lazy`, because
-/// `iam`'s Service is a VIP (D23); `connect_task` goes through
-/// `yadgar_dial::connect`, because `task`'s is headless. Until v0.2.0 the two
-/// DISAGREED about an upstream that is not there yet: the lazy one handed back a
-/// channel, and the balanced one returned `BalanceError::Dns` — a Service that
-/// does not exist answers NXDOMAIN, so the resolution failed before the
-/// empty-answer branch — which `main` turned into a failed boot with `?`. ADR-0532 made the balanced dial
-/// seed itself with the name instead, so the two now agree — and two
-/// implementations that agree only by coincidence are two that stop agreeing.
+/// **IT WAS A PARITY TEST AND IS A BEHAVIOUR TEST.** It used to hold two
+/// implementations to one answer: `connect_iam` dialled directly with
+/// `Endpoint::connect_lazy` while `connect_task` went through
+/// `yadgar_dial::connect`, and until `dial` v0.2.0 the two DISAGREED about an
+/// upstream that is not there yet — the lazy one handed back a channel, the
+/// balanced one returned `BalanceError::Dns`, and `main` turned that into a
+/// failed boot with `?`. Both hops go through `dial` now, so there is no
+/// second implementation to compare against and the parity framing is deleted.
 ///
-/// **THE ASSERTION IS NOT `is_ok()`.** A channel handed back holding NO endpoint
-/// is `Ok` too, and it is a worse failure than the crash loop it replaced:
-/// `tower`'s `p2c::Balance::poll_ready` returns `Pending` on an empty ready set,
-/// and nothing in `dial` bounds that, so every caller would wait for ever. Each
+/// **THE PROPERTY IS NOT DELETED WITH IT.** What is asserted here is what a
+/// CONSUMER observes: a channel handed back holding NO endpoint is `Ok` too,
+/// and it is a worse failure than the crash loop it replaced — `tower`'s
+/// `p2c::Balance::poll_ready` returns `Pending` on an empty ready set, and
+/// nothing in `dial` bounds that, so every caller would wait for ever. Each
 /// channel is therefore DRIVEN — `request` polls readiness and then calls — and
-/// the whole of that is bounded here. A request that completed and FAILED is the
-/// pass. The outer timeout elapsing is the empty-balancer hang, which is the
-/// failure this case exists to catch and the reason it is not one line.
+/// the whole of that is bounded here. A request that completed and FAILED is
+/// the pass. The outer timeout elapsing is the empty-balancer hang, which is
+/// the failure this case exists to catch and the reason it is not one line.
+///
+/// **BOTH HOPS STAY IN THE TABLE even though they share a body**, because the
+/// two call sites still differ in the argument that decides which environment
+/// prefix and which port they carry, and a `connect_iam` rewritten to stop
+/// dialling at all would otherwise go unnoticed here.
 ///
 /// The host is under `.invalid`, reserved by RFC 6761, so the case needs no rig
 /// and no wildcard in a search domain can make it resolve.
@@ -717,20 +656,20 @@ async fn the_cleartext_path_cannot_reach_a_tls_server() {
 /// "the request ENDS rather than hanging on balancer readiness", which holds on
 /// both routes. It is not a test that the seed was used.
 ///
-/// **REVERT THE PIN TO `v0.1.3` AND THIS GOES RED** on the `connect_task`
-/// expectation, which is the mutation that matters for a change whose whole
-/// diff is a version number.
+/// **REVERT THE PIN TO `v0.1.3` AND THIS GOES RED** on both expectations now,
+/// where it used to go red on one.
 #[tokio::test]
-async fn both_implementations_survive_an_absent_upstream() {
+async fn an_absent_upstream_never_fails_the_dial_and_never_hangs_a_request() {
     const ABSENT: &str = "gateway-no-such-upstream-6d1a04.invalid";
 
-    let balanced = upstream::connect_task(ABSENT, 50052, None)
+    let task = upstream::connect_task(ABSENT, 50052, None)
         .await
         .expect("an absent task must not fail the dial (ADR-0532)");
-    let lazy =
-        upstream::connect_iam(ABSENT, 50052, None).expect("an absent iam never failed the dial");
+    let iam = upstream::connect_iam(ABSENT, 50052, None)
+        .await
+        .expect("an absent iam must not fail the dial");
 
-    for (which, channel) in [("connect_task", balanced), ("connect_iam", lazy)] {
+    for (which, channel) in [("connect_task", task), ("connect_iam", iam)] {
         let outcome = tokio::time::timeout(Duration::from_secs(20), request(channel)).await;
         assert!(
             matches!(outcome, Ok(Err(_))),

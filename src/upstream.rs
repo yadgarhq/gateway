@@ -12,31 +12,38 @@
 //! in the estate serves TLS yet. Per upstream because `task` and `iam` are cut
 //! over one at a time, and a single flag would make that all-or-nothing.
 //!
-//! **THE TRAP, and it is why this module has two implementations of the same
-//! idea.** tonic decides TLS from `uri.scheme_str() == Some("https")`, NOT from
-//! whether `Endpoint::tls_config` was set. An `http://` URI carrying a perfectly
-//! valid `ClientTlsConfig` connects in cleartext, silently, with no error and no
-//! log line — so a change that attaches a configuration and leaves the scheme
-//! alone looks encrypted, passes any test that inspects configuration, and sends
-//! the bearer token in the clear. `yadgar_dial::endpoint` couples the two
-//! structurally; [`iam_endpoint`] below does the same thing for the one channel
-//! that cannot go through `yadgar_dial` at all.
+//! **THE TRAP, and it is why ADR-0514 exists.** tonic decides TLS from
+//! `uri.scheme_str() == Some("https")`, NOT from whether `Endpoint::tls_config`
+//! was set. An `http://` URI carrying a perfectly valid `ClientTlsConfig`
+//! connects in cleartext, silently, with no error and no log line — so a change
+//! that attaches a configuration and leaves the scheme alone looks encrypted,
+//! passes any test that inspects configuration, and sends the bearer token in
+//! the clear. `yadgar_dial::endpoint` couples the two structurally, in one
+//! expression, and BOTH upstreams reach it: [`connect_task`] and
+//! [`connect_iam`] hand their settings to that crate and build no endpoint of
+//! their own.
 //!
-//! **Why that channel cannot.** `iam`'s Service is a VIP rather than headless,
-//! so it is dialled directly (see [`connect_iam`]); routing it through
-//! `yadgar_dial` would change the balancing decision D23 made. The cost is that
-//! the CA bundle checks exist twice — once inside `yadgar_dial`, once in
-//! [`UpstreamTls::client_tls_config`] — and the two can drift. They are written
-//! to the same list on purpose: read, decode, ASSERT THE SECTIONS ARE NOT EMPTY,
-//! ASSERT THE ROOT STORE IS NOT EMPTY, pin the verification domain to the host,
-//! bound the handshake, and add no platform trust store.
+//! **THIS MODULE HELD A SECOND IMPLEMENTATION UNTIL IT DID NOT NEED TO.**
+//! `connect_iam` used to build its own `Endpoint` and read its own CA bundle,
+//! on the grounds that `iam`'s Service is a ClusterIP rather than headless and
+//! that routing it through `yadgar_dial` would change the balancing decision
+//! D23 made. It would not: a ClusterIP resolves to ONE address, so the balancer
+//! holds one endpoint and every request rides one HTTP/2 connection through
+//! kube-proxy — which is precisely what `Endpoint::connect_lazy` did. The
+//! second implementation bought nothing and cost the thing a second
+//! implementation always costs.
 //!
-//! **THE TWO DID DRIFT, which is why the fourth item is spelled out.** A count of
-//! PEM sections is not a count of trust anchors, and this copy made only the
-//! first check for as long as the comment claimed the lists were identical. The
-//! claim is a test now — `tests/iam_tls.rs::both_implementations_refuse_the_same_bundles`
-//! — because a copy that only a paragraph holds together is a copy that drifts
-//! again.
+//! **THE TWO DID DRIFT, and that is why the copy is gone rather than better
+//! commented.** A count of PEM sections is not a count of trust anchors, and
+//! this module's copy made only the first check for as long as its comment
+//! claimed the lists were identical. A parity test caught it and then had to be
+//! maintained forever. One implementation needs no parity test.
+//!
+//! **AND ROUTING BOTH HOPS THROUGH `yadgar_dial` IS WHAT PUBLISHES THE
+//! ABSENCE GAUGE.** `yadgar_dial_upstream_never_resolved` is emitted from
+//! inside that crate, so the hop that bypassed it emitted nothing and
+//! `deploy`'s `DialUpstreamNeverResolved` rule could not fire for the upstream
+//! carrying every login. See [`connect_iam`] and `tests/upstream_absence.rs`.
 //!
 //! # Mutual TLS
 //!
@@ -63,11 +70,14 @@
 //! in a process that serves no certificate of its own, they are the only
 //! material whose expiry the gauge can report.
 //!
-//! **BOTH IMPLEMENTATIONS TAKE THEM, AND A TEST HOLDS THAT.** `options()` hands
-//! them to `yadgar_dial` for the `task` hop; [`UpstreamTls::client_tls_config`]
-//! reads them itself for the `iam` hop, which cannot go through `dial` at all.
-//! `tests/iam_tls.rs::both_implementations_refuse_the_same_client_identity`
-//! feeds one table of bad material to both and requires both to refuse.
+//! **ONE READ SERVES BOTH HOPS.** [`UpstreamTls::options`] hands the pair to
+//! `yadgar_dial`, which reads them before it resolves anything, for `task` and
+//! for `iam` alike. This module used to read them a second time for `iam` and
+//! a parity test held the two spellings together; the second spelling is gone.
+//! `tests/iam_tls.rs::a_client_identity_that_cannot_be_read_is_an_error_before_any_channel_exists`
+//! is what remains, and it asserts the WIRING — that the `IAM_TLS_CLIENT_*`
+//! pair actually reaches that read — rather than a parity nothing can drift
+//! from any more.
 //!
 //! **NOTHING HERE CHECKS WHAT THE CERTIFICATE SAYS THE CALLER IS.** The upstream
 //! learns that this deployment issued the leaf, not which service presented it.
@@ -78,11 +88,8 @@
 //! tell the difference — which is the point.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::CertificateDer;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::Channel;
 
 /// The environment variables one upstream's transport is configured from.
 ///
@@ -96,14 +103,6 @@ pub const TASK: &str = "TASK";
 
 /// The other one. See [`TASK`].
 pub const IAM: &str = "IAM";
-
-/// How long one phase of establishing the `iam` connection may take.
-///
-/// Matches `yadgar_dial`'s, and bounds TWO phases once TLS is on for the reason
-/// recorded there: tonic applies `connect_timeout` to the TCP connect alone,
-/// while the handshake runs a layer above it, so the handshake is given the same
-/// bound explicitly in [`UpstreamTls::client_tls_config`].
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What a deployment got wrong about the transport, before anything is dialled.
 #[derive(Debug, thiserror::Error)]
@@ -135,87 +134,6 @@ pub enum TlsConfigError {
          Point {0}_TLS_CLIENT_CERT_FILE at the certificate that key belongs to."
     )]
     ClientKeyWithoutCertificate(&'static str),
-}
-
-/// Why the `iam` channel could not be built.
-///
-/// The first three mirror `yadgar_dial::BalanceError`'s CA arms deliberately: an
-/// operator who mounted the wrong bundle should get the same sentence whichever
-/// upstream they got it wrong for.
-#[derive(Debug, thiserror::Error)]
-pub enum IamChannelError {
-    #[error(
-        "could not read the CA certificate bundle at {path}: {source}. TLS was \
-         requested, so this is an error rather than a reason to connect in \
-         cleartext."
-    )]
-    CaUnreadable {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("could not decode the CA certificate bundle at {path}: {source}")]
-    CaUnparsable {
-        path: PathBuf,
-        #[source]
-        source: rustls_pki_types::pem::Error,
-    },
-
-    #[error(
-        "the CA certificate bundle at {path} decoded without error but contains \
-         no certificate. That is not the same as a missing file: the PEM reader \
-         returns an empty list for input with no certificate section, so an \
-         empty or truncated bundle would otherwise produce a trust store with \
-         no roots — which trusts nobody and fails much later, at the handshake."
-    )]
-    CaEmpty { path: PathBuf },
-
-    #[error(
-        "the CA certificate bundle at {path} holds {sections} PEM certificate \
-         section(s) and NONE of them is a usable trust anchor. That is not the \
-         same as an empty bundle: the sections are present and they decode as \
-         PEM, so counting them says the file is fine. tonic builds its root \
-         store with `add_parsable_certificates`, which reports how many it \
-         accepted and how many it threw away, and discards that report — so a \
-         bundle like this one produces a trust store with no roots and no error, \
-         and fails much later, at the handshake."
-    )]
-    CaNoTrustAnchor { path: PathBuf, sections: usize },
-
-    #[error(
-        "could not read the client certificate at {path}: {source}. A client \
-         certificate was configured, so this is an error rather than a reason \
-         to connect without presenting one."
-    )]
-    ClientCertificateUnreadable {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error(
-        "could not read the client private key at {path}: {source}. A client \
-         certificate without its key proves nothing, so this is an error rather \
-         than a reason to connect without presenting one."
-    )]
-    ClientKeyUnreadable {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("iam's address is not a usable URI: {source}")]
-    Uri {
-        #[source]
-        source: tonic::transport::Error,
-    },
-
-    #[error("TLS could not be configured for iam: {source}")]
-    Tls {
-        #[source]
-        source: tonic::transport::Error,
-    },
 }
 
 /// Server TLS for one upstream: a CA bundle on disk, and optionally the name to
@@ -358,7 +276,8 @@ impl UpstreamTls {
         self.client.as_ref().map(|c| c.key.as_path())
     }
 
-    /// The same settings as `yadgar_dial` takes them, for [`connect_task`].
+    /// The same settings as `yadgar_dial` takes them, for [`connect_task`] and
+    /// [`connect_iam`] alike — the one read the module header names.
     pub fn options(&self) -> yadgar_dial::TlsOptions {
         let options = yadgar_dial::TlsOptions::new(&self.ca_file);
         let options = match &self.domain {
@@ -369,163 +288,6 @@ impl UpstreamTls {
             None => options,
             Some(client) => options.identity(&client.certificate, &client.key),
         }
-    }
-
-    /// Read and CHECK the CA bundle, and settle the verification domain, for
-    /// [`connect_iam`].
-    ///
-    /// **A second implementation of `yadgar_dial::TlsOptions::prepare`, and it
-    /// is forced rather than chosen.** `iam` is dialled directly because its
-    /// Service is a VIP (D23), so `yadgar_dial` never sees this configuration
-    /// and its own preparation cannot be reached. The list is kept identical on
-    /// purpose; every line below has a counterpart there.
-    ///
-    /// **THAT SENTENCE WAS FALSE FOR AS LONG AS IT TOOK TO NOTICE, and saying so
-    /// is the point.** `dial` grew the trust-anchor check first; this copy kept
-    /// counting PEM sections, so the two disagreed about what "the bundle is
-    /// usable" means while the comment went on asserting they agreed. A claim of
-    /// sameness that nothing checks is how the copy drifts, so the claim is now
-    /// backed by a TEST rather than by this paragraph:
-    /// `tests/iam_tls.rs::both_implementations_refuse_the_same_bundles` feeds one
-    /// table of bad bundles to BOTH paths and requires both to refuse. Delete a
-    /// check on either side and it goes red.
-    ///
-    /// **What still differs, enumerated rather than waved at.** The CA list
-    /// itself is identical: read, decode, non-empty sections, non-empty root
-    /// store. The error TYPE differs — `IamChannelError` here,
-    /// `yadgar_dial::BalanceError` there — because each names what its own
-    /// caller can get wrong: this one adds `Uri`, and `dial`'s adds
-    /// `InvalidHost`, which is the same mistake under the other name.
-    ///
-    /// **THAT SENTENCE USED TO NAME `Dns`, `DnsTimedOut` AND `NoEndpoints` as
-    /// what `dial` adds, and v0.2.0 emptied the list.** `NoEndpoints` is
-    /// DELETED — an empty resolution is no longer a failure — and `InvalidHost`
-    /// replaces it. `Dns` and `DnsTimedOut` are still variants, and as far as
-    /// this repository can tell no public entry point of that crate returns
-    /// either one now: `resolve` is private, `connect_with` warns and continues
-    /// with an empty set, and the refresh loop reports through `still_absent`
-    /// and continues. That is a READING of another crate rather than a property
-    /// anything here tests, and it is written as one. So the two error
-    /// sets differ in naming alone, and what is CHECKED rather than asserted
-    /// here is that neither implementation fails a dial because its upstream is
-    /// absent —
-    /// `tests/iam_tls.rs::both_implementations_survive_an_absent_upstream`.
-    /// All four CA arms are one-for-one and their sentences are
-    /// word-for-word — CHECKED against
-    /// `yadgar_dial::BalanceError`, not assumed. Two wordings stay deliberately
-    /// apart, and neither is a CA arm: the `Tls` arm names the upstream here
-    /// ("for iam") because this module knows which one it is, and the comment on
-    /// `.domain_name` differs because `dial` verifies a Service name against pod
-    /// ADDRESSES while `iam` is reached by the name itself.
-    ///
-    /// Everything that can be wrong about the configuration is wrong here, once,
-    /// before a channel exists — so a bad path is a startup error rather than an
-    /// unexplained handshake failure much later, and never a quiet downgrade.
-    pub fn client_tls_config(&self, host: &str) -> Result<ClientTlsConfig, IamChannelError> {
-        let pem = std::fs::read(&self.ca_file).map_err(|source| IamChannelError::CaUnreadable {
-            path: self.ca_file.clone(),
-            source,
-        })?;
-
-        // THE ASSERTION THIS FUNCTION EXISTS FOR. The PEM reader yields nothing
-        // — rather than an error — for input that contains no certificate
-        // section, so "parsed successfully" can mean "parsed nothing", and a
-        // trust store with no roots trusts nobody. Left unchecked that surfaces
-        // as a handshake failure against a hostname the operator has never seen,
-        // which is among the hardest errors here to diagnose.
-        let certificates = CertificateDer::pem_slice_iter(&pem)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| IamChannelError::CaUnparsable {
-                path: self.ca_file.clone(),
-                source,
-            })?;
-        if certificates.is_empty() {
-            return Err(IamChannelError::CaEmpty {
-                path: self.ca_file.clone(),
-            });
-        }
-
-        // AND THE ASSERTION A SECTION COUNT CANNOT MAKE. The check above counts
-        // PEM SECTIONS. What has to be non-empty is the ROOT STORE, and the two
-        // part company for a bundle whose sections decode as PEM and then fail
-        // to parse as a trust anchor — a key pasted under a CERTIFICATE header,
-        // a truncated DER body. tonic hands exactly these DERs to
-        // `add_parsable_certificates` and DISCARDS its `(accepted, rejected)`
-        // return with no check after it
-        // (`tonic-0.14.6/src/transport/channel/service/tls.rs:104`), so such a
-        // bundle yields precisely the rootless trust store this function exists
-        // to prevent, and the section count sees a healthy `1`.
-        //
-        // The store is built HERE, the way tonic will build it, and then
-        // dropped: tonic accepts a PEM bundle rather than a store, so what this
-        // buys is the answer to "how many roots will that produce", asked before
-        // a channel exists instead of never.
-        //
-        // ORDER MATTERS. `CaEmpty` stays above: `accepted == 0` is also true of a
-        // bundle with no sections at all, and that one has its own name and its
-        // own sentence for the operator.
-        let sections = certificates.len();
-        let mut roots = rustls::RootCertStore::empty();
-        let (accepted, _rejected) = roots.add_parsable_certificates(certificates);
-        if accepted == 0 {
-            return Err(IamChannelError::CaNoTrustAnchor {
-                path: self.ca_file.clone(),
-                sections,
-            });
-        }
-
-        let mut configured = ClientTlsConfig::new()
-            // The host, NOT an address. `iam` is reached by its Service name so
-            // the two coincide today; naming it anyway keeps this arm the same
-            // shape as dial's, where they do not.
-            .domain_name(self.domain.as_deref().unwrap_or(host))
-            .ca_certificate(Certificate::from_pem(&pem))
-            // The handshake needs its own bound: `connect_timeout` below covers
-            // the TCP connect alone, so a peer that accepts the connection and
-            // then stalls the handshake would otherwise be unbounded.
-            .timeout(CONNECT_TIMEOUT);
-
-        // THE CLIENT IDENTITY, READ HERE AND EAGERLY, with the bundle and for
-        // the same reason: a mount that did not happen is the operator's mistake
-        // and is reported as itself, naming the file, rather than as a
-        // connection the peer closed without saying why. `connect_iam` is lazy
-        // about the NAME RESOLUTION, never about the material.
-        //
-        // THIS IS THE FIFTH ITEM ON THE LIST THIS FUNCTION'S DOC KEEPS, and it
-        // is the one most likely to drift: `yadgar_dial::TlsOptions::prepare`
-        // does exactly this, in the same order, with error sentences copied
-        // word for word. `tests/iam_tls.rs::both_implementations_refuse_the_same_bundles`
-        // feeds one table of bad material to BOTH paths and requires both to
-        // refuse, so deleting either read goes red rather than quiet.
-        //
-        // THERE IS NO EMPTY-FILE CHECK TO MATCH `CaEmpty`, and the asymmetry is
-        // deliberate rather than an omission — dial says the same. An empty CA
-        // bundle parses to a trust store with no roots and fails much later; an
-        // empty client chain is refused where rustls builds the configuration
-        // and reaches the caller as `Tls` from `iam_endpoint`, before any
-        // channel exists. Neither dials.
-        if let Some(identity) = &self.client {
-            let certificate = std::fs::read(&identity.certificate).map_err(|source| {
-                IamChannelError::ClientCertificateUnreadable {
-                    path: identity.certificate.clone(),
-                    source,
-                }
-            })?;
-            let key = std::fs::read(&identity.key).map_err(|source| {
-                IamChannelError::ClientKeyUnreadable {
-                    path: identity.key.clone(),
-                    source,
-                }
-            })?;
-            configured = configured.identity(Identity::from_pem(certificate, key));
-        }
-
-        Ok(configured)
-        // NOTE the two methods NOT called here: `with_native_roots` and
-        // `with_webpki_roots`. Either would add the platform's trust store
-        // alongside the bundle, so a CA that failed to load would leave `iam`
-        // verified against public roots instead — the silent downgrade this
-        // change exists to remove, reintroduced one layer up.
     }
 }
 
@@ -576,70 +338,44 @@ pub async fn connect_task(
     }
 }
 
-/// One endpoint for `iam`, with the scheme and the TLS configuration decided
-/// TOGETHER.
-///
-/// **THE SCHEME IS WHAT SWITCHES TLS ON, not the presence of a configuration.**
-/// tonic's connector tests `uri.scheme_str() == Some("https")` and, for an
-/// `http://` URI, connects in cleartext while holding a perfectly good TLS
-/// configuration it never consults. Nothing about the resulting channel says it
-/// happened: no error, no log line, and a bearer token on the wire. So the two
-/// are decided together, here, and cannot drift apart — which is exactly what
-/// `yadgar_dial::endpoint` does for the upstreams that go through it.
-fn iam_endpoint(
-    host: &str,
-    port: u16,
-    tls: Option<&ClientTlsConfig>,
-) -> Result<Endpoint, IamChannelError> {
-    let scheme = if tls.is_some() { "https" } else { "http" };
-    let endpoint = Endpoint::from_shared(format!("{scheme}://{host}:{port}"))
-        .map_err(|source| IamChannelError::Uri { source })?
-        // A stalled pod must not hold a request open until the caller's
-        // deadline. tonic applies this to the TCP connect alone; the handshake
-        // is bounded separately in `UpstreamTls::client_tls_config`.
-        .connect_timeout(CONNECT_TIMEOUT)
-        // HTTP/2 keepalive notices a pod that vanished without closing its
-        // connection — the common case when a node goes away.
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_timeout(Duration::from_secs(3));
-
-    match tls {
-        None => Ok(endpoint),
-        Some(tls) => endpoint
-            .tls_config(tls.clone())
-            .map_err(|source| IamChannelError::Tls { source }),
-    }
-}
-
 /// Connect to the `iam` logic service.
 ///
 /// It carries the whole credential lifecycle: `POST /auth/login` and
 /// `POST /auth/enrol` ISSUE a token over it (D75, D73), and `attest::attest`
 /// RESOLVES one over it on every `tools/call` (ADR-0488).
 ///
-/// **LAZY — and no longer the only lazy dial in this module.** `connect` used to
-/// resolve DNS eagerly and return `Err` when the name did not resolve, and
-/// `main` propagated that with `?`, so an `iam` that was not deployed yet would
-/// have crashlooped the pod — and a pod stuck in startup is one D68's autoscaler
-/// cannot help. Rolling this gateway out before `iam`'s Service exists is an
-/// ordinary ordering, not an exotic one.
+/// **IT GOES THROUGH `yadgar_dial` NOW, and the paragraph that said it could
+/// not is deleted rather than softened.** That paragraph gave two reasons and
+/// neither survived. The first was ADR-0514: the scheme and the TLS
+/// configuration must be decided in one expression, and a hand-rolled
+/// `Endpoint` was how that was held here. `yadgar_dial::endpoint` IS that
+/// expression — it is the implementation ADR-0514's own record points at — so
+/// routing through it keeps the invariant in the one place that owns it
+/// instead of holding it in two. The second was D23: `iam`'s Service is a
+/// ClusterIP rather than headless, so "routing it through `yadgar_dial` would
+/// change the balancing decision". It would not. A ClusterIP resolves to ONE
+/// address, so the balancer holds one endpoint and every request rides one
+/// HTTP/2 connection through kube-proxy — which is exactly what
+/// `Endpoint::connect_lazy` did. Nothing about D23 moves, and the Service can
+/// become headless later without a second code path appearing here.
 ///
-/// **`dial` v0.2.0 ADOPTED THIS SHAPE, which is why the paragraph above is in
-/// the past tense.** ADR-0532 seeds `yadgar_dial`'s balancer with the NAME —
-/// `Peer::Unresolved`, dialled the way `connect_lazy` dials it here — and
-/// withdraws it once an address answers. So [`connect_task`] and this function
-/// now AGREE about an absent upstream where they used to disagree: both hand
-/// back a channel and defer the failure to the request.
-/// `tests/iam_tls.rs::both_implementations_survive_an_absent_upstream` holds
-/// that, because an agreement only a comment asserts is one that drifts — which
-/// this module has already watched happen once, on the CA checks below.
+/// **WHAT ROUTING IT HERE BUYS is the absence gauge.** `yadgar_dial` publishes
+/// `yadgar_dial_upstream_never_resolved` for every upstream it dials, and
+/// `deploy`'s `DialUpstreamNeverResolved` rule is the only thing that says a
+/// lazy dial is pointed at nothing — ADR-0532 made an absent upstream cost a
+/// failed request rather than a failed boot, so the pod is `1/1 Running` and
+/// Argo-`Healthy` while it cannot log anybody in. The gauge is emitted from
+/// INSIDE that crate, so the hop that bypassed the crate emitted nothing:
+/// measured against the live store on 2026-09-05, series existed for `task`,
+/// `task-db` and `iam-db`, and none for `iam`.
+/// `tests/upstream_absence.rs` holds that, against string literals rather than
+/// the crate's exported constant.
 ///
-/// A lazy channel connects on first use instead, so an absent `iam` degrades to a
-/// per-request failure that `http::opaque_status` collapses to one opaque status —
-/// the same answer given for every other upstream problem, by construction rather
-/// than by a second code path. The only way THIS call can fail is a host string
-/// that cannot form a URI, or a CA bundle that cannot be used — both configuration
-/// mistakes rather than outages, and D69's rule is the right one for those.
+/// **STILL LAZY, and now lazy by the same mechanism as [`connect_task`].**
+/// ADR-0532 seeds the balancer with the NAME — `Peer::Unresolved`, dialled the
+/// way `connect_lazy` used to dial it — and withdraws it once an address
+/// answers. An absent `iam` therefore degrades to a per-request failure that
+/// `http::opaque_status` collapses to one opaque status, exactly as before.
 ///
 /// **What that outage costs is larger than it was.** This comment used to say `/`
 /// kept serving throughout, which was true while identity came from headers. It is
@@ -651,31 +387,25 @@ fn iam_endpoint(
 /// miss rather than one per request, bounded by
 /// `YADGAR_CREDENTIAL_TTL_SECONDS`.
 ///
-/// **It pins ONE connection, and does not balance.** `iam`'s Service is a VIP
-/// rather than headless, so there is one address to reach regardless; the
-/// balancing `connect_task` exists for would have nothing to balance across. Fine
-/// at the rate a person types a password. Written down because anyone reading
-/// these two functions side by side would otherwise assume the gateway spreads
-/// login across `iam` replicas, and would be wrong silently.
+/// **THE BUNDLE IS STILL READ EAGERLY, and that is not in tension with the
+/// laziness above.** What stays lazy is the NAME RESOLUTION and the connection
+/// — the parts that depend on `iam` existing. `yadgar_dial::connect_tls` calls
+/// `TlsOptions::prepare` BEFORE it resolves anything, so a CA bundle that
+/// cannot be used is still a refusal to boot rather than a per-request mystery
+/// found under traffic.
 ///
-/// The timeouts match `yadgar_dial::endpoint`'s: a stalled pod must not hold a
-/// request open, and HTTP/2 keepalive is what notices a pod that vanished without
-/// closing its connection.
-///
-/// **THE BUNDLE IS READ HERE, EAGERLY, and that is not in tension with the
-/// laziness above.** What stays lazy is the NAME RESOLUTION and the connection —
-/// the parts that depend on `iam` existing. A CA bundle depends on nothing but
-/// the deployment that wrote it, so deferring the read would turn an operator's
-/// mistake into a per-request failure discovered under traffic instead of a
-/// refusal to boot. `yadgar_dial::connect_tls` reads its bundle before the DNS
-/// lookup for the same reason.
-pub fn connect_iam(
+/// The only ways THIS call can fail are a host string that cannot form a URI
+/// authority and material that cannot be used — both configuration mistakes
+/// rather than outages, and D69's rule is the right one for those.
+pub async fn connect_iam(
     host: &str,
     port: u16,
     tls: Option<&UpstreamTls>,
-) -> Result<Channel, IamChannelError> {
-    let prepared = tls.map(|tls| tls.client_tls_config(host)).transpose()?;
-    Ok(iam_endpoint(host, port, prepared.as_ref())?.connect_lazy())
+) -> Result<Channel, yadgar_dial::BalanceError> {
+    match tls {
+        None => yadgar_dial::connect(host, port).await,
+        Some(tls) => yadgar_dial::connect_tls(host, port, &tls.options()).await,
+    }
 }
 
 #[cfg(test)]
@@ -776,37 +506,6 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(UpstreamTls::from_lookup(IAM, lookup(&vars)).unwrap(), None);
-    }
-
-    /// A REGRESSION GUARD on tonic's rule, not the proof that TLS works — the
-    /// proof is `tests/iam_tls.rs`, which does real handshakes. It is here
-    /// because the failure it catches is silent: tonic's connector switches on
-    /// the URI SCHEME, so an `http://` endpoint carrying a TLS configuration
-    /// connects in cleartext and reports nothing.
-    #[test]
-    fn the_scheme_follows_the_tls_configuration() {
-        let cleartext = iam_endpoint("iam", 50052, None).unwrap();
-        assert_eq!(cleartext.uri().scheme_str(), Some("http"));
-
-        let secured = iam_endpoint(
-            "iam",
-            50052,
-            Some(&ClientTlsConfig::new().domain_name("iam")),
-        )
-        .expect("a TLS endpoint with a valid domain builds");
-        assert_eq!(secured.uri().scheme_str(), Some("https"));
-    }
-
-    /// A host that is not a name TLS can verify has to be refused. `ServerName`
-    /// rejects it, and the only alternatives are to dial it unverified or to
-    /// dial it in cleartext.
-    #[test]
-    fn a_host_that_is_not_a_valid_server_name_is_refused() {
-        let tls = ClientTlsConfig::new().domain_name("not a server name");
-        assert!(matches!(
-            iam_endpoint("iam", 50052, Some(&tls)),
-            Err(IamChannelError::Tls { .. })
-        ));
     }
 
     /// THE DEFAULT: no client certificate, so the dial presents no identity and
@@ -952,15 +651,16 @@ mod tests {
     /// scrape. It differs from `yadgar_rotation_watched_files_unreadable` for
     /// that reason, not by oversight.
     ///
-    /// **`task` IS THE ONLY UPSTREAM THIS BINARY COVERS, and that is a real gap
-    /// rather than a gap in the test.** [`connect_iam`] builds its `Endpoint`
-    /// here rather than through `yadgar_dial`, because the scheme and the TLS
-    /// configuration are decided together in [`iam_endpoint`]. So no code path
-    /// in this process publishes the series for `iam` — the upstream that
-    /// carries every login, every enrolment and every attestation — and moving
-    /// this pin does not change that. Closing it means routing `connect_iam`
-    /// through the same crate, which is a change to how the gateway dials and
-    /// not a change to what it observes.
+    /// **`task` IS NO LONGER THE ONLY UPSTREAM THIS BINARY COVERS, and this
+    /// paragraph used to say the opposite.** It recorded a real gap:
+    /// `connect_iam` built its own `Endpoint`, so no code path in this process
+    /// published the series for `iam` — the upstream carrying every login,
+    /// every enrolment and every attestation — and the alert over the gauge
+    /// could not fire for it. [`connect_iam`] goes through `yadgar_dial` now,
+    /// and the `iam` series is asserted end to end in
+    /// `tests/upstream_absence.rs`, which drives BOTH hops under one recorder
+    /// so neither can pass on an empty snapshot. This case stays as the unit
+    /// of the pair, on the hop whose gauge has existed longest.
     #[test]
     fn an_absent_task_is_published_as_a_gauge() {
         let (emitted, _channel) = dial_under_a_recorder(UNRESOLVABLE);

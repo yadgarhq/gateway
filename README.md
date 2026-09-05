@@ -411,7 +411,7 @@ either could be deleted and every test still passed. `main.rs` calls `watch_set`
 now and `tests/assembly.rs` calls the same function, so that edit turns a test
 red.
 
-## Balancing
+## Balancing, and how an absent upstream becomes visible
 
 The gateway balances across `task`'s replicas rather than pinning to one.
 
@@ -421,6 +421,63 @@ same upstream pod while the other sat idle looking healthy. The balancing itself
 lives in `yadgar-dial`, shared with `task` rather than copied, because two
 services holding their own copy is how they come to disagree about how they find
 their peers.
+
+**BOTH upstreams go through that crate.** The `iam` hop used to build its own
+`Endpoint`, because `iam`'s Service is a ClusterIP rather than headless. That
+made no difference to the balancing — a ClusterIP resolves to one address, so
+one endpoint is all there ever was to hold, and kube-proxy picks the pod — and
+it cost a second implementation of the rule that the URI scheme and the TLS
+configuration are decided together (ADR-0514), which drifted once before a test
+caught it.
+
+**What it also cost was the only signal that says a dial is pointed at
+nothing.** An absent upstream is no longer a failed boot (ADR-0532): the dial is
+lazy, so the pod is `1/1 Running`, Argo reports `Healthy`, and every login
+fails. `yadgar-dial` publishes `yadgar_dial_upstream_never_resolved{upstream}`
+for that — `1` for a name that has not resolved since boot, `0` once it has,
+and never back to `1` — and `deploy`'s `DialUpstreamNeverResolved` rule alerts
+on it. The gauge is emitted from inside the crate, so the hop that bypassed the
+crate published nothing: the series existed for `task`, `task-db` and `iam-db`,
+and not for `iam` — the one hop carrying every login, enrolment and
+attestation. Routing `iam` through `yadgar_dial` is what closes that.
+
+**WHAT IT CLOSES FOR `iam` IS NARROWER THAN WHAT IT CLOSES FOR A HEADLESS
+UPSTREAM.** CoreDNS answers a ClusterIP Service's A record from
+`spec.clusterIP` alone; it consults that Service's EndpointSlices for nothing.
+For a headless Service it answers with the ready endpoint addresses instead,
+and NXDOMAIN when there are none. `iam` is a ClusterIP — the only one among the
+four upstreams `DialUpstreamNeverResolved` covers, `task`, `task-db` and
+`iam-db` all being headless. Scale `iam` to zero, or crash-loop every replica,
+and the Service object survives: DNS still answers its virtual IP, so the dial
+resolves and the gauge is written `0` while every login, enrolment and
+attestation fails. A gateway that RESTARTS into that outage resolves too, and
+publishes `0` as well. On a headless upstream the same outage answers NXDOMAIN,
+so a gateway that starts during it publishes `1` and the rule fires.
+
+**THE GAUGE ANSWERS A QUESTION ABOUT BOOT RATHER THAN ABOUT NOW, and that is
+what the asymmetry rests on.** It goes `1` to `0` and never back, as the
+paragraph above says: `dial` forbids a resolved upstream from returning to the
+unresolved state, because a headless Service briefly answers nothing during a
+rollout and acting on that would empty the balancer. So on EVERY hop the series
+answers "did this name resolve when this process started", and the Service type
+decides what that answer is worth during an outage — on the three headless
+upstreams a restart reports the outage, and on `iam` a restart reports nothing
+wrong. One gauge, two meanings, split by Service type, and `iam` is the hop
+where it means the weaker of the two.
+
+**That is a limit rather than a reason to deflate the change.** `iam` published
+no series at all before this, so the hop carrying every login goes from no
+signal to one that catches an `iam` Service that was never created, a mistyped
+`IAM_HOST` and a resolver that is not answering when the pod starts — the
+boot-time mistakes ADR-0532 made survivable, and therefore silent. The
+structural fix is to make `iam` headless, so the gauge means one thing on every
+hop; that is tracked as ledger 615, and it is a change to `iam`'s chart rather
+than to this repository.
+
+The label is the host dialled, so it is whatever `IAM_HOST` and `TASK_HOST` are
+set to — `iam` and `task` in the reference deployment. There is no `service`
+label: `dial` writes one dimension and the exporter adds no global one, so the
+pod and the job come from the scrape.
 
 ## Development
 

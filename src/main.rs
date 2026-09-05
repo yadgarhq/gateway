@@ -20,7 +20,8 @@
 //! through `yadgar_dial::connect`, which resolved DNS eagerly and returned an
 //! error for an empty answer, and the `?` on it made a `task` Service that did
 //! not exist yet a failed boot. ADR-0532 made that dial lazy as well, so the
-//! paragraph above now describes both upstreams rather than one.
+//! paragraph above now describes both upstreams rather than one — and both by
+//! the SAME mechanism, since `connect_iam` goes through `yadgar_dial` too.
 //!
 //! **WHAT IT COSTS, stated rather than left to be found.** The readiness probe
 //! is a `tcpSocket` on the HTTP port, so this pod reports Ready as soon as it is
@@ -354,8 +355,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // failure found under traffic rather than a refusal to boot.
     let iam_host = env_or("IAM_HOST", "iam");
     let iam_port: u16 = env_or("IAM_PORT", "50052").parse()?;
-    let iam =
-        upstream::connect_iam(&iam_host, iam_port, iam_tls.as_ref()).map_err(|e| e.to_string())?;
+    let iam = upstream::connect_iam(&iam_host, iam_port, iam_tls.as_ref())
+        .await
+        .map_err(|e| e.to_string())?;
     tracing::info!(
         host = %iam_host,
         port = iam_port,

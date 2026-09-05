@@ -178,10 +178,10 @@ spec:
             # two can be cut over one at a time.
             - name: IAM_TLS_ENABLED
               value: "1"
-            # A PATH, never an issuer-specific resource (D80). This channel does
-            # not go through yadgar-dial — iam's Service is a VIP rather than
-            # headless (D23) — but it takes the same values and gets the same
-            # checks; see `upstream::connect_iam`.
+            # A PATH, never an issuer-specific resource (D80). This channel
+            # goes through yadgar-dial, exactly as task's does, so this bundle is
+            # read once — by that crate, before it resolves anything — rather
+            # than by a second copy here; see `upstream::connect_iam`.
             - name: IAM_TLS_CA_FILE
               value: /var/run/config/iam-ca/ca.pem
             {{- if $clientCert }}

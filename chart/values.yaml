@@ -90,8 +90,11 @@ task:
 # visible in yadgar_gateway_credential_cache_total. See `upstream::connect_iam`.
 #
 # ORDERING-SAFE, and the cost of being out of order is higher than it was. The
-# channel is lazy, so this name is not resolved at startup and installing gateway
-# before `iam` exists still starts. It no longer costs "a 503 on /auth/login and
+# dial DOES attempt to resolve this name at startup, bounded by `yadgar-dial`'s
+# RESOLVE_TIMEOUT, so it is not lazy in the sense of resolving nothing. It does
+# not DEPEND on the answer: a name that does not resolve is warned about and the
+# channel is seeded with the name itself, so installing gateway before `iam`
+# exists still starts. It no longer costs "a 503 on /auth/login and
 # nothing on /": an `iam` that cannot answer stops MCP traffic too, because that is
 # where identity comes from. A pod that refused to BOOT would still be worse — D68's
 # autoscaler cannot help one stuck in startup.
@@ -106,11 +109,13 @@ iam:
   # SAME SHAPE AS `task.tls` ABOVE, and configured independently of it, so the
   # two can be cut over one at a time.
   #
-  # **THIS CHANNEL DOES NOT GO THROUGH `yadgar-dial`**, because iam's Service is
-  # a VIP rather than headless (D23) — see `upstream::connect_iam`. It gets the
-  # same values and the same guarantees anyway: a second implementation, held to
-  # the same list, and proved by real handshakes in tests/iam_tls.rs rather than
-  # by showing that a configuration was attached.
+  # **THIS CHANNEL GOES THROUGH `yadgar-dial`**, exactly as `task.tls` above
+  # does — see `upstream::connect_iam`. It used not to, on the grounds that
+  # iam's Service is a VIP rather than headless (D23); that reason did not hold,
+  # and the second implementation it justified is deleted. So these values reach
+  # one set of checks rather than two spellings of one list, and they are proved
+  # by real handshakes in tests/iam_tls.rs rather than by showing that a
+  # configuration was attached.
   tls:
     # OFF, and it stays off until the servers can answer. **iam does not serve
     # TLS yet**, so turning this on today breaks the hop rather than securing
