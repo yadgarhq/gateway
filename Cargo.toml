@@ -36,10 +36,11 @@ tonic = { version = "0.14", default-features = false, features = [
   "transport",
   "channel",
   # `tls-ring`, NOT `tls-aws-lc`, and NAMED HERE rather than inherited. Feature
-  # unification would hand this crate `ClientTlsConfig` anyway, because
-  # yadgar-dial asks for it — but `upstream::connect_iam` builds one DIRECTLY,
-  # and a type that compiles only because a dependency happens to ask for a
-  # feature is one a dependency can also stop asking for.
+  # unification would hand this crate the TLS types anyway, because yadgar-dial
+  # asks for them — but a feature that is present only because a dependency
+  # happens to ask for it is one a dependency can also stop asking for, and
+  # `tests/iam_tls.rs` stands up a real `ServerTlsConfig` against this
+  # dependency rather than the dev one.
   #
   # ring rather than aws-lc-rs for the reason dial gives: aws-lc-rs needs cmake
   # and a C toolchain, and this builds for x86_64-unknown-linux-musl (D63).
@@ -53,42 +54,27 @@ tonic = { version = "0.14", default-features = false, features = [
 tonic-prost = "0.14"
 prost = "0.14"
 prost-types = "0.14"
-# The SAME PEM parser tonic itself uses on a CA bundle, so "we found N
-# certificates" is exactly what tonic will find. Present in the tree already by
-# way of tokio-rustls; naming it directly costs nothing and buys the non-empty
-# assertion in `upstream::UpstreamTls::client_tls_config`, without which a
-# bundle that decodes to no certificate produces a trust store that trusts
-# nobody and fails much later, at the handshake.
-rustls-pki-types = { version = "1", features = ["std"] }
 # How this process starts, stops and restarts: ADR-0523's exit-on-change rotation
 # watcher, the SIGTERM drain, and the budget that bounds it. This repository held
 # the THIRD copy of the watcher and one of five copies of `shutdown`. The X.509
 # parser that read a leaf's expiry is ITS dependency now, so it is gone from
-# here; `rustls-pki-types` stays because `upstream` reads a bundle of its own.
+# here, and so is `rustls-pki-types` now that `upstream` reads no bundle of its
+# own either — `yadgar_dial::TlsOptions::prepare` performs that read for both
+# upstreams.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
 yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.3" }
-# For `RootCertStore::add_parsable_certificates` ALONE, so the CA bundle can be
-# asserted non-empty the way tonic will actually build it. Counting PEM sections
-# is NOT counting trust anchors: tonic feeds the DERs into
-# `add_parsable_certificates` and DISCARDS the `(accepted, rejected)` return with
-# no check after it
-# (`tonic-0.14.6/src/transport/channel/service/tls.rs:104`), so a bundle whose
-# sections decode as PEM and parse as no trust anchor yields the empty root store
-# with no error — the exact thing the section count exists to prevent.
+# HOW THIS PROCESS DIALS, for BOTH upstreams. Client-side balancing over task's
+# headless Service (D23), and — since the `iam` hop stopped building an
+# `Endpoint` of its own — the single implementation of ADR-0514's rule that the
+# URI scheme and the TLS configuration are decided in one expression. It is also
+# what publishes `yadgar_dial_upstream_never_resolved`, which is the only signal
+# that says a lazy dial is pointed at nothing.
 #
-# `default-features = false` with `std` alone: NO crypto provider is pulled in
-# here. tonic already chooses `ring` through `tls-ring`, and a second provider in
-# the tree is how a build acquires an ambiguous default. CHECKED rather than
-# assumed: `cargo tree -e normal -i aws-lc-rs` still matches no package.
-#
-# Already in the lock file by way of tokio-rustls, so this adds nothing to the
-# build — the same reasoning `rustls-pki-types` above is here for.
-rustls = { version = "0.23", default-features = false, features = ["std"] }
-
-# Client-side balancing over task's headless Service (D23). Shared rather than
-# copied from task, per the invariant that anything every service needs is
-# implemented once.
+# Shared rather than copied from task, per the invariant that anything every
+# service needs is implemented once. That invariant is why `rustls` and
+# `rustls-pki-types` are no longer direct dependencies here: the CA-bundle
+# checks they existed for are performed once, in this crate.
 #
 # The RELEASE TAG, like every other in-org pin in this file. A published tag
 # never moves in this organisation — a correction is a new tag, never a moved
