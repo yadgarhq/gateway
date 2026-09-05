@@ -405,6 +405,163 @@ message Scope {
   InheritedSetting owner_reads_own_record = 6;
 }
 
+// WHO THE GATEWAY BELIEVED WAS CALLING AN ADMINISTRATIVE RPC, CARRIED FOR THE
+// AUDIT RECORD AND FOR NOTHING ELSE.
+//
+// **A RECEIVER MUST NOT USE THIS AS AN AUTHORISATION INPUT.** It MUST NOT
+// decide whether a request is permitted, MUST NOT widen or narrow a reach,
+// MUST NOT select or filter A ROW OF THE ENTITY THE REQUEST ACTS UPON, and
+// MUST NOT stand in for `Scope.user_id`. ITS ONE SANCTIONED USE IS
+// ATTRIBUTION: writing it into an audit record so a later reader knows who the
+// gateway believed was calling. A receiver that authorises on it has built an
+// authentication mechanism out of a field that anything able to reach that
+// receiver can set to anything.
+//
+// **READING AN AUDIT RECORD BACK BY ITS RECORDED ATTRIBUTION IS SANCTIONED,
+// AND THE ROW CLAUSE IS NARROWED SO THAT IT SAYS SO.** Unnarrowed, that clause
+// forbade the one thing that makes an attribution usable. An incident review
+// asks what `u-42` did, and a store obeying the wide reading answers with every
+// attested act while silently omitting every administrative one — no error, no
+// gap marker, an answer that looks complete. D25 refuses an audit log with
+// silent holes precisely because it will be trusted, and that hole would be
+// reached by following this contract rather than by breaking it.
+//
+// **THE TWO CASES ARE TOLD APART BY DIRECTION, NOT BY WHO IS ASKING.** On a
+// REQUEST the value is a live assertion about an operation that has not
+// happened yet, and every clause above binds — save the carve-out stated here,
+// which is the one exception there is. In an AUDIT RECORD it is a recorded
+// artifact of an act already committed, on a different message travelling the
+// other way, and matching a stored column against a value a query supplied
+// decides nothing about anybody's reach.
+//
+// **A QUERY FIELD NAMING AN ACTOR TO SEARCH RECORDED ATTRIBUTIONS FOR IS THE
+// CARVE-OUT'S INSTRUMENT, AND THE ROW CLAUSE DOES NOT BIND IT, HOWEVER IT IS
+// TYPED.** Said rather than left to be worked out, because the field carrying
+// this query does not exist yet and will arrive on a REQUEST: an audit query is
+// a request, and the records it selects are the entity it acts upon, so the row
+// clause read without this sentence would forbid the very query the paragraph
+// above sanctions. Its implementor would then meet the same three losing
+// options one level down, which is the trap this narrowing exists to close.
+//
+// **THE CARVE-OUT IS A SELECTION OVER RECORDS AND IS NEVER AN AUTHORISATION.**
+// Whoever runs that query was authorised to read the audit store by something
+// else entirely, and this field takes no part in that decision. A caller who
+// names an actor learns which rows carry that unverifiable attribution, which
+// is exactly as good as the attribution and no better. A row matching an actor
+// is NOT evidence that the named person acted.
+//
+// **NO FIELD CARRIES THAT QUERY TODAY, AND ONE EXISTING FIELD MUST NOT BE
+// MISTAKEN FOR IT.** `yadgar.audit.v1.QueryAuditRequest.actor_user_id` filters
+// the ATTESTED column and only that one. It MUST NOT be mapped onto both
+// columns: that would re-collapse the very distinction the split field exists
+// to create, and a reader could no longer tell which of the two an answer came
+// from. A filter of its own is additive and is not added here.
+//
+// **IT IS NEVER PART OF AN IDEMPOTENCY PAYLOAD COMPARISON, ON ANY RPC THAT
+// CARRIES IT, TODAY OR LATER.** D9 refuses the same key carrying a DIFFERENT
+// request, and which fields count as the request is enumerated per RPC. This
+// field counts on NONE of those enumerations, and the ones that call themselves
+// complete say so explicitly rather than leaving a reader to work it out.
+// Including it would refuse, with INVALID_ARGUMENT, a retry of an IDENTICAL
+// operation that happened to be stamped with a different actor — a second
+// administrator picking up a change the first one lost, or a gateway that
+// resolved the credential to another id. The field would then decide whether a
+// request SUCCEEDS, which is a behavioural input, and the four MUST NOTs above
+// exist precisely so that it has none. INERT BY CONSTRUCTION IS THE PROPERTY:
+// this field changes what is RECORDED and never what HAPPENS.
+//
+// **THE FIRST ACTOR'S IS THE ATTRIBUTION OF RECORD, AND A REPLAY RECORDS NO
+// SECOND ONE.** The exclusion above is what makes a retry under a used key a
+// replay: the original outcome is returned and no write happens, so there is no
+// transaction for D25's outbox row to be written in and no new audit event to
+// carry the second actor. Administrator A promotes a user and the response is
+// lost; administrator B retries the same key stamped with their own id. The
+// store holds ONE event, naming A, and B's administrative attempt is recorded
+// NOWHERE. A READER OF AN ATTRIBUTION IS READING WHO THE GATEWAY BELIEVED MADE
+// THE ACT, NEVER THE SET OF PEOPLE WHO ASKED FOR IT.
+//
+// **D9's OWN TEST IS WHETHER A REPLAY WOULD SILENTLY DISCARD THE DIFFERENCE,
+// AND READ LITERALLY THIS FIELD FAILS IT.** The difference is discarded and the
+// discarding is silent. The exclusion stands anyway, and it stands on which
+// harm each answer buys rather than on a claim that the test is passed. D9's
+// test was written for a difference that changes the OPERATION — a second
+// password under a used key, where the first stays live and the caller believes
+// the second took effect — and there a refusal is the only answer that does not
+// lie. This difference changes only the RECORD. Refusing it would let an
+// audit-only field decide whether a request SUCCEEDS, so an identical retry by
+// a second administrator picking up a change the first one lost is answered
+// with INVALID_ARGUMENT while nothing about the operation differs.
+//
+// **THE CHOICE IS ONE LOST ATTRIBUTION AGAINST A REFUSED CORRECT OPERATION,
+// AND THE CONTRACT TAKES THE FIRST.** It is a cost rather than the absence of
+// one, and it is written here so that an incident review holding a single actor
+// on a replayed key knows the hole is by construction and not a gateway that
+// forgot to stamp.
+//
+// **THE TYPE IS NAMED FOR THE WARNING BECAUSE THE COMMENT DOES NOT TRAVEL.**
+// This paragraph is read once, by whoever wires the field. The field is read
+// for ever, at every use site, in generated code where no comment appears. A
+// bare `actor` or `actor_user_id` reads as a verified identity at those sites,
+// and `actor_claim` reads WORSE rather than better — "claim" is the OIDC and
+// JWT word for an assertion that IS verifiable, precisely because a signature
+// travels with it. Nothing travels with this. `req.unverified_actor.user_id`
+// on the right-hand side of an access decision looks wrong on sight, and that
+// is the whole of what the name is for.
+//
+// **UNVERIFIED MEANS UNVERIFIABLE BY THE RECEIVER, NOT UNCHECKED BY THE
+// GATEWAY.** The gateway is the one place identity is attested (ADR-0488) and
+// it stamps this from the credential it resolved, so the value is exactly as
+// good as that hop. What no receiver can do is CHECK it: an administrative RPC
+// on `iam` or `iam-db` carries no credential of any kind — deliberately, since
+// a second authentication mechanism inside `iam` would be a second place for
+// it to be wrong, holding the same secret twice — so anything that can reach
+// those services can send any actor it likes. The name states the property at
+// the seat where the field is READ, and it errs towards under-trust on
+// purpose. A reader who trusts it too little declines an attribution they
+// could have leaned on; a reader who trusts it too much authorises on a string
+// a caller wrote. D80 ranks that pair for a different property and the
+// ordering is the same one: a thing that stops working is a bug, and a thing
+// that keeps working and stops protecting is worse.
+//
+// **ABSENT MEANS NO ACTOR WAS STAMPED. A PRESENT MESSAGE HOLDING AN EMPTY
+// `user_id` IS THE SAME CASE AND IS RECORDED THE SAME WAY — AS UNATTRIBUTED.**
+// It is NEVER recorded as an actor whose id is the empty string. ADR-0512 is
+// the precedent and this estate has already paid for it once:
+// `ResolveCredential` answers "no live credential" with an empty `user_id`, a
+// consumer read that straight into a `Scope`, and every bypasser then shared
+// one identity. An audit store that writes "" as an actor makes every
+// unattributed administrative act in the deployment look like the same actor,
+// which is that same collapse pointed at the audit trail instead of at the
+// authorisation path.
+//
+// **IT AUTHORISES NOTHING NEW AND CLOSES NO PART OF THE AUTHORISATION STORY.**
+// `yadgar.iam.v1.SetInheritedSetting` states the gap in as many words: no
+// administrative RPC on either identity boundary carries an attested identity,
+// so neither service can VERIFY that the caller is an administrator nor RECORD
+// which one acted. This field closes the RECORDING half, for every
+// administrative RPC at once, and leaves the verifying half exactly where it
+// was — at the gateway, on D73's admin flag.
+//
+// **A MESSAGE STAMPED PER REQUEST, RATHER THAN A FIELD ON SOMETHING ALREADY
+// TRAVELLING.** It is NOT folded into `Scope`: that is the ATTESTED identity
+// and says so — "attested by the gateway ... Never supplied by the caller
+// itself" — and it reaches every `-db` in the estate, where an unverifiable
+// value sitting in the message a service already authorises against is the
+// exact confusion this type exists to prevent. It is not folded into
+// `Idempotency` either: that key identifies a WRITE and this identifies a
+// PERSON, they have different lifetimes, and one message carrying two concepts
+// is the coupling this contract refuses elsewhere.
+//
+// **NO `agent` FIELD, UNLIKE `yadgar.audit.v1.WriteEvent`.** D72 puts
+// administrative minting in GitOps or a CLI and never in an agent operation,
+// so there is no agent behind these calls to record.
+message UnverifiedActor {
+  // The gateway's `user_id` for the caller. Never a name, never a token and
+  // never a credential id: this is written to an audit store, and D72 keeps
+  // personal data out of everything but the encrypted columns.
+  string user_id = 1;
+}
+
 // Applied to every mutating RPC (D9). The same key replayed returns the
 // original outcome rather than performing the write twice; required because a
 // retrying load balancer will deliver a write more than once. THE SAME KEY
