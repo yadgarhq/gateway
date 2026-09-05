@@ -397,15 +397,31 @@ spec:
             # `periodSeconds` stretches the withdrawal silently, and that is the
             # defect this stanza exists to stop repeating.
             #
-            # WHY NOT TIGHTER. `failureThreshold: 1` lets one dropped SYN evict a
-            # healthy pod, and against `replicaCount: 2` behind a PDB that is
-            # half this service for the length of a transient. `periodSeconds: 1`
+            # WHY NOT TIGHTER, AND WHY NOT LOOSER. `failureThreshold: 1` lets one
+            # dropped SYN withdraw a healthy pod, and against `replicaCount: 2`
+            # that is half this service for the length of a transient. Note it
+            # would be a WITHDRAWAL, not an eviction: a PodDisruptionBudget
+            # governs the Eviction API and cannot act on a readiness-driven
+            # EndpointSlice change, so it is no backstop here.
+            #
+            # KEEPING 3 WAS THE REAL ALTERNATIVE and it is not free either. At
+            # `periodSeconds: 2` a threshold of 3 gives 6s — nine of the eleven
+            # seconds cut, while keeping the whole inherited transient budget.
+            # Dropping to 2 spends a third of that budget for the last 2s. It is
+            # taken because no chart here sets `affinity`, `topologySpread` or a
+            # `strategy`, so both replicas can co-locate and any node-local fault
+            # is already a whole-service fault; what 3 buys back is roughly 3s of
+            # recovery tail after the fault clears, against 11s off every
+            # rotation drain. `periodSeconds: 1`
             # buys the same 4s at threshold 4, but it puts the period ON the
             # timeout, so the arithmetic stops holding the moment a probe has to
             # wait rather than being refused. There is no boot cost either way:
-            # failing readiness never kills a pod, and under D69 the port is not
-            # open until probe-and-migrate have finished, so failing repeatedly
-            # before that is the intended state rather than a regression.
+            # failing readiness never kills a pod, and THIS SERVICE OWNS NO
+            # ENGINE — it reports Ready as soon as it is listening, and boot to
+            # listening is sub-second, so the pre-listen failures are a fraction
+            # of one period. D69's probe-migrate-listen gate is NOT in front of
+            # this port; it lives in the `-db` services, and an earlier revision
+            # of this comment claimed it here.
             #
             # WHAT THIS DOES NOT FIX: a wedged process that keeps its socket open
             # answers a `tcpSocket` probe at every threshold. The root fix for
