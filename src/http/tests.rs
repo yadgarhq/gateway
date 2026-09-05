@@ -340,6 +340,106 @@ async fn an_empty_allowlist_denies_every_origin() {
     );
 }
 
+/// The `outcome` this route writes is a value the SHARED MAPPING can produce.
+///
+/// **`yadgar_calls_total` has ONE `outcome` label space, and this binary writes
+/// into it from two seams.** `telemetry::grpc::status_name` exists to be the one
+/// place a gRPC status becomes a label, and a literal written here bypasses it —
+/// so the set an operator has to know is the mapping's range PLUS whatever any
+/// handler happened to type. This route typed `FORBIDDEN`, which no arm of that
+/// mapping produces, and it was the only such value in `gateway`, `iam` or
+/// `task`: every other literal on either side (`INVALID_ARGUMENT`, `UNAVAILABLE`,
+/// `RESOURCE_EXHAUSTED`, `INTERNAL`, `UNAUTHENTICATED`, `UNIMPLEMENTED`,
+/// `FAILED_PRECONDITION`, `OK`) already spells a name `status_name` returns.
+///
+/// **IT MATTERS BEYOND TIDINESS.** ADR-0556 names the `outcome` label space open
+/// and cites this exact value as the reason a KEDA query must count `OK` as a
+/// closed POSITIVE set rather than exclude a list of failures. It is also the
+/// label an alert on "Ready but failing everything" would key on.
+///
+/// **THE ASSERTION IS MEMBERSHIP IN THE MAPPING'S RANGE, computed from the
+/// mapping**, not a second spelling of one name. A test that only compared the
+/// label with `"PERMISSION_DENIED"` would go green for any invented value
+/// somebody also typed into the test; this one cannot, because the set is
+/// derived. The literal is asserted as well, so a change of WHICH status this
+/// refusal reports is a decision somebody makes rather than a drift.
+#[test]
+fn the_outcome_of_an_origin_refusal_is_one_the_shared_mapping_produces() {
+    // A LOCAL recorder rather than `metrics::set_global_recorder`: a global one
+    // is process-wide and this binary runs its tests in parallel.
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let req = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .header(axum::http::header::ORIGIN, "http://evil.example")
+                .body(Body::from(r#"{"username":"u","password":"p"}"#.to_string()))
+                .expect("request");
+            let resp = router(state(vec!["http://localhost".into()]))
+                .oneshot(req)
+                .await
+                .expect("the router answers");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "the HTTP status is unchanged: this is about the metric label"
+            );
+        });
+    });
+
+    let emitted = snapshotter.snapshot().into_vec();
+    // LENGTH FIRST. A `metrics-util` resolving against another `metrics` major
+    // links a SECOND facade; then this snapshot is empty and every assertion
+    // built on it passes vacuously.
+    assert!(
+        !emitted.is_empty(),
+        "the recorder saw no metric at all, which is what a second metrics \
+         facade in the tree looks like"
+    );
+    let outcomes: Vec<String> = emitted
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == yadgar_telemetry::metrics::CALLS)
+        .flat_map(|(key, _, _, _)| {
+            key.key()
+                .labels()
+                .filter(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "one refused call, one series: {emitted:?}"
+    );
+
+    // The mapping's whole range, derived rather than retyped. `Code::from_i32`
+    // saturates to `Unknown` above the enum, so the sweep covers every code
+    // tonic defines and the catch-all arm besides.
+    let mapped: std::collections::BTreeSet<&'static str> = (0..32)
+        .map(|i| {
+            yadgar_telemetry::grpc::status_name(&tonic::Status::new(tonic::Code::from_i32(i), ""))
+        })
+        .collect();
+    assert!(
+        mapped.contains(outcomes[0].as_str()),
+        "the outcome {:?} is not a value telemetry::grpc::status_name can \
+         produce; its range is {mapped:?}",
+        outcomes[0]
+    );
+    assert_eq!(
+        outcomes[0], "PERMISSION_DENIED",
+        "a refusal on identity is PermissionDenied, not a locally invented name"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The MCP header cross-check, when a header cannot be read.
 // ---------------------------------------------------------------------------

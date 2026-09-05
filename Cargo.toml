@@ -96,7 +96,7 @@ rustls = { version = "0.23", default-features = false, features = ["std"] }
 # records the full 40-character revision it resolved to. The pin stays exact and
 # auditable, and the git dependency finally states a version it had no way to
 # state before.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.0" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.1" }
 
 # The shared instrumentation seam (D67). Pinned by release tag like every other
 # in-org crate — a branch is a moving target, a published tag is not.
