@@ -578,6 +578,24 @@ sourceAddress:
   # would never learn their audit records carry no address.
   trustedProxyHops: ""
 
+# WHICH BROWSER ORIGINS MAY CALL THIS GATEWAY.
+#
+# EMPTY IS THE SHIPPED POSTURE AND IT IS A REAL ANSWER: no browser origin is
+# allowed. That is right for a server whose clients are agents, and it is the
+# closed state rather than the convenient one — a default that allowed an origin
+# would be a default nobody chose.
+#
+# RENDERED UNCONDITIONALLY, empty included, for the reason
+# sourceAddress.trustedProxyHops is: the binary now REFUSES TO START when the
+# variable is absent (ADR-0569), because "nobody stated a CORS policy" and
+# "somebody chose the closed one" must not look identical. Setting it to the
+# empty string is how a deployment states the closed one.
+#
+# Comma-separated, and each entry is a full scheme-and-authority origin —
+# "https://console.example.com", never a bare hostname and never a trailing path.
+cors:
+  allowedOrigins: ""
+
 # WHAT BOUNDS THE TWO UNAUTHENTICATED ENDPOINTS (ledger 497).
 #
 # /auth/login and /auth/enrol are the only surfaces a stranger reaches with no

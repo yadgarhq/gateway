@@ -63,8 +63,51 @@ use yadgar_gateway::rotate;
 use yadgar_gateway::source::TrustBoundary;
 use yadgar_gateway::upstream;
 
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+/// One configuration knob, read from its ONE source, with no compiled-in
+/// default behind it (ADR-0569).
+///
+/// This replaced `env_or(key, default)`, and the deletion is the point rather
+/// than the rename: while the helper took a `default` argument, every knob in
+/// this binary had somewhere for a fallback to live, and a fallback is invisible
+/// at the point of use, survives an upgrade unnoticed, and makes the effective
+/// setting depend on which layer a reader happens to inspect.
+///
+/// AN EMPTY VALUE REFUSES TOO, and with its own message. A set-but-empty
+/// variable and an absent one collapsing into a single branch is a defect this
+/// estate found three separate times in one week: Helm renders an unset value as
+/// `""`, so the empty case is what a nulled chart value actually produces, and it
+/// is the one an operator is most likely to hit. Where an empty value is a
+/// DECLARED STATE rather than an oversight, use [`env_required_allow_empty`].
+fn env_required(key: &str) -> Result<String, String> {
+    match std::env::var(key) {
+        Ok(value) if !value.is_empty() => Ok(value),
+        Ok(_) => Err(format!(
+            "{key} is set but EMPTY. It has no compiled-in default (ADR-0569), so there is \
+             nothing to fall back to. The chart renders it; a values override that nulls it \
+             produces exactly this."
+        )),
+        Err(_) => Err(format!(
+            "{key} is NOT SET. It has no compiled-in default (ADR-0569): this process reads \
+             it from the environment alone and refuses to start rather than invent a value. \
+             The chart renders it."
+        )),
+    }
+}
+
+/// A knob that must be STATED, but whose empty value is a real instruction.
+///
+/// The distinction [`env_required`] cannot make on its own. `YADGAR_ALLOWED_ORIGINS`
+/// empty means "no browser origin is allowed", which is the correct posture for a
+/// server whose clients are agents — it is a choice, not a missing value. Absence
+/// still refuses, so the deployment cannot silently omit the decision.
+fn env_required_allow_empty(key: &str) -> Result<String, String> {
+    std::env::var(key).map_err(|_| {
+        format!(
+            "{key} is NOT SET. It has no compiled-in default (ADR-0569). An EMPTY value is \
+             accepted here and is a deliberate state, but the variable itself must be \
+             rendered so the choice is visible. The chart renders it."
+        )
+    })
 }
 
 /// One `<rate>:<burst>` from the environment, naming the variable when it is
@@ -74,8 +117,41 @@ fn env_or(key: &str, default: &str) -> String {
 /// `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
 /// `NotPositive("0", "0:10")` on the operator's terminal instead of the sentence
 /// saying which variable is unusable and why.
-fn parse_bucket_env(key: &str, default: &str) -> Result<Bucket, String> {
-    Bucket::parse(&env_or(key, default)).map_err(|e| format!("{key} is not usable: {e}"))
+///
+/// NO `default` PARAMETER any more. This helper was the second place a
+/// compiled-in default lived in this binary, which is why the ADR-0569 gate
+/// forbids the SHAPE — an environment reader taking a fallback — and not merely
+/// the name `env_or`.
+fn parse_bucket_env(key: &str) -> Result<Bucket, String> {
+    Bucket::parse(&env_required(key)?).map_err(|e| format!("{key} is not usable: {e}"))
+}
+
+/// **AN ARGUED EXCEPTION TO ADR-0569, and the only one in this binary.**
+///
+/// It is a named function rather than a bare fallback at the call site precisely
+/// so a reader can tell it apart from an oversight. Every other knob here reads
+/// through [`env_required`]; this one does not, and the argument is:
+///
+/// UNSET IS A STATE THE DESIGN NEEDS. `TrustBoundary::Undeclared` means "nobody
+/// has said how many proxies stand in front", which is DIFFERENT from `Hops(0)`
+/// meaning "there is no proxy". Making absence fatal would delete the first
+/// state and leave no way to express it, and ADR-0569's own revisit trigger
+/// names this shape: a knob whose absence leaves the system correct.
+///
+/// It is not a value nobody chose, either. Undeclared is the SAFE posture, not a
+/// convenient one — gateway then records no source address at all rather than
+/// trusting a header the caller can write, and bounds the credential endpoints
+/// per observed hop. The chart renders the variable unconditionally, empty
+/// included, so `kubectl describe pod` still answers the question.
+///
+/// A MALFORMED value is a different matter and still fails the boot: see the
+/// call site.
+fn trusted_proxy_hops() -> String {
+    // Absence is the declared state `TrustBoundary::Undeclared` ("nobody knows"),
+    // which `Hops(0)` ("there is no proxy") cannot express. Full argument above.
+    // The marker must sit on the READ ITSELF, so `git grep ADR-0569-EXCEPTION`
+    // lands on the line that takes the fallback rather than on prose near it.
+    std::env::var("YADGAR_TRUSTED_PROXY_HOPS").unwrap_or_default() // ADR-0569-EXCEPTION
 }
 
 #[tokio::main]
@@ -150,16 +226,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` here would
     // put `UnknownKind("wrote")` on the operator's terminal instead of the
     // sentence saying which kinds exist.
+    //
+    // `YADGAR_RATE_LIMITS` MAY BE EMPTY and that is a real answer: it says no
+    // kind carries its own bucket and every kind takes the default below. The
+    // default bucket itself may NOT be empty — it is the one that applies when
+    // nothing else does. The chart rendered "10:300" while the compiled-in
+    // default here said "10:100"; nobody noticed, because the compiled value is
+    // only reachable when the chart is not, which is exactly the drift ADR-0569
+    // deletes.
     let limits = Limits::parse(
-        &env_or("YADGAR_RATE_LIMITS", ""),
-        &env_or("YADGAR_RATE_LIMIT_DEFAULT", "10:100"),
+        &env_required_allow_empty("YADGAR_RATE_LIMITS")?,
+        &env_required("YADGAR_RATE_LIMIT_DEFAULT")?,
     )
     .map_err(|e| format!("YADGAR_RATE_LIMITS is not usable: {e}"))?;
     // SHORT, and on the hot path of every call. A hung round trip to the cache
     // would otherwise put its latency at the one hop all traffic passes through;
     // a timeout degrades into the same fail-open path as unreachable.
     let limit_timeout = Duration::from_millis(
-        env_or("YADGAR_RATE_LIMIT_TIMEOUT_MS", "20")
+        env_required("YADGAR_RATE_LIMIT_TIMEOUT_MS")?
             .parse()
             .map_err(|e| format!("YADGAR_RATE_LIMIT_TIMEOUT_MS is not a whole number: {e}"))?,
     );
@@ -172,12 +256,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the replica count, which is the exact failure D74 names, on the error path
     // where nobody looks. A deployment that cannot say how far it scales cannot
     // have a correct floor, so it does not start.
-    let max_replicas: u32 = env_or("YADGAR_MAX_REPLICAS", "")
+    let max_replicas: u32 = env_required("YADGAR_MAX_REPLICAS")?
         .parse()
         .ok()
         .filter(|n| (1..=1000).contains(n))
         .ok_or(
-            "YADGAR_MAX_REPLICAS is unset or is not a whole number between 1 and 1000. It is \
+            "YADGAR_MAX_REPLICAS is not a whole number between 1 and 1000. It is \
              the largest number of replicas the autoscaler may run, and it divides the local \
              floor this gateway falls back to while the shared cache cannot answer (D74). The \
              chart wires it from autoscaling.maxReplicas.",
@@ -318,8 +402,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cut-over.
     let schedule = config.schedule().map_err(|e| e.to_string())?;
 
-    let task_host = env_or("TASK_HOST", "task");
-    let task_port: u16 = env_or("TASK_PORT", "50052").parse()?;
+    let task_host = env_required("TASK_HOST")?;
+    let task_port: u16 = env_required("TASK_PORT")?.parse()?;
     let task = upstream::connect_task(&task_host, task_port, task_tls.as_ref())
         .await
         // Same reasoning: `BalanceError`'s messages are paragraphs explaining
@@ -370,8 +454,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // EXISTING. A bundle depends only on the deployment that wrote it, so
     // deferring the read would turn an operator's mistake into a per-request
     // failure found under traffic rather than a refusal to boot.
-    let iam_host = env_or("IAM_HOST", "iam");
-    let iam_port: u16 = env_or("IAM_PORT", "50052").parse()?;
+    let iam_host = env_required("IAM_HOST")?;
+    let iam_port: u16 = env_required("IAM_PORT")?.parse()?;
     let iam = upstream::connect_iam(&iam_host, iam_port, iam_tls.as_ref())
         .await
         .map_err(|e| e.to_string())?;
@@ -386,7 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // installs one picks the backend for every service linking it. A failure is
     // logged and ignored: telemetry must never fail a call (D25), and that rule
     // covers the metrics endpoint too.
-    let metrics_addr: SocketAddr = env_or("METRICS_LISTEN", "0.0.0.0:9090").parse()?;
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
@@ -400,7 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Comma-separated, and EMPTY BY DEFAULT. An empty list rejects every browser
     // origin, which is right for a server whose clients are agents: a default
     // that allowed one would be a default nobody chose.
-    let allowed_origins: Vec<String> = env_or("YADGAR_ALLOWED_ORIGINS", "")
+    let allowed_origins: Vec<String> = env_required_allow_empty("YADGAR_ALLOWED_ORIGINS")?
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -419,20 +503,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // correctly fails startup.
     //
     // `.to_string()` on the way out, for the reason `Limits::parse` gives above.
-    let trust = TrustBoundary::parse(&env_or("YADGAR_TRUSTED_PROXY_HOPS", ""))
+    let trust = TrustBoundary::parse(&trusted_proxy_hops())
         .map_err(|e| format!("YADGAR_TRUSTED_PROXY_HOPS is not usable: {e}"))?;
     // The two buckets that bound the unauthenticated endpoints (task 497). Read
     // as `<rate>:<burst>` through the SAME parser D74's limits use, so one syntax
     // and one set of refusals covers every bucket this binary configures.
     let credential_limits = CredentialLimits {
-        attributed: parse_bucket_env(
-            "YADGAR_LOGIN_RATE_LIMIT",
-            CredentialLimits::DEFAULT_ATTRIBUTED,
-        )?,
-        unattributed: parse_bucket_env(
-            "YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT",
-            CredentialLimits::DEFAULT_UNATTRIBUTED,
-        )?,
+        attributed: parse_bucket_env("YADGAR_LOGIN_RATE_LIMIT")?,
+        unattributed: parse_bucket_env("YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT")?,
     };
     match trust {
         TrustBoundary::Undeclared => tracing::warn!(
@@ -511,7 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let addr: SocketAddr = env_or("LISTEN", "0.0.0.0:8080").parse()?;
+    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // ARMED BEFORE THE LISTENER IS SERVED, and that ordering is the fix rather
     // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
@@ -582,4 +660,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{env_required, env_required_allow_empty, trusted_proxy_hops};
+
+    // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
+    // runs these on threads of one process, so tests sharing a variable name
+    // would pass or fail depending on scheduling.
+
+    /// The case a naive test omits, and the only one that proves the value is
+    /// USED. A test that merely asserts "boot succeeds" passes just as happily
+    /// with a compiled-in default still in place behind the read.
+    #[test]
+    fn a_set_value_is_returned_verbatim() {
+        std::env::set_var("YADGAR_TEST_REQUIRED_PRESENT", "0.0.0.0:8080");
+        assert_eq!(
+            env_required("YADGAR_TEST_REQUIRED_PRESENT").as_deref(),
+            Ok("0.0.0.0:8080")
+        );
+    }
+
+    #[test]
+    fn an_absent_knob_refuses_and_names_itself() {
+        std::env::remove_var("YADGAR_TEST_REQUIRED_ABSENT");
+        let err = env_required("YADGAR_TEST_REQUIRED_ABSENT").unwrap_err();
+        assert!(
+            err.contains("YADGAR_TEST_REQUIRED_ABSENT"),
+            "the refusal must name the knob, got: {err}"
+        );
+        assert!(err.contains("NOT SET"), "got: {err}");
+    }
+
+    /// **THE CASE THAT DISCRIMINATES.** Helm renders an unset value as `""`, so
+    /// a nulled chart value arrives here as set-but-empty rather than as absent.
+    /// An implementation that collapses the two into one branch is the defect
+    /// this estate found three separate times in one week, so the messages are
+    /// asserted to DIFFER rather than merely to exist.
+    #[test]
+    fn an_empty_knob_refuses_with_its_own_message() {
+        std::env::set_var("YADGAR_TEST_REQUIRED_EMPTY", "");
+        std::env::remove_var("YADGAR_TEST_REQUIRED_EMPTY_ABSENT");
+        let empty = env_required("YADGAR_TEST_REQUIRED_EMPTY").unwrap_err();
+        let absent = env_required("YADGAR_TEST_REQUIRED_EMPTY_ABSENT").unwrap_err();
+        assert!(empty.contains("set but EMPTY"), "got: {empty}");
+        assert!(
+            empty.replace("YADGAR_TEST_REQUIRED_EMPTY", "K")
+                != absent.replace("YADGAR_TEST_REQUIRED_EMPTY_ABSENT", "K"),
+            "empty and absent must not share one message"
+        );
+    }
+
+    /// The other reader, and the reason it is a separate function: here an empty
+    /// value is a DECLARED STATE, and only absence refuses.
+    #[test]
+    fn allow_empty_accepts_empty_but_still_refuses_absence() {
+        std::env::set_var("YADGAR_TEST_ALLOW_EMPTY_SET", "");
+        std::env::remove_var("YADGAR_TEST_ALLOW_EMPTY_ABSENT");
+        assert_eq!(
+            env_required_allow_empty("YADGAR_TEST_ALLOW_EMPTY_SET").as_deref(),
+            Ok("")
+        );
+        let err = env_required_allow_empty("YADGAR_TEST_ALLOW_EMPTY_ABSENT").unwrap_err();
+        assert!(err.contains("YADGAR_TEST_ALLOW_EMPTY_ABSENT"), "got: {err}");
+    }
+
+    /// The argued exception keeps its fallback, and the test says so out loud so
+    /// that deleting the exception breaks a test rather than passing silently.
+    #[test]
+    fn the_trust_boundary_is_undeclared_when_unset() {
+        std::env::remove_var("YADGAR_TRUSTED_PROXY_HOPS");
+        assert_eq!(trusted_proxy_hops(), "");
+        std::env::set_var("YADGAR_TRUSTED_PROXY_HOPS", "1");
+        assert_eq!(trusted_proxy_hops(), "1");
+        std::env::remove_var("YADGAR_TRUSTED_PROXY_HOPS");
+    }
 }
