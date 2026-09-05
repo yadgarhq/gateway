@@ -265,10 +265,17 @@ clientCertificate:
 # reports the expiry of the certificates this process actually loaded, told apart
 # by a `kind` label. Here that is one series, `kind="client"`.
 #
-# THE WATCHER IDLES ON A DEFAULT INSTALL. With both upstreams cleartext the watch
-# set is empty and nothing is polled. The schedule below is still parsed at boot
-# in that case: a value an operator set and the binary cannot use is an error
-# whether or not the watcher would have run.
+# THE WATCHER NO LONGER IDLES ON A DEFAULT INSTALL, and this paragraph used to
+# say it did. With both upstreams cleartext the watch set was empty and nothing
+# was polled; since the mounted configuration document joined the set
+# unconditionally, every pod polls `shared/shared.yaml` on any install and will
+# drain and exit when an operator edits it. That is ADR-0523 working, not a
+# fault.
+#
+# THE TWO VALUES BELOW ARE NO LONGER READ BY THIS BINARY EITHER. They are
+# rendered so that a rollout landing this chart before this binary's digest
+# still resolves a schedule on the old one, and step 2b deletes them once that
+# digest has landed — see `yadgarhq/deploy`'s MIGRATION_NOTES.md.
 tlsRotation:
   # How often the files are re-hashed. Reading a handful of small files a minute
   # costs nothing, and the deadline this protects is 30 days wide.

@@ -277,6 +277,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let task_tls = upstream::UpstreamTls::from_env(upstream::TASK).map_err(|e| e.to_string())?;
     let iam_tls = upstream::UpstreamTls::from_env(upstream::IAM).map_err(|e| e.to_string())?;
 
+    // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
+    // `yadgarhq/config` renders into the `shared` ConfigMap, mounted at
+    // `/etc/yadgar/config/shared/shared.yaml`. There is no compiled-in default
+    // behind it any more: an absent, empty, or half-written document refuses the
+    // boot and names the file. The chart still sets TLS_ROTATION_POLL_SECS and
+    // TLS_ROTATION_SPLAY_MAX_SECS — this binary no longer reads either, but they
+    // stay so a rollout that lands this chart before this binary's digest still
+    // resolves a schedule on the old one. The runbook is `yadgarhq/deploy`'s
+    // MIGRATION_NOTES.md, steps 2a and 2b — NOT this repository's, which has no
+    // such section.
+    let config = rotate::Configuration::mounted();
+
     // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION AND BEFORE THE
     // DIALS (ADR-0523). The baseline is the bytes each file held when this
     // process read them; deferring the first reading to the watcher's first poll
@@ -288,18 +300,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fold de-duplicates, so the pair is hashed once and named once in the line
     // that reports a change.
     //
+    // THE MOUNTED DOCUMENT JOINS THE SAME SET, as a fourth `Material` — an
+    // operator editing `shared.yaml` now restarts this pod exactly as editing a
+    // CA bundle would.
+    //
     // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be two chained
     // builder calls here, where nothing could reach them: no test spawns this
     // binary, so deleting either compiled and passed everything. The list lives
     // in `rotate::watch_set` now and `tests/assembly.rs` calls it.
-    let tls_inputs = rotate::watch_set(task_tls.as_ref(), iam_tls.as_ref());
+    let watch_inputs = rotate::watch_set(task_tls.as_ref(), iam_tls.as_ref(), &config);
 
-    // PARSED AT BOOT WHETHER OR NOT ANY TLS IS CONFIGURED. A value an operator
-    // set and this binary cannot use is a mistake to refuse, not one to paper
-    // over with a default nobody chose — and refusing it here means it is
-    // refused on a cleartext deployment too, which is where it would otherwise
-    // sit unnoticed until the cut-over.
-    let schedule = rotate::Schedule::from_env().map_err(|e| e.to_string())?;
+    // READ FROM THE SAME DOCUMENT THE WATCH SET JUST JOINED, whether or not any
+    // TLS is configured. A value the document names and this binary cannot use
+    // is a mistake to refuse, not one to paper over with a default nobody
+    // chose — and refusing it here means it is refused on a cleartext
+    // deployment too, which is where it would otherwise sit unnoticed until the
+    // cut-over.
+    let schedule = config.schedule().map_err(|e| e.to_string())?;
 
     let task_host = env_or("TASK_HOST", "task");
     let task_port: u16 = env_or("TASK_PORT", "50052").parse()?;
@@ -378,7 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // recorder is a value nobody ever sees. This process serves no certificate,
     // so the only series it publishes is the CLIENT leaf's — which under
     // ADR-0516 is the one whose expiry stops a hop.
-    tls_inputs.export_not_after();
+    watch_inputs.export_not_after();
 
     // Comma-separated, and EMPTY BY DEFAULT. An empty list rejects every browser
     // origin, which is right for a server whose clients are agents: a default
@@ -511,7 +528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         %addr,
         protocol = yadgar_gateway::mcp::PROTOCOL_VERSION,
-        watching = tls_inputs.watched().len(),
+        watching = watch_inputs.watched().len(),
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
         drain_budget_secs = DRAIN_BUDGET.as_secs(),
@@ -551,7 +568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stop = async {
         tokio::select! {
             () = signals => {}
-            () = rotate::watch(tls_inputs, schedule) => {}
+            () = rotate::watch(watch_inputs, schedule) => {}
         }
     };
 

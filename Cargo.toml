@@ -63,7 +63,7 @@ prost-types = "0.14"
 # upstreams.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.1.3" }
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.0" }
 # HOW THIS PROCESS DIALS, for BOTH upstreams. Client-side balancing over task's
 # headless Service (D23), and — since the `iam` hop stopped building an
 # `Endpoint` of its own — the single implementation of ADR-0514's rule that the

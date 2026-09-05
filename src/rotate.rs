@@ -64,8 +64,8 @@
 //! SAME function, so dropping an upstream from the list below turns a test red.
 
 pub use yadgar_lifecycle::rotate::{
-    watch, File, Inputs, Material, Presented, Schedule, ScheduleError, CERTIFICATE_NOT_AFTER,
-    WATCHED_FILES_UNREADABLE,
+    watch, Configuration, File, Inputs, Material, Presented, Schedule, ScheduleError,
+    CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
 use crate::upstream::UpstreamTls;
@@ -115,11 +115,25 @@ impl Material for UpstreamTls {
 /// to both upstreams, so the same two paths arrive twice; the fold watches a
 /// path once, in the position it first appeared.
 ///
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE FOURTH MEMBER (step 2a).**
+/// `config` is `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared`
+/// ConfigMap, and it is a [`Material`] like the other three: `Configuration`
+/// implements the trait by returning the one file it read its schedule from
+/// (`yadgar_lifecycle::rotate::Configuration::files`), so folding it in here
+/// joins the document to the ADR-0523 watch set through the exact same
+/// `Inputs::also` path the CA bundles and the client leaf already take. An
+/// operator editing `shared.yaml` restarts this pod exactly as editing a CA
+/// bundle would.
+///
 /// Called from `main.rs` INSIDE boot and BEFORE the dials: every entry is hashed
 /// as it is added, so the baseline is the bytes the process actually loaded.
 /// Collecting paths and reading them when the watcher first polls would put the
 /// rest of boot inside a window where a kubelet swap quietly becomes the
 /// baseline, and the real rotation would never be noticed.
-pub fn watch_set(task: Option<&UpstreamTls>, iam: Option<&UpstreamTls>) -> Inputs {
-    Inputs::of(SERVICE, &[&task, &iam])
+pub fn watch_set(
+    task: Option<&UpstreamTls>,
+    iam: Option<&UpstreamTls>,
+    config: &Configuration,
+) -> Inputs {
+    Inputs::of(SERVICE, &[&task, &iam, config])
 }

@@ -1,12 +1,13 @@
 {{/*
   WHETHER THIS POD PRESENTS A CLIENT CERTIFICATE AT ALL (ADR-0516).
 
-  Computed ONCE, here, because it is asked six times below — twice for the
-  environment, once for the mount, once for the volume, and twice more inside the
-  `or` guards those two live under. Those guards are the reason this is not
-  inlined: this chart wraps `volumeMounts:` and `volumes:` in an `or` over every
-  optional mount, so a client-certificate mount added without widening BOTH would
-  render a mount with no volume behind it, or nothing at all.
+  Computed ONCE, here, because it is asked four times below — twice for the
+  environment, once for the mount, once for the volume. `volumeMounts:` and
+  `volumes:` render unconditionally now (step 2a mounts the two ConfigMaps from
+  `yadgarhq/config` on every deployment), so a client-certificate mount added
+  without widening BOTH the mount and the volume renders one with no volume
+  behind it, or a volume no mount names — either half missing is the mistake to
+  watch for.
 
   ONE LEAF, TWO UPSTREAMS, so the per-upstream environment blocks still guard on
   their own `tls.enabled` beside this: a deployment can cut `task` over before
@@ -400,8 +401,45 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
-          {{- if or $presentsIdentity .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
           volumeMounts:
+            # THE CONFIGURATION REPOSITORY'S TWO CONFIGMAPS (ADR-0569, ADR-0570,
+            # step 2a): the knobs every service reads, and this service's own —
+            # empty today, mounted anyway so it is ready the day it is not.
+            #
+            # DIRECTORIES, NEVER `subPath`. A subPath mount is copied once at
+            # container start and kubelet never updates it, so the file would be
+            # frozen for the life of the pod while the ConfigMap moved underneath
+            # it — the rotation watcher would see nothing and an edited knob
+            # would silently never take effect.
+            #
+            # NO `optional: true`, unlike every Secret mount below. The default,
+            # `false`, is what makes kubelet refuse to start this pod at all
+            # while `shared` or `gateway` is absent — `ContainerCreating` naming
+            # the missing ConfigMap — rather than starting it with an empty
+            # directory the binary would then refuse to read from anyway
+            # (ScheduleError::Absent).
+            #
+            # **`gateway` IS MOUNTED, AND TODAY IT IS NEITHER READ NOR WATCHED.**
+            # `yadgar-lifecycle`'s `Configuration::under(root)` yields exactly one
+            # path, `root/shared/shared.yaml`; the crate has no API for a
+            # per-service document, so `config-gateway` is in no process's
+            # ADR-0523 watch set. Two things follow and both are deliberate. The
+            # `optional: false` reasoning above is true of `shared` and NOT of
+            # this one — an absent `gateway` ConfigMap blocks the pod for no
+            # functional benefit, which is accepted so that both mounts are
+            # governed by one rule rather than two. And the day this file gains
+            # its first knob, Argo will sync it and kubelet will swap it and NO
+            # POD WILL RESTART, so the new value never takes effect and nothing
+            # reports that — the exact failure ADR-0570 names for `envFrom`,
+            # reproduced through a file mount. THE MOUNT IS READY; JOINING THIS
+            # DOCUMENT TO THE WATCH SET IS A FURTHER CHANGE, and it belongs in
+            # the same pull request as the first gateway-only knob.
+            - name: config-shared
+              mountPath: /etc/yadgar/config/shared
+              readOnly: true
+            - name: config-gateway
+              mountPath: /etc/yadgar/config/gateway
+              readOnly: true
             {{- if .Values.rateLimit.passwordSecret }}
             # A DIRECTORY MOUNT, never subPath — the same rule the CA mounts
             # below state. A subPath mount is a one-time copy kubelet never
@@ -451,9 +489,15 @@ spec:
               mountPath: /var/run/secrets/client-cert
               readOnly: true
             {{- end }}
-          {{- end }}
-      {{- if or $presentsIdentity .Values.task.tls.enabled .Values.iam.tls.enabled .Values.rateLimit.passwordSecret .Values.nats.passwordSecret }}
       volumes:
+        # The two ConfigMaps `yadgarhq/config` renders, same reasoning as the
+        # mounts above: unconditional, a directory each, never optional.
+        - name: config-shared
+          configMap:
+            name: shared
+        - name: config-gateway
+          configMap:
+            name: gateway
         {{- if .Values.rateLimit.passwordSecret }}
         - name: valkey-password
           secret:
@@ -554,4 +598,3 @@ spec:
               - key: {{ required "iam.tls.caSecretKey names the key inside iam.tls.caSecret that holds the CA bundle and must be set whenever iam.tls.enabled is; see the chart's values.yaml" .Values.iam.tls.caSecretKey | quote }}
                 path: ca.pem
         {{- end }}
-      {{- end }}
