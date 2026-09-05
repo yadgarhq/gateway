@@ -464,6 +464,11 @@ message IssueCredentialRequest {
   string label = 3;
   // Zero means no expiry.
   int64 expires_in_seconds = 4;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 5;
 }
 message IssueCredentialResponse {
   // Returned ONCE and never again — the store holds only a hash (D72). A
@@ -476,6 +481,11 @@ message IssueCredentialResponse {
 message RevokeCredentialRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string credential_id = 2;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 3;
 }
 message RevokeCredentialResponse {}
 
@@ -528,6 +538,11 @@ message ListCredentialsRequest {
   string user_id = 1;
   int32 page_size = 2;
   string page_token = 3;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 4;
 }
 message ListCredentialsResponse {
   repeated Credential credentials = 1;
@@ -617,6 +632,11 @@ message IssueEnrolmentRequest {
   // than the token it is waiting for.
   yadgar.common.v1.Idempotency idempotency = 1;
   string user_id = 2;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 3;
 }
 message IssueEnrolmentResponse {
   // base64(EnrolmentToken) — the whole of what the admin hands over. `iam`
@@ -644,6 +664,11 @@ message SetUserAdminRequest {
   // excludes admin SELF-demotion from the first cut, which is a rule about who
   // may call this and belongs in the service rather than in the shape.
   bool is_admin = 3;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 4;
 }
 message SetUserAdminResponse {}
 
@@ -661,6 +686,11 @@ message SetRateLimitOverrideRequest {
   // the same zero, which is the same distinction ResolveCredentialResponse
   // depends on at the other end.
   optional RateLimit limit = 5;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 6;
 }
 message SetRateLimitOverrideResponse {}
 
@@ -696,14 +726,19 @@ message SetRateLimitOverrideResponse {}
 // token that exists to create the FIRST admin rewrite the read policy for the
 // whole deployment before an admin exists to notice.
 //
-// **THE GAP, STATED RATHER THAN LEFT TO BE FOUND.** The request carries no
-// attested identity, in common with every administrative RPC on this service.
-// So `iam` can neither VERIFY that the caller is an administrator nor RECORD
-// which one changed the policy. The authorisation site exists and is the
-// gateway; the audit point cannot attribute. That is a property of the contract
-// as it stands, and a second authentication mechanism invented for this one
-// verb would be a second place for it to be wrong, holding the same secret
-// twice.
+// **THE GAP, STATED RATHER THAN LEFT TO BE FOUND — AND HALF OF IT IS NOW
+// CLOSED.** The request carries no attested identity, in common with every
+// administrative RPC on this service, so `iam` cannot VERIFY that the caller is
+// an administrator. That half is unchanged: the authorisation site exists and
+// is the gateway, on D73's admin flag. A second authentication mechanism
+// invented for this one verb would be a second place for it to be wrong,
+// holding the same secret twice.
+//
+// THE RECORDING HALF IS SERVED BY `unverified_actor` BELOW. The audit point
+// attributes, and what it attributes is a self-asserted id this service cannot
+// check — A RECORD RATHER THAN AN ATTESTATION, and never evidence that the
+// named person acted. `yadgar.common.v1.UnverifiedActor` states what may be
+// done with it.
 //
 // **VALIDATION IS STATED ONCE, ON `yadgar.common.v1.SettingScope`**, and is
 // binding here rather than summarised — this service refuses these itself
@@ -735,7 +770,12 @@ message SetInheritedSettingRequest {
   // D9's key, under the ORDINARY replay rule: the same key replayed returns the
   // original outcome, and the same key carrying a DIFFERENT request is refused
   // with INVALID_ARGUMENT. The request, for that comparison, is `scope`,
-  // `team_id`, `name`, `value`, `locked` and `clear` — all of it.
+  // `team_id`, `name`, `value`, `locked` and `clear` — every field of this
+  // message but two. `idempotency` carries the key the comparison is keyed on.
+  // `unverified_actor` is EXCLUDED because it is inert by construction: a
+  // second administrator picking up a change the first one lost would otherwise
+  // be told their identical request differs. yadgar.common.v1.UnverifiedActor
+  // states that exclusion once, for every RPC that carries the field.
   //
   // NOT A MEMBER OF ADR-0519's SINGLE-USE-SECRET CARVE-OUT. The outcome is the
   // stored setting, which the store keeps and can re-derive, so nothing is
@@ -850,6 +890,11 @@ message SetInheritedSettingRequest {
   // zero-mutation read. That is the response's shape, not this field's, and it
   // is left open deliberately: see SettingScope in yadgar.common.v1.
   bool clear = 7;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 8;
 }
 
 // The setting as it now stands, WHOLE — both levels and every team's override.
@@ -876,6 +921,11 @@ message CreateUserRequest {
   // before anyone can log in to promote one. That chicken-and-egg problem is
   // why the bootstrap token exists, and this is the verb it reaches.
   bool is_admin = 4;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 5;
 }
 message CreateUserResponse {
   yadgar.common.v1.Meta meta = 1;
@@ -885,6 +935,11 @@ message AddTeamMemberRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string team_id = 2;
   string user_id = 3;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 4;
 }
 message AddTeamMemberResponse {}
 
@@ -892,6 +947,11 @@ message RemoveTeamMemberRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string team_id = 2;
   string user_id = 3;
+
+  // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
+  // service cannot verify it and MUST NOT authorise on it. The rule is stated
+  // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
+  yadgar.common.v1.UnverifiedActor unverified_actor = 4;
 }
 message RemoveTeamMemberResponse {}
 
