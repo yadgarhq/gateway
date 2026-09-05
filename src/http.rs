@@ -142,29 +142,6 @@ pub struct CredentialLimits {
     pub unattributed: Bucket,
 }
 
-impl CredentialLimits {
-    /// The shipped default for [`Self::attributed`].
-    ///
-    /// Sized for a person typing a password: ten at once, then one every five
-    /// seconds. Nobody types faster; a guesser is held to roughly 17,000 attempts
-    /// a day from one address, each against an Argon2id hash.
-    ///
-    /// **A CONSTANT RATHER THAN A LITERAL IN `main`, so a test can reach it.** A
-    /// shipped default that fails `Bucket::parse` is a pod that exits at boot for
-    /// a value nobody chose — the exact failure this whole configuration story
-    /// exists to prevent, in the one place no test would otherwise look, because
-    /// `cargo test` never calls `main`.
-    pub const DEFAULT_ATTRIBUTED: &'static str = "0.2:10";
-
-    /// The shipped default for [`Self::unattributed`], reachable for
-    /// [`Self::DEFAULT_ATTRIBUTED`]'s reason.
-    ///
-    /// Sized against a core rather than against a guesser — see this type's own
-    /// comment. `iam` spends ~50ms on Argon2id per attempt, so 10/s is about half
-    /// a core's worth of hashing.
-    pub const DEFAULT_UNATTRIBUTED: &'static str = "10:100";
-}
-
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         // MCP is ONE endpoint, POST only.

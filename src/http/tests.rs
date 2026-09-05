@@ -90,34 +90,6 @@ fn unlimited_credentials() -> CredentialLimits {
     }
 }
 
-/// The shipped defaults must actually parse.
-///
-/// **`cargo test` NEVER CALLS `main`, which is where they are read.** So a
-/// default that `Bucket::parse` refuses — a rate of zero, a refill window longer
-/// than a key's life — would ship, and the first anyone knew of it would be every
-/// gateway pod exiting at boot naming a variable nobody set. That is the failure
-/// the whole refuse-a-bad-value story exists to prevent, arriving through the one
-/// value the story cannot refuse safely: its own.
-///
-/// It asserts the CONSTANTS rather than two literals copied here, because two
-/// literals that must agree is the shape this repository keeps refusing.
-#[test]
-fn the_shipped_credential_limit_defaults_parse() {
-    let attributed = crate::limit::Bucket::parse(CredentialLimits::DEFAULT_ATTRIBUTED)
-        .expect("the shipped attributed default parses");
-    let unattributed = crate::limit::Bucket::parse(CredentialLimits::DEFAULT_UNATTRIBUTED)
-        .expect("the shipped unattributed default parses");
-    // AND THE RELATION BETWEEN THEM, which is the part a careless edit breaks
-    // without breaking either parse: the shared-hop bucket must be the LOOSER of
-    // the two. Swapping them would put a guess-prevention rate on a key every
-    // caller behind an ingress shares, which is one attacker refusing every login
-    // in the installation — the failure `CredentialLimits` is written to explain.
-    assert!(
-        unattributed.rate > attributed.rate,
-        "the bucket shared by everybody behind a proxy must be looser than the per-client one"
-    );
-}
-
 fn envelope(method: &str, id: Option<i64>) -> Value {
     let mut v = json!({
         "jsonrpc": "2.0",

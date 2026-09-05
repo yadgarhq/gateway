@@ -330,6 +330,18 @@ spec:
             # know which branch of a template ran.
             - name: YADGAR_TRUSTED_PROXY_HOPS
               value: {{ .Values.sourceAddress.trustedProxyHops | quote }}
+            # WHICH BROWSER ORIGINS MAY CALL THIS GATEWAY, and ALWAYS RENDERED
+            # even when empty — the same shape as YADGAR_TRUSTED_PROXY_HOPS above
+            # and for the same reason. An empty value is a real instruction: no
+            # browser origin is allowed, which is the correct closed posture for a
+            # server whose clients are agents.
+            #
+            # It became REQUIRED in the binary with ADR-0569, so this line is what
+            # keeps the pod booting. Before it, an absent variable and a
+            # deliberately-closed policy were the same observable state and the
+            # compiled-in "" was the only source.
+            - name: YADGAR_ALLOWED_ORIGINS
+              value: {{ .Values.cors.allowedOrigins | quote }}
             # The two buckets bounding /auth/login and /auth/enrol (ledger 497).
             # SEPARATE FROM YADGAR_RATE_LIMITS above, because D74's buckets key on
             # a user and a login has none yet — see values.yaml.
