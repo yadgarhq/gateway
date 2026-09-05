@@ -924,4 +924,135 @@ mod tests {
         );
         assert_eq!(iam.client_certificate_file(), None);
     }
+
+    /// The gauge `dial` publishes for an upstream that never resolved reaches
+    /// this binary's registry, under the name and the label an alert queries.
+    ///
+    /// **A METRIC A LIBRARY EMITS IS NOT AUTOMATICALLY A SERIES THIS SERVICE
+    /// EXPORTS, and this case is what makes the difference visible.** On `dial`
+    /// v0.2.0 the key does not exist at all, so this went RED before the pin
+    /// moved. What it proves once green is the whole chain: the emission is on
+    /// the boot path this service actually calls, it goes through the `metrics`
+    /// facade this binary links rather than a second one, and
+    /// `yadgar_telemetry::metrics::install_prometheus` builds a
+    /// `PrometheusBuilder` with no allow-list, so a gauge in the registry is a
+    /// gauge on `/metrics`.
+    ///
+    /// **THE NAME IS ASSERTED AS A STRING LITERAL, NOT AS
+    /// `yadgar_dial::UPSTREAM_NEVER_RESOLVED`.** Comparing that constant with
+    /// itself passes through a rename, and a rename is the one change to a
+    /// metric that fails nowhere: every consumer compiles, a dashboard blanks
+    /// and an alert stops. Spelling it out makes the next pin move that renames
+    /// it fail HERE instead.
+    ///
+    /// **THERE IS NO `service` LABEL ON THIS SERIES.** `dial` is a library
+    /// dialling outward with no service identity of its own and documents that
+    /// it writes no second label, and `install_prometheus` adds no global one.
+    /// `upstream` is the only dimension; the pod and the job come from the
+    /// scrape. It differs from `yadgar_rotation_watched_files_unreadable` for
+    /// that reason, not by oversight.
+    ///
+    /// **`task` IS THE ONLY UPSTREAM THIS BINARY COVERS, and that is a real gap
+    /// rather than a gap in the test.** [`connect_iam`] builds its `Endpoint`
+    /// here rather than through `yadgar_dial`, because the scheme and the TLS
+    /// configuration are decided together in [`iam_endpoint`]. So no code path
+    /// in this process publishes the series for `iam` — the upstream that
+    /// carries every login, every enrolment and every attestation — and moving
+    /// this pin does not change that. Closing it means routing `connect_iam`
+    /// through the same crate, which is a change to how the gateway dials and
+    /// not a change to what it observes.
+    #[test]
+    fn an_absent_task_is_published_as_a_gauge() {
+        let (emitted, _channel) = dial_under_a_recorder(UNRESOLVABLE);
+        assert!(
+            gauge_for(&emitted, UNRESOLVABLE, 1.0),
+            "a task that never resolved must be published as a gauge an alert \
+             can read: {emitted:?}"
+        );
+    }
+
+    /// The other direction, and it is not symmetry for its own sake.
+    ///
+    /// **A GAUGE WRITTEN ONLY ON THE UNHEALTHY PATH DOES NOT EXIST ON A HEALTHY
+    /// POD**, and a series that does not exist cannot be compared against zero:
+    /// `> 0` matches nothing, so "healthy" reads the same as "this crate was
+    /// never linked" and the same as "the process died before its first tick".
+    /// The boot dial publishing BOTH ways is what the alert `> 0` depends on,
+    /// and it is a property of the pin rather than of this repository — so it is
+    /// asserted here, where the pin is.
+    #[test]
+    fn a_task_that_resolves_publishes_the_same_gauge_at_zero() {
+        let (emitted, _channel) = dial_under_a_recorder(RESOLVABLE);
+        assert!(
+            gauge_for(&emitted, RESOLVABLE, 0.0),
+            "a resolvable task must still publish the series, at zero: \
+             {emitted:?}"
+        );
+    }
+
+    /// One row of a [`metrics_util::debugging::Snapshotter`] snapshot: the key
+    /// with its kind, the unit and description a `describe_*` would have set,
+    /// and the value.
+    type Emitted = (
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        metrics_util::debugging::DebugValue,
+    );
+
+    /// A host that resolves to nothing, so the dial can only report absence.
+    const UNRESOLVABLE: &str = "task-no-such-host-4b7e02.invalid";
+
+    /// A name every host resolves without a network: `dial` only needs an
+    /// address to build an endpoint, and nothing here connects.
+    const RESOLVABLE: &str = "localhost";
+
+    /// Dial `host` through [`connect_task`] with a LOCAL recorder and return
+    /// everything it emitted.
+    ///
+    /// Local rather than `metrics::set_global_recorder`: a global one is
+    /// process-wide and this binary runs its tests in parallel, so installing
+    /// here would race every other case that emits a metric.
+    ///
+    /// The channel comes back with the snapshot and the caller HOLDS IT.
+    /// `dial`'s refresh loop writes this same gauge back to 0 on the way out,
+    /// and it leaves when the channel is dropped.
+    fn dial_under_a_recorder(host: &str) -> (Vec<Emitted>, Channel) {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let channel = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async { connect_task(host, 50051, None).await })
+        })
+        .expect("a cleartext dial is lazy and hands back a channel");
+
+        // ONE SNAPSHOT. `Snapshotter::snapshot` DRAINS the registry, so a second
+        // call sees nothing and its assertion fails while the gauge is being
+        // emitted perfectly well.
+        let emitted = snapshotter.snapshot().into_vec();
+        // LENGTH FIRST, AND IT IS NOT A FORMALITY. A `metrics-util` resolving
+        // against another `metrics` major links a SECOND facade; then this
+        // snapshot is empty, and every assertion built on it passes vacuously.
+        assert!(
+            !emitted.is_empty(),
+            "the recorder saw no metric at all, which is what a second metrics \
+             facade in the tree looks like"
+        );
+        (emitted, channel)
+    }
+
+    /// Is the gauge present for `upstream`, holding `want`?
+    fn gauge_for(emitted: &[Emitted], upstream: &str, want: f64) -> bool {
+        emitted.iter().any(|(key, _, _, value)| {
+            key.key().name() == "yadgar_dial_upstream_never_resolved"
+                && key
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "upstream" && l.value() == upstream)
+                && matches!(value, metrics_util::debugging::DebugValue::Gauge(g) if g.0 == want)
+        })
+    }
 }

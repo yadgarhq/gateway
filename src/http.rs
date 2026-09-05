@@ -570,7 +570,24 @@ async fn guard(
     // Legitimate clients pay nothing: a non-browser client sends no `Origin`, and
     // `origin_ok` allows an absent one.
     if !origin_ok(state, headers) {
-        Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id())).fail("FORBIDDEN");
+        // `PERMISSION_DENIED`, NOT `FORBIDDEN`, and the difference is the label
+        // space rather than the wording. `yadgar_calls_total` carries ONE
+        // `outcome` label and this binary writes into it from two seams;
+        // `yadgar_telemetry::grpc::status_name` is the one place a status
+        // becomes that label, and no arm of it produces `FORBIDDEN`. So the
+        // literal that used to be here widened the set an operator has to know
+        // by one value that exists nowhere else in the estate — while every
+        // other literal on this path already spells a name that mapping returns.
+        // ADR-0556 cites this exact value as the reason its KEDA query counts
+        // `OK` as a closed POSITIVE set rather than excluding a list of
+        // failures.
+        //
+        // The HTTP status stays 403. `PermissionDenied` is the gRPC code for a
+        // caller refused on identity rather than on credentials, which is what
+        // an unlisted `Origin` is, and it is what this refusal would report if
+        // it were an RPC.
+        Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id()))
+            .fail("PERMISSION_DENIED");
         return Some(text(
             StatusCode::FORBIDDEN,
             r#"{"error":"origin not allowed"}"#,
