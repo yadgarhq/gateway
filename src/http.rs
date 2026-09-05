@@ -75,6 +75,49 @@ const AUTH_MODULE: &str = "auth";
 /// path of every call rather than on a person typing a password.
 const AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The longest `label` `iam` accepts, IN CHARACTERS. Its `MAX_LABEL_CHARS`.
+///
+/// **A SECOND ENFORCEMENT POINT, NOT A SECOND AUTHORITY.** `iam/src/service.rs`
+/// owns this number and keeps its check: `iam`'s gRPC is reachable in-cluster
+/// without this process — that is how the identity ceremony mints the first
+/// administrator — so a bound that lived only here would leave the path this
+/// server does not sit on unguarded. What the copy here buys is the STATUS: an
+/// over-long label refused upstream comes back as `INVALID_ARGUMENT`, and
+/// [`opaque_status`] collapses that into a 503 that says login is unavailable.
+/// Nothing is unavailable. The request was measurable from here.
+///
+/// **DRIFT CUTS BOTH WAYS AND ONLY ONE WAY IS OBVIOUS.** Too LOOSE here and the
+/// 503 comes back for the labels between the two numbers, which is the defect
+/// this exists to close, quietly reopened. Too TIGHT here and this server refuses
+/// a request `iam` would have accepted — a 400 the caller cannot appeal to any
+/// upstream, which is worse than what it replaced. If `iam` moves its constant,
+/// this one moves with it.
+///
+/// **CHARACTERS AND NOT BYTES.** The column is `label VARCHAR(255)` on utf8mb4
+/// and `VARCHAR(n)` there bounds characters, so 255 four-byte codepoints is 1020
+/// bytes and stores without complaint. A `.len()` check here would refuse it and
+/// invent a rule `iam` does not have.
+const MAX_LABEL_CHARS: usize = 255;
+
+/// The longest password `iam.RedeemEnrolment` will hash, IN BYTES. Its
+/// `MAX_PASSWORD_BYTES`.
+///
+/// **ENROLMENT ONLY, AND THE ASYMMETRY IS THE POINT.** `RedeemEnrolment` hashes
+/// the password BEFORE it looks the secret up — which is what stops its
+/// `INVALID_ARGUMENT` from reporting that the secret was good — so an unbounded
+/// input there is Argon2id work a stranger can ask for. `Login` has no
+/// counterpart bound: it verifies against a stored hash and answers 401 whatever
+/// the length. Borrowing this number onto the login path would refuse a request
+/// `iam` accepts, and an edge check that invents refusals is a defect wearing the
+/// shape of a fix.
+///
+/// The same second-enforcement-point argument as [`MAX_LABEL_CHARS`] above, and
+/// `iam` keeps its own check for the same reason.
+///
+/// BYTES, because that is the unit `iam` uses (`r.password.len()`) and a password
+/// is hashed as bytes.
+const MAX_PASSWORD_BYTES: usize = 1024;
+
 pub struct AppState {
     pub attestation: Attestation,
     pub task: Channel,
@@ -198,10 +241,25 @@ async fn method_not_allowed() -> Response {
 /// `iam`. It maps `e.code()` and logs `e`: the real code and message go to the
 /// log, where an operator can read them and a caller cannot.
 ///
-/// The two 400s below are the exception, and are not one in substance. They are
-/// raised before the request is sent, so they describe THIS server's reading of
-/// the caller's own JSON and can disclose nothing about a password nobody has
-/// checked yet.
+/// The THREE 400s below are the exception, and are not one in substance. They
+/// are raised before the request is sent, so they describe THIS server's reading
+/// of the caller's own JSON and can disclose nothing about a password nobody has
+/// checked yet. In order: unparseable JSON, an absent `username` or `password`,
+/// and a `label` past what the store will hold (see [`label_ok`]).
+///
+/// **THE THIRD ONE IS NEWER THAN THE OTHER TWO AND IT IS WHY THIS COUNT IS
+/// SPELLED OUT.** This comment said "the two 400s" while there were three, which
+/// is how an enumeration that reads as complete stops being one. The property is
+/// what matters and it is unchanged: each of the three is REQUEST-ONLY —
+/// answerable from the caller's own bytes, with no dependence on stored state —
+/// which is precisely what makes a sharp status safe here and unsafe on anything
+/// [`opaque_status`] sees. A check that needed to know whether a username exists
+/// would belong on neither list.
+///
+/// `username` is deliberately NOT bounded, and neither is the length of
+/// `password`: `iam` bounds neither on this path, and a refusal invented here
+/// would be one no upstream has. See [`MAX_PASSWORD_BYTES`], which is the enrol
+/// path's and not this one's.
 async fn login(
     State(state): State<Arc<AppState>>,
     PeerAddr(peer): PeerAddr,
@@ -232,6 +290,15 @@ async fn login(
             r#"{"error":"`username` and `password` are required"}"#,
         );
     };
+    // REQUEST-ONLY, AND THAT WORD IS DOING ALL THE WORK. See [`label_ok`].
+    // `username` is NOT checked here: `iam` blind-indexes it to a fixed-width
+    // HMAC and states no bound, so a refusal here would be one no upstream has —
+    // and a length-keyed 400 on this path is an account-enumeration oracle the
+    // moment it correlates with anything about who exists.
+    if let Some(refusal) = label_ok(&req) {
+        call.fail("INVALID_ARGUMENT");
+        return refusal;
+    }
 
     let mut client = IamServiceClient::new(state.iam.clone());
     let rpc = client.login(LoginRequest {
@@ -331,8 +398,23 @@ async fn login(
 /// that check runs only after the store has confirmed the secret was good. Two
 /// sides of the lookup, one code, nothing in the code to tell them apart: exactly
 /// the property that makes `login`'s codes uncollapsible, in the same shape. So
-/// the caller is told which of ITS OWN fields was absent (the 400s below, raised
+/// the caller is told what was wrong with ITS OWN fields (the 400s below, raised
 /// before anything is sent) and nothing about what `iam` made of them.
+///
+/// **"ABSENT" USED TO BE THE WHOLE OF THAT SENTENCE AND IS NO LONGER.** The 400s
+/// below are five: unparseable JSON, an absent `secret` or `password`, an EMPTY
+/// `password`, a `password` past [`MAX_PASSWORD_BYTES`], and a `label` past what
+/// the store will hold (see [`label_ok`]). The last three are bounds rather than
+/// presence checks, and every one of the five is REQUEST-ONLY — answerable from
+/// the caller's own bytes with no dependence on stored state — which is the
+/// property that makes a sharp status safe before the call and unsafe after it.
+///
+/// **`secret` IS ON NEITHER LIST BEYOND ITS PRESENCE, AND THAT IS THE CASE THAT
+/// DEFINES THE LINE.** A length or charset bound on it WOULD be request-only, so
+/// request-only is necessary and not sufficient: ONE FAILURE, NOT THREE means a
+/// caller holding a real secret that failed a shape check would meet a 400 where
+/// the contract promises a 401, and the two statuses are the oracle. `iam`
+/// refuses to check it for the same reason and says so in those words.
 ///
 /// The `label` is optional here for the same reason it is on `login`, and
 /// `credential_id` is dropped for the same reason too. `username` is NOT dropped:
@@ -370,6 +452,35 @@ async fn enrol(
             r#"{"error":"`secret` and `password` are required"}"#,
         );
     };
+    // THE PASSWORD IS BOUNDED HERE AND NOT ON `login`, because `iam` bounds it
+    // here and not there. See [`MAX_PASSWORD_BYTES`].
+    //
+    // **`secret` IS NOT CHECKED, AND IT IS THE CASE THAT DEFINES THE LINE.** A
+    // length or a charset bound on it would be answerable from the request alone
+    // — it passes the same test everything on this list passes — and `iam`
+    // refuses to check it anyway, because ONE FAILURE, NOT THREE means an unknown
+    // secret, a spent one and an expired one must be one answer. A caller holding
+    // a REAL secret that failed a shape check would get a 400 where the contract
+    // promises a 401, and the two statuses are the oracle. Request-only is
+    // NECESSARY and not SUFFICIENT.
+    if password.is_empty() {
+        call.fail("INVALID_ARGUMENT");
+        return text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"a `password` is required"}"#,
+        );
+    }
+    if password.len() > MAX_PASSWORD_BYTES {
+        call.fail("INVALID_ARGUMENT");
+        return text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"the `password` is longer than this service will hash: at most 1024 bytes"}"#,
+        );
+    }
+    if let Some(refusal) = label_ok(&req) {
+        call.fail("INVALID_ARGUMENT");
+        return refusal;
+    }
 
     let mut client = IamServiceClient::new(state.iam.clone());
     let rpc = client.redeem_enrolment(RedeemEnrolmentRequest {
@@ -453,6 +564,58 @@ fn text(status: StatusCode, body: &str) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// The ONE request-only check `/auth/login` and `/auth/enrol` share: the `label`.
+///
+/// # THE RULE THIS FUNCTION EXISTS TO KEEP (task 624)
+///
+/// [`opaque_status`] collapses every non-`UNAUTHENTICATED` code `iam` returns
+/// into one 503, and it must keep doing so — the argument is written out on that
+/// function and it is that a code coming BACK cannot be told apart by which side
+/// of a lookup produced it. The cost is that a caller who sent a malformed
+/// request is told the service is unavailable.
+///
+/// **THE DISTINCTION THAT MAKES A 400 BUILDABLE IS REQUEST-ONLY.** A field this
+/// server can judge from the request ALONE — a length, a charset, a missing
+/// field, unparseable JSON — leaks nothing, because the answer does not depend on
+/// any stored state. Refusing a 300-character label tells an attacker nothing
+/// about who exists. Refusing because a lookup missed does. So the shape is
+/// judged HERE, before anything is sent, and everything that comes back from
+/// `iam` keeps collapsing.
+///
+/// **AND REQUEST-ONLY IS NECESSARY, NOT SUFFICIENT.** The enrolment `secret` is
+/// judgeable from the request alone and is deliberately never judged: its
+/// contract requires ONE FAILURE, NOT THREE, so a 400 where the contract promises
+/// a 401 would be the oracle. The second test a check must pass is that the field
+/// is not one whose contract mandates a single answer.
+///
+/// # Why this runs before the call and not after
+///
+/// `iam::login_inner` places its own copy of this check INSIDE the function that
+/// pays the response-time floor, deliberately, "so a refusal placed above the
+/// call would be the fast path the floor exists to close". A refusal here IS
+/// faster than the floor, and that is safe for the same reason the 400 is safe:
+/// the floor equalises answers that depend on STORED STATE, and this one is
+/// computed entirely from the caller's own bytes. There is nothing for it to be
+/// equalised against — the caller can compute the same answer without asking.
+///
+/// # Absent is not the same as too long
+///
+/// An ABSENT label is legal and stays legal on both paths: the proto requires
+/// nothing of the field, and `iam` accepts an empty one explicitly. This is a
+/// BOUND, not a requirement.
+fn label_ok(req: &Value) -> Option<Response> {
+    let label = req.get("label").and_then(Value::as_str)?;
+    // CHARACTERS, counted as `char`s, which is the column's own unit — utf8mb4
+    // stores one per Unicode scalar value, so the two counts agree exactly. Bytes
+    // would refuse a 100-character emoji label the store holds without complaint.
+    (label.chars().count() > MAX_LABEL_CHARS).then(|| {
+        text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"the `label` is longer than the store will hold: at most 255 characters"}"#,
+        )
+    })
 }
 
 /// Reject a browser origin we do not know.

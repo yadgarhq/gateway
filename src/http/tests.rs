@@ -1588,3 +1588,228 @@ async fn discover_reports_the_stamped_version_rather_than_the_manifest() {
         "the manifest placeholder must never reach a client"
     );
 }
+
+// ---------------------------------------------------------------------------
+// THE REQUEST-ONLY LINE (task 624).
+//
+// `opaque_status` collapses everything `iam` answers that is not
+// `UNAUTHENTICATED` into one 503, and it must keep doing so: the codes coming
+// BACK cannot be told apart by which side of a lookup they came from, which is
+// the argument written out on `opaque_status` itself. So the only refusals this
+// server can state SHARPLY are the ones it decides from the request ALONE,
+// before anything is sent. Those disclose nothing, because the answer does not
+// depend on any stored state: a 900-byte password is a 900-byte password whether
+// or not the account exists.
+//
+// The tests below pin BOTH halves of that line — what is refused here, and what
+// is deliberately NOT.
+// ---------------------------------------------------------------------------
+
+/// A label past the column is the gateway's own 400 on BOTH unauthenticated paths.
+///
+/// **THIS IS THE DEFECT TASK 624 NAMES.** `iam` refuses an over-long label with
+/// `INVALID_ARGUMENT`, `opaque_status` collapses that to 503, and the person who
+/// typed a long machine name is told login is unavailable. Nothing was
+/// unavailable; their request was malformed, and this server could have said so
+/// without asking anybody.
+///
+/// **256 IS A TYPED LITERAL AND NAMES NO CONSTANT** (ADR-0573). Written as
+/// `MAX_LABEL_CHARS + 1` this test would agree with the constant whatever the
+/// constant said, which is the failure it exists to catch.
+#[tokio::test]
+async fn a_label_past_the_column_is_a_400_rather_than_an_opaque_503() {
+    let past = "l".repeat(256);
+    for (path, (status, body)) in [
+        (
+            "/auth/login",
+            login_post(&format!(
+                r#"{{"username":"u","password":"p","label":"{past}"}}"#
+            ))
+            .await,
+        ),
+        (
+            "/auth/enrol",
+            enrol_post(&format!(
+                r#"{{"secret":"s","password":"p","label":"{past}"}}"#
+            ))
+            .await,
+        ),
+    ] {
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path}: a label this server can measure itself must not be reported \
+             as an outage; got {body}"
+        );
+        assert!(body.contains("label"), "{path}: got {body}");
+    }
+}
+
+/// The LAST label the column holds is NOT refused, and it is counted in CHARACTERS.
+///
+/// Pinning both sides, per ADR-0565: 255 is the last granted value and 256 is the
+/// first refused one above. A one-sided test passes for a bound set anywhere
+/// below it — and a bound set too tight here is worse than the defect, because it
+/// turns a working request into a 400 the caller cannot appeal.
+///
+/// **AND THE UNIT IS CHARACTERS, WHICH IS THE CASE A BYTE COUNT GETS WRONG.**
+/// The column is `label VARCHAR(255)` on utf8mb4 and `VARCHAR(n)` there bounds
+/// CHARACTERS, so 255 four-byte codepoints is 1020 bytes and stores fine. A
+/// `.len()` check here would refuse it — inventing a refusal `iam` does not have,
+/// which is the one thing an edge check must never do.
+///
+/// A 503 is the PASS here: it means the request went upstream to the unreachable
+/// `iam` rather than being stopped at the edge.
+#[tokio::test]
+async fn the_last_label_the_column_holds_reaches_iam_and_is_counted_in_characters() {
+    for label in [
+        "l".repeat(255),
+        "\u{1F600}".repeat(255),
+        "\u{1F600}".repeat(100),
+    ] {
+        for (path, (status, body)) in [
+            (
+                "/auth/login",
+                login_post(&format!(
+                    r#"{{"username":"u","password":"p","label":"{label}"}}"#
+                ))
+                .await,
+            ),
+            (
+                "/auth/enrol",
+                enrol_post(&format!(
+                    r#"{{"secret":"s","password":"p","label":"{label}"}}"#
+                ))
+                .await,
+            ),
+        ] {
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {} characters is {} bytes and the column stores it, so \
+                 this must reach iam rather than being refused here; got {body}",
+                label.chars().count(),
+                label.len()
+            );
+        }
+    }
+}
+
+/// A password past what `iam` will hash is a 400 on `/auth/enrol`, and NOT on login.
+///
+/// **THE ASYMMETRY IS DELIBERATE AND IT IS NOT AN OVERSIGHT TO TIDY.**
+/// `iam::validate_redemption` bounds `RedeemEnrolmentRequest.password` because
+/// that path HASHES the password before the secret is looked up, so an unbounded
+/// input there is work a stranger can ask for. `Login` has no such bound: it
+/// verifies against a stored hash and answers 401. An edge check must refuse only
+/// what `iam` would refuse — a bound invented here turns a request `iam` accepts
+/// into a 400 no upstream would have given, which is a defect wearing the shape
+/// of a fix.
+///
+/// 1025 and 1024 are typed literals for the reason on the label rows above.
+#[tokio::test]
+async fn a_password_past_what_iam_will_hash_is_a_400_on_enrol_only() {
+    let past = "p".repeat(1025);
+    let (status, body) = enrol_post(&format!(r#"{{"secret":"s","password":"{past}"}}"#)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "enrol hashes before it looks the secret up, so this is refusable from \
+         the request alone; got {body}"
+    );
+    assert!(body.contains("password"), "got {body}");
+
+    // THE LAST ONE `iam` WILL HASH goes upstream.
+    let last = "p".repeat(1024);
+    let (status, _) = enrol_post(&format!(r#"{{"secret":"s","password":"{last}"}}"#)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // AND LOGIN DOES NOT BORROW THE BOUND. `iam::login` accepts any password and
+    // answers 401; refusing here would be a rule the contract does not have.
+    let (status, _) = login_post(&format!(r#"{{"username":"u","password":"{past}"}}"#)).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "login has no password bound in iam, so the gateway must not invent one"
+    );
+}
+
+/// An EMPTY password is a 400 on `/auth/enrol`, and is left alone on login.
+///
+/// `{"password":""}` is `Some("")`, so it passes the required-fields check and
+/// reaches `iam` — which refuses it on enrol ("a password nobody typed is not a
+/// password") and does NOT on login, where it is simply a wrong password and a
+/// 401. The same asymmetry as the length bound above, from the same rule.
+#[tokio::test]
+async fn an_empty_password_is_a_400_on_enrol_only() {
+    let (status, body) = enrol_post(r#"{"secret":"s","password":""}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+
+    let (status, _) = login_post(r#"{"username":"u","password":""}"#).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an empty password on login is a wrong password, and iam answers it 401 \
+         after a full verification — a 400 here would be a second way for this \
+         endpoint to answer"
+    );
+}
+
+/// THE FIELD THE GATEWAY DELIBERATELY DOES NOT CHECK, pinned so nobody adds one.
+///
+/// **REQUEST-ONLY IS NECESSARY AND NOT SUFFICIENT, and `secret` is the case that
+/// proves it.** A length or charset bound on an enrolment secret IS computable
+/// from the request alone — so it passes the test every other check on this list
+/// passes — and `iam` refuses to check it anyway, in those words: "a shape check
+/// on it would be a second way for this endpoint to answer, told apart from the
+/// first by its status code."
+///
+/// The contract requires ONE FAILURE, NOT THREE: an unknown secret, a spent one
+/// and an expired one are one answer. A caller holding a REAL secret that
+/// happened to fail a shape check would get a 400 where the contract promises a
+/// 401 — and the difference between the two statuses is exactly the oracle. So an
+/// empty secret, a huge one and a malformed one all go upstream and are refused
+/// as unknown, which is what they are.
+#[tokio::test]
+async fn the_enrolment_secret_is_never_shape_checked_here() {
+    for secret in ["", &"s".repeat(4096), "\u{0000}not a ulid"] {
+        let body = json!({ "secret": secret, "password": "p" }).to_string();
+        let (status, answered) = enrol_post(&body).await;
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a shape check on `secret` is a second way for this endpoint to \
+             answer, and the status is what tells it from the first: {answered}"
+        );
+    }
+}
+
+/// THE USERNAME IS NEVER BOUNDED HERE EITHER, and for a different reason.
+///
+/// `iam::login` turns a username into a fixed-width HMAC blind index, so no
+/// length of username can trouble any column on that path and `iam` states no
+/// bound. A bound invented here would refuse a request `iam` answers.
+///
+/// It is ALSO the row that would redden `estate`'s C-03 if it were ever added
+/// carelessly: that contract sends a deliberately unknown username and requires
+/// the answer to be byte-identical to a known username with a wrong password. A
+/// gateway that answered 400 for some usernames and 401 for others would be an
+/// account-enumeration oracle keyed on whatever the check measured.
+#[tokio::test]
+async fn a_username_is_never_bounded_here() {
+    // AN EMPTY USERNAME IS IN THIS LIST, AND IT IS NOT THE CASE
+    // `a_missing_field_is_a_400` COVERS. That row refuses an ABSENT `username`; a
+    // present-but-empty one is `Some("")`, passes the required-fields check, and
+    // goes upstream, where `iam` blind-indexes it, verifies against the dummy hash
+    // and answers 401. Measured rather than assumed — that row's doc comment reads
+    // as though the empty string were covered, and it is not.
+    for username in ["", &"u".repeat(4096), "\u{1F600}".repeat(600).as_str()] {
+        let body = json!({ "username": username, "password": "p" }).to_string();
+        let (status, answered) = login_post(&body).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "iam bounds no username, so neither does this: {answered}"
+        );
+    }
+}
