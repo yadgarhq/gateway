@@ -241,10 +241,25 @@ async fn method_not_allowed() -> Response {
 /// `iam`. It maps `e.code()` and logs `e`: the real code and message go to the
 /// log, where an operator can read them and a caller cannot.
 ///
-/// The two 400s below are the exception, and are not one in substance. They are
-/// raised before the request is sent, so they describe THIS server's reading of
-/// the caller's own JSON and can disclose nothing about a password nobody has
-/// checked yet.
+/// The THREE 400s below are the exception, and are not one in substance. They
+/// are raised before the request is sent, so they describe THIS server's reading
+/// of the caller's own JSON and can disclose nothing about a password nobody has
+/// checked yet. In order: unparseable JSON, an absent `username` or `password`,
+/// and a `label` past what the store will hold (see [`label_ok`]).
+///
+/// **THE THIRD ONE IS NEWER THAN THE OTHER TWO AND IT IS WHY THIS COUNT IS
+/// SPELLED OUT.** This comment said "the two 400s" while there were three, which
+/// is how an enumeration that reads as complete stops being one. The property is
+/// what matters and it is unchanged: each of the three is REQUEST-ONLY —
+/// answerable from the caller's own bytes, with no dependence on stored state —
+/// which is precisely what makes a sharp status safe here and unsafe on anything
+/// [`opaque_status`] sees. A check that needed to know whether a username exists
+/// would belong on neither list.
+///
+/// `username` is deliberately NOT bounded, and neither is the length of
+/// `password`: `iam` bounds neither on this path, and a refusal invented here
+/// would be one no upstream has. See [`MAX_PASSWORD_BYTES`], which is the enrol
+/// path's and not this one's.
 async fn login(
     State(state): State<Arc<AppState>>,
     PeerAddr(peer): PeerAddr,
@@ -383,8 +398,23 @@ async fn login(
 /// that check runs only after the store has confirmed the secret was good. Two
 /// sides of the lookup, one code, nothing in the code to tell them apart: exactly
 /// the property that makes `login`'s codes uncollapsible, in the same shape. So
-/// the caller is told which of ITS OWN fields was absent (the 400s below, raised
+/// the caller is told what was wrong with ITS OWN fields (the 400s below, raised
 /// before anything is sent) and nothing about what `iam` made of them.
+///
+/// **"ABSENT" USED TO BE THE WHOLE OF THAT SENTENCE AND IS NO LONGER.** The 400s
+/// below are five: unparseable JSON, an absent `secret` or `password`, an EMPTY
+/// `password`, a `password` past [`MAX_PASSWORD_BYTES`], and a `label` past what
+/// the store will hold (see [`label_ok`]). The last three are bounds rather than
+/// presence checks, and every one of the five is REQUEST-ONLY — answerable from
+/// the caller's own bytes with no dependence on stored state — which is the
+/// property that makes a sharp status safe before the call and unsafe after it.
+///
+/// **`secret` IS ON NEITHER LIST BEYOND ITS PRESENCE, AND THAT IS THE CASE THAT
+/// DEFINES THE LINE.** A length or charset bound on it WOULD be request-only, so
+/// request-only is necessary and not sufficient: ONE FAILURE, NOT THREE means a
+/// caller holding a real secret that failed a shape check would meet a 400 where
+/// the contract promises a 401, and the two statuses are the oracle. `iam`
+/// refuses to check it for the same reason and says so in those words.
 ///
 /// The `label` is optional here for the same reason it is on `login`, and
 /// `credential_id` is dropped for the same reason too. `username` is NOT dropped:
