@@ -198,7 +198,7 @@ iam:
 # leaf even though it trusts the issuer perfectly well.
 #
 # IT ROTATES, AND IT IS WATCHED. The mount is a DIRECTORY, never subPath, and
-# both files join the rotation watch set described under `tlsRotation` below.
+# both files join the rotation watch set this binary assembles at boot (ADR-0523).
 # That matters more here than anywhere else in this chart: this process serves no
 # certificate at all, so the client leaf is the ONLY certificate it holds — and
 # ADR-0516 records that an expired client leaf STOPS a hop rather than degrading
@@ -271,25 +271,6 @@ clientCertificate:
 # unconditionally, every pod polls `shared/shared.yaml` on any install and will
 # drain and exit when an operator edits it. That is ADR-0523 working, not a
 # fault.
-#
-# THE TWO VALUES BELOW ARE NO LONGER READ BY THIS BINARY EITHER. They are
-# rendered so that a rollout landing this chart before this binary's digest
-# still resolves a schedule on the old one, and step 2b deletes them once that
-# digest has landed — see `yadgarhq/deploy`'s MIGRATION_NOTES.md.
-tlsRotation:
-  # How often the files are re-hashed. Reading a handful of small files a minute
-  # costs nothing, and the deadline this protects is 30 days wide.
-  pollSeconds: 60
-  # THE LONGEST A POD WAITS BEFORE EXITING, drawn per pod inside that range.
-  #
-  # Both replicas see the refreshed file inside the same kubelet sync window, so
-  # an unsplayed exit can drop both at once — and the PodDisruptionBudget does
-  # NOT govern a self-exit, it constrains eviction. This is the only control
-  # there is. Five minutes against 30 days of slack is free.
-  #
-  # `0` exits immediately, which is what a single-replica or a development
-  # deployment wants.
-  splayMaxSeconds: 300
 
 credentialCache:
   ttlSeconds: 30
