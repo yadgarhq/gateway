@@ -1098,7 +1098,10 @@ async fn tools_call(
             Call::start(SERVICE, label, kind_of(name), tel(request_id)).fail(answer.label);
             return reply(
                 answer.status.as_u16(),
-                mcp::error(Some(id), answer.code, &answer.message),
+                match answer.data {
+                    Some(data) => mcp::error_data(Some(id), answer.code, &answer.message, data),
+                    None => mcp::error(Some(id), answer.code, &answer.message),
+                },
             );
         }
     };
@@ -1610,8 +1613,56 @@ fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
                 code: codes::INVALID_REQUEST,
                 label: "UNAUTHENTICATED",
                 message: e.to_string(),
+                data: None,
             }
         }
+        // **A MISSING WORKSPACE IS NOT A CREDENTIAL FAILURE, AND USED TO BE
+        // ANSWERED AS ONE.** This shared the 401 above until ledger 739. The
+        // credential is fine — on the DEFAULT arm `iam` has already resolved it,
+        // because `from_resolved` is where the refusal is raised — and what is
+        // absent is `x-yadgar-project`, a fact about the request rather than about
+        // the caller. Answering 401 sent a caller holding a good token to
+        // re-authenticate against a condition re-authenticating cannot fix.
+        //
+        // `yadgar/project/v1/project.proto` states the rule on `ResolveProject`:
+        // "IT IS A CALLER ERROR AND MUST NOT BE RENDERED AS `401`."
+        //
+        // **400 AND NOT 404, AND THE NEIGHBOURING RULE IS WHY.** The same contract
+        // gives the registry `NOT_FOUND` for a path with NO REGISTERED ANCESTOR —
+        // a workspace that was named and resolves to nothing, which is the code
+        // `project-db/src/read.rs` already answers. This gateway cannot produce
+        // that condition: `PROTO_PATHS` vendors `yadgar/taskapi/v1` and
+        // `yadgar/iam/v1` and reaches no `ProjectService`, so nothing here ever
+        // asks the registry anything. Answering 404 would mint, for "you named no
+        // workspace", the code that already means "the workspace you named does
+        // not exist" — collapsing two conditions into one, which is the failure
+        // being fixed rather than a second instance of consistency. Keeping the
+        // two consistent means keeping them APART: 400 here, `NOT_FOUND` there.
+        //
+        // **THE REASON IS A TOKEN AND NOT A SENTENCE.** The JSON-RPC code stays
+        // `INVALID_REQUEST` — it IS an invalid request — so without `data` the
+        // error object would be byte-identical to the 401 above and a client could
+        // tell them apart only by string-matching English. `reason` is what a
+        // client branches on; the prose is for a person.
+        //
+        // Safe to describe in full, for the reason the doc comment above gives:
+        // this is decided HERE, before any credential is checked, so naming the
+        // header discloses nothing about whether a token exists.
+        attest::AttestError::MissingWorkspace(header) => AttestAnswer {
+            status: StatusCode::BAD_REQUEST,
+            code: codes::INVALID_REQUEST,
+            // INVALID_ARGUMENT, not a new word: ADR-0558 closed this label space
+            // on the values `yadgar_telemetry::grpc::status_name` produces, and a
+            // hand-written literal outside that set is the defect it fixed. A
+            // credential-stuffing dashboard counting `UNAUTHENTICATED` also stops
+            // counting this, which is the point — it never was one.
+            label: "INVALID_ARGUMENT",
+            message: e.to_string(),
+            data: Some(json!({
+                "reason": "MISSING_WORKSPACE",
+                "header": header.to_ascii_lowercase(),
+            })),
+        },
         attest::AttestError::Upstream(code) => {
             let status = opaque_status(*code);
             let refused = status == StatusCode::UNAUTHORIZED;
@@ -1632,6 +1683,7 @@ fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
                     "UNAVAILABLE"
                 },
                 message: "the credential could not be verified".to_string(),
+                data: None,
             }
         }
         // **A THIRD ANSWER, AND IT IS NOT AN OUTAGE.** This used to be the same
@@ -1656,6 +1708,7 @@ fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
             code: codes::INTERNAL_ERROR,
             label: "FAILED_PRECONDITION",
             message: "a rate limit configured for this credential cannot be applied".to_string(),
+            data: None,
         },
     }
 }
@@ -1673,6 +1726,15 @@ struct AttestAnswer {
     /// `&'static str` from a closed set, for D67's cardinality rule.
     label: &'static str,
     message: String,
+    /// The machine-readable reason, for the answers where the status alone does
+    /// not carry it.
+    ///
+    /// **PRESENT ON EXACTLY ONE ARM TODAY, and absent on the rest deliberately.**
+    /// Everything derived from `iam` answers a CONSTANT message behind a status
+    /// that was made opaque on purpose, and a structured reason beside it would
+    /// reopen the channel the constant closes. The one arm that carries it is
+    /// decided HERE, before anything was sent, so it discloses nothing.
+    data: Option<Value>,
 }
 
 /// The whole failing response for one gRPC code: status, body and headers.

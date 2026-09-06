@@ -1332,6 +1332,139 @@ async fn tools_call_with(state: Arc<AppState>, token: &str) -> StatusCode {
     send(state, req).await.0
 }
 
+/// One `tools/call` against `state`, with each of the two identity-bearing
+/// headers present or absent, returning the STATUS AND THE BODY.
+///
+/// **`tools_call_with` cannot express the requests below**, because it hardcodes
+/// both headers and returns only the status. What ledger 739 is about is which
+/// answer each ABSENCE earns, and the reason token that tells them apart lives in
+/// the body — so a helper that drops the body can assert the fix only halfway.
+async fn tools_call_omitting(
+    state: Arc<AppState>,
+    token: Option<&str>,
+    project: Option<&str>,
+) -> (StatusCode, Value) {
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "_meta": {
+                meta_keys::PROTOCOL_VERSION: PROTOCOL_VERSION,
+                meta_keys::CLIENT_CAPABILITIES: {},
+            },
+            "name": "find_tasks",
+            "arguments": {},
+        }
+    });
+    let mut req = post()
+        .header(headers::METHOD, "tools/call")
+        .header(headers::NAME, "find_tasks");
+    if let Some(project) = project {
+        req = req.header("x-yadgar-project", project);
+    }
+    if let Some(token) = token {
+        req = req.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let req = req.body(Body::from(body.to_string())).expect("request");
+    send(state, req).await
+}
+
+/// The answer `iam` gives for a credential that IS live.
+///
+/// Both signals set, because `from_resolved` checks both: an empty `user_id` or a
+/// zero lifetime is the negative answer, and a test built on either would be
+/// refused before it reached the condition it means to exercise.
+fn a_live_credential() -> crate::pb::yadgar::iam::v1::ResolveCredentialResponse {
+    crate::pb::yadgar::iam::v1::ResolveCredentialResponse {
+        user_id: "u-that-iam-resolved".to_string(),
+        valid_for_seconds: 300,
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ledger 739: a missing workspace is a caller error, not a credential failure.
+// ---------------------------------------------------------------------------
+
+/// **A GOOD TOKEN AND NO `x-yadgar-project` IS A 400, NOT A 401.**
+///
+/// The defect this pins: an absent workspace header was refused as
+/// `MissingIdentity` and mapped to `401 UNAUTHENTICATED`, so a caller whose
+/// credential was perfect was told to re-authenticate against a condition
+/// re-authenticating cannot fix. `yadgar/project/v1/project.proto` states the rule
+/// on `ResolveProject`: "IT IS A CALLER ERROR AND MUST NOT BE RENDERED AS `401`."
+///
+/// **THROUGH THE `Iam` ARM, WHICH IS THE ONLY ARM THAT MAKES THE POINT.** Under
+/// `TrustedHeaders` there is no credential to be good, so a 400 there would prove
+/// nothing about the conflation. Here `iam` resolves the token — the stub answers
+/// a live credential and the call reaches `from_resolved` — and the refusal is
+/// raised AFTER the credential has been accepted. That is the arm a reader who
+/// checked only the trusted-headers body concludes is inert.
+///
+/// **THE STATUS IS NOT THE WHOLE ASSERTION.** The JSON-RPC code stays
+/// `INVALID_REQUEST` on both answers, so a client that could not read `data.reason`
+/// would be back to string-matching English to tell a missing workspace from a
+/// missing token.
+#[tokio::test]
+async fn a_resolved_credential_with_no_workspace_header_is_a_caller_error() {
+    let (state, resolves) =
+        state_resolving_to(a_live_credential(), std::time::Duration::from_secs(30)).await;
+
+    let (status, body) = tools_call_omitting(state, Some("a-token-iam-resolves"), None).await;
+
+    assert_eq!(
+        resolves.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the credential must have been RESOLVED for this to be about the workspace \
+         rather than about the token"
+    );
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a valid credential with no workspace is a caller error; got {status}"
+    );
+    assert_eq!(
+        body["error"]["data"]["reason"], "MISSING_WORKSPACE",
+        "the reason must be machine-readable, not a sentence: {body}"
+    );
+    assert_eq!(body["error"]["data"]["header"], "x-yadgar-project");
+    assert_eq!(body["error"]["code"], codes::INVALID_REQUEST);
+}
+
+/// **AND A MISSING CREDENTIAL IS STILL A 401.**
+///
+/// The other half, and the half a fix can quietly break: widening the new 400 to
+/// cover the whole arm would turn every unauthenticated request into a caller
+/// error and stop telling a client to authenticate at all. Separating the two is
+/// the point of ledger 739, so the retained answer is asserted beside the changed
+/// one — a suite that pinned only the new status would pass with the distinction
+/// destroyed.
+///
+/// The workspace header IS present here, so the only thing missing is the token.
+#[tokio::test]
+async fn a_request_with_no_credential_is_still_unauthenticated() {
+    let (state, resolves) =
+        state_resolving_to(a_live_credential(), std::time::Duration::from_secs(30)).await;
+
+    let (status, body) = tools_call_omitting(state, None, Some("acme/demo")).await;
+
+    assert_eq!(
+        resolves.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a credentialless request must be refused here rather than at `iam`"
+    );
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a missing token is an authentication failure and owes a 401; got {status}"
+    );
+    assert_eq!(
+        body["error"]["data"],
+        Value::Null,
+        "the 401 carries no structured reason: it is the answer that was deliberately \
+         made opaque"
+    );
+}
+
 /// One `tools/call` with a bearer token, against an `iam` that answers `answer`.
 ///
 /// A FRESH state each time, so the credential cache built into it is cold — these
