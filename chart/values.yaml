@@ -375,6 +375,21 @@ rateLimit:
   # The bucket for a (module, kind) nobody named above. A new tool is limited
   # rather than unlimited on the day it ships; the alternative is a tool that
   # goes unprotected until somebody remembers to add a line here.
+  #
+  # THIS LINE IS THE ONE STATEMENT OF THIS VALUE, and keeping it that way is a
+  # rule rather than an observation (ADR-0569). `deployment.yaml` renders it into
+  # `YADGAR_RATE_LIMIT_DEFAULT`; `main.rs` reads that with `env_required` and
+  # carries no fallback, so an absent value exits at boot instead of quietly
+  # taking a number nobody wrote. Nothing else in this repository spells it — not
+  # a doc comment, not a test fixture, not the README's variable table, which
+  # names this path rather than the bucket.
+  #
+  # IT WAS TWO STATEMENTS ONCE and they disagreed for as long as nobody looked,
+  # which is the shape worth remembering rather than the numbers: a compiled-in
+  # default is reachable ONLY when the chart is not, so the copy that is wrong is
+  # exactly the copy no deployment exercises, and no test can be red about it.
+  # Correcting two copies into agreement does not fix that — two agreeing copies
+  # drift again on the next edit. Deleting the second copy does.
   default: "10:300"
   # Milliseconds. This is on the hot path of every user-attributed call, at the
   # one hop all traffic passes through, so a hung round trip to the cache must

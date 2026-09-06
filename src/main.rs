@@ -275,10 +275,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `YADGAR_RATE_LIMITS` MAY BE EMPTY and that is a real answer: it says no
     // kind carries its own bucket and every kind takes the default below. The
     // default bucket itself may NOT be empty — it is the one that applies when
-    // nothing else does. The chart rendered "10:300" while the compiled-in
-    // default here said "10:100"; nobody noticed, because the compiled value is
-    // only reachable when the chart is not, which is exactly the drift ADR-0569
-    // deletes.
+    // nothing else does.
+    //
+    // BOTH ARE `env_required`, AND NEITHER NUMBER IS WRITTEN DOWN HERE. This
+    // binary once carried its own default bucket beside the chart's and the two
+    // disagreed for as long as nobody looked, because a compiled-in default is
+    // reachable only when the chart is NOT: the copy that is wrong is exactly
+    // the copy no deployment exercises. `chart/values.yaml`'s
+    // `rateLimit.default` is the ONE statement of that value.
+    //
+    // THIS COMMENT DELIBERATELY DOES NOT QUOTE IT, and the omission is the
+    // point rather than an economy. A number quoted in a comment is the same
+    // two-sources defect with a slower fuse — nothing recompiles when the chart
+    // changes, so the quotation rots silently and reads as authoritative while
+    // it does. ADR-0569.
     let limits = Limits::parse(
         &env_required_allow_empty("YADGAR_RATE_LIMITS")?,
         &env_required("YADGAR_RATE_LIMIT_DEFAULT")?,

@@ -337,7 +337,17 @@ fn parse_bucket(spec: &str, whole: &str) -> Result<Bucket, ConfigError> {
 }
 
 impl Limits {
-    /// Parse `task.write=2:20,task.read=20:200` and a `<rate>:<burst>` fallback.
+    /// Parse a `<module>.<kind>=<rate>:<burst>` list and a bare
+    /// `<rate>:<burst>` fallback — `example.write=3:33,example.read=7:77`, say.
+    ///
+    /// **THE EXAMPLE NAMES A MODULE THAT DOES NOT EXIST, DELIBERATELY.** A doc
+    /// example spelling the shipped buckets is a second statement of
+    /// `chart/values.yaml`'s `rateLimit.limits`: nothing recompiles when the
+    /// chart moves, no test reads it, and it goes on reading as authoritative
+    /// after it stops being true. This example was exactly that and had already
+    /// drifted — it spelled a `task.write` bucket the chart had not shipped for
+    /// some time. What a deployment actually sets is in the chart and nowhere
+    /// else (ADR-0569); this line is here to show the SHAPE.
     ///
     /// The fallback exists because the tool surface grows and the configuration
     /// should not have to grow with it in lockstep. A pair nobody named is
@@ -1170,17 +1180,41 @@ mod tests {
     }
 
     #[test]
-    fn every_configurable_bucket_refills_inside_a_keys_lifetime() {
+    fn representative_bucket_shapes_refill_inside_a_keys_lifetime() {
         // The invariant the constant rests on, checked rather than assumed: no
         // bucket that PARSES may outlive the key it writes. If one could, the
         // TTL would have to vary again and the defect above would return.
+        //
+        // **THE NAME USED TO SAY `every_configurable_bucket`, AND THIS FILE
+        // CANNOT KNOW WHAT THOSE ARE.** The list below is four specs written by
+        // hand; the buckets a deployment actually configures live in
+        // `chart/values.yaml` and reach this process as `YADGAR_RATE_LIMITS`.
+        // Nothing links the two, so the old name promised coverage of a set this
+        // test never sees, and a reader who trusted it would stop looking for
+        // the guard that does cover it. That guard is
+        // `ConfigError::Unrefillable`, refused at boot on whatever the chart
+        // rendered — this case only fixes the shapes it is worth pinning by
+        // hand: a fast bucket, a slow one, and a burst large against its rate.
+        //
+        // **NOT ONE OF THESE SPECS IS A SHIPPED VALUE, and that is the second
+        // half of the same repair.** The list used to spell the chart's own
+        // `task.write` and `task.read` buckets, so it read as a copy of the
+        // deployment while being answerable to nothing — and the next reader
+        // could not tell the copy from the coincidence. `example` is a module
+        // this estate does not have, which is what makes these unmistakably
+        // fixtures (ADR-0599).
+        //
+        // `1:3600` IS THE BOUNDARY CASE and the reason the list is worth having:
+        // `validate` refuses a window ABOVE `KEY_TTL_SECONDS`, so a bucket that
+        // refills in exactly a key's lifetime must pass. An off-by-one there
+        // turns a legal configuration into a boot failure.
         for spec in [
-            "task.write=2:120",
-            "task.read=20:600",
-            "memory.write=0.5:600",
-            "recall.read=10:300",
+            "example.write=3:33",
+            "example.read=0.25:600",
+            "example.generate=50:900",
+            "example.write=1:3600",
         ] {
-            let limits = Limits::parse(spec, "10:300").expect("{spec} parses");
+            let limits = Limits::parse(spec, "2:22").expect("{spec} parses");
             for bucket in limits.per_pair.values().chain([&limits.fallback]) {
                 assert!(
                     bucket.refill_seconds() <= KEY_TTL_SECONDS,
