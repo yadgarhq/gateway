@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -967,5 +968,236 @@ async fn a_refusal_that_arrives_after_the_flush_still_ends_the_subscription() {
          though the broker were merely unreachable — a deployment error that does not fix \
          itself, logged and retried as an outage that does",
         ATTRIBUTION_WINDOW
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The gauge that makes a refused replica visible from outside the process.
+//
+// **THE LOG IS NOT AN INSTRUMENT, AND THAT IS THE GAP THESE TWO TESTS CLOSE.**
+// `on_event` already writes an ERROR naming both subjects, and `start` already
+// answers `false` — but nothing reads that `bool` past `main`'s boot line, this
+// binary serves no readiness route, and a broker-side typo hits every replica at
+// once. So "is anything in this fleet consuming revocations?" was a question
+// answerable only by grepping every pod's log, for the signal that bounds how
+// long a revoked credential keeps working.
+//
+// **A LOCAL RECORDER, NEVER `install()`.** A global one is process-wide and this
+// binary runs its tests in parallel, so installing here would race every other
+// test in the file. `#[tokio::test]` builds a CURRENT-THREAD runtime, so the
+// background task `start` spawns is polled on the very thread the guard below
+// covers — which is why the gauge `drain` writes from that task is visible here
+// at all.
+//
+// **THE NAME IS A LITERAL AND `invalidate::CONSUMING` IS NOT IMPORTED**, for the
+// reason `REVOKED` above is a literal: a series name asserted through the
+// constant that produced it passes straight through a rename, and a renamed
+// metric is the one change where every consumer still compiles while the query
+// blanks (ADR-0599).
+const CONSUMING_GAUGE: &str = "yadgar_gateway_invalidation_consuming";
+
+/// Every `CONSUMING_GAUGE` series in the snapshot, and how many series it held.
+///
+/// ONE SNAPSHOT, READ ONCE. `Snapshotter::snapshot` DRAINS the registry, so a
+/// second call sees nothing — the trap `attest`'s cache test records.
+///
+/// The total is returned so the caller can refuse to trust an EMPTY snapshot. An
+/// empty one means the recorder never saw a write — a `metrics-util` resolved
+/// against a second `metrics` facade links a second registry — and every
+/// assertion built on a filter over nothing passes vacuously.
+fn consuming(snapshotter: &Snapshotter) -> (usize, Vec<f64>) {
+    let snapshot = snapshotter.snapshot().into_vec();
+    let total = snapshot.len();
+    let series = snapshot
+        .into_iter()
+        .filter_map(|(key, _, _, value)| {
+            if key.key().name() != CONSUMING_GAUGE {
+                return None;
+            }
+            match value {
+                DebugValue::Gauge(v) => Some(v.into_inner()),
+                other => panic!("{CONSUMING_GAUGE} is published as {other:?}, not as a gauge"),
+            }
+        })
+        .collect();
+    (total, series)
+}
+
+#[tokio::test]
+async fn a_consuming_replica_publishes_the_gauge_as_one() {
+    // THE POSITIVE CONTROL, and it is what stops the test below passing for an
+    // implementation that writes `0` unconditionally. Without this one, deleting
+    // every `set(1.0)` in the module would leave a green suite and a gauge that
+    // reports the whole fleet dark.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let local = metrics::set_default_local_recorder(&recorder);
+
+    let rig = broker(None).await;
+    let cache = Arc::new(Credentials::new(TTL));
+    let (consuming_now, _evicted) = start(&rig, cache, None).await;
+    assert!(consuming_now, "the fixture broker permits both subjects");
+
+    drop(local);
+    let (total, series) = consuming(&snapshotter);
+    assert!(
+        total > 0,
+        "the snapshot is EMPTY, so nothing below could fail for the right reason: the local \
+         recorder never saw a write, or metrics-util resolved against a different metrics facade"
+    );
+    assert_eq!(
+        series.len(),
+        1,
+        "expected exactly one {CONSUMING_GAUGE} series and found {}; a count rather than a \
+         `find` because a filter that merely finds one survives a rename at the emit site. \
+         Snapshot held {total} series; {CONSUMING_GAUGE} series were {series:?}",
+        series.len()
+    );
+    assert_eq!(
+        series[0], 1.0,
+        "a replica that IS consuming publishes {CONSUMING_GAUGE} as 0, so an operator asking \
+         which replicas are dark would be told all of them"
+    );
+}
+
+#[tokio::test]
+async fn a_forbidden_subscription_publishes_the_gauge_as_zero_rather_than_nothing() {
+    // **THE FAILURE WITH NO OTHER SYMPTOM, ASKED OF THE ONLY SURFACE THAT LEAVES
+    // THE PROCESS.** The broker here accepts the connection and then answers
+    // `-ERR 'Permissions Violation for Subscription to ...'`, exactly as a real
+    // `nats-server` does: the connection stays OPEN and `Client::subscribe`
+    // already returned `Ok`. A gateway in that state serves every revoked
+    // credential until its cache entry expires.
+    //
+    // **ZERO, NOT ABSENT.** An implementation that published the series only once
+    // a subscription succeeded would make "not consuming" and "not scraped" the
+    // same observation — the silence, moved from the log to the metrics endpoint.
+    // The count assertion below is what refuses that: a missing series fails it.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let local = metrics::set_default_local_recorder(&recorder);
+
+    let rig = forbidding_broker(REVOKED).await;
+    let cache = Arc::new(Credentials::new(TTL));
+    let (consuming_now, _evicted) = start(&rig, cache, None).await;
+    assert!(!consuming_now, "the fixture broker forbids {REVOKED}");
+
+    drop(local);
+    let (total, series) = consuming(&snapshotter);
+    assert!(
+        total > 0,
+        "the snapshot is EMPTY, so nothing below could fail for the right reason: the local \
+         recorder never saw a write, or metrics-util resolved against a different metrics facade"
+    );
+    assert_eq!(
+        series.len(),
+        1,
+        "expected exactly one {CONSUMING_GAUGE} series and found {}: a replica the broker has \
+         FORBIDDEN must still publish the series, or a dark gateway is indistinguishable from \
+         one nothing scraped. Snapshot held {total} series; {CONSUMING_GAUGE} series were \
+         {series:?}",
+        series.len()
+    );
+    assert_eq!(
+        series[0], 0.0,
+        "the broker FORBADE this gateway's subscription and {CONSUMING_GAUGE} says it is \
+         consuming, which is the silent fall back to TTL-only eviction with a green dashboard \
+         over it"
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_with_no_broker_configured_publishes_the_gauge_as_zero_rather_than_nothing() {
+    // **THE PATH THAT NEVER REACHES A SUBSCRIPTION AT ALL**, and it is the one
+    // that pins the write `start` makes BEFORE its first dial. The two tests
+    // above cannot: both get as far as `drain`, so `run`'s write on the way out
+    // would publish the `0` for them even if the pre-dial one were deleted.
+    //
+    // `NATS_URL` unset is a supported local run and it is also what a chart
+    // rendered without a broker produces — the state ADR-0525 records the
+    // gateway shipping in. A gateway in it consumes nothing for ever, and if the
+    // series only appeared once something had been dialled, the metrics endpoint
+    // of that gateway would be indistinguishable from one nothing scraped.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let local = metrics::set_default_local_recorder(&recorder);
+
+    let consuming_now = invalidate::start(None, |_user_id: &str| {}).await;
+    assert!(!consuming_now, "there is no broker to consume from");
+
+    drop(local);
+    let (total, series) = consuming(&snapshotter);
+    assert!(
+        total > 0,
+        "the snapshot is EMPTY. With no broker configured this is the ONLY series this call \
+         emits, so an empty snapshot is the defect rather than a broken fixture: nothing is \
+         published before the dial, and a gateway that consumes nothing looks unscraped"
+    );
+    assert_eq!(
+        series.len(),
+        1,
+        "expected exactly one {CONSUMING_GAUGE} series and found {}; snapshot held {total} \
+         series and {CONSUMING_GAUGE} series were {series:?}",
+        series.len()
+    );
+    assert_eq!(
+        series[0], 0.0,
+        "a gateway with no broker at all publishes {CONSUMING_GAUGE} as anything but 0"
+    );
+}
+
+#[tokio::test]
+async fn a_late_refusal_takes_the_gauge_back_down_from_one() {
+    // **THE TRANSITION, AND IT IS THE ONE 543 IS ABOUT.** A replica that reported
+    // `consuming` at boot and is then refused — because the `-ERR` arrived after
+    // the window, or because the broker's permissions were narrowed while it ran,
+    // which `async-nats`' `handle_reconnect` re-enqueues subscriptions without
+    // re-checking — must stop saying so. A gauge written once at boot would sit
+    // at `1` for the life of the pod and be worse than no gauge at all: it would
+    // answer the operator's question confidently and wrongly.
+    //
+    // **THE BOOT ANSWER IS DELIBERATELY NOT ASSERTED ON**, exactly as
+    // `a_refusal_that_arrives_after_the_flush_still_ends_the_subscription` does
+    // not assert on it. The refusal is held past `PERMISSION_GRACE`, so nothing
+    // could have waited for it; that limit is documented rather than fixable.
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let local = metrics::set_default_local_recorder(&recorder);
+
+    let cache = Arc::new(Credentials::new(TTL));
+    let mut rig = forbidding_broker_after(REVOKED, Duration::from_millis(400)).await;
+    let (_consuming, _evicted) = start(&rig, cache, None).await;
+    // Only the permitted subject's `SUB` is forwarded; the forbidden one earns
+    // the `-ERR` instead.
+    let _ = rig.next_sub().await;
+
+    // **THE SYNCHRONISATION, AND IT IS ORDERED RATHER THAN TIMED.** `run` writes
+    // the gauge the instant `drain` returns and drops the client several lines
+    // later, so a close observed here means the write has already happened. The
+    // back-off after it is `REFUSED_RETRY`, far past this test, so no redial can
+    // race the snapshot back up.
+    tokio::time::timeout(DEADLINE, rig.closes.recv())
+        .await
+        .expect("the consumer never acted on the late refusal")
+        .expect("and the broker is still running");
+
+    drop(local);
+    let (total, series) = consuming(&snapshotter);
+    assert!(
+        total > 0,
+        "the snapshot is EMPTY, so nothing below could fail for the right reason: the local \
+         recorder never saw a write, or metrics-util resolved against a different metrics facade"
+    );
+    assert_eq!(
+        series.len(),
+        1,
+        "expected exactly one {CONSUMING_GAUGE} series and found {}; snapshot held {total} \
+         series and {CONSUMING_GAUGE} series were {series:?}",
+        series.len()
+    );
+    assert_eq!(
+        series[0], 0.0,
+        "the broker refused this subscription after the boot window and {CONSUMING_GAUGE} is \
+         still 1, so a replica that has gone dark reports itself healthy for the life of the pod"
     );
 }

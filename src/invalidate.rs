@@ -148,6 +148,39 @@ pub mod subject {
     pub const TEAMS_CHANGED: &str = "yadgar.iam.user.teams-changed";
 }
 
+/// Whether this replica is consuming D72's invalidation right now: `1` or `0`.
+///
+/// **A GAUGE BECAUSE A REFUSAL IS A STATE, NOT AN EVENT.** It stands until
+/// somebody edits the broker's `subscribe.allow` list, and [`run`] re-enters it
+/// every [`REFUSED_RETRY`] for as long as it stands — so a counter would tick
+/// monotonically on nothing new, and could never answer the question an operator
+/// actually has, which is whether THIS replica is consuming at this moment.
+///
+/// **AND IT IS THE ONLY ANSWER TO THAT QUESTION OUTSIDE THE LOG.** Everything
+/// above this line reports a refusal by writing `tracing::error!`, at the right
+/// level and with the right wording, and that is still not an instrument: nothing
+/// reads [`start`]'s `bool` past the boot line in `main`, this binary serves no
+/// readiness route — its `readinessProbe` is a `tcpSocket` — and the refusal is
+/// broker-side, so every replica has it at once. Before this series the question
+/// "is anything in this fleet consuming revocations?" was answerable only by
+/// grepping each pod's boot log, for the signal that bounds how long a revoked
+/// credential keeps working: `attest`'s `MAX_TTL_SECONDS` ceiling, 300 seconds.
+///
+/// **PUBLISHED AS `0` BEFORE THE FIRST DIAL, so absent never has to mean
+/// anything.** A series that appeared only once a subscription succeeded would
+/// make "not consuming" and "not scraped" the same observation, which is the
+/// silence this module exists to remove.
+///
+/// UNLABELLED, under D67's cardinality rule. WHICH failure this is — refused
+/// credential, unreachable broker, forbidden subscription — is in the ERROR line
+/// that accompanies every one of them, and splitting it across label values would
+/// buy a dashboard the log already carries.
+///
+/// The series exists exactly when the cache it protects exists: with
+/// `credentialCache.ttlSeconds: 0` there is nothing an event could evict, `main`
+/// never calls [`start`], and nothing is published.
+pub const CONSUMING: &str = "yadgar_gateway_invalidation_consuming";
+
 /// Where the broker is. The same name `iam` reads, because it is the same broker.
 const URL: &str = "NATS_URL";
 /// The account this gateway authenticates as. It is NOT `iam`'s.
@@ -518,6 +551,13 @@ pub async fn start<F>(broker: Option<Broker>, forget_user: F) -> bool
 where
     F: Fn(&str) + Send + Sync + 'static,
 {
+    // BEFORE THE FIRST DIAL, AND BEFORE THE `None` ARM BELOW. See [`CONSUMING`]:
+    // a gauge that appeared only on success would make a refused replica and an
+    // unscraped one the same observation. Every path out of this function has
+    // published a `0` by the time it returns, including the one that never had a
+    // broker to dial.
+    metrics::gauge!(CONSUMING).set(0.0);
+
     let Some(broker) = broker else {
         tracing::warn!(
             "NO BROKER IS CONFIGURED ({URL} is unset), so this gateway consumes no cache \
@@ -681,6 +721,13 @@ async fn run<F>(
         };
 
         let outcome = drain(&connected, &forget_user, &mut ready).await;
+        // **`drain` RETURNS ONLY WHEN THIS REPLICA HAS STOPPED CONSUMING**, by
+        // every path it has: a subscribe error, a refusal fast or late, a failed
+        // flush, or a stream that ended. One write here rather than one per arm,
+        // so an arm added later cannot leave the gauge reading `1` for a consumer
+        // that is gone. The redial that follows sets it back to `1` from `drain`
+        // when, and only when, it earns it.
+        metrics::gauge!(CONSUMING).set(0.0);
         // WHATEVER HAPPENED, `start` GETS AN ANSWER. `drain` sends its own on the
         // path that reaches a subscription; this catches the one that does not, so
         // a subscribe error is a `false` boot line rather than a boot that hangs.
@@ -811,6 +858,16 @@ where
         return Ok(());
     }
     let forbidden = forbidden_after_flush(connection).await;
+    // **BEFORE THE ANSWER, NOT AFTER IT**, and the ordering is the whole point:
+    // `start` returns the instant this channel is answered, so a caller that reads
+    // `true` must be looking at a gauge that already agrees. Written on the same
+    // condition as the answer, from the same `forbidden`, so the two cannot say
+    // different things about one subscription. The `false` case needs no write —
+    // `start` published `0` before the dial and `run` republishes it the moment
+    // this function returns.
+    if !forbidden {
+        metrics::gauge!(CONSUMING).set(1.0);
+    }
     // `start` is waiting on the FIRST pass only; every later one is a redial, and
     // is the one that has to announce itself.
     let redial = ready.is_none();
@@ -905,6 +962,15 @@ mod tests {
         // `tests/credential_invalidation.rs`.
         assert_eq!(subject::CREDENTIAL_REVOKED, "yadgar.iam.credential.revoked");
         assert_eq!(subject::TEAMS_CHANGED, "yadgar.iam.user.teams-changed");
+    }
+
+    #[test]
+    fn the_gauge_name_is_pinned_by_a_literal() {
+        // ADR-0599, and the same shape as `attest`'s pin of `CACHE`. A series
+        // name crosses a boundary this repository does not own: a rename is a
+        // query that goes blank rather than red, and asserting it THROUGH
+        // `CONSUMING` would pass for any rename at all.
+        assert_eq!(CONSUMING, "yadgar_gateway_invalidation_consuming");
     }
 
     #[test]
