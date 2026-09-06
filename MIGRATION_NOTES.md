@@ -1,5 +1,28 @@
 # Migration notes
 
+## A missing workspace header answers `400` instead of `401` (ledger 739)
+
+**Nothing to run against the cluster.** No manifest, no chart value and no
+environment variable changes; this is a status code a client sees.
+
+A `tools/call` with no `x-yadgar-project` used to answer `401 UNAUTHENTICATED`
+and now answers `400`, carrying
+`error.data = {"reason": "MISSING_WORKSPACE", "header": "x-yadgar-project"}`.
+A request with no `Authorization: Bearer <token>` is unaffected and still
+answers `401`. The reasoning is in `README.md`, beside the scope table it
+belongs to, rather than repeated here.
+
+**What to check before merging, in this order:**
+
+- **A client that retries a `401` by re-authenticating** now stops looping on
+  this condition, which is the point. A client that treated any non-`401` as
+  fatal sees a new terminal error instead of a retry — an improvement, but a
+  visible change in behaviour.
+- **A dashboard or alert counting the outcome label `UNAUTHENTICATED`** loses
+  these refusals; they are counted as `INVALID_ARGUMENT` now. If an alert
+  thresholds on credential failures, its numbers move down by however many of
+  them were never credential failures.
+
 ## The Valkey password — this image first, the cache second (ledger 518)
 
 `gateway` can now present a password to the shared cache. **Nothing to run
