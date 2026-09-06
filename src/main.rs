@@ -392,10 +392,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // would make this image unrollable before the manifest that gives the
         // cache one. It is loud because the property it names is one somebody
         // must positively choose to leave off.
+        //
+        // **WHAT THE VALKEY HOP IS AND IS NOT IS ARGUED IN ONE PLACE**, and it is
+        // `attest::Credentials`, which points on to `tests/valkey_auth.rs` for
+        // what this repository can actually measure. Restating it here is what
+        // this comment used to do and it is how it went wrong: the sentence below
+        // said "anything on the pod network", which stopped being true when
+        // `valkey-ingress` began denying by default, and no copy of the claim in
+        // this crate noticed.
         tracing::warn!(
             "the connection to the shared cache is UNAUTHENTICATED: no \
-             YADGAR_VALKEY_PASSWORD_FILE is configured, so anything on the pod network can read \
-             and rewrite D74's token buckets. Set requirepass on the cache and mount its Secret."
+             YADGAR_VALKEY_PASSWORD_FILE is configured, so anything the cache's NetworkPolicy \
+             admits can read and rewrite D74's token buckets, and that policy is then the only \
+             control the hop has. Set requirepass on the cache and mount its Secret."
         );
     }
 
