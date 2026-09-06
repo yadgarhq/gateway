@@ -361,6 +361,7 @@ impl Broker {
             return Ok(Some(Self::new(url, None)));
         }
 
+        // ADR-0523-WATCHED: Broker
         let raw = std::fs::read_to_string(&path).map_err(|e| {
             format!(
                 "{PASSWORD_FILE} names {path}, which cannot be read: {e}. It is the password \
