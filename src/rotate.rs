@@ -16,8 +16,28 @@
 //! (D71, D80), so `gateway-tls` is never read by this process. What IS read once
 //! and never again are the CA bundles `iam` and `task` are verified against, and
 //! the client certificate and key this gateway presents to both of them
-//! (ADR-0516). Those are the watch set, and there is no serving leaf beside
-//! them.
+//! (ADR-0516). There is no serving leaf beside them.
+//!
+//! **AND TWO FILES THAT ARE NOT CERTIFICATES AT ALL.** The password this gateway
+//! presents to the shared cache (D74) and the one it presents to the broker
+//! (D72) are read once at boot and then held as VALUES for the life of the
+//! process — the first baked into `crate::limit::Limiter`, the second into an
+//! `async-nats` client. ADR-0523's rule is about PROVENANCE rather than payload:
+//! a file this process read at boot is watched, whatever is in it. `iam` has
+//! watched its broker password since its own set was lifted into a function;
+//! this gateway watched neither of its own, which is the gap this module's
+//! [`watch_set`] closes.
+//!
+//! **WHAT A ROTATION OF EITHER COSTS, and it is worse than a stale certificate.**
+//! The cache password is on the hot path of every user-attributed call, and
+//! `crate::limit::Decision::Unauthenticated` deliberately does NOT take the
+//! fail-open floor an unreachable cache takes — so a rotated `requirepass`
+//! turns every such call into a refusal, and it does not recover. The broker
+//! password fails quieter and lasts longer: the broker answers
+//! `AuthorizationViolation`, `crate::invalidate::run` redials at the refused
+//! rate for ever, and NO invalidation is consumed, so a revoked credential goes
+//! on working until its cached identity ages out. Neither ends the process, and
+//! neither moves a gauge.
 //!
 //! The chart mounts those Secrets as DIRECTORIES rather than with `subPath`,
 //! deliberately, so kubelet does refresh the files inside the pod. Only the
@@ -61,14 +81,36 @@
 //!
 //! [`watch_set`] is the one expression naming this gateway's material, and
 //! `main.rs` calls it rather than repeating it. `tests/assembly.rs` calls the
-//! SAME function, so dropping an upstream from the list below turns a test red.
+//! SAME function, so dropping ANY member from the list below turns a test red.
 
 pub use yadgar_lifecycle::rotate::{
     watch, Configuration, File, Inputs, Material, Presented, Schedule, ScheduleError,
     CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
+use std::path::Path;
+
+use crate::invalidate::Broker;
 use crate::upstream::UpstreamTls;
+
+/// The password this gateway presents to the broker that carries D72's cache
+/// invalidation.
+///
+/// Not a certificate, and watched on exactly the same ground — see the module
+/// documentation for what its rotation costs. The same shape `iam` already uses
+/// for the same file.
+///
+/// **A BROKER THAT DEMANDS NO CREDENTIAL CONTRIBUTES NOTHING**, which is the
+/// deployment running today rather than an edge case: the broker ships with no
+/// authorization block at all. An empty list is the right answer for it — a path
+/// invented here would be reported unreadable for ever by
+/// [`WATCHED_FILES_UNREADABLE`] on a gateway with nothing wrong with it, and
+/// that gauge is one an operator is meant to be able to read as a fault.
+impl Material for Broker {
+    fn files(&self) -> Vec<File<'_>> {
+        self.password_file().map(File::read).into_iter().collect()
+    }
+}
 
 /// The `service` label on [`CERTIFICATE_NOT_AFTER`], and the name in the
 /// watcher's log lines.
@@ -115,9 +157,28 @@ impl Material for UpstreamTls {
 /// to both upstreams, so the same two paths arrive twice; the fold watches a
 /// path once, in the position it first appeared.
 ///
-/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE FOURTH MEMBER (step 2a).**
+/// **THE TWO PASSWORDS ARE MEMBERS THREE AND FOUR, and neither is transport.**
+/// `broker` is `crate::invalidate::Broker`, which keeps the path beside the
+/// value precisely so this set can be built from the RESOLVED credential rather
+/// than by reading the environment a second time; a second reading could name a
+/// different file from the one actually opened. `cache_password` is the plain
+/// path `main.rs` read `YADGAR_VALKEY_PASSWORD_FILE` from, taken as `&Path`
+/// exactly the way the three `*-db` services take their database password —
+/// this gateway has no resolved cache-credential type to hang a [`Material`] on,
+/// and inventing one to satisfy the shape would be a restructuring rather than
+/// a fix.
+///
+/// **BOTH ARE `Option`, AND BOTH ARE `None` IN THE DEPLOYMENT RUNNING TODAY.**
+/// The cache has no `requirepass` and the broker no authorization block, so this
+/// change adds NOTHING to the watch set of a pod as currently deployed — which
+/// is what makes it safe to roll ahead of either credential rather than in
+/// lockstep with it. It also means neither can push
+/// [`WATCHED_FILES_UNREADABLE`] off zero: an absent credential named no file,
+/// and `Option<M>: Material` folds it to nothing.
+///
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE LAST MEMBER (step 2a).**
 /// `config` is `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared`
-/// ConfigMap, and it is a [`Material`] like the other three: `Configuration`
+/// ConfigMap, and it is a [`Material`] like the other four: `Configuration`
 /// implements the trait by returning the one file it read its schedule from
 /// (`yadgar_lifecycle::rotate::Configuration::files`), so folding it in here
 /// joins the document to the ADR-0523 watch set through the exact same
@@ -133,7 +194,9 @@ impl Material for UpstreamTls {
 pub fn watch_set(
     task: Option<&UpstreamTls>,
     iam: Option<&UpstreamTls>,
+    broker: Option<&Broker>,
+    cache_password: Option<&Path>,
     config: &Configuration,
 ) -> Inputs {
-    Inputs::of(SERVICE, &[&task, &iam, config])
+    Inputs::of(SERVICE, &[&task, &iam, &broker, &cache_password, config])
 }

@@ -129,6 +129,7 @@
 //!   accepted limit rather than a guarantee this module can make.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -228,10 +229,27 @@ const PERMISSION_POLL: Duration = Duration::from_millis(5);
 /// `Debug` is written by hand rather than derived. A derived one would print the
 /// password into any log line, panic message or test failure that formatted the
 /// struct, which is how a credential ends up somewhere nobody meant to put it.
+///
+/// **THE PATH IS KEPT BESIDE THE VALUE, and it is not decoration.** ADR-0523's
+/// rule is that every file the process read at boot is watched, and the file
+/// this password came from is one — mounted as a DIRECTORY by the chart
+/// precisely so it can rotate. `crate::rotate::Inputs` is built from the
+/// configuration that was already resolved and NEVER by reading the environment
+/// a second time, because a second reading could name a different file from the
+/// one actually opened. So the resolved credential has to carry its own
+/// provenance, or the watch set cannot include it without breaking that rule.
+/// `iam::invalidate::Credentials` carries the same field for the same reason.
+///
+/// A path is not a secret — the chart puts it in `NATS_PASSWORD_FILE`, which is
+/// visible in `kubectl describe pod` — so it is printed by `Debug` while the
+/// password stays redacted. That is the same split D80 draws everywhere: the
+/// location travels, the value does not.
 #[derive(Clone)]
 pub struct BrokerCredentials {
     pub user: String,
     pub password: String,
+    /// The file the password was read from, for the rotation watch set.
+    pub password_file: PathBuf,
 }
 
 impl fmt::Debug for BrokerCredentials {
@@ -239,6 +257,7 @@ impl fmt::Debug for BrokerCredentials {
         f.debug_struct("BrokerCredentials")
             .field("user", &self.user)
             .field("password", &"<redacted>")
+            .field("password_file", &self.password_file)
             .finish()
     }
 }
@@ -253,6 +272,21 @@ pub struct Broker {
 impl Broker {
     pub fn new(url: String, credentials: Option<BrokerCredentials>) -> Self {
         Self { url, credentials }
+    }
+
+    /// The file this broker's password was read from, or `None` when this broker
+    /// asks for no credential.
+    ///
+    /// The accessor `Broker`'s `Material` implementation reads, so the watch set
+    /// is built the same way as every other member: from the resolved
+    /// configuration, through a method on it.
+    ///
+    /// **`None` IS THE ORDINARY ANSWER TODAY, and it must stay a real one.** A
+    /// broker that demands no credential named no file, and a path invented here
+    /// would sit in the watch set unreadable for ever on a deployment with
+    /// nothing wrong with it.
+    pub fn password_file(&self) -> Option<&Path> {
+        self.credentials.as_ref().map(|c| c.password_file.as_path())
     }
 
     /// The broker this process will use, or `None` if none is configured.
@@ -323,7 +357,11 @@ impl Broker {
         }
         Ok(Some(Self::new(
             url,
-            Some(BrokerCredentials { user, password }),
+            Some(BrokerCredentials {
+                user,
+                password,
+                password_file: PathBuf::from(path),
+            }),
         )))
     }
 
@@ -970,6 +1008,7 @@ mod tests {
             BrokerCredentials {
                 user: "gateway".into(),
                 password: "sentinel-of-the-nats-password".into(),
+                password_file: PathBuf::from("/var/run/secrets/nats/password"),
             }
         );
         assert!(

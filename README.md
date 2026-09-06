@@ -388,6 +388,21 @@ with nothing having warned. `yadgar_tls_certificate_not_after_seconds` carries t
 expiry of the leaf actually loaded — one series, `kind="client"`, because that is
 the only certificate this process holds.
 
+**Two of the watched files are not certificates.** The password this gateway
+presents to the shared cache (D74) and the one it presents to the broker (D72)
+are read once at boot and then held as values for the life of the process — the
+first baked into `Limiter`, the second into an `async-nats` client. ADR-0523's
+rule is about provenance rather than payload, so both are members of the set.
+Rotating either without a restart costs more than a stale bundle does: the cache
+password is on the hot path of every user-attributed call and
+`limit::Decision::Unauthenticated` deliberately does not take the fail-open floor
+an unreachable cache takes, so every such call becomes a refusal; the broker
+password fails quieter and lasts longer, because the consumer redials against
+`AuthorizationViolation` for ever and no invalidation is consumed, so a revoked
+credential keeps working until its cached identity ages out. Both are optional
+and both are absent on the deployment running today, in which case they name no
+file and the set is unchanged.
+
 **The drain is bounded now, and it had to become so in the same change.**
 `terminationGracePeriodSeconds` bounds a drain kubelet started; the watcher ends
 the serve itself, so kubelet's clock never runs — and tokio never unregisters a
@@ -402,13 +417,15 @@ measuring the server's whole life from coming back.
 copies of `shutdown`, which is the state ADR-0523 asked to be ended before it
 arrived. What is left in this repository is `rotate::watch_set` — the one
 expression naming what a `gateway` reads at boot — and the `Material`
-implementation that says which files an upstream's configuration read.
+implementations that say which files an upstream's configuration and a broker
+credential read.
 
 **That function is the point of the lift, not the de-duplication.** The set used
 to be two chained builder calls in `main.rs`, and no test here spawns the binary:
 either could be deleted and every test still passed. `main.rs` calls `watch_set`
 now and `tests/assembly.rs` calls the same function, so that edit turns a test
-red.
+red. Measured rather than asserted: each of the five members was deleted in turn
+and each deletion failed at least two cases in `tests/assembly.rs`.
 
 ## Balancing, and how an absent upstream becomes visible
 
