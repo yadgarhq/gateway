@@ -383,10 +383,29 @@ fn is_live(answer: &ResolveCredentialResponse) -> bool {
 ///   - It is ONE SHARED SECRET for every tenant rather than per-key authorisation,
 ///     so each future consumer of D21's cache becomes a full-write principal over
 ///     this keyspace and the blast radius grows with adoption.
-///   - It authenticates the hop; it does not encrypt it.
+///   - It authenticates the hop; it does not encrypt it. The `redis` client is
+///     compiled with no TLS feature at all (`Cargo.toml`), so this is a
+///     dependency change rather than a setting, and nothing on this hop is
+///     confidential or integrity-protected in transit.
+///   - The `valkey-ingress` NetworkPolicy is the hop's OTHER control and it is
+///     the ONLY other one. `docs/plans/mtls-and-networkpolicy.md` measured the
+///     estate hop by hop and rules on this one in as many words: valkey "has one
+///     control, not two… It must not be described as defence in depth." A label
+///     admits a pod, and anything that can create a pod carrying that label
+///     passes it.
 ///
 /// What it no longer does is decide the question by itself, which is why it is
 /// second here rather than first.
+///
+/// **THIS PARAGRAPH IS THE ONE STATEMENT OF THE VALKEY HOP IN THIS CRATE, and
+/// the other two places that need the fact point HERE rather than restating
+/// it** — `limit::Decision::Unauthenticated` and the boot warning in `main`.
+/// The facts were asserted in three places and named their source in one, which
+/// is the arrangement that let a reader who checked the nearest copy feel
+/// corroborated by a copy that had never been checked at all. The paragraph
+/// below is the proof that the arrangement fails in practice rather than in
+/// principle: the deciding fact changed in another repository and every copy of
+/// it here stayed exactly as it was.
 ///
 /// **AND THE ARGUMENT MAY NOT REST ON ANOTHER REPOSITORY'S MANIFEST.** This
 /// paragraph used to, naming the absence of `--requirepass` in

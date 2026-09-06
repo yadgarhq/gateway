@@ -576,6 +576,13 @@ pub enum Decision {
     /// this whole change exists to remove: a control that reads healthy while
     /// enforcing nothing.
     ///
+    /// **WHAT THE CACHE'S AUTHENTICATION IS, AND WHAT IT BUYS, IS ARGUED ONCE**
+    /// — on `crate::attest::Credentials`, which names where each fact came from
+    /// and points on to `tests/valkey_auth.rs` for the half this repository can
+    /// measure on every pull request. Nothing here restates it. This arm needs
+    /// only the narrow consequence: `requirepass` exists, so a WRONGPASS is a
+    /// state a deployment can be in, and it is permanent.
+    ///
     /// So it is loud and it is total. A 503 stops the deployment being usable,
     /// which is what makes it get fixed, and a 503 is also honest — this gateway
     /// genuinely cannot do the thing it is for.
