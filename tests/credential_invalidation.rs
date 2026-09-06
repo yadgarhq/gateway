@@ -644,6 +644,11 @@ async fn the_configured_password_is_what_actually_goes_on_the_wire() {
         Some(BrokerCredentials {
             user: NATS_USER.to_string(),
             password: NATS_PASSWORD.to_string(),
+            // The provenance the watch set is built from (ADR-0523). Nothing on
+            // this path reads it — `tests/assembly.rs` is where the file's
+            // membership of the set is asserted — but a credential cannot be
+            // constructed without saying where it came from.
+            password_file: std::path::PathBuf::from("/var/run/secrets/nats/password"),
         }),
     )
     .await;

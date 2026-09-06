@@ -36,6 +36,7 @@ use rcgen::{
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
 
+use yadgar_gateway::invalidate::Broker;
 use yadgar_gateway::rotate::{
     self, Configuration, Presented, CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
@@ -103,6 +104,19 @@ fn generation() -> Generation {
             format!("{}{}", client_leaf.pem(), ca.pem()),
         ),
         ("client-key.pem".to_string(), client_key.serialize_pem()),
+        // THE TWO PASSWORDS, which are not certificates and are watched on
+        // exactly the same ground: this process read each of them once at boot
+        // and holds the VALUE for its whole life, so a rotated file reaches it
+        // through nothing but a restart. The trailing newline is the shape
+        // `kubectl create secret --from-file` really writes.
+        (
+            "nats-password".to_string(),
+            "sentinel-of-the-broker-password\n".to_string(),
+        ),
+        (
+            "valkey-password".to_string(),
+            "sentinel-of-the-cache-password\n".to_string(),
+        ),
     ]
 }
 
@@ -207,37 +221,83 @@ fn upstream_tls(mount: &Mount, prefix: &'static str, ca: &str) -> UpstreamTls {
     .expect("the flag is set")
 }
 
+/// Where the broker is and what this gateway presents to it.
+///
+/// **Built from the configuration rather than from a path spelled out here**,
+/// for the reason [`upstream_tls`] gives: going through `Broker::from_lookup`
+/// proves that a deployment's CONFIGURATION puts the password file where the
+/// watch set then finds it. `Broker` keeps the path beside the value precisely
+/// so the set can be built from the resolved credential and never by reading
+/// the environment a second time — a second reading could name a different file
+/// from the one actually opened.
+fn broker(mount: &Mount) -> Broker {
+    let vars = [
+        ("NATS_URL".to_string(), "nats://nats:4222".to_string()),
+        ("NATS_USER".to_string(), "gateway".to_string()),
+        (
+            "NATS_PASSWORD_FILE".to_string(),
+            mount.path("nats-password").display().to_string(),
+        ),
+    ];
+    Broker::from_lookup(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+        .expect("a complete configuration")
+        .expect("the broker is configured")
+}
+
 /// EVERY FILE THE CONFIGURATION NAMED IS IN THE WATCH SET, IN ORDER, AND NOTHING
 /// ELSE.
 ///
-/// This is the assertion the whole lift was for. Delete `&task` or `&iam` from
-/// the list in `rotate::watch_set` and this case goes red; before the lift the
-/// equivalent edit in `main.rs` was a mutant nothing killed.
+/// This is the assertion the whole lift was for. Delete ANY member from the list
+/// in `rotate::watch_set` and this case goes red; before the lift the equivalent
+/// edit in `main.rs` was a mutant nothing killed.
+///
+/// **THE TWO PASSWORDS ARE MEMBERS, and they are the half this service was
+/// missing.** Neither is transport and neither is a certificate. Each is a file
+/// this process reads once at boot and then holds as a VALUE for the life of the
+/// process — the cache password baked into `Limiter`, the broker password baked
+/// into the `async-nats` client — and each is mounted as a DIRECTORY by the
+/// chart precisely so it can rotate. ADR-0523's rule is about provenance rather
+/// than payload, so both are watched exactly as the bundles are. `iam` has
+/// watched its broker password since the set was lifted; this gateway watched
+/// neither of its own.
 ///
 /// **THE ORDER IS THE FOLD'S.** `task`'s bundle, then the shared identity pair
-/// in the position it first appeared, then `iam`'s bundle, then the mounted
-/// configuration document last — which is what one client leaf presented to two
-/// upstreams, plus the shared document every service now mounts (step 2a),
+/// in the position it first appeared, then `iam`'s bundle, then the broker
+/// password, then the cache password, then the mounted configuration document
+/// last — which is what one client leaf presented to two upstreams, plus the two
+/// credentials, plus the shared document every service now mounts (step 2a),
 /// looks like once de-duplicated.
 #[test]
 fn the_watch_set_holds_every_file_this_deployment_configured() {
     let mount = Mount::new(&generation());
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
+    let broker = broker(&mount);
+    let cache_password = mount.path("valkey-password");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
     assert_eq!(
-        rotate::watch_set(Some(&task), Some(&iam), &config).watched(),
+        rotate::watch_set(
+            Some(&task),
+            Some(&iam),
+            Some(&broker),
+            Some(&cache_password),
+            &config,
+        )
+        .watched(),
         vec![
             mount.path("task-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
             mount.path("client-key.pem").as_path(),
             mount.path("iam-ca.pem").as_path(),
+            mount.path("nats-password").as_path(),
+            mount.path("valkey-password").as_path(),
             config.path(),
         ],
-        "a fully configured `gateway` reads five files at boot: a bundle per upstream, the \
-         one client identity it presents to both (ADR-0516), and the mounted configuration \
-         document every service now watches (step 2a)"
+        "a fully configured `gateway` reads seven files at boot: a bundle per upstream, the \
+         one client identity it presents to both (ADR-0516), the broker password (D72), the \
+         cache password (D74), and the mounted configuration document every service now \
+         watches (step 2a)"
     );
 }
 
@@ -256,8 +316,16 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
     let mount = Mount::new(&generation());
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
+    let broker = broker(&mount);
+    let cache_password = mount.path("valkey-password");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
-    let inputs = rotate::watch_set(Some(&task), Some(&iam), &config);
+    let inputs = rotate::watch_set(
+        Some(&task),
+        Some(&iam),
+        Some(&broker),
+        Some(&cache_password),
+        &config,
+    );
 
     assert_eq!(inputs.not_after(Presented::Client), Some(CLIENT_NOT_AFTER));
     assert_eq!(
@@ -267,28 +335,39 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
     );
 }
 
-/// EACH UPSTREAM CONTRIBUTES ON ITS OWN, AND THE SHARED LEAF IS COUNTED ONCE.
+/// EACH MEMBER CONTRIBUTES ON ITS OWN, AND THE SHARED LEAF IS COUNTED ONCE.
 ///
-/// It also pins the cleartext default: with neither upstream configured this
-/// process watches only the mounted configuration document (step 2a) — never
-/// nothing, now that every service mounts `shared.yaml` unconditionally — and
+/// It also pins the cleartext default: with nothing else configured this process
+/// watches only the mounted configuration document (step 2a) — never nothing,
+/// now that every service mounts `shared.yaml` unconditionally — and
 /// `rotate::watch` idles until an operator edits that file. `iam` differs — its
 /// enrolment CA (D73) is watched too, and its chart ships a default for it.
+///
+/// **AN ABSENT CREDENTIAL CONTRIBUTES NOTHING RATHER THAN A MISSING FILE**, and
+/// the last case below is the one that says so. Both passwords are SET in the
+/// deployment running today — the chart sets `rateLimit.passwordSecret` by
+/// default and points `nats.url` at a broker whose authorization block declares
+/// a `gateway` user — so this is the off-reference shape rather than the
+/// reference one (D80). It still has to hold: an implementation that watched a
+/// path it had not actually read would put every open-broker gateway permanently
+/// above zero on `yadgar_rotation_watched_files_unreadable`, which is a gauge an
+/// operator is meant to be able to read as a fault.
 #[test]
 fn each_configured_half_contributes_on_its_own() {
     let mount = Mount::new(&generation());
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
     assert_eq!(
-        rotate::watch_set(None, None, &config).watched(),
+        rotate::watch_set(None, None, None, None, &config).watched(),
         vec![config.path()],
-        "with both upstreams cleartext, the mounted configuration document is the only thing \
-         watched — it is unconditional, unlike the TLS material either side of it"
+        "with both upstreams cleartext and neither password configured, the mounted \
+         configuration document is the only thing watched — it is unconditional, unlike \
+         everything either side of it"
     );
 
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     assert_eq!(
-        rotate::watch_set(Some(&task), None, &config).watched(),
+        rotate::watch_set(Some(&task), None, None, None, &config).watched(),
         vec![
             mount.path("task-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
@@ -300,7 +379,7 @@ fn each_configured_half_contributes_on_its_own() {
 
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     assert_eq!(
-        rotate::watch_set(None, Some(&iam), &config).watched(),
+        rotate::watch_set(None, Some(&iam), None, None, &config).watched(),
         vec![
             mount.path("iam-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
@@ -326,10 +405,55 @@ fn each_configured_half_contributes_on_its_own() {
     .expect("a complete configuration")
     .expect("the flag is set");
     assert_eq!(
-        rotate::watch_set(Some(&server_only), None, &config).watched(),
+        rotate::watch_set(Some(&server_only), None, None, None, &config).watched(),
         vec![mount.path("task-ca.pem").as_path(), config.path()],
         "an encrypted hop with no identity watches the bundle, the mounted document, and \
          nothing else"
+    );
+
+    // THE BROKER PASSWORD ON ITS OWN. A cleartext gateway that consumes D72's
+    // invalidation still reads one file at boot, and a rotation of it is the one
+    // with no other signal at all: the broker answers `AuthorizationViolation`,
+    // `invalidate::run` redials at the refused rate for ever, and NO
+    // invalidation is consumed — so a revoked credential keeps working until its
+    // cache entry ages out, with no exit and no recovery but a restart.
+    assert_eq!(
+        rotate::watch_set(None, None, Some(&broker(&mount)), None, &config).watched(),
+        vec![mount.path("nats-password").as_path(), config.path()],
+        "the broker password is a member on its own, exactly as `iam`'s already is"
+    );
+
+    // THE CACHE PASSWORD ON ITS OWN, and its rotation is worse than the broker's
+    // because it is on the hot path: the old password stays baked into `Limiter`,
+    // and `limit::Decision::Unauthenticated` deliberately does NOT take the
+    // fail-open floor an unreachable cache takes. Every user-attributed call is
+    // refused until somebody restarts the pod.
+    assert_eq!(
+        rotate::watch_set(
+            None,
+            None,
+            None,
+            Some(&mount.path("valkey-password")),
+            &config
+        )
+        .watched(),
+        vec![mount.path("valkey-password").as_path(), config.path()],
+        "the cache password is a member on its own"
+    );
+
+    // A BROKER THAT DEMANDS NO CREDENTIAL — an off-reference deployment rather
+    // than this chart's, and the state that must contribute NOTHING. `NATS_URL`
+    // is set, the account is not, and there is no file to watch: a path invented
+    // here would be unreadable for ever on a gateway with nothing wrong with it.
+    let open_broker =
+        Broker::from_lookup(|k| (k == "NATS_URL").then(|| "nats://nats:4222".to_string()))
+            .expect("a broker that asks for no credential is a complete configuration")
+            .expect("the url is set");
+    assert_eq!(
+        rotate::watch_set(None, None, Some(&open_broker), None, &config).watched(),
+        vec![config.path()],
+        "a broker that demands no credential named no file, so there is no file to watch — \
+         and inventing one would report it unreadable for ever"
     );
 }
 
@@ -353,16 +477,31 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
+    let broker = broker(&mount);
+    let cache_password = mount.path("valkey-password");
+
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();
     metrics::with_local_recorder(&recorder, || {
-        rotate::watch_set(Some(&task), Some(&iam), &config).export_not_after()
+        rotate::watch_set(
+            Some(&task),
+            Some(&iam),
+            Some(&broker),
+            Some(&cache_password),
+            &config,
+        )
+        .export_not_after()
     });
 
     let emitted = snapshotter.snapshot().into_vec();
     // A metrics-util built against another `metrics` major links a SECOND
     // facade: everything compiles, nothing is captured, and the assertions below
     // would pass vacuously against an empty snapshot.
+    //
+    // ONE, WITH TWO PASSWORDS IN THE SET. `File::read` puts a file in the watch
+    // set and records no certificate for it, so neither credential can reach
+    // this gauge — a second series here would mean an implementation had
+    // labelled a password as something whose expiry a dashboard could plot.
     assert_eq!(
         emitted.len(),
         1,
@@ -419,8 +558,16 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
     let mount = Mount::new(&generation());
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
+    let broker = broker(&mount);
+    let cache_password = mount.path("valkey-password");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
-    let inputs = rotate::watch_set(Some(&task), Some(&iam), &config);
+    let inputs = rotate::watch_set(
+        Some(&task),
+        Some(&iam),
+        Some(&broker),
+        Some(&cache_password),
+        &config,
+    );
 
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();

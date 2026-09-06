@@ -51,6 +51,7 @@
 
 use std::future::IntoFuture;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -290,6 +291,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // password. A cache that demands one this process cannot satisfy is refused at
     // the first call instead — see `limit::Decision::Unauthenticated`, which
     // deliberately does NOT take the fail-open floor an unreachable cache takes.
+    //
+    // **THE PATH COMES OUT BESIDE THE VALUE**, and that is what puts this file in
+    // the ADR-0523 watch set below. The set is built from the configuration this
+    // process ACTUALLY RESOLVED and never by reading the environment a second
+    // time — a second reading could name a different file from the one opened
+    // here. `invalidate::Broker` carries its own path for the same reason.
     let valkey_password = match std::env::var("YADGAR_VALKEY_PASSWORD_FILE") {
         Err(_) => None,
         Ok(path) if path.is_empty() => None,
@@ -317,12 +324,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .into());
             }
-            Some(password)
+            Some((password, PathBuf::from(path)))
         }
     };
     let limiter = Limiter::new(
         &valkey_addr,
-        valkey_password.as_deref(),
+        valkey_password.as_ref().map(|(p, _)| p.as_str()),
         limits,
         limit_timeout,
         max_replicas,
@@ -384,15 +391,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fold de-duplicates, so the pair is hashed once and named once in the line
     // that reports a change.
     //
-    // THE MOUNTED DOCUMENT JOINS THE SAME SET, as a fourth `Material` — an
-    // operator editing `shared.yaml` now restarts this pod exactly as editing a
-    // CA bundle would.
+    // AND THE TWO PASSWORDS, WHICH ARE NOT TRANSPORT. The broker password and
+    // the cache password are files this process read at boot and is about to
+    // bake into an `async-nats` client and into `Limiter` for the life of the
+    // process. ADR-0523's rule is about provenance rather than payload, so both
+    // are watched exactly as the bundles are. Each is passed as the value this
+    // boot RESOLVED — `broker` carries its own path, `valkey_password` carries
+    // the one it opened — because re-reading the environment here could name a
+    // different file from the one actually read.
+    //
+    // BOTH ARE `Some` ON THE DEPLOYMENT RUNNING TODAY. The chart sets
+    // `rateLimit.passwordSecret` by default and points `nats.url` at a broker
+    // whose authorization block declares a `gateway` user, so a reference pod
+    // watches FIVE files rather than three and a rotation of either credential
+    // ends this process from the first release that carries this line. Both
+    // reads above are boot-fatal on an unreadable or empty file, so a pod that
+    // reached this point has read both. The `Option` is for the off-reference
+    // deployment running an open cache or an open broker (D80): there the
+    // credential names no file, and nothing is watched for it rather than a path
+    // that never existed.
+    //
+    // THE MOUNTED DOCUMENT JOINS THE SAME SET, last — an operator editing
+    // `shared.yaml` now restarts this pod exactly as editing a CA bundle would.
     //
     // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be two chained
     // builder calls here, where nothing could reach them: no test spawns this
     // binary, so deleting either compiled and passed everything. The list lives
     // in `rotate::watch_set` now and `tests/assembly.rs` calls it.
-    let watch_inputs = rotate::watch_set(task_tls.as_ref(), iam_tls.as_ref(), &config);
+    let watch_inputs = rotate::watch_set(
+        task_tls.as_ref(),
+        iam_tls.as_ref(),
+        broker.as_ref(),
+        valkey_password.as_ref().map(|(_, file)| file.as_path()),
+        &config,
+    );
 
     // READ FROM THE SAME DOCUMENT THE WATCH SET JUST JOINED, whether or not any
     // TLS is configured. A value the document names and this binary cannot use
