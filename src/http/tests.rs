@@ -1135,6 +1135,75 @@ async fn tools_call_under(attestation: Attestation, credential: Option<&str>) ->
     send(state_with(attestation, Vec::new()), req).await.0
 }
 
+/// The degradation counter is EMITTED, and nothing asserted that before.
+///
+/// **Both halves of this series were unproven.** `limit.rs` pins the label set
+/// and now the name; no test anywhere reached the code that emits it, so the
+/// counter could be deleted outright and every suite would stay green.
+///
+/// That matters more than an ordinary missing assertion. D74's floor is accepted
+/// on the single ground that the degradation IS NOT SILENT — and a counter nobody
+/// emits is the D76 shape that argument exists to rule out: a dead mechanism that
+/// reads healthy. An operator would see a gateway serving traffic with no
+/// rate limiting and no signal saying so.
+///
+/// **The degraded path is reached for real rather than stubbed.** The limiter in
+/// `state` points at nothing, so every `tools/call` in this file already takes
+/// it — see that function's own note.
+#[test]
+fn a_degraded_call_is_counted_rather_than_passing_silently() {
+    // A LOCAL recorder rather than a global one: this binary runs its tests in
+    // parallel and installing process-wide would race every other emitter.
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            tools_call_under(Attestation::TrustedHeaders, None).await;
+        });
+    });
+
+    let emitted = snapshotter.snapshot().into_vec();
+    // LENGTH FIRST, for the reason the origin-refusal test above gives: a second
+    // `metrics` facade in the tree makes this snapshot empty and everything
+    // built on it pass vacuously.
+    assert!(
+        !emitted.is_empty(),
+        "the recorder saw no metric at all, which is what a second metrics \
+         facade in the tree looks like"
+    );
+
+    let degraded: Vec<_> = emitted
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == crate::limit::DEGRADED)
+        .collect();
+    assert_eq!(
+        degraded.len(),
+        1,
+        "one degraded call, one series: {emitted:?}"
+    );
+
+    // The two labels that make the series answerable, read off what was emitted
+    // rather than off the call site. `unreachable` is the shared cache being
+    // absent, which is exactly this state's limiter.
+    let (key, _, _, value) = degraded[0];
+    let label = |want: &str| {
+        key.key()
+            .labels()
+            .find(|l| l.key() == want)
+            .map(|l| l.value().to_string())
+    };
+    assert_eq!(label("reason").as_deref(), Some("unreachable"));
+    assert_eq!(label("outcome").as_deref(), Some("allowed"));
+    assert!(
+        matches!(value, metrics_util::debugging::DebugValue::Counter(n) if *n >= 1),
+        "the series exists but was never incremented: {value:?}"
+    );
+}
+
 /// A self-asserted username attests on the DEVELOPMENT path and nowhere else.
 ///
 /// **The assertion that matters relates the two paths to each other**, not each to

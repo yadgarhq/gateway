@@ -1349,6 +1349,21 @@ mod tests {
     }
 
     #[test]
+    fn the_degradation_counter_is_named_the_thing_an_operator_alerts_on() {
+        // AS A LITERAL, and there was no assertion on this name at all before —
+        // not here and not on the emit path. The labels below were pinned and the
+        // series they hang on was not, so the counter could be renamed with the
+        // whole suite green.
+        //
+        // The floor D74 permits is permitted BECAUSE IT IS NOT SILENT. That
+        // argument rests entirely on this series reaching an operator, and
+        // `reason = "unauthenticated"` is the one value here that does not end by
+        // itself. A renamed series is a query that returns nothing, which reads
+        // as a gateway with no degradation rather than as a broken metric.
+        assert_eq!(DEGRADED, "yadgar_gateway_rate_limit_degraded_total");
+    }
+
+    #[test]
     fn every_degrade_reason_has_a_bounded_label() {
         // It is a metric label, so the set must be closed and must not include
         // anything derived from an error string or a user.
