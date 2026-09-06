@@ -330,11 +330,15 @@ fn is_live(answer: &ResolveCredentialResponse) -> bool {
 /// replica's own heap contains the same flood to this replica's own memory, and
 /// [`CAPACITY`] is the bound.
 ///
-/// **It decides because it survives an AUTHENTICATED cache.** This gateway holds
+/// **It decides because it survives an AUTHENTICATED cache.** Two different
+/// things in this module are called unauthenticated, and keeping them apart is
+/// the whole of the argument. One is the CALLER that mints an entry — the sense
+/// [`CAPACITY`] is bounded against, and one no deployment can change. The other
+/// is the HOP to the cache, and that one is authenticated now. This gateway holds
 /// the cache's password legitimately — `main.rs` reads it and logs whether it has
-/// one — so the flood's writes would be authenticated writes, and every one of
-/// them would still evict somebody else's key. A credential on the hop makes an
-/// eviction no less of an eviction.
+/// one — so the flood's writes would be authenticated writes made on behalf of an
+/// unauthenticated caller, and every one of them would still evict somebody
+/// else's key. A credential on the hop makes an eviction no less of an eviction.
 ///
 /// **REACHABILITY IS A SUPPORTING ARGUMENT, AND A REDUCED ONE.** An entry here
 /// maps a token hash to a `user_id` and a `team_ids` list, so anyone who can write
