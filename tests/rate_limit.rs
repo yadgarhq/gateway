@@ -583,9 +583,12 @@ async fn a_loosened_bucket_does_not_read_an_expired_key_as_full() {
 /// share, and nothing bounded it.**
 ///
 /// `header()` does `to_str().ok()` and no more, so under
-/// `Attestation::TrustedHeaders` — which the shipped chart enables — the id is
-/// whatever the caller wrote. `http.rs` already bounds `label` and `module` for
-/// exactly this reason and then the key took the raw header.
+/// `Attestation::TrustedHeaders` — off by default; the shipped chart leaves
+/// `trustUnauthenticatedHeaders` at its `values.yaml` default of `false`, so
+/// `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` is unset and
+/// `Attestation::from_lookup` resolves that to `Iam` instead — the id is
+/// whatever the caller wrote. `http.rs` already bounds `label` and `module`
+/// for exactly this reason and then the key took the raw header.
 ///
 /// **The bypass half is inside D74's accepted posture** and is asserted here
 /// rather than fixed: a caller who rotates its id gets a fresh bucket every time,
