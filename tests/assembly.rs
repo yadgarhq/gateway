@@ -344,12 +344,14 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
 /// enrolment CA (D73) is watched too, and its chart ships a default for it.
 ///
 /// **AN ABSENT CREDENTIAL CONTRIBUTES NOTHING RATHER THAN A MISSING FILE**, and
-/// the last case below is the one that says so. Both passwords are off in the
-/// deployment running today — the cache has no `requirepass` and the broker no
-/// authorization block — so an implementation that watched a path it had not
-/// actually read would put every such gateway permanently above zero on
-/// `yadgar_rotation_watched_files_unreadable`, which is a gauge an operator is
-/// meant to be able to read as a fault.
+/// the last case below is the one that says so. Both passwords are SET in the
+/// deployment running today — the chart sets `rateLimit.passwordSecret` by
+/// default and points `nats.url` at a broker whose authorization block declares
+/// a `gateway` user — so this is the off-reference shape rather than the
+/// reference one (D80). It still has to hold: an implementation that watched a
+/// path it had not actually read would put every open-broker gateway permanently
+/// above zero on `yadgar_rotation_watched_files_unreadable`, which is a gauge an
+/// operator is meant to be able to read as a fault.
 #[test]
 fn each_configured_half_contributes_on_its_own() {
     let mount = Mount::new(&generation());
@@ -439,10 +441,10 @@ fn each_configured_half_contributes_on_its_own() {
         "the cache password is a member on its own"
     );
 
-    // A BROKER THAT DEMANDS NO CREDENTIAL — the deployment running today, and
-    // the state that must contribute NOTHING. `NATS_URL` is set, the account is
-    // not, and there is no file to watch: a path invented here would be
-    // unreadable for ever on a gateway with nothing wrong with it.
+    // A BROKER THAT DEMANDS NO CREDENTIAL — an off-reference deployment rather
+    // than this chart's, and the state that must contribute NOTHING. `NATS_URL`
+    // is set, the account is not, and there is no file to watch: a path invented
+    // here would be unreadable for ever on a gateway with nothing wrong with it.
     let open_broker =
         Broker::from_lookup(|k| (k == "NATS_URL").then(|| "nats://nats:4222".to_string()))
             .expect("a broker that asks for no credential is a complete configuration")

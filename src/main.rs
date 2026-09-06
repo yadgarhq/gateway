@@ -400,10 +400,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the one it opened — because re-reading the environment here could name a
     // different file from the one actually read.
     //
-    // BOTH ARE `None` ON THE DEPLOYMENT RUNNING TODAY: the cache has no
-    // `requirepass` and the broker no authorization block. So this adds nothing
-    // to a current pod's watch set, and nothing to the unreadable-files gauge
-    // either — an absent credential named no file.
+    // BOTH ARE `Some` ON THE DEPLOYMENT RUNNING TODAY. The chart sets
+    // `rateLimit.passwordSecret` by default and points `nats.url` at a broker
+    // whose authorization block declares a `gateway` user, so a reference pod
+    // watches FIVE files rather than three and a rotation of either credential
+    // ends this process from the first release that carries this line. Both
+    // reads above are boot-fatal on an unreadable or empty file, so a pod that
+    // reached this point has read both. The `Option` is for the off-reference
+    // deployment running an open cache or an open broker (D80): there the
+    // credential names no file, and nothing is watched for it rather than a path
+    // that never existed.
     //
     // THE MOUNTED DOCUMENT JOINS THE SAME SET, last — an operator editing
     // `shared.yaml` now restarts this pod exactly as editing a CA bundle would.

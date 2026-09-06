@@ -100,10 +100,13 @@ use crate::upstream::UpstreamTls;
 /// documentation for what its rotation costs. The same shape `iam` already uses
 /// for the same file.
 ///
-/// **A BROKER THAT DEMANDS NO CREDENTIAL CONTRIBUTES NOTHING**, which is the
-/// deployment running today rather than an edge case: the broker ships with no
-/// authorization block at all. An empty list is the right answer for it — a path
-/// invented here would be reported unreadable for ever by
+/// **A BROKER THAT DEMANDS NO CREDENTIAL CONTRIBUTES NOTHING**, and that arm is
+/// for an adopter rather than for the reference deployment. This chart points at
+/// a broker whose authorization block declares a `gateway` user
+/// (`chart/values.yaml`, `nats.url`), so the reference deployment resolves a
+/// credential and this list is never empty there. An off-reference deployment
+/// may still run an open broker, and an empty list is the right answer for it —
+/// a path invented here would be reported unreadable for ever by
 /// [`WATCHED_FILES_UNREADABLE`] on a gateway with nothing wrong with it, and
 /// that gauge is one an operator is meant to be able to read as a fault.
 impl Material for Broker {
@@ -168,13 +171,17 @@ impl Material for UpstreamTls {
 /// and inventing one to satisfy the shape would be a restructuring rather than
 /// a fix.
 ///
-/// **BOTH ARE `Option`, AND BOTH ARE `None` IN THE DEPLOYMENT RUNNING TODAY.**
-/// The cache has no `requirepass` and the broker no authorization block, so this
-/// change adds NOTHING to the watch set of a pod as currently deployed — which
-/// is what makes it safe to roll ahead of either credential rather than in
-/// lockstep with it. It also means neither can push
-/// [`WATCHED_FILES_UNREADABLE`] off zero: an absent credential named no file,
-/// and `Option<M>: Material` folds it to nothing.
+/// **BOTH ARE `Option`, AND BOTH ARE `Some` IN THE DEPLOYMENT RUNNING TODAY.**
+/// The chart sets `rateLimit.passwordSecret` by default and points `nats.url` at
+/// a broker whose authorization block declares a `gateway` user, so a reference
+/// pod resolves both credentials and this set is FIVE members rather than three.
+/// Both files are read boot-fatally — an unreadable or empty one refuses the
+/// start — so a pod that is up has read both, and a rotation of either now ends
+/// it. The `Option` is for the off-reference deployment that runs an open cache
+/// or an open broker (D80): there the credential names no file, `Option<M>:
+/// Material` folds it to nothing, and it cannot push
+/// [`WATCHED_FILES_UNREADABLE`] off zero by watching a path that never
+/// existed.
 ///
 /// **THE MOUNTED CONFIGURATION DOCUMENT IS THE LAST MEMBER (step 2a).**
 /// `config` is `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared`

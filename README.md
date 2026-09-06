@@ -399,9 +399,11 @@ password is on the hot path of every user-attributed call and
 an unreachable cache takes, so every such call becomes a refusal; the broker
 password fails quieter and lasts longer, because the consumer redials against
 `AuthorizationViolation` for ever and no invalidation is consumed, so a revoked
-credential keeps working until its cached identity ages out. Both are optional
-and both are absent on the deployment running today, in which case they name no
-file and the set is unchanged.
+credential keeps working until its cached identity ages out. Both are set on the
+deployment running today, so a reference pod watches five files rather than
+three. They stay optional for the off-reference deployment that runs an open
+cache or an open broker (D80): there a credential names no file, and nothing is
+watched for it rather than a path that never existed.
 
 **The drain is bounded now, and it had to become so in the same change.**
 `terminationGracePeriodSeconds` bounds a drain kubelet started; the watcher ends
