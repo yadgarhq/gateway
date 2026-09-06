@@ -166,16 +166,81 @@ impl Drop for Mount {
     }
 }
 
-/// A name no other case in this run can collide with.
-fn unique() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
+/// One reading of the clock per PROCESS, so two runs the OS gave the same
+/// recycled pid do not name the same files. It varies per run and never
+/// within one, which is what leaves [`unique`] with exactly one varying part.
+fn run_id() -> u128 {
+    static RUN: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *RUN.get_or_init(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    })
+}
+
+/// A name no other case in this run can collide with.
+///
+/// **THE CLOCK IS NOT A UNIQUENESS SOURCE ACROSS THREADS** (ledger 629/706).
+/// Two concurrent calls used to be able to read the same nanosecond and
+/// return the same name, and whichever `Mount`'s `Drop` ran first then
+/// deleted a directory a sibling test was still reading. The counter is the
+/// ONLY part that varies within a run, which is what makes two names differ
+/// BY CONSTRUCTION rather than by chance.
+fn unique() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        run_id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     )
+}
+
+/// THE SEQUENTIAL PROPERTY, and it is a mutation guard rather than a
+/// reproduction — stated plainly because the distinction was measured
+/// (ledger 707). It PASSES against the clock-based name this change
+/// replaces: same-thread readings advance by tens of nanoseconds and never
+/// repeat, so a sequential assertion cannot see the defect.
+#[test]
+fn two_temporary_names_are_never_the_same_name() {
+    assert_ne!(unique(), unique());
+
+    let many: std::collections::HashSet<String> = (0..1000).map(|_| unique()).collect();
+    assert_eq!(many.len(), 1000, "1000 names must be 1000 distinct names");
+}
+
+/// THE CONCURRENT PROPERTY, which is the one that reproduces ledger 706.
+/// Cross-thread readings of `SystemTime::now()` repeat constantly; same-thread
+/// ones do not, which is why only a threaded assertion can see it.
+#[test]
+fn concurrent_names_are_all_distinct() {
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 2000;
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                (0..PER_THREAD).map(|_| unique()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let all: Vec<String> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let distinct: std::collections::HashSet<&String> = all.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        THREADS * PER_THREAD,
+        "{} of {} names collided across {THREADS} threads",
+        THREADS * PER_THREAD - distinct.len(),
+        THREADS * PER_THREAD
+    );
 }
 
 /// The mounted document `yadgarhq/config` renders into the `shared` ConfigMap

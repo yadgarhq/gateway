@@ -89,18 +89,98 @@ fn pki(san: &str) -> Pki {
 /// it (D80: paths and a flag, never an issuer-specific resource).
 struct TempPem(PathBuf);
 
+/// One reading of the clock per PROCESS, so two runs the OS gave the same
+/// recycled pid do not name the same files. It varies per run and never
+/// within one, which is what leaves [`unique_name`] with exactly one varying
+/// part.
+fn run_id() -> u128 {
+    static RUN: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *RUN.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    })
+}
+
+/// The name of one temporary PEM, unique within this process by CONSTRUCTION.
+///
+/// **THE CLOCK IS NOT A UNIQUENESS SOURCE ACROSS THREADS** (ledger 629/706).
+/// The name used to be `pid` plus a fresh nanosecond reading. Every test in
+/// this binary shares the pid and runs on its own thread, so two concurrent
+/// calls collided whenever both readings landed on the same nanosecond — and
+/// then one `TempPem`'s `Drop` deleted a path a sibling test was still
+/// reading. The counter is the ONLY part that varies within a run, which is
+/// what makes two names differ BY CONSTRUCTION rather than by chance.
+fn unique_name() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "yadgar-gateway-{}-{}-{}.pem",
+        std::process::id(),
+        run_id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// The SEQUENTIAL property, and it is a mutation guard rather than a
+/// reproduction — stated plainly because the distinction was measured
+/// (ledger 707). It PASSES against the clock-based name this change
+/// replaces: same-thread readings advance by tens of nanoseconds and never
+/// repeat, so a sequential assertion cannot see the defect.
+#[test]
+fn two_temporary_names_are_never_the_same_name() {
+    assert_ne!(unique_name(), unique_name());
+
+    let many: std::collections::HashSet<String> = (0..1000).map(|_| unique_name()).collect();
+    assert_eq!(many.len(), 1000, "1000 names must be 1000 distinct names");
+}
+
+/// THE CONCURRENT PROPERTY, which is the one that reproduces ledger 706.
+/// Cross-thread readings of `SystemTime::now()` repeat constantly; same-thread
+/// ones do not, which is why only a threaded assertion can see it.
+#[test]
+fn concurrent_names_are_all_distinct() {
+    const THREADS: usize = 16;
+    const PER_THREAD: usize = 2000;
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                (0..PER_THREAD).map(|_| unique_name()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+
+    let all: Vec<String> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
+    let distinct: std::collections::HashSet<&String> = all.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        THREADS * PER_THREAD,
+        "{} of {} names collided across {THREADS} threads",
+        THREADS * PER_THREAD - distinct.len(),
+        THREADS * PER_THREAD
+    );
+}
+
 impl TempPem {
     fn with(contents: &str) -> Self {
-        let name = format!(
-            "yadgar-gateway-{}-{}.pem",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(name);
-        std::fs::write(&path, contents).unwrap();
+        let path = std::env::temp_dir().join(unique_name());
+        // `create_new`, not `fs::write`. Silence is what made the old
+        // collision expensive: two tests shared a path, one deleted it, and
+        // the other failed somewhere else entirely. If a name is ever
+        // reused, this panics and names the file instead.
+        let mut file = std::fs::File::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("{} already exists or cannot be made: {e}", path.display()));
+        std::io::Write::write_all(&mut file, contents.as_bytes()).unwrap();
         Self(path)
     }
 
@@ -164,18 +244,6 @@ fn settings_with_identity(ca: &TempPem, certificate: &Path, key: &Path) -> Upstr
     })
     .expect("a flag, a bundle and a complete identity are a valid configuration")
     .expect("the flag is set, so TLS is on")
-}
-
-/// A path under the temporary directory that is guaranteed not to exist.
-fn absent(what: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "yadgar-gateway-no-such-{what}-{}-{}.pem",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
 }
 
 /// Serve gRPC over TLS on every address `SERVED_NAME` resolves to, and return
@@ -489,8 +557,10 @@ async fn a_client_identity_that_cannot_be_read_is_an_error_before_any_channel_ex
     let certificate = TempPem::with(&good.cert_pem);
     let key = TempPem::with(&good.key_pem);
 
-    // A CLIENT CERTIFICATE THAT IS NOT THERE.
-    let missing_cert = absent("client-cert");
+    // A CLIENT CERTIFICATE THAT IS NOT THERE. A fixed name, not a clock-based
+    // one: this path is never created, so it needs no uniqueness at all
+    // (ledger 706 — `absent` used to read the clock for no reason).
+    let missing_cert = std::env::temp_dir().join("yadgar-gateway-no-such-client-cert-7c2b91.pem");
     let outcome = upstream::connect_iam(
         SERVED_NAME,
         50052,
@@ -507,7 +577,7 @@ async fn a_client_identity_that_cannot_be_read_is_an_error_before_any_channel_ex
 
     // AND A PRIVATE KEY THAT IS NOT THERE. A certificate without its key proves
     // nothing, so this is an error rather than a reason to connect anonymously.
-    let missing_key = absent("client-key");
+    let missing_key = std::env::temp_dir().join("yadgar-gateway-no-such-client-key-4e19af.pem");
     let outcome = upstream::connect_iam(
         SERVED_NAME,
         50052,
