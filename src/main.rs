@@ -131,17 +131,26 @@ fn env_required_allow_empty(key: &str) -> Result<String, String> {
 /// | --- | --- | --- |
 /// | `connect_task`, `connect_iam` | `yadgar_dial::BalanceError` | TAKES IT. `Tls` renders `TLS could not be configured: transport error` and keeps `invalid dns name` a layer below tonic's own error, where nothing else can reach it. |
 /// | `UpstreamTls::from_env` (twice) | `upstream::TlsConfigError` | no. Every variant carries a `&'static str` and no `#[source]`, so `chain` is byte-identical to `to_string()` — measured, both render the same sentence. |
-/// | `Configuration::schedule` | `rotate::ScheduleError` | no. Its `#[error]` already interpolates `({source})`, so walking prints the inner text TWICE. |
+/// | `Configuration::schedule` | `rotate::ScheduleError` | no. Its `#[error]` already interpolates `({source})`, so walking prints the inner text TWICE — and there is no further layer to gain: `serde_norway` 0.9.42's `Error::source()` forwards to `ErrorImpl::source()`, which answers `Some` only for `Io`/`FromUtf8`/`Shared`, and malformed YAML yields `Message` or `Libyaml`, both `None`. `Unreadable`'s `io::Error` has no source either. Settled, not deferred. |
 /// | `TrustBoundary::parse` | `source::TrustBoundaryError` | no. Two variants, neither with a source. |
 ///
-/// **The cost this accepts, stated rather than discovered.** Six of
-/// `BalanceError`'s seven source-carrying variants also interpolate `{source}`,
-/// so on those the walk appends a duplicate tail — `... (os error 2). TLS was
-/// requested ...: No such file or directory (os error 2)`. That is noise on
-/// messages that were already complete, traded for the one message that was a
-/// dead end. The real fix is in `yadgar-dial`, whose `#[error]` strings should
-/// not inline a field they also mark `#[source]`; until then the walk is the only
-/// way that layer reaches an operator.
+/// **The cost this accepts, stated rather than discovered.** `BalanceError` has
+/// TEN variants, of which exactly SIX carry `#[source]` — and ALL SIX also
+/// interpolate `{source}` into their own `#[error]` string, `Tls` INCLUDED
+/// (`dial` v0.2.1 `src/lib.rs:1172-1264`, `Tls` at `:1259`). So the walk appends
+/// a duplicate tail on every one of them: `... (os error 2). TLS was requested
+/// ...: No such file or directory (os error 2)`.
+///
+/// `Tls` is not an exception to that and the worked example above shows it —
+/// `TLS could not be configured: transport error: transport error: invalid dns
+/// name` says `transport error` twice for exactly this reason. What makes `Tls`
+/// worth the walk anyway is not that it avoids the duplication but that a THIRD
+/// layer sits under it, and nothing else reaches that layer.
+///
+/// The duplication is noise on messages that were already complete, traded for
+/// the one message that was a dead end. The real fix is in `yadgar-dial`, whose
+/// `#[error]` strings should not inline a field they also mark `#[source]`;
+/// until then the walk is the only way that layer reaches an operator.
 fn refusal(error: &dyn std::error::Error) -> String {
     yadgar_telemetry::diagnose::chain(error)
 }
