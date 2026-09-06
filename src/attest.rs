@@ -1907,6 +1907,18 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_counter_is_named_the_thing_an_operator_queries() {
+        // AS A LITERAL, never through `CACHE`. The emitted-name assertion in the
+        // test below reads the constant on both sides, so it renames with it: the
+        // counter could be called anything at all and stay green. This name is an
+        // interface — `chart/values.yaml` points an operator at it by hand and
+        // `MIGRATION_NOTES.md` names it as the instrument for deciding whether
+        // the hop this cache removed is actually gone — and nothing outside this
+        // repository would fail if it moved.
+        assert_eq!(CACHE, "yadgar_gateway_credential_cache_total");
+    }
+
+    #[test]
     fn the_cache_counter_reports_a_miss_and_then_a_hit() {
         // [`CACHE`] is the only way an operator can tell whether the hop this
         // change removed is actually gone, and a counter emitted under one label
@@ -2014,5 +2026,14 @@ mod tests {
             err.contains(&MAX_TTL_SECONDS.to_string()),
             "the message must name the ceiling it refused against: {err}"
         );
+
+        // AND THE CEILING ITSELF, as a literal. Every assertion above reads
+        // `MAX_TTL_SECONDS`, including the one about the message, so the whole
+        // test moves with the constant: 3599 satisfies its own `expect_err` —
+        // 3600 is still above it and the message still names it — while the
+        // revocation window this bounds becomes an hour. The number is not a
+        // tuning knob: `iam` declares 300 as a live credential's own lifetime,
+        // and a cache entry may not outlive the thing it caches.
+        assert_eq!(MAX_TTL_SECONDS, 300);
     }
 }

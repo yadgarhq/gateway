@@ -432,6 +432,83 @@ mod tests {
     }
 
     #[test]
+    fn the_wire_codes_are_pinned_as_literals() {
+        // AS LITERALS. Every other assertion in this file reads `codes::*` on
+        // both sides of the comparison, so it moves with the constant: a code
+        // could be renumbered and the suite would say nothing, while a client
+        // keying on the old number and this server keying on the new one agree
+        // in no place but a green test run. These are a wire contract with
+        // software this repository does not build.
+        //
+        // `INVALID_PARAMS` is deliberately absent: `estate`'s front-end smoke
+        // test already pins it, and a second copy is a second thing to keep in
+        // step for no gain.
+        assert_eq!(codes::PARSE_ERROR, -32700);
+        assert_eq!(codes::INVALID_REQUEST, -32600);
+        assert_eq!(codes::METHOD_NOT_FOUND, -32601);
+        assert_eq!(codes::INTERNAL_ERROR, -32603);
+        assert_eq!(codes::HEADER_MISMATCH, -32020);
+        assert_eq!(codes::MISSING_REQUIRED_CLIENT_CAPABILITY, -32021);
+        assert_eq!(codes::UNSUPPORTED_PROTOCOL_VERSION, -32022);
+        assert_eq!(codes::RATE_LIMITED, -32023);
+    }
+
+    #[test]
+    fn every_code_this_module_allocates_stays_in_the_range_that_is_open() {
+        // A RULE RATHER THAN A NUMBER, and the literals above do not carry it.
+        // This module's own comment says the MCP-reserved sub-range is -32020 to
+        // -32099 and that the legacy -32000 to -32019 range is CLOSED: the spec
+        // says new codes MUST NOT be allocated there. Moving any of these four
+        // into that closed range is a spec violation that the literals catch only
+        // if somebody also changes the test, which is the same edit.
+        for (name, code) in [
+            ("HEADER_MISMATCH", codes::HEADER_MISMATCH),
+            (
+                "MISSING_REQUIRED_CLIENT_CAPABILITY",
+                codes::MISSING_REQUIRED_CLIENT_CAPABILITY,
+            ),
+            (
+                "UNSUPPORTED_PROTOCOL_VERSION",
+                codes::UNSUPPORTED_PROTOCOL_VERSION,
+            ),
+            ("RATE_LIMITED", codes::RATE_LIMITED),
+        ] {
+            assert!(
+                (-32099..=-32020).contains(&code),
+                "{name} is {code}, outside the MCP-reserved range this module \
+                 allocates in — -32000 to -32019 is closed to new codes"
+            );
+        }
+    }
+
+    #[test]
+    fn the_strings_a_client_has_to_spell_exactly_are_pinned_as_literals() {
+        // The revision is already pinned OUTSIDE this repository, by
+        // `estate/reference.toml` and the harness that reads it, so this is a
+        // second reader rather than the only one — worth having in the repository
+        // that has to change when the revision moves.
+        assert_eq!(PROTOCOL_VERSION, "2026-07-28");
+
+        // The `_meta` keys and the headers have no such reader anywhere. A
+        // near-miss on a `_meta` key parses as a field the client never sent, and
+        // a near-miss on a header name is a cross-check that silently stops
+        // cross-checking — which is the failure the mirroring exists to catch.
+        assert_eq!(
+            meta_keys::PROTOCOL_VERSION,
+            "io.modelcontextprotocol/protocolVersion"
+        );
+        assert_eq!(
+            meta_keys::CLIENT_CAPABILITIES,
+            "io.modelcontextprotocol/clientCapabilities"
+        );
+        assert_eq!(meta_keys::CLIENT_INFO, "io.modelcontextprotocol/clientInfo");
+        assert_eq!(meta_keys::SERVER_INFO, "io.modelcontextprotocol/serverInfo");
+        assert_eq!(headers::PROTOCOL_VERSION, "mcp-protocol-version");
+        assert_eq!(headers::METHOD, "mcp-method");
+        assert_eq!(headers::NAME, "mcp-name");
+    }
+
+    #[test]
     fn every_result_carries_result_type() {
         let v = result(&json!(1), serde_json::Map::new());
         assert_eq!(v["result"]["resultType"], "complete");
