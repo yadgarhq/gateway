@@ -441,8 +441,8 @@ services holding their own copy is how they come to disagree about how they find
 their peers.
 
 **BOTH upstreams go through that crate.** The `iam` hop used to build its own
-`Endpoint`, because `iam`'s Service is a ClusterIP rather than headless. That
-made no difference to the balancing — a ClusterIP resolves to one address, so
+`Endpoint`, because `iam`'s Service was a ClusterIP rather than headless at the
+time. That made no difference to the balancing — a ClusterIP resolves to one address, so
 one endpoint is all there ever was to hold, and kube-proxy picks the pod — and
 it cost a second implementation of the rule that the URI scheme and the TLS
 configuration are decided together (ADR-0514), which drifted once before a test
@@ -459,38 +459,40 @@ crate published nothing: the series existed for `task`, `task-db` and `iam-db`,
 and not for `iam` — the one hop carrying every login, enrolment and
 attestation. Routing `iam` through `yadgar_dial` is what closes that.
 
-**WHAT IT CLOSES FOR `iam` IS NARROWER THAN WHAT IT CLOSES FOR A HEADLESS
-UPSTREAM.** CoreDNS answers a ClusterIP Service's A record from
+**THIS USED TO CLOSE LESS FOR `iam` THAN FOR A HEADLESS UPSTREAM, AND LEDGER 615
+CLOSED THE GAP.** CoreDNS answers a ClusterIP Service's A record from
 `spec.clusterIP` alone; it consults that Service's EndpointSlices for nothing.
-For a headless Service it answers with the ready endpoint addresses instead,
-and NXDOMAIN when there are none. `iam` is a ClusterIP — the only one among the
-four upstreams `DialUpstreamNeverResolved` covers, `task`, `task-db` and
-`iam-db` all being headless. Scale `iam` to zero, or crash-loop every replica,
-and the Service object survives: DNS still answers its virtual IP, so the dial
-resolves and the gauge is written `0` while every login, enrolment and
-attestation fails. A gateway that RESTARTS into that outage resolves too, and
-publishes `0` as well. On a headless upstream the same outage answers NXDOMAIN,
-so a gateway that starts during it publishes `1` and the rule fires.
+For a headless Service it answers with the ready endpoint addresses instead, and
+NXDOMAIN when there are none. `iam` was a ClusterIP — the only one among the four
+upstreams `DialUpstreamNeverResolved` covers, `task`, `task-db` and `iam-db` all
+being headless. Scaling it to zero, or crash-looping every replica, left the
+Service object answering its virtual IP: the dial resolved, and the gauge was
+written `0` while every login, enrolment and attestation failed. A gateway that
+RESTARTED into that outage published `0` as well.
 
-**THE GAUGE ANSWERS A QUESTION ABOUT BOOT RATHER THAN ABOUT NOW, and that is
-what the asymmetry rests on.** It goes `1` to `0` and never back, as the
-paragraph above says: `dial` forbids a resolved upstream from returning to the
+**`iam`'s Service IS HEADLESS NOW** — `clusterIP: None` in its chart, shipped as
+ledger 615. So that outage answers NXDOMAIN, a gateway starting during it
+publishes `1`, and `DialUpstreamNeverResolved` fires for `iam` exactly as it does
+for the other three. All four upstreams the rule covers are headless, and the
+gauge means one thing on every hop. **This section previously said the alert
+could not fire for `iam` and that the fix was outstanding; both statements are
+now wrong, and an operator reading them would understate the alerting that
+exists.**
+
+**THE GAUGE STILL ANSWERS A QUESTION ABOUT BOOT RATHER THAN ABOUT NOW**, and
+that limit is real on every hop rather than special to one. It goes `1` to `0`
+and never back: `dial` forbids a resolved upstream from returning to the
 unresolved state, because a headless Service briefly answers nothing during a
-rollout and acting on that would empty the balancer. So on EVERY hop the series
-answers "did this name resolve when this process started", and the Service type
-decides what that answer is worth during an outage — on the three headless
-upstreams a restart reports the outage, and on `iam` a restart reports nothing
-wrong. One gauge, two meanings, split by Service type, and `iam` is the hop
-where it means the weaker of the two.
+rollout and acting on that would empty the balancer. So the series answers "did
+this name resolve when this process started" — a restart during an outage reports
+it, and an outage that begins after boot does not. That is a property of the
+gauge, not of the Service type, and it is the same on `task`, `task-db`,
+`iam-db` and `iam`.
 
-**That is a limit rather than a reason to deflate the change.** `iam` published
-no series at all before this, so the hop carrying every login goes from no
-signal to one that catches an `iam` Service that was never created, a mistyped
-`IAM_HOST` and a resolver that is not answering when the pod starts — the
-boot-time mistakes ADR-0532 made survivable, and therefore silent. The
-structural fix is to make `iam` headless, so the gauge means one thing on every
-hop; that is tracked as ledger 615, and it is a change to `iam`'s chart rather
-than to this repository.
+`iam` published no series at all before the hop was routed through `yadgar_dial`,
+so it goes from no signal to one that catches an `iam` Service that was never
+created, a mistyped `IAM_HOST` and a resolver that is not answering when the pod
+starts — the boot-time mistakes ADR-0532 made survivable, and therefore silent.
 
 The label is the host dialled, so it is whatever `IAM_HOST` and `TASK_HOST` are
 set to — `iam` and `task` in the reference deployment. There is no `service`

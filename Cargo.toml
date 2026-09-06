@@ -86,7 +86,7 @@ yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.1" }
 
 # The shared instrumentation seam (D67). Pinned by release tag like every other
 # in-org crate — a branch is a moving target, a published tag is not.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.1", features = [
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.5", features = [
   "grpc",
 ] }
 
