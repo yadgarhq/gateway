@@ -1043,7 +1043,11 @@ async fn tools_call(
     // lives. Where the id COMES FROM now depends on the identity source: `iam`
     // returns it under `Attestation::Iam`, and only under `TrustedHeaders` is it a
     // header the caller wrote. `user_component` is scoped to that path already and
-    // still earns its place there, because the chart still enables it.
+    // still earns its place there, because `TrustedHeaders` stays reachable via
+    // `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` even though the shipped chart
+    // leaves `trustUnauthenticatedHeaders` at its `values.yaml` default of
+    // `false`, so the var is unset and `Attestation::from_lookup` resolves
+    // that to `Iam` instead.
     let (Some(label), Some(module)) = (tools::label_for(name), tools::module_for(name)) else {
         return reply(
             200,

@@ -119,8 +119,11 @@ const KEY_TTL_SECONDS: f64 = 3600.0;
 /// The user id, as a fixed-width component of a key in a SHARED cache.
 ///
 /// **The id is caller-supplied and nothing bounded it.** `http::header` does
-/// `to_str().ok()` and no more, so under `Attestation::TrustedHeaders` — which
-/// the shipped chart enables — this string is whatever the caller wrote.
+/// `to_str().ok()` and no more, so under `Attestation::TrustedHeaders` — off
+/// by default; the shipped chart leaves `trustUnauthenticatedHeaders` at its
+/// `values.yaml` default of `false`, so `YADGAR_TRUST_UNAUTHENTICATED_HEADERS`
+/// is unset and `Attestation::from_lookup` resolves that to `Iam` instead —
+/// this string is whatever the caller wrote.
 /// Measured against the built binary: a 4000-byte id produced a 4017-byte key.
 /// `http.rs` already resolves `label` and `module` to bounded values before
 /// anything is measured, for exactly this reason, and then the key took the raw
