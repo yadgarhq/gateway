@@ -64,6 +64,24 @@ not alike:
 | `team_ids`               | `iam.ResolveCredential`                        | teams decide what a TEAM-visible record is readable by (D12), so a caller naming its own would read other people's records                                                                                                               |
 | `owner_reads_own_record` | `iam.ResolveCredential`                        | ADR-0522's inheritable setting. The gateway carries it and resolves NONE of it — the answer depends on the team of the ROW being read, so it is resolved where the reach is computed. An absent one is forwarded absent, never defaulted |
 
+**A missing `X-Yadgar-Project` is a `400`, not a `401`** (ledger 739). It shared
+the `401` with a missing credential until then, so a caller holding a perfectly
+good token was told it was unauthenticated and sent to re-authenticate against a
+condition re-authenticating cannot fix. The credential is fine; a workspace fact
+is absent, which is the caller having omitted a required field of its own
+request. `yadgar/project/v1/project.proto` states the rule on `ResolveProject` —
+_"IT IS A CALLER ERROR AND MUST NOT BE RENDERED AS `401`."_ A **missing
+credential keeps its `401`**: separating the two is the whole of the change.
+
+The JSON-RPC code stays `-32600` on both, so the answer carries the reason in
+`error.data` — `{"reason": "MISSING_WORKSPACE", "header": "x-yadgar-project"}` —
+and a client branches on that token rather than on the English. It is `400` and
+not `404` because this gateway reaches no `ProjectService` and so never meets the
+condition `404` is spoken for: `NOT_FOUND` is the registry's answer for a
+workspace that was NAMED and resolves to nothing. Naming no workspace and naming
+an unregistered one are two conditions, and one code for both is the collapse
+this change undoes.
+
 `X-Yadgar-User` is **ignored** on the `iam` path rather than refused: clients
 already in flight send it, an ignored forged header is inert, and refusing one
 would add a rollout failure that buys nothing. The function that builds a scope

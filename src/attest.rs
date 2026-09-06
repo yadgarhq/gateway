@@ -113,10 +113,38 @@ const RESOLVE_DEADLINE: Duration = Duration::from_secs(5);
 /// same discipline `http::login_answer` follows, for the same reason: a message
 /// that varied with the upstream would be a channel sitting behind a status line
 /// that was deliberately made opaque.
+///
+/// **[`MissingWorkspace`](AttestError::MissingWorkspace) IS A SEPARATE VARIANT
+/// FROM THE OTHER TWO, AND THAT SEPARATION IS THE POINT OF THE ENUM.** A missing
+/// credential and a missing workspace are not the same failure: one is about who
+/// the caller is, the other is about which workspace the caller is addressing, and
+/// only the first has anything to do with authentication. They were one variant
+/// once, and a caller holding a perfectly good token was told it was
+/// unauthenticated — sent to re-authenticate against a condition re-authenticating
+/// cannot fix. `http::attest_answer` reads this distinction rather than
+/// re-deriving it from the header name, because a match on a string literal is a
+/// distinction the type system cannot keep.
 #[derive(Debug, thiserror::Error)]
 pub enum AttestError {
     #[error("request is missing the {0} header, which identifies the caller")]
     MissingIdentity(&'static str),
+
+    /// No workspace was named. NOT an authentication failure.
+    ///
+    /// **The header, and no other source.** A workspace is not a fact about a
+    /// credential and the token cannot carry it — `from_resolved` says so at
+    /// length — so an absent `x-yadgar-project` is the caller having omitted a
+    /// required field of its own request, which is the definition of a caller
+    /// error. `yadgar/project/v1/project.proto` states the rule this variant
+    /// exists to keep: "IT IS A CALLER ERROR AND MUST NOT BE RENDERED AS `401`."
+    ///
+    /// **IT IS RAISED FROM BOTH ATTESTATION ARMS**, which is easy to miss and was
+    /// missed: `attest` refuses it inline on the trusted-headers arm, and the
+    /// DEFAULT `Iam` arm refuses it by delegating to [`from_resolved`]. A reader
+    /// who opens one arm, finds no refusal in its own body and concludes the other
+    /// is inert has read half the call.
+    #[error("request is missing the {0} header, which names the workspace to act in")]
+    MissingWorkspace(&'static str),
 
     #[error("request carries no `Authorization: Bearer <token>` header")]
     MissingCredential,
@@ -686,7 +714,7 @@ pub async fn attest(
                     .to_string(),
                 claimed
                     .project_id
-                    .ok_or(AttestError::MissingIdentity("X-Yadgar-Project"))?
+                    .ok_or(AttestError::MissingWorkspace("X-Yadgar-Project"))?
                     .to_string(),
                 claimed.instance_id.unwrap_or_default().to_string(),
                 // Team membership comes from iam. Empty means "no team
@@ -812,7 +840,7 @@ fn from_resolved(
         scope: scope(
             resolved.user_id,
             claimed_project
-                .ok_or(AttestError::MissingIdentity("X-Yadgar-Project"))?
+                .ok_or(AttestError::MissingWorkspace("X-Yadgar-Project"))?
                 .to_string(),
             claimed_instance.unwrap_or_default().to_string(),
             // FROM THE RESPONSE, and reachable no other way. Teams decide what a
@@ -1239,9 +1267,19 @@ mod tests {
     fn a_resolved_credential_without_a_project_is_refused_rather_than_defaulted() {
         // An empty project reads as "everything", not as "none": D12 scopes
         // records by it, so defaulting one is a widening nobody asked for.
+        //
+        // **THE VARIANT IS ASSERTED BECAUSE THE VARIANT IS THE DIAGNOSIS.** This
+        // refusal is reached with a credential `iam` has already RESOLVED, so
+        // reporting it as a missing identity is the false diagnosis ledger 739 is
+        // about. `MissingIdentity(_)` would still match a refusal that had gone
+        // back to blaming the credential, which is the mutation this test exists
+        // to catch.
         let err = from_resolved(resolved("u"), None, None, "REQ-2".to_string())
             .expect_err("a missing project must not become an empty one");
-        assert!(matches!(err, AttestError::MissingIdentity(_)));
+        assert!(
+            matches!(err, AttestError::MissingWorkspace(_)),
+            "a resolved credential with no workspace is not an identity problem; got {err:?}"
+        );
     }
 
     #[test]
