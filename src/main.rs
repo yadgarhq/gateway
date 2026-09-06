@@ -355,6 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => None,
         Ok(path) if path.is_empty() => None,
         Ok(path) => {
+            // ADR-0523-WATCHED: cache_password
             let raw = std::fs::read_to_string(&path).map_err(|e| {
                 format!(
                     "YADGAR_VALKEY_PASSWORD_FILE names {path}, which cannot be read: {e}. It is \
