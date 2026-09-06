@@ -319,28 +319,52 @@ fn is_live(answer: &ResolveCredentialResponse) -> bool {
 /// evict from is local. Read wider than that, D18 would also forbid
 /// `limit::Floor`, which the same paragraph exists to permit.
 ///
-/// **THE DECIDING ARGUMENT IS THAT VALKEY IS UNAUTHENTICATED.** Read out of
-/// `yadgarhq/deploy/infra/valkey/valkey.yaml`, which is the manifest that deploys
-/// it: the container's whole `args` list is `--maxmemory 512mb --maxmemory-policy
-/// allkeys-lru --save "" --appendonly no`, with **no `--requirepass`**, and
-/// `grep -rn 'requirepass\|NetworkPolicy'` over the `deploy` repository matches
-/// nothing at all. That is the declared state; no running cluster was inspected
-/// for it. Anything on the pod network can therefore write
-/// `valkey:6379`. For a rate-limit counter that costs a limit. For THIS cache the
-/// entry maps a token hash to a `user_id` and a `team_ids` list, so anyone who can
-/// write to that store can MINT AN IDENTITY — the same bypass class that was closed
-/// when the gateway stopped trusting `x-yadgar-user`, reopened through a different
-/// door. Nothing on this replica's own heap is reachable that way.
-///
-/// **The second argument is who writes the keys.** Attestation happens BEFORE
+/// **THE DECIDING ARGUMENT IS WHO WRITES THE KEYS.** Attestation happens BEFORE
 /// D74's limiter, so every entry here is minted by a request that has not proved
 /// anything yet — a caller with no valid token chooses this keyspace's cardinality.
 /// `limit.rs` already records what evicting another tenant of the shared cache
-/// costs: "evicting D46's throttle counters is itself a limit bypass". Putting an
-/// anonymously-writable keyspace in there turns a token-guessing flood into an
-/// eviction attack on four other subsystems. A bounded map on this replica's own
-/// heap contains the same flood to this replica's own memory, and [`CAPACITY`] is
-/// the bound.
+/// costs: "evicting D46's throttle counters is itself a limit bypass". Putting a
+/// keyspace an unauthenticated caller sizes into the one 512mb `allkeys-lru`
+/// instance D21 shares with D17, D29, D46 and D52 turns a token-guessing flood
+/// into an eviction attack on four other subsystems. A bounded map on this
+/// replica's own heap contains the same flood to this replica's own memory, and
+/// [`CAPACITY`] is the bound.
+///
+/// **It decides because it survives an AUTHENTICATED cache.** This gateway holds
+/// the cache's password legitimately — `main.rs` reads it and logs whether it has
+/// one — so the flood's writes would be authenticated writes, and every one of
+/// them would still evict somebody else's key. A credential on the hop makes an
+/// eviction no less of an eviction.
+///
+/// **REACHABILITY IS A SUPPORTING ARGUMENT, AND A REDUCED ONE.** An entry here
+/// maps a token hash to a `user_id` and a `team_ids` list, so anyone who can write
+/// to that store can MINT AN IDENTITY — the same bypass class that was closed when
+/// the gateway stopped trusting `x-yadgar-user`, reopened through a different
+/// door. The same write against a rate-limit counter costs only a limit, and that
+/// asymmetry is a property of what the entry MEANS rather than of any deployment.
+/// The cache's `requirepass` (ledger 518) narrows who can reach the store. Three
+/// things it cannot supply are why reachability still argues for a local map:
+///
+///   - It gates REACHABILITY, not what a writer may do once past the gate. A cache
+///     that is compromised, or whose password leaks by any route, still serves
+///     attacker-chosen values into the one branch that mints a `Scope`.
+///   - It is ONE SHARED SECRET for every tenant rather than per-key authorisation,
+///     so each future consumer of D21's cache becomes a full-write principal over
+///     this keyspace and the blast radius grows with adoption.
+///   - It authenticates the hop; it does not encrypt it.
+///
+/// What it no longer does is decide the question by itself, which is why it is
+/// second here rather than first.
+///
+/// **AND THE ARGUMENT MAY NOT REST ON ANOTHER REPOSITORY'S MANIFEST.** This
+/// paragraph used to, naming the absence of `--requirepass` in
+/// `yadgarhq/deploy/infra/valkey/valkey.yaml` as the DECIDING fact. Ledger 518
+/// then added `--requirepass` to that exact file, and the reasoning here went
+/// stale with no line of this crate changing — the D80 mistake, made about a
+/// decision rather than about a capability. Who mints the entries, and what an
+/// entry means, hold on every cluster and on every CNI. What this repository
+/// believes about the cache's authentication belongs in `tests/valkey_auth.rs`,
+/// which changes in the same commit as the code that depends on it.
 ///
 /// **What it costs, stated rather than discovered later, and sized against SIX
 /// replicas** — `autoscaling.maxReplicas` in this chart, which the reference
