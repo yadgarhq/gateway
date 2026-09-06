@@ -25,13 +25,19 @@
 //!
 //! **THIS MODULE HELD A SECOND IMPLEMENTATION UNTIL IT DID NOT NEED TO.**
 //! `connect_iam` used to build its own `Endpoint` and read its own CA bundle,
-//! on the grounds that `iam`'s Service is a ClusterIP rather than headless and
+//! on the grounds that `iam`'s Service WAS a ClusterIP rather than headless and
 //! that routing it through `yadgar_dial` would change the balancing decision
 //! D23 made. It would not: a ClusterIP resolves to ONE address, so the balancer
 //! holds one endpoint and every request rides one HTTP/2 connection through
 //! kube-proxy — which is precisely what `Endpoint::connect_lazy` did. The
 //! second implementation bought nothing and cost the thing a second
 //! implementation always costs.
+//!
+//! **`iam`'s Service IS HEADLESS NOW** — `clusterIP: None`, ledger 615 — so the
+//! premise that argument rested on is gone as well as the argument. Nothing
+//! here changes with it, which was the prediction: this module names a host and
+//! a port and hands both to `yadgar_dial`, so the Service type is not something
+//! it can observe.
 //!
 //! **THE TWO DID DRIFT, and that is why the copy is gone rather than better
 //! commented.** A count of PEM sections is not a count of trust anchors, and
@@ -351,13 +357,18 @@ pub async fn connect_task(
 /// `Endpoint` was how that was held here. `yadgar_dial::endpoint` IS that
 /// expression — it is the implementation ADR-0514's own record points at — so
 /// routing through it keeps the invariant in the one place that owns it
-/// instead of holding it in two. The second was D23: `iam`'s Service is a
+/// instead of holding it in two. The second was D23: `iam`'s Service WAS a
 /// ClusterIP rather than headless, so "routing it through `yadgar_dial` would
 /// change the balancing decision". It would not. A ClusterIP resolves to ONE
 /// address, so the balancer holds one endpoint and every request rides one
 /// HTTP/2 connection through kube-proxy — which is exactly what
-/// `Endpoint::connect_lazy` did. Nothing about D23 moves, and the Service can
-/// become headless later without a second code path appearing here.
+/// `Endpoint::connect_lazy` did. Nothing about D23 moved.
+///
+/// **AND THE SERVICE DID BECOME HEADLESS, WITH NO SECOND CODE PATH** — ledger
+/// 615 set `clusterIP: None` on `iam`'s chart. That sentence used to read "can
+/// become headless later"; it has, and the prediction it made held: this
+/// function is unchanged, because it names a host and a port and `yadgar_dial`
+/// owns everything downstream of that.
 ///
 /// **WHAT ROUTING IT HERE BUYS is the absence gauge.** `yadgar_dial` publishes
 /// `yadgar_dial_upstream_never_resolved` for every upstream it dials, and
