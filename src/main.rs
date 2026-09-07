@@ -208,7 +208,10 @@ fn bootstrap_token() -> Result<(BootstrapToken, Option<PathBuf>), String> {
     // restarts, exactly as editing a CA bundle gives them one.
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         format!(
-            "YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE names {path}, which cannot be read: {e}. Unset the              variable to run with the administrative bootstrap path disabled; a path that cannot              be read is a configuration that was attempted and failed."
+            "YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE names {path}, which cannot be read: {e}. \
+             Unset the variable to run with the administrative bootstrap path disabled; a \
+             path that cannot be read is a configuration that was ATTEMPTED and failed, \
+             which is D69's rule and the same shape YADGAR_VALKEY_PASSWORD_FILE already has."
         )
     })?;
     // BLANK IS ABSENT, and `from_secret` is what decides that — see the type.
@@ -538,11 +541,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bootstrap, bootstrap_file) = bootstrap_token()?;
     if bootstrap.is_configured() {
         tracing::info!(
-            "the administrative bootstrap path is ENABLED: a bootstrap token is configured, and              it reaches creating an administrator and promoting one and nothing else (ADR-0492)"
+            "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
+             and it reaches creating an administrator and promoting one and nothing else \
+             (ADR-0492)"
         );
     } else {
         tracing::warn!(
-            "the administrative bootstrap path is DISABLED: no bootstrap token is configured, so              every request presenting one is refused naming the missing configuration.              /auth/login, /auth/enrol, MCP and the administrator-authenticated half of /admin are              unaffected. Set YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE to the mounted              `admin-bootstrap-token` Secret to enable it."
+            "the administrative bootstrap path is DISABLED: no bootstrap token is configured, \
+             so every request presenting one is refused naming the missing configuration. \
+             /auth/login, /auth/enrol, MCP and the administrator-authenticated half of \
+             /admin are unaffected. Set YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE to the mounted \
+             `admin-bootstrap-token` Secret to enable it."
         );
     }
 
@@ -679,8 +688,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         unattributed: parse_bucket_env("YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT")?,
     };
     // THE ADMIN SURFACE'S OWN BUCKETS (§3.2), and NOT a share of login's. See
-    // `parse_bucket_env_or` for why these two have a default where login's do
-    // not, and `AppState::admin_limits` for why they are separate numbers at all.
+    // `AppState::admin_limits` for why they are separate numbers at all.
+    //
     // REQUIRED, LIKE LOGIN'S, and the chart renders both keys. **A default here
     // would have been an ADR-0569 violation the repository's own gate catches**
     // (`no-compiled-in-defaults`): "a knob reader must not accept a fallback".

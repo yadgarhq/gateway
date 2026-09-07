@@ -11,9 +11,21 @@ follows is what changes and what is deliberately still missing.
 `adminLimits.attributed` / `adminLimits.unattributed`. They are required because
 ADR-0569 forbids a compiled-in default and this repository's own
 `no-compiled-in-defaults` hook enforces it — so the chart key has to exist in the
-same change, or every gateway in the estate fails to boot. **An operator running a
-values file of their own must add the `adminLimits` block**, or `helm upgrade`
-renders an empty value and the pod refuses to start naming the variable.
+same change, or every gateway in the estate fails to boot.
+
+**An operator values file that does NOT mention `adminLimits` needs no edit**, and
+an earlier draft of this note said the opposite. Helm coalesces the chart's own
+`values.yaml` beneath every `-f` file, and `chart/values.yaml` defines both keys,
+so a user file lacking the block renders the chart defaults (`0.05:6` and `1:30`).
+Measured rather than assumed: `helm template` against a values file carrying only
+`replicaCount` and `cors.allowedOrigins` renders both variables at those values.
+
+**The one case that does break is an explicit `adminLimits: null`**, and it breaks
+in the safe direction. That is a RENDER-time failure —
+`nil pointer evaluating interface {}.attributed` — so `helm upgrade` refuses
+before anything is applied and the pods already running are untouched. It is not a
+booted pod refusing to start. An operator who deliberately nulls the block wanted
+something and should set the two values instead.
 
 **The bootstrap path ships DISABLED, and that is the design rather than a gap in
 it.** `YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE` is unset, no Secret is mounted, and
