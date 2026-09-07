@@ -23,14 +23,45 @@ pub const CREATE_TASK: &str = "create_task";
 pub const READ_TASK: &str = "read_task";
 pub const FIND_TASKS: &str = "find_tasks";
 
+/// EVERY tool this gateway serves, stated ONCE.
+///
+/// **ADR-0492: an administrative verb is never a member.** Its rule is about
+/// CALLABILITY, not advertisement — "an MCP tool is callable by the agent, and
+/// therefore callable by anything that can influence the agent's context" — and
+/// the catalogue is not what makes a verb callable. `tools_call`
+/// (`http.rs:1051`) never reads [`definitions`]; it gates on [`label_for`] and
+/// [`module_for`] and dispatches through [`call`]'s own match. Those were four
+/// independent literals, so a verb wired into three of them was fully callable,
+/// absent from `tools/list`, and green on every check that existed.
+///
+/// This array is the MEMBERSHIP AUTHORITY, not a payload source. [`module_for`],
+/// [`definitions`] and [`call`] each keep their own per-tool body — no array of
+/// names yields a module string, a JSON schema, or a dispatch — but each gates
+/// on membership here first, so a name outside this array reaches none of them.
+/// **Adding a tool anywhere is adding it HERE.**
+pub const SERVED: [&str; 3] = [CREATE_TASK, READ_TASK, FIND_TASKS];
+
+/// Whether `name` is a tool this gateway serves.
+///
+/// **THE GUARD BEING THE ONLY ROUTE INTO EACH FUNCTION BELOW IS A REVIEW
+/// OBLIGATION, NOT AN ASSERTED ONE**, and it is stated here rather than left to
+/// be discovered. `the_served_set_is_exactly_the_three_task_tools` bounds the
+/// ARRAY; nothing bounds the derivation. A `match` arm added AHEAD of one of
+/// these calls makes a verb reachable with the array untouched, and the tests
+/// catch it only if the verb happens to be one they probe by name. Read the
+/// diff.
+fn is_served(name: &str) -> bool {
+    SERVED.contains(&name)
+}
+
 /// Resolve a caller-supplied name to the bounded label, or refuse it.
+///
+/// A lookup in [`SERVED`] rather than a match of its own, because the answer IS
+/// the name — every arm this replaced read `CREATE_TASK => Some(CREATE_TASK)`.
+/// `.copied()` turns the `&&'static str` the iterator yields into the
+/// `&'static str` a metric label needs.
 pub fn label_for(name: &str) -> Option<&'static str> {
-    match name {
-        CREATE_TASK => Some(CREATE_TASK),
-        READ_TASK => Some(READ_TASK),
-        FIND_TASKS => Some(FIND_TASKS),
-        _ => None,
-    }
+    SERVED.iter().find(|&&served| served == name).copied()
 }
 
 /// Whether a tool writes. Decides `CallRecord.kind`, and a wrong answer here
@@ -51,6 +82,12 @@ pub fn is_write(name: &str) -> bool {
 /// real mapping, and a limit keyed on a hardcoded `"task"` would silently pool
 /// `memory` writes into `task`'s bucket.
 pub fn module_for(name: &str) -> Option<&'static str> {
+    // ADR-0492's membership gate, FIRST. The body below is this function's own
+    // and stays so — `"task"` is a string no array of tool names produces — but
+    // a name outside `SERVED` never reaches it.
+    if !is_served(name) {
+        return None;
+    }
     match name {
         CREATE_TASK | READ_TASK | FIND_TASKS => Some("task"),
         _ => None,
@@ -61,14 +98,28 @@ pub fn module_for(name: &str) -> Option<&'static str> {
 ///
 /// `inputSchema` is REQUIRED and must be a valid JSON Schema object — not null,
 /// not absent. Clients drive argument collection from it.
+///
+/// The NAME LIST is [`SERVED`], iterated in order; the descriptions and schemas
+/// are [`definition`]'s, per tool. So the catalogue cannot advertise a name the
+/// membership authority does not carry, and cannot silently drop one it does.
 pub fn definitions() -> Value {
-    json!([
-        {
-            "name": CREATE_TASK,
-            "title": "Create a task",
-            "description": "Create a task in the caller's project. \
-                            The id, number and version are assigned by the module.",
-            "inputSchema": {
+    Value::Array(SERVED.iter().map(|&name| definition(name)).collect())
+}
+
+/// One catalogue entry.
+///
+/// The name is stamped from the argument rather than repeated in each arm, so a
+/// member of [`SERVED`] always appears under its own name. A member with no arm
+/// here is a defect, and it surfaces as a MISSING SCHEMA rather than a missing
+/// entry — `every_tool_declares_an_object_input_schema` fails, and nothing
+/// panics in a request path.
+fn definition(name: &str) -> Value {
+    let (title, description, input_schema) = match name {
+        CREATE_TASK => (
+            "Create a task",
+            "Create a task in the caller's project. \
+             The id, number and version are assigned by the module.",
+            json!({
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short summary of the task" },
@@ -76,33 +127,39 @@ pub fn definitions() -> Value {
                     "tags": { "type": "array", "items": { "type": "string" } },
                 },
                 "required": ["title"],
-            },
-        },
-        {
-            "name": READ_TASK,
-            "title": "Read a task",
-            "description": "Read one task by its id or by its per-project number.",
-            "inputSchema": {
+            }),
+        ),
+        READ_TASK => (
+            "Read a task",
+            "Read one task by its id or by its per-project number.",
+            json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
                     "number": { "type": "integer", "description": "Per-project task number" },
                 },
-            },
-        },
-        {
-            "name": FIND_TASKS,
-            "title": "Find tasks",
-            "description": "List tasks visible to the caller, newest first.",
-            "inputSchema": {
+            }),
+        ),
+        FIND_TASKS => (
+            "Find tasks",
+            "List tasks visible to the caller, newest first.",
+            json!({
                 "type": "object",
                 "properties": {
                     "page_size": { "type": "integer", "description": "Maximum results" },
                     "page_token": { "type": "string", "description": "Continuation token" },
                 },
-            },
-        },
-    ])
+            }),
+        ),
+        // Unreachable for a member of `SERVED`, and deliberately not a panic.
+        _ => ("", "", Value::Null),
+    };
+    json!({
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": input_schema,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +219,18 @@ pub async fn call(
     name: &str,
     args: &Value,
 ) -> Result<Output, ToolError> {
+    // ADR-0492'S MEMBERSHIP GATE, AND IT IS THE FIRST STATEMENT IN THE FUNCTION
+    // deliberately. Nothing below dispatches for a name outside `SERVED`, and
+    // the `other =>` arm at the bottom would refuse it anyway — but this is
+    // where a reader is told that the array governs CALLABILITY, which is
+    // ADR-0492's actual property and the one the catalogue does not carry.
+    //
+    // Like the other two guards, its being the only route in is a review
+    // obligation. See [`is_served`].
+    if !is_served(name) {
+        return Err(ToolError::Unknown(name.to_string()));
+    }
+
     let mut client = TaskServiceClient::new(channel);
 
     match name {
@@ -299,6 +368,85 @@ impl From<Option<crate::pb::yadgar::task::v1::Task>> for TaskView {
 mod tests {
     use super::*;
 
+    /// The tool set, WRITTEN OUT HERE and never derived from the code under
+    /// test. A test that read `SERVED` to check `SERVED` would agree with any
+    /// value it was given, including one an administrative verb had been added
+    /// to — which is the whole failure ADR-0492 is defended against.
+    const EXPECTED: [&str; 3] = ["create_task", "read_task", "find_tasks"];
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn the_served_set_is_exactly_the_three_task_tools() {
+        // DIRECTION 1, AND THE GATE THE OTHER THREE REST ON. `label_for`,
+        // `module_for`, `definitions` and `call` all consult `SERVED` before
+        // they do anything else, so this is the one place a fourth tool can be
+        // introduced — and ADR-0492 rules that an administrative verb is never
+        // one of them.
+        assert_eq!(
+            sorted(&SERVED),
+            sorted(&EXPECTED),
+            "ADR-0492: the served tool set changed. An administrative verb is \
+             NEVER an MCP tool — if this is a legitimate new tool, change the \
+             literal in this test deliberately"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_advertises_exactly_the_served_set() {
+        // DIRECTION 2 — ADVERTISEMENT. `definitions()` derives its name list
+        // from `SERVED`, so this catches a catalogue that drifted from the
+        // membership authority.
+        let catalogue = definitions();
+        let advertised: Vec<&str> = catalogue
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sorted(&advertised),
+            sorted(&EXPECTED),
+            "ADR-0492: tools/list advertises a set other than the one this test \
+             pins"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_refuses_a_name_outside_the_served_set() {
+        // DIRECTION 4, AND ADR-0492'S ACTUAL PROPERTY: CALLABILITY. The
+        // catalogue governs what `tools/list` advertises and nothing else, so a
+        // verb wired into dispatch but left out of `definitions()` would be
+        // callable and invisible. This asserts the refusal instead.
+        //
+        // `connect_lazy` never dials — the refusal must come before any upstream
+        // is touched, and a test that needed a live task service could not prove
+        // that.
+        //
+        // WHAT THIS DOES NOT DISTINGUISH: whether the `SERVED` guard refused or
+        // the `other =>` arm at the bottom of the `match` did. Both satisfy
+        // "never a dispatch", so the assertion is correct either way — but it is
+        // not evidence that the guard is what fired. See the note at the guard
+        // sites.
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        // `match` rather than `expect_err`, because `Output` carries a
+        // `serde_json::Value` and is not `Debug` — and adding a derive to
+        // production code so a test can phrase itself more tidily is the wrong
+        // trade.
+        let err = match call(channel, Scope::default(), "admin_create_user", &json!({})).await {
+            Ok(_) => panic!("ADR-0492: an administrative verb must never dispatch"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, ToolError::Unknown(name) if name == "admin_create_user"),
+            "ADR-0492: expected a refusal by name, got {err:?}"
+        );
+    }
+
     #[test]
     fn every_advertised_tool_resolves_to_a_bounded_label() {
         // The list a client is told about and the set the metric layer accepts
@@ -313,6 +461,30 @@ mod tests {
     fn an_unknown_tool_gets_no_label() {
         assert!(label_for("../../etc/passwd").is_none());
         assert!(label_for("").is_none());
+
+        // DIRECTION 3. `admin_create_user` is the exact verb ADR-0492's
+        // rationale names, and `module_for` is probed beside `label_for`
+        // because `tools_call` gates on BOTH — a name that resolved on either
+        // one alone would still be refused, but the pair is what the let-else
+        // at `http.rs:1051` actually reads.
+        for name in EXPECTED {
+            assert!(
+                label_for(name).is_some(),
+                "{name} is served and must have a bounded label"
+            );
+            assert!(
+                module_for(name).is_some(),
+                "{name} is served and must have a bounded module"
+            );
+        }
+        assert!(
+            label_for("admin_create_user").is_none(),
+            "ADR-0492: an administrative verb must never resolve to a tool label"
+        );
+        assert!(
+            module_for("admin_create_user").is_none(),
+            "ADR-0492: an administrative verb must never resolve to a tool module"
+        );
     }
 
     #[test]
