@@ -30,6 +30,52 @@ use sha2::{Digest, Sha256};
 
 use crate::pb::yadgar::common::v1::UnverifiedActor;
 
+/// Every time this deployment's bootstrap token was ACCEPTED — every time a
+/// stranger holding a shared secret became, or promoted, an administrator.
+///
+/// # Why a metric exists for something a log line already says
+///
+/// ADR-0492 accepts leaving this credential live on the reasoning that a leak
+/// "is loud and lands in the audit trail". **There is no audit trail.** The
+/// audit store is a deferred future module, and the estate runs a Prometheus
+/// server and NO log shipper — no promtail, loki, fluent-bit or vector, which
+/// `deploy`'s `infra/prometheus.yaml` states in as many words. So the
+/// `tracing::warn!` beside this counter's emit site lives in a pod's stdout and
+/// **dies with the pod**: the only record of a stranger becoming an
+/// administrator does not survive the event it records.
+///
+/// This series is that record's replacement, and it is DETECTION RATHER THAN
+/// ATTRIBUTION. It cannot say WHO, because the bootstrap path carries no actor
+/// by construction (D73, and [`Authority::actor`] returns `None` for it). It
+/// says THAT, to somebody who is not tailing a pod. That is strictly less than
+/// an audit trail and strictly more than nothing, and ADR-0492's §7.3.4 gap
+/// stays open.
+///
+/// # UNLABELLED, and that is a decision rather than a default
+///
+/// D67 forbids a label a caller can influence, which rules out the token, the
+/// presented value and anything derived from either. It does not rule out
+/// `verb`, whose only two reachable values here are closed by [`Verb`] —
+/// `CreateUser` and `SetUserAdmin`, the two ADR-0492 grants. That label is
+/// omitted anyway, because **it would not change what the operator does**:
+/// either value sends them to enumerate the administrators `iam` holds and to
+/// rotate the Secret, and the split buys a dashboard nobody has. The scrape
+/// already attaches `pod` and `namespace`, which is what an operator needs to
+/// reach the log line while that pod still lives.
+///
+/// # NOT published as `0` at boot, unlike [`crate::invalidate::CONSUMING`]
+///
+/// That gauge is eagerly zeroed so that "not consuming" and "not scraped" stop
+/// being the same observation, and the argument is right — for a GAUGE, where
+/// `0` and `1` both mean something. **A counter of security events has no
+/// meaningful zero to publish.** Every replica emitting `0` at boot would make
+/// this series permanently present, and then EXISTENCE would stop being the
+/// signal and an alert would have to reason about a rate instead. Here the
+/// series is absent until the first acceptance and its appearance IS the event
+/// — argued in full at the emit site in `http.rs`, because that property is
+/// what decides the shape of `deploy`'s alerting rule.
+pub const ACCEPTED: &str = "yadgar_gateway_bootstrap_accepted_total";
+
 /// The three administrative verbs `/admin` serves.
 ///
 /// **A CLOSED ENUM RATHER THAN A STRING**, for `tools::SERVED`'s reason one
@@ -417,6 +463,22 @@ mod tests {
         let token = BootstrapToken::from_secret(&format!("{SECRET}\n"));
         assert_eq!(token.check(SECRET), Bootstrap::Accepted);
         assert_eq!(token.check(&format!("{SECRET}\n")), Bootstrap::Refused);
+    }
+
+    #[test]
+    fn the_acceptance_counter_is_named_the_thing_an_operator_alerts_on() {
+        // AS A LITERAL, never through `ACCEPTED`. An assertion that read the
+        // constant on both sides renames with it, so the series could be called
+        // anything at all and stay green.
+        //
+        // This name is an INTERFACE and it is one whose only consumer is in
+        // ANOTHER REPOSITORY: `deploy`'s `infra/prometheus.yaml` hard-codes it in
+        // the `BootstrapTokenAccepted` rule, and nothing in that repository is
+        // built or tested by this one. A rename here is a rule that matches
+        // nothing there, which reads as a deployment where the bootstrap token
+        // has never been accepted rather than as a broken metric — the precise
+        // false negative this counter exists to remove.
+        assert_eq!(ACCEPTED, "yadgar_gateway_bootstrap_accepted_total");
     }
 
     /// ADR-0492's grant, and every excluded cell around it.
