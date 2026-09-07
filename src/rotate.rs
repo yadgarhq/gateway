@@ -183,6 +183,18 @@ impl Material for UpstreamTls {
 /// [`WATCHED_FILES_UNREADABLE`] off zero by watching a path that never
 /// existed.
 ///
+/// **D73'S BOOTSTRAP TOKEN IS MEMBER FIVE, AND IT IS ABSENT ON THE DEPLOYMENT
+/// RUNNING TODAY.** The chart mounts no `admin-bootstrap-token` Secret yet
+/// (ledger 638's step 7), so this arm folds to nothing and the reference pod
+/// watches what it always did. What it buys on the day the mount lands: the token
+/// is held as a DIGEST for the life of the process, so a Secret rotated
+/// underneath a running pod would otherwise leave the gateway comparing against
+/// the value it booted with — the `present-and-wrong` shape ADR-0596 names, and
+/// one no existence check discriminates. `Option<&Path>` rather than a resolved
+/// type for `cache_password`'s reason: there is no credential object here to hang
+/// a [`Material`] on, and inventing one to satisfy the shape would be a
+/// restructuring rather than a fix.
+///
 /// **THE MOUNTED CONFIGURATION DOCUMENT IS THE LAST MEMBER (step 2a).**
 /// `config` is `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared`
 /// ConfigMap, and it is a [`Material`] like the other four: `Configuration`
@@ -203,7 +215,18 @@ pub fn watch_set(
     iam: Option<&UpstreamTls>,
     broker: Option<&Broker>,
     cache_password: Option<&Path>,
+    bootstrap_token: Option<&Path>,
     config: &Configuration,
 ) -> Inputs {
-    Inputs::of(SERVICE, &[&task, &iam, &broker, &cache_password, config])
+    Inputs::of(
+        SERVICE,
+        &[
+            &task,
+            &iam,
+            &broker,
+            &cache_password,
+            &bootstrap_token,
+            config,
+        ],
+    )
 }

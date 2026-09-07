@@ -46,6 +46,10 @@ const PROXY: &str = "10.244.3.11:41000";
 /// What a single trusted proxy appends. RFC 5737 documentation space, so it
 /// cannot have come from the implementation.
 const REAL_CLIENT: &str = "198.51.100.9";
+
+/// The bootstrap token this file's gateway holds. A literal, so nothing here
+/// depends on how a deployment mints one.
+const BOOTSTRAP: &str = "a-bootstrap-token-for-this-file";
 const OTHER_CLIENT: &str = "198.51.100.42";
 
 /// A bucket holding exactly one token, refilling slowly enough that a test never
@@ -57,7 +61,30 @@ fn one_token() -> Bucket {
     }
 }
 
+/// The two unauthenticated endpoints' buckets, wide enough not to interfere.
+fn wide() -> CredentialLimits {
+    CredentialLimits {
+        attributed: Bucket {
+            rate: 600.0,
+            burst: 600.0,
+        },
+        unattributed: Bucket {
+            rate: 600.0,
+            burst: 600.0,
+        },
+    }
+}
+
+/// A state whose ADMIN buckets are wide, for every test that is not about them.
 fn state(trust: TrustBoundary, credential_limits: CredentialLimits) -> Arc<AppState> {
+    state_with_admin(trust, credential_limits, wide())
+}
+
+fn state_with_admin(
+    trust: TrustBoundary,
+    credential_limits: CredentialLimits,
+    admin_limits: CredentialLimits,
+) -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::Iam,
         task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
@@ -84,6 +111,12 @@ fn state(trust: TrustBoundary, credential_limits: CredentialLimits) -> Arc<AppSt
         allowed_origins: Vec::new(),
         trust,
         credential_limits,
+        admin_limits,
+        // CONFIGURED, so the bootstrap tests below reach the THROTTLE rather than
+        // stopping at the disabled-path refusal. `guard` runs before any
+        // authority is judged, so a throttled request is a 429 either way — but a
+        // test that could not tell the two apart would be measuring nothing.
+        bootstrap: yadgar_gateway::admin::BootstrapToken::from_secret(BOOTSTRAP),
     })
 }
 
@@ -376,5 +409,232 @@ async fn a_client_that_sends_no_origin_is_unaffected() {
         login(state, Some(&format!("203.0.113.1, {REAL_CLIENT}"))).await,
         StatusCode::SERVICE_UNAVAILABLE,
         "no Origin means a non-browser client, which reaches iam as it always did"
+    );
+}
+
+// ---- The administrative surface (ADR-0492, D73, ledger 638) -----------------
+//
+// §3.2: an `/admin` handler inherits NOTHING. The body limit is the gateway's
+// one shared layer and everything else — the `Origin` check, the throttle — is
+// an explicit call inside a handler. These two files' worth of shapes are copied
+// onto the admin paths because the estate has already shipped the omission once,
+// on `/auth/*`, and `guard`'s own comment records it.
+
+/// One POST to an `/admin` path from [`PROXY`], carrying `forwarded` if given.
+async fn admin(
+    state: Arc<AppState>,
+    path: &str,
+    body: &str,
+    origin: Option<&str>,
+    forwarded: Option<&str>,
+) -> StatusCode {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("x-yadgar-bootstrap-token", BOOTSTRAP);
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    if let Some(forwarded) = forwarded {
+        request = request.header("x-forwarded-for", forwarded);
+    }
+    let mut request = request
+        .body(Body::from(body.to_string()))
+        .expect("the request builds");
+    request.extensions_mut().insert(ConnectInfo(
+        PROXY
+            .parse::<SocketAddr>()
+            .expect("the peer address parses"),
+    ));
+    router(state)
+        .oneshot(request)
+        .await
+        .expect("the router answers")
+        .status()
+}
+
+/// A body the bootstrap token is granted: create an ADMINISTRATOR.
+const CREATE_ADMIN: &str = r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#;
+
+#[tokio::test]
+async fn the_admin_surface_is_bounded_by_its_own_bucket_and_not_login_s() {
+    // §3.2: "Sharing them would make an administrator's ordinary work consume a
+    // bucket sized for password attempts, and would make a bootstrap-token brute
+    // force spend a bucket an operator reads as 'login pressure'."
+    //
+    // Both directions are asserted, because either alone passes against a shared
+    // bucket in one of the two orders.
+    let state = state_with_admin(
+        TrustBoundary::Hops(1),
+        CredentialLimits {
+            attributed: one_token(),
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
+        CredentialLimits {
+            attributed: one_token(),
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
+    );
+    let forwarded = format!("203.0.113.1, {REAL_CLIENT}");
+
+    // Empty LOGIN's bucket.
+    assert_eq!(
+        login(Arc::clone(&state), Some(&forwarded)).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        login(Arc::clone(&state), Some(&forwarded)).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "login's bucket is now empty"
+    );
+
+    // The admin path still has its own token.
+    let first = admin(
+        Arc::clone(&state),
+        "/admin/create-user",
+        CREATE_ADMIN,
+        None,
+        Some(&forwarded),
+    )
+    .await;
+    assert_ne!(
+        first,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the admin surface has its own bucket; login's empty one must not refuse it"
+    );
+
+    // AND IT IS BOUNDED. Without this the test passes against an admin path with
+    // no throttle at all, which is exactly the omission §3.2 exists to prevent.
+    let second = admin(
+        Arc::clone(&state),
+        "/admin/create-user",
+        CREATE_ADMIN,
+        None,
+        Some(&forwarded),
+    )
+    .await;
+    assert_eq!(
+        second,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the admin surface must call guard(): an unthrottled one is a bootstrap-token brute force \
+         with no bound at all"
+    );
+}
+
+#[tokio::test]
+async fn each_admin_verb_has_its_own_throttle_key() {
+    // §3.2 again, one level down: `guard` passes `endpoint` into the bucket key,
+    // so three labels are three buckets. A shared key would let an administrator
+    // creating users be refused an enrolment they have spent nothing on.
+    let state = state_with_admin(
+        TrustBoundary::Hops(1),
+        wide(),
+        CredentialLimits {
+            attributed: one_token(),
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
+    );
+    let forwarded = format!("203.0.113.1, {REAL_CLIENT}");
+
+    assert_ne!(
+        admin(
+            Arc::clone(&state),
+            "/admin/create-user",
+            CREATE_ADMIN,
+            None,
+            Some(&forwarded)
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        admin(
+            Arc::clone(&state),
+            "/admin/create-user",
+            CREATE_ADMIN,
+            None,
+            Some(&forwarded)
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "create-user's own bucket is now empty"
+    );
+    assert_ne!(
+        admin(
+            Arc::clone(&state),
+            "/admin/set-user-admin",
+            r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
+            None,
+            Some(&forwarded)
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a second admin verb has its own key; emptying one must not refuse the other"
+    );
+}
+
+#[tokio::test]
+async fn a_cross_origin_browser_request_is_refused_on_every_admin_path() {
+    // §3.2: "An `/admin` route that does not call `guard()` reproduces that bug
+    // on the one surface where the prize is an admin account. The admin path is
+    // more attractive to a cross-origin POST than login is, not less: a
+    // browser-driven request to `/admin/users` carrying a stolen or guessed
+    // bootstrap token creates an administrator, and the attacker never needs to
+    // read the response to benefit."
+    //
+    // ALL THREE PATHS, because the check is a per-handler call and the compiler
+    // cannot notice one is missing.
+    let state = state_with_admin(TrustBoundary::Hops(1), wide(), wide());
+    let forwarded = format!("203.0.113.1, {REAL_CLIENT}");
+
+    for (path, body) in [
+        ("/admin/create-user", CREATE_ADMIN),
+        ("/admin/issue-enrolment", r#"{"user_id":"yadgar:user:x"}"#),
+        (
+            "/admin/set-user-admin",
+            r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
+        ),
+    ] {
+        assert_eq!(
+            admin(
+                Arc::clone(&state),
+                path,
+                body,
+                Some("https://attacker.example"),
+                Some(&forwarded)
+            )
+            .await,
+            StatusCode::FORBIDDEN,
+            "{path} must refuse an unknown browser origin before it reaches iam"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_admin_client_that_sends_no_origin_is_unaffected() {
+    // The cost of the check above, stated directly rather than left implicit in
+    // the tests that send no Origin.
+    let state = state_with_admin(TrustBoundary::Hops(1), wide(), wide());
+    assert_ne!(
+        admin(
+            state,
+            "/admin/create-user",
+            CREATE_ADMIN,
+            None,
+            Some(&format!("203.0.113.1, {REAL_CLIENT}"))
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "no Origin means a non-browser client, which must reach iam"
     );
 }

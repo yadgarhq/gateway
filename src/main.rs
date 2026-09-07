@@ -57,6 +57,7 @@ use std::time::Duration;
 
 use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 
+use yadgar_gateway::admin::BootstrapToken;
 use yadgar_gateway::attest::{Attestation, Credentials};
 use yadgar_gateway::http::{router, AppState, CredentialLimits};
 use yadgar_gateway::limit::{Bucket, Limiter, Limits};
@@ -169,6 +170,57 @@ fn refusal(error: &dyn std::error::Error) -> String {
 /// the name `env_or`.
 fn parse_bucket_env(key: &str) -> Result<Bucket, String> {
     Bucket::parse(&env_required(key)?).map_err(|e| format!("{key} is not usable: {e}"))
+}
+
+/// D73's bootstrap token, from the file the Secret is mounted at.
+///
+/// **ABSENT IS A STATE THE DESIGN NEEDS, which is ADR-0569's own revisit
+/// trigger** — "a knob whose absence leaves the system correct". An absent
+/// variable, an absent file and a blank one all mean the same thing here: the
+/// bootstrap path is DISABLED, everything else serves, and every request on that
+/// path is refused with a status naming the missing configuration. §7.2 states
+/// the rule and `deploy`'s `infra/bootstrap/admin-bootstrap-token.yaml` states
+/// it again as the consumer contract this must honour.
+///
+/// **AN UNREADABLE FILE IS NOT A MISSING ONE and still fails the boot.** The
+/// variable naming a path that cannot be read is a deployment that TRIED to
+/// configure this and got it wrong, which is `YADGAR_VALKEY_PASSWORD_FILE`'s
+/// existing shape and D69's rule: a capability that cannot be configured
+/// correctly fails startup rather than serving without it. Absence is a posture;
+/// a broken path is a mistake.
+fn bootstrap_token() -> Result<(BootstrapToken, Option<PathBuf>), String> {
+    // ADR-0569-EXCEPTION
+    let Ok(path) = std::env::var("YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE") else {
+        return Ok((BootstrapToken::disabled(), None));
+    };
+    if path.trim().is_empty() {
+        return Ok((BootstrapToken::disabled(), None));
+    }
+    // ADR-0523-WATCHED: bootstrap_token
+    //
+    // **A ROTATION MUST TAKE EFFECT, and exit-on-change is how it does.** The
+    // token is held as a DIGEST for the life of the process, exactly as the cache
+    // password is held as a value, so a Secret updated underneath a running pod
+    // would leave this gateway comparing against the old one. The Secret's own
+    // manifest warns that a cluster rebuild mints a DIFFERENT token while the
+    // operator still holds the old value — "present-and-wrong, which no existence
+    // check can discriminate" — so an operator who rotates it must get a pod that
+    // restarts, exactly as editing a CA bundle gives them one.
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE names {path}, which cannot be read: {e}. \
+             Unset the variable to run with the administrative bootstrap path disabled; a \
+             path that cannot be read is a configuration that was ATTEMPTED and failed, \
+             which is D69's rule and the same shape YADGAR_VALKEY_PASSWORD_FILE already has."
+        )
+    })?;
+    // BLANK IS ABSENT, and `from_secret` is what decides that — see the type.
+    //
+    // **THE PATH COMES OUT BESIDE THE VALUE**, for `valkey_password`'s stated
+    // reason: the watch set is built from what this process ACTUALLY READ and
+    // never by reading the environment a second time, because a second reading
+    // could name a different file from the one opened here.
+    Ok((BootstrapToken::from_secret(&raw), Some(PathBuf::from(path))))
 }
 
 /// **AN ARGUED EXCEPTION TO ADR-0569, and the only one in this binary.**
@@ -482,11 +534,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // builder calls here, where nothing could reach them: no test spawns this
     // binary, so deleting either compiled and passed everything. The list lives
     // in `rotate::watch_set` now and `tests/assembly.rs` calls it.
+    // READ HERE, BEFORE THE WATCH SET, because that set is hashed as it is built
+    // and every entry has to be a file this process ACTUALLY LOADED. Reading it
+    // beside `admin_limits` further down would put the rest of boot inside a
+    // window where a kubelet swap quietly becomes the baseline.
+    let (bootstrap, bootstrap_file) = bootstrap_token()?;
+    if bootstrap.is_configured() {
+        tracing::info!(
+            "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
+             and it reaches creating an administrator and promoting one and nothing else \
+             (ADR-0492)"
+        );
+    } else {
+        tracing::warn!(
+            "the administrative bootstrap path is DISABLED: no bootstrap token is configured, \
+             so every request presenting one is refused naming the missing configuration. \
+             /auth/login, /auth/enrol, MCP and the administrator-authenticated half of \
+             /admin are unaffected. Set YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE to the mounted \
+             `admin-bootstrap-token` Secret to enable it."
+        );
+    }
+
     let watch_inputs = rotate::watch_set(
         task_tls.as_ref(),
         iam_tls.as_ref(),
         broker.as_ref(),
         valkey_password.as_ref().map(|(_, file)| file.as_path()),
+        bootstrap_file.as_deref(),
         &config,
     );
 
@@ -613,6 +687,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         attributed: parse_bucket_env("YADGAR_LOGIN_RATE_LIMIT")?,
         unattributed: parse_bucket_env("YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT")?,
     };
+    // THE ADMIN SURFACE'S OWN BUCKETS (§3.2), and NOT a share of login's. See
+    // `AppState::admin_limits` for why they are separate numbers at all.
+    //
+    // REQUIRED, LIKE LOGIN'S, and the chart renders both keys. **A default here
+    // would have been an ADR-0569 violation the repository's own gate catches**
+    // (`no-compiled-in-defaults`): "a knob reader must not accept a fallback".
+    // The plan puts the chart keys in step 7; they are here instead, because a
+    // required variable no chart renders is a boot failure on every gateway in
+    // the estate, and ADR-0569's rule is that a knob is read from ONE source —
+    // which obliges the source to exist. See the PR body.
+    let admin_limits = CredentialLimits {
+        attributed: parse_bucket_env("YADGAR_ADMIN_RATE_LIMIT")?,
+        unattributed: parse_bucket_env("YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT")?,
+    };
     match trust {
         TrustBoundary::Undeclared => tracing::warn!(
             "NO TRUST BOUNDARY IS DECLARED: YADGAR_TRUSTED_PROXY_HOPS is unset, so this \
@@ -641,6 +729,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         allowed_origins,
         trust,
         credential_limits,
+        admin_limits,
+        bootstrap,
     });
 
     // D72's invalidation, BEFORE the listener binds. The first dial is awaited so

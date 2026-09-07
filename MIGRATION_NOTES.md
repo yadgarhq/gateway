@@ -1,5 +1,68 @@
 # Migration notes
 
+## The administrative surface — three routes, two new required knobs, one Secret still unmounted (ADR-0492, ledger 638)
+
+**Nothing to run against the cluster from here.** The chart renders the two new
+required variables itself, so an ordinary upgrade needs no operator action. What
+follows is what changes and what is deliberately still missing.
+
+**The two new REQUIRED variables ship with their chart keys, in this repository.**
+`YADGAR_ADMIN_RATE_LIMIT` and `YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT` come from
+`adminLimits.attributed` / `adminLimits.unattributed`. They are required because
+ADR-0569 forbids a compiled-in default and this repository's own
+`no-compiled-in-defaults` hook enforces it — so the chart key has to exist in the
+same change, or every gateway in the estate fails to boot.
+
+**An operator values file that does NOT mention `adminLimits` needs no edit**, and
+an earlier draft of this note said the opposite. Helm coalesces the chart's own
+`values.yaml` beneath every `-f` file, and `chart/values.yaml` defines both keys,
+so a user file lacking the block renders the chart defaults (`0.05:6` and `1:30`).
+Measured rather than assumed: `helm template` against a values file carrying only
+`replicaCount` and `cors.allowedOrigins` renders both variables at those values.
+
+**The one case that does break is an explicit `adminLimits: null`**, and it breaks
+in the safe direction. That is a RENDER-time failure —
+`nil pointer evaluating interface {}.attributed` — so `helm upgrade` refuses
+before anything is applied and the pods already running are untouched. It is not a
+booted pod refusing to start. An operator who deliberately nulls the block wanted
+something and should set the two values instead.
+
+**The bootstrap path ships DISABLED, and that is the design rather than a gap in
+it.** `YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE` is unset, no Secret is mounted, and
+every request presenting `X-Yadgar-Bootstrap-Token` is answered
+`503 {"error":"the bootstrap token is not configured"}`. MCP, `/auth/login`,
+`/auth/enrol` and the administrator-authenticated half of `/admin` are unaffected.
+`yadgarhq/deploy` already creates the `admin-bootstrap-token` Secret
+(namespace `yadgar`, key `token`); mounting it into this deployment and pointing
+the variable at it is the plan's step 7 and is NOT in this change.
+
+**Until that mount lands there is no way to create the first administrator through
+this surface**, because `is_admin` defaults to 0 for every user that exists
+(`iam-db` migration 8). The in-cluster ceremony in `estate/MIGRATION_NOTES.md`
+remains the only route to one, exactly as before this change.
+
+**Retrieving the token when the mount does land** — the command
+`yadgarhq/deploy`'s manifest documents, reproduced so it is findable from the
+consumer side:
+
+```
+kubectl -n yadgar get secret admin-bootstrap-token -o jsonpath='{.data.token}' | base64 -d; echo
+```
+
+A cluster rebuild mints a DIFFERENT token while the old one still looks valid in
+an operator's notes — the Secret is never absent, only present-and-wrong — so
+retrieve it again after every recreate.
+
+**The token file is WATCHED (ADR-0523).** It is held as a digest for the life of
+the process, so a rotated Secret would otherwise leave this gateway comparing
+against the value it booted with. Rotating it ends the pod, exactly as editing a
+CA bundle does.
+
+**No audit record.** None of the three verbs emits one; there is no audit store on
+this boundary. A `warn` line marks every accepted bootstrap token and that is the
+whole of the observability. Do not read ADR-0492's "a leak is loud and lands in
+the audit trail" as met.
+
 ## A missing workspace header answers `400` instead of `401` (ledger 739)
 
 **Nothing to run against the cluster.** No manifest, no chart value and no

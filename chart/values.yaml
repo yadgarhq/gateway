@@ -653,6 +653,43 @@ credentialLimits:
 # `terminationGracePeriodSeconds` below, never added to it. `0` renders no
 # `lifecycle` block at all. The reasoning, and why an `exec` of /bin/sleep is
 # not an option on a distroless image, is in `templates/deployment.yaml`.
+
+# WHAT BOUNDS THE THREE ADMINISTRATIVE ENDPOINTS (ADR-0492, D73, ledger 638).
+#
+# /admin/create-user, /admin/issue-enrolment and /admin/set-user-admin are
+# reached by an attested administrator OR by D73's bootstrap token, and they pass
+# the same guard /auth/login and /auth/enrol do — the Origin check and a
+# source-address bucket.
+#
+# A THIRD AND FOURTH BUCKET RATHER THAN A SHARE OF credentialLimits ABOVE, and
+# the reason is that they are two different controls wearing one mechanism.
+# Sharing login's numbers would make an administrator's ordinary work consume a
+# budget sized for password attempts, and would make a bootstrap-token brute
+# force spend a bucket an operator watching a dashboard reads as login pressure.
+#
+# EACH VERB KEYS ITS OWN BUCKET within these numbers: the key is
+# (source address, endpoint), and the three endpoints are three labels — so
+# emptying one verb's budget does not refuse another.
+#
+# `<rate>:<burst>`, the same spelling rateLimit and credentialLimits use.
+adminLimits:
+  # PER CLIENT, and only reachable once sourceAddress.trustedProxyHops is set.
+  # SIZED FOR A PERSON DOING ADMINISTRATIVE WORK, not for a script: six at once —
+  # enough to create a user, enrol them and promote them without waiting — and
+  # then one every twenty seconds. Deliberately TIGHTER than
+  # credentialLimits.attributed, because administrative work is rare and the
+  # traffic this bucket exists to bound is a search for a 264-bit shared secret.
+  attributed: "0.05:6"
+  # PER OBSERVED HOP, which is what applies while no trust boundary is declared.
+  # Behind an ingress that is ONE address for every caller in the installation.
+  #
+  # LOOSER, AND IT IS THE OTHER CONTROL RATHER THAN A WEAKER ONE — the same
+  # argument credentialLimits.unattributed makes. A guess-prevention rate on a
+  # shared key would let one attacker refuse every administrative action for
+  # everybody, which is a limiter that is itself the outage. Guess prevention
+  # arrives when the operator declares the boundary.
+  unattributed: "1:30"
+
 preStopSleepSeconds: 5
 
 # THE WHOLE BUDGET FOR A POD'S DEATH: the sleep above, then SIGTERM, then the

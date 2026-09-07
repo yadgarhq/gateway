@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod attest;
 pub mod http;
 pub mod invalidate;

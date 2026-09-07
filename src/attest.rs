@@ -263,6 +263,22 @@ pub struct Attested {
     /// carry a limit. A caller who could name its own limits would raise them,
     /// which is the same reason `team_ids` is never taken from the caller.
     pub limits: Overrides,
+    /// D73's administrative flag, from `ResolveCredentialResponse.is_admin`.
+    ///
+    /// **AUTHORITY, AND THEREFORE NOT ON [`Scope`].** `Scope` is a proto message
+    /// this gateway MINTS and forwards to every module (ADR-0511), and what a
+    /// caller may do administratively is no part of what a module needs to serve
+    /// a task. It is read by `/admin`'s handlers and by nothing else, so it lives
+    /// on the type the gateway keeps rather than on the one it sends.
+    ///
+    /// **FALSE ON THE TRUSTED-HEADER PATH, on `limits`' and `team_ids`' own
+    /// argument.** Nothing was resolved there and no header could carry authority
+    /// — a caller able to write `X-Yadgar-Admin: true` would write it. So a
+    /// development gateway has no administrator reachable through a credential,
+    /// and the bootstrap token is the only administrative authority on it. That is
+    /// the case ADR-0492 minted the bootstrap token for, so it is a gap the design
+    /// already fills rather than one this default opens.
+    pub is_admin: bool,
 }
 
 /// The environment variable holding the cached lifetime of one resolution.
@@ -726,6 +742,11 @@ pub async fn attest(
     match how {
         Attestation::TrustedHeaders => Ok(Attested {
             limits: Overrides::default(),
+            // FALSE, and the field's own comment carries the argument: no
+            // credential was resolved here, so there is nothing that could have
+            // said otherwise, and a header saying so would be a caller naming its
+            // own authority.
+            is_admin: false,
             scope: scope(
                 claimed
                     .user_id
@@ -856,6 +877,12 @@ fn from_resolved(
     }
     Ok(Attested {
         limits: overrides_from(resolved.rate_limit_overrides)?,
+        // D73'S FLAG, ARRIVING AT LAST. It has been on the wire since
+        // `ResolveCredentialResponse` grew it and was discarded here, so the
+        // gateway held an identity that could not say whether it was an
+        // administrator. `false` is the safe default and `iam` populates the
+        // field with the same comment on its own side.
+        is_admin: resolved.is_admin,
         scope: scope(
             resolved.user_id,
             claimed_project

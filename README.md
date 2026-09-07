@@ -35,14 +35,14 @@ cutoff.
 
 Consequences here:
 
-|                   |                                                                                                                                                              |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                                      |
-| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login` and `POST /auth/enrol` are the non-MCP paths. |
-| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                                         |
-| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`.                |
-| `resultType`      | Required on every result. This server only returns `complete`.                                                                                               |
-| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                      |
+|                   |                                                                                                                                                                                                                                                           |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                                                                                                                                   |
+| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login`, `POST /auth/enrol` and the three `POST /admin/*` verbs are the non-MCP paths. **An administrative verb is never an MCP tool** (ADR-0492). |
+| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                                                                                                                                      |
+| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`.                                                                                                             |
+| `resultType`      | Required on every result. This server only returns `complete`.                                                                                                                                                                                            |
+| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                                                                                                                   |
 
 ## Identity
 
@@ -218,6 +218,55 @@ secret and is refused. See `## Risk` on the pull request that added this, and
 No rate limit and no audit record, exactly as `/auth/login` — and this endpoint
 does Argon2id work for anyone who can reach the port.
 
+### `POST /admin/create-user`, `POST /admin/issue-enrolment`, `POST /admin/set-user-admin`
+
+ADR-0492's administrative surface (D73, ledger 638). **These are never MCP
+tools**: no name of theirs is in `tools::SERVED`, so `tools/call` cannot dispatch
+to one and `tools/list` cannot advertise one.
+
+| path                     | body                                               | answers                               |
+| ------------------------ | -------------------------------------------------- | ------------------------------------- |
+| `/admin/create-user`     | `external_id`, `display_name`, optional `is_admin` | `{"user_id": ...}`                    |
+| `/admin/issue-enrolment` | `user_id`                                          | `{"token": ..., "enrolment_id": ...}` |
+| `/admin/set-user-admin`  | `user_id`, `is_admin` (a required boolean)         | `{"user_id": ..., "is_admin": ...}`   |
+
+The `user_id` `/admin/create-user` returns is the one the other two take.
+
+**Two authority mechanisms, and neither works alone.**
+
+- **An attested administrator.** The bearer token is resolved through
+  `iam.ResolveCredential`, and `is_admin` must come back `true`. A resolved
+  caller who is not one gets `403`; a caller presenting no credential gets `401`.
+  `x-yadgar-project` is required, exactly as on `tools/call`.
+- **D73's bootstrap token**, presented in `X-Yadgar-Bootstrap-Token`. It reaches
+  **exactly two things — create an administrator, or promote one** — so
+  `/admin/create-user` only with `is_admin: true`, `/admin/set-user-admin` only
+  when setting it to `true`, and `/admin/issue-enrolment` never. A request
+  carrying the header is judged by these rules alone and never falls back to the
+  attested path.
+
+**An absent or empty bootstrap Secret DISABLES the bootstrap path**, answering
+`503 {"error":"the bootstrap token is not configured"}` — never a comparison
+against a missing value, because a constant-time comparator over two empty inputs
+returns true. Everything else keeps serving; refusing to boot over one
+administrative knob would take MCP and login down with it.
+
+**D73 excludes admin self-demotion**, and this is where it is enforced: `iam`
+cannot, because the only caller identity it has is `unverified_actor`, which
+ADR-0534 forbids authorising on. It is also what keeps the administrator count
+above zero — the bootstrap token can only ever SET the flag, so every demotion
+has a demoter who stays an administrator.
+
+Each verb calls the same `guard()` `/auth/*` does — the `Origin` check and a
+throttle — with its own key, and all three are registered above the 1 MiB body
+limit.
+
+**What is NOT here.** These verbs emit no audit record: `iam-db` writes an
+attribution line for one verb and it is none of these. A `warn` line marks every
+accepted bootstrap token, which is the only observability available on the one
+path that has no actor to relay — and a log line is not an audit trail. ADR-0492's
+"a leak is loud and lands in the audit trail" premise is therefore unmet.
+
 ## Configuration
 
 | Variable                                                 | required? — and what the chart renders                                                                   |                                                                                                                                                                                                                                                                                                   |
@@ -241,6 +290,9 @@ does Argon2id work for anyone who can reach the port.
 | `YADGAR_TRUSTED_PROXY_HOPS`                              | always rendered, empty included; UNSET is the declared `Undeclared` state (an argued ADR-0569 exception) | how many proxies append to `X-Forwarded-For` in front. Unset RECORDS NO SOURCE ADDRESS; a non-number EXITS at boot                                                                                                                                                                                |
 | `YADGAR_LOGIN_RATE_LIMIT`                                | required — from `credentialLimits.attributed`                                                            | `<rate>:<burst>` for `/auth/login` and `/auth/enrol`, per ATTRIBUTABLE client address                                                                                                                                                                                                             |
 | `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT`                   | required — from `credentialLimits.unattributed`                                                          | the same, per OBSERVED HOP, which is what applies while no trust boundary is declared                                                                                                                                                                                                             |
+| `YADGAR_ADMIN_RATE_LIMIT`                                | required — from `adminLimits.attributed`                                                                 | `<rate>:<burst>` for the three `/admin/*` verbs, per ATTRIBUTABLE client address. A THIRD bucket rather than a share of login's, and each verb keys its own within it                                                                                                                             |
+| `YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT`                   | required — from `adminLimits.unattributed`                                                               | the same, per OBSERVED HOP                                                                                                                                                                                                                                                                        |
+| `YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE`                      | unset (an argued ADR-0569 exception)                                                                     | a FILE holding D73's bootstrap token. **Unset DISABLES the bootstrap path** and serves everything else; set-but-unreadable EXITS at boot. Watched (ADR-0523): rotating the Secret restarts the pod                                                                                                |
 | `RUST_LOG`                                               | chart renders `info`; the binary also falls back to `info` (an argued ADR-0569 exception)                | a default, because an unset `RUST_LOG` enables nothing at all                                                                                                                                                                                                                                     |
 | `TASK_TLS_CLIENT_CERT_FILE` / `TASK_TLS_CLIENT_KEY_FILE` | unset                                                                                                    | the certificate this gateway PRESENTS to `task`, and its key — mutual TLS (ADR-0516). Off by default even when `TASK_TLS_ENABLED` is `1`. Both or neither: half an identity EXITS at boot naming the variable                                                                                     |
 | `IAM_TLS_CLIENT_CERT_FILE` / `IAM_TLS_CLIENT_KEY_FILE`   | unset                                                                                                    | the same for the `iam` hop. The chart points both prefixes at ONE mounted leaf; the prefixes exist so one hop can be cut over before the other                                                                                                                                                    |
