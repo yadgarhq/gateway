@@ -68,7 +68,27 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         // The throttle has its own state, in `credential_throttle.rs`.
         trust: crate::source::TrustBoundary::Undeclared,
         credential_limits: unlimited_credentials(),
+        admin_limits: unlimited_credentials(),
+        // DISABLED, which is the state the route ships in until the chart mounts
+        // the Secret — and therefore the state most of this file should exercise.
+        // `state_bootstrapped` is what the tests about a CONFIGURED token reach
+        // for.
+        bootstrap: crate::admin::BootstrapToken::disabled(),
     })
+}
+
+/// The same state, holding a configured bootstrap token.
+///
+/// **A SEPARATE CONSTRUCTOR RATHER THAN A PARAMETER ON `state_with`**, so that
+/// every test written before this one keeps the DISABLED token and none of them
+/// silently acquires a configured one. The absent-secret rule (§7.2) is asserted
+/// against the default; the exclusions are asserted against this.
+fn state_bootstrapped(token: &str) -> Arc<AppState> {
+    let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
+    Arc::get_mut(&mut state)
+        .expect("the state is not shared yet")
+        .bootstrap = crate::admin::BootstrapToken::from_secret(token);
+    state
 }
 
 /// Credential buckets wide enough not to interfere.
@@ -1374,6 +1394,8 @@ async fn state_resolving_to(
         allowed_origins: Vec::new(),
         trust: crate::source::TrustBoundary::Undeclared,
         credential_limits: unlimited_credentials(),
+        admin_limits: unlimited_credentials(),
+        bootstrap: crate::admin::BootstrapToken::disabled(),
     });
     (state, resolves)
 }
@@ -2012,6 +2034,354 @@ async fn a_username_is_never_bounded_here() {
             status,
             StatusCode::SERVICE_UNAVAILABLE,
             "iam bounds no username, so neither does this: {answered}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The administrative surface: POST /admin/* (ADR-0492, D73, ledger 638)
+// ---------------------------------------------------------------------------
+//
+// **Every test below is a REFUSAL**, and that is the shape rather than an
+// accident of what was easy to write. Plan §9 states it once for the whole
+// surface: "every control in this plan is a per-handler function call in a
+// language whose compiler cannot notice one is missing. So for each control, the
+// test is not 'does the path work' but 'does the path refuse'." The positive
+// halves — an administrator admitted, an actor stamped — need an `iam` that
+// answers, and live in `tests/admin_http.rs`.
+
+/// The three administrative paths, with a body each verb accepts.
+const ADMIN_PATHS: [(&str, &str); 3] = [
+    (
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+    ),
+    ("/admin/issue-enrolment", r#"{"user_id":"yadgar:user:x"}"#),
+    (
+        "/admin/set-user-admin",
+        r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
+    ),
+];
+
+/// POST to an administrative path against `state`, with optional headers.
+async fn admin_post(
+    state: Arc<AppState>,
+    path: &str,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let mut req = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in extra {
+        req = req.header(*name, *value);
+    }
+    let req = req
+        .body(Body::from(body.to_string()))
+        .expect("the request builds");
+    let resp = router(state)
+        .oneshot(req)
+        .await
+        .expect("the router answers");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.expect("a body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// The body limit covers every administrative route.
+///
+/// **THE ROW §9 NAMES, AND ITS OWN WORDS ARE "THE COMMENT IS NOT THE CHECK".**
+/// `Router::layer` applies only to routes registered above it, so an `/admin`
+/// route added below the `.layer(...)` call compiles, serves, passes every other
+/// test in this file, and accepts a body of any size — on the surface whose prize
+/// is an administrator. `http.rs:203-206` says exactly this in advance and said
+/// it before the mistake was available to make.
+#[tokio::test]
+async fn the_body_limit_covers_every_admin_route() {
+    let huge = format!(
+        r#"{{"external_id":"{}","display_name":"a","user_id":"u","is_admin":true}}"#,
+        "u".repeat(2_000_000)
+    );
+    for (path, _) in ADMIN_PATHS {
+        let (status, _) = admin_post(state(Vec::new()), path, &huge, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the 1MiB limit must apply to {path}: a route registered below the layer would take a \
+             body of any size"
+        );
+    }
+}
+
+/// GET is 405 on the administrative paths, as it is on every other.
+#[tokio::test]
+async fn the_admin_routes_are_post_only() {
+    for (path, _) in ADMIN_PATHS {
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .expect("the request builds");
+        let status = router(state(Vec::new()))
+            .oneshot(req)
+            .await
+            .expect("the router answers")
+            .status();
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{path}");
+    }
+}
+
+/// **THE ROW THAT MAKES STEP 3 LOAD-BEARING, in its cheapest form.**
+///
+/// §9: "The field is carried into `Attested` and no handler reads it. Every test
+/// passes; every admin route is open." A caller who attests successfully and is
+/// NOT an administrator must be refused.
+///
+/// `Attestation::TrustedHeaders` resolves no credential, so `Attested::is_admin`
+/// is `false` there by construction — which makes this the non-administrator
+/// every administrative route has to refuse. The half this CANNOT prove is that
+/// `is_admin: true` is ever read from `iam`'s answer; that is
+/// `tests/admin_http.rs`'s, and it is the half a hardcoded `false` would still
+/// pass.
+///
+/// **403 AND NOT 401.** The caller has said who they are and the answer is that
+/// they may not do this. A 401 would send them to re-authenticate against a
+/// condition re-authenticating cannot fix.
+#[tokio::test]
+async fn a_non_administrator_is_refused_every_admin_verb() {
+    for (path, body) in ADMIN_PATHS {
+        let (status, answer) = admin_post(
+            state(Vec::new()),
+            path,
+            body,
+            &[
+                ("x-yadgar-user", "ada"),
+                ("x-yadgar-project", "acme/demo"),
+                (axum::http::header::AUTHORIZATION.as_str(), "Bearer a-token"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{path} must refuse a caller who is not an administrator; got {answer}"
+        );
+    }
+}
+
+// ---- The bootstrap token's exclusions (§3.3) --------------------------------
+//
+// §9: "The exclusions are the contract; the inclusions are the feature."
+
+const BOOTSTRAP_HEADER_NAME: &str = "x-yadgar-bootstrap-token";
+const BOOTSTRAP_SECRET: &str = "a-bootstrap-token-for-this-file";
+
+/// POST carrying the bootstrap token, against a gateway that holds it.
+async fn bootstrap_post(path: &str, body: &str) -> (StatusCode, Value) {
+    admin_post(
+        state_bootstrapped(BOOTSTRAP_SECRET),
+        path,
+        body,
+        &[(BOOTSTRAP_HEADER_NAME, BOOTSTRAP_SECRET)],
+    )
+    .await
+}
+
+/// A negative test per EXCLUDED verb, which is the §9 row verbatim.
+#[tokio::test]
+async fn the_bootstrap_token_is_refused_on_every_verb_outside_its_two() {
+    for (path, body, why) in [
+        (
+            "/admin/issue-enrolment",
+            r#"{"user_id":"yadgar:user:x"}"#,
+            "an enrolment mints a credential for an ARBITRARY user, which is takeover rather than \
+             bootstrap",
+        ),
+        (
+            "/admin/create-user",
+            r#"{"external_id":"ada","display_name":"Ada","is_admin":false}"#,
+            "an ORDINARY account is a power ADR-0492 never granted an unattributable credential",
+        ),
+        (
+            "/admin/set-user-admin",
+            r#"{"user_id":"yadgar:user:x","is_admin":false}"#,
+            "a demotion would let a shared secret remove every administrator in the deployment",
+        ),
+    ] {
+        let (status, answer) = bootstrap_post(path, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {why}. Got {answer}");
+    }
+}
+
+/// An OMITTED `is_admin` on `create-user` is an ordinary account, so the
+/// bootstrap token is refused it too.
+///
+/// The row the exclusion test above would miss: a caller who sends no flag at all
+/// rather than `false`. Reading absence as `true` would be the one default that
+/// hands a stranger an administrator.
+#[tokio::test]
+async fn the_bootstrap_token_is_refused_a_create_user_with_no_flag_at_all() {
+    let (status, _) = bootstrap_post(
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// A WRONG token on a granted verb is refused.
+#[tokio::test]
+async fn a_wrong_bootstrap_token_is_refused_on_a_granted_verb() {
+    let (status, _) = admin_post(
+        state_bootstrapped(BOOTSTRAP_SECRET),
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        &[(BOOTSTRAP_HEADER_NAME, "not-the-token")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// A bootstrap request NEVER falls back to the attested path.
+///
+/// If it did, "no actor on the bootstrap path" would stop being structural: a
+/// request carrying both credentials could acquire an identity and stamp it, and
+/// which mechanism admitted a call would depend on which check happened to run
+/// first.
+#[tokio::test]
+async fn a_bootstrap_request_never_falls_back_to_the_attested_path() {
+    let (status, _) = admin_post(
+        state_bootstrapped(BOOTSTRAP_SECRET),
+        "/admin/issue-enrolment",
+        r#"{"user_id":"yadgar:user:x"}"#,
+        &[
+            (BOOTSTRAP_HEADER_NAME, BOOTSTRAP_SECRET),
+            ("x-yadgar-user", "ada"),
+            ("x-yadgar-project", "acme/demo"),
+            (axum::http::header::AUTHORIZATION.as_str(), "Bearer a-token"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the bootstrap header decides the path; presenting a credential beside it must not open \
+         the verb the token is excluded from"
+    );
+}
+
+// ---- The absent secret, both halves (§7.2) ----------------------------------
+
+/// §7.2 rule 1: an absent secret DISABLES the path, with a status naming the
+/// missing configuration.
+///
+/// **AND THE BODY IS ASSERTED, not only the status.** "Refused by the disable
+/// path rather than by a comparison" is a claim no test can make if both answers
+/// are the same 403 — the distinct message is the only thing that discriminates
+/// them, which is why the Secret's own manifest requires one.
+#[tokio::test]
+async fn an_absent_bootstrap_secret_disables_the_path_naming_the_configuration() {
+    for (path, body) in ADMIN_PATHS {
+        let (status, answer) = admin_post(
+            // NO SECRET: the shipped state until the chart mounts one.
+            state(Vec::new()),
+            path,
+            body,
+            &[(BOOTSTRAP_HEADER_NAME, BOOTSTRAP_SECRET)],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path}: an unmounted Secret is an operator problem, not a permission one"
+        );
+        assert_eq!(
+            answer["error"],
+            json!("the bootstrap token is not configured"),
+            "{path}: the refusal must NAME the missing configuration, or nothing distinguishes it \
+             from a comparison that failed"
+        );
+    }
+}
+
+/// §7.2 rule 2, and it is a DIFFERENT bug from rule 1.
+///
+/// **A constant-time comparator over two empty inputs returns TRUE.** So the
+/// request that matters here is the one presenting an EMPTY token against a
+/// gateway holding no secret: a comparator reached at all would answer "equal"
+/// and hand a stranger an administrator. It must be refused by the disable path,
+/// which the body assertion is what proves.
+#[tokio::test]
+async fn an_empty_bootstrap_token_against_no_secret_is_refused_by_the_disable_path() {
+    let (status, answer) = admin_post(
+        state(Vec::new()),
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        &[(BOOTSTRAP_HEADER_NAME, "")],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an empty presented token against an absent secret must be the DISABLED answer"
+    );
+    assert_eq!(
+        answer["error"],
+        json!("the bootstrap token is not configured"),
+        "and it must arrive by the disable path, never by a comparison that happened to match"
+    );
+}
+
+/// The fourth cell of the matrix: a secret IS configured and the caller presents
+/// an empty token.
+#[tokio::test]
+async fn an_empty_bootstrap_token_against_a_configured_secret_is_refused() {
+    let (status, answer) = admin_post(
+        state_bootstrapped(BOOTSTRAP_SECRET),
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        &[(BOOTSTRAP_HEADER_NAME, "")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        answer["error"],
+        json!("the bootstrap token is not accepted here"),
+        "a configured secret refuses an empty token as a REFUSAL, not as a missing configuration"
+    );
+}
+
+// ---- Request-only refusals, decided before anything is sent -----------------
+
+#[tokio::test]
+async fn an_unparseable_admin_body_is_a_400() {
+    for (path, _) in ADMIN_PATHS {
+        let (status, _) = admin_post(state(Vec::new()), path, "not json", &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+    }
+}
+
+/// `is_admin` is REQUIRED on `set-user-admin`, and must be a real boolean.
+///
+/// An absent flag defaulting to `false` would make a malformed request a
+/// demotion, which is the wrong direction for the verb that removes
+/// administrators.
+#[tokio::test]
+async fn set_user_admin_requires_a_real_boolean_flag() {
+    for body in [
+        r#"{"user_id":"yadgar:user:x"}"#,
+        r#"{"user_id":"yadgar:user:x","is_admin":"false"}"#,
+        r#"{"user_id":"yadgar:user:x","is_admin":0}"#,
+    ] {
+        let (status, _) = admin_post(state(Vec::new()), "/admin/set-user-admin", body, &[]).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "guessing what {body} meant on the verb that removes administrators is not a kindness"
         );
     }
 }

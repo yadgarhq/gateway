@@ -454,6 +454,21 @@ spec:
               value: {{ .Values.credentialLimits.attributed | quote }}
             - name: YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT
               value: {{ .Values.credentialLimits.unattributed | quote }}
+            # The two buckets bounding the /admin surface (ADR-0492, ledger 638).
+            # A THIRD AND FOURTH BUCKET rather than a share of the two above:
+            # sharing them would make an administrator's ordinary work consume a
+            # budget sized for password attempts, and would make a
+            # bootstrap-token brute force spend a bucket an operator reads as
+            # login pressure. See values.yaml.
+            #
+            # REQUIRED IN THE BINARY (ADR-0569), so these two lines are what keep
+            # the pod booting — the repository's own `no-compiled-in-defaults`
+            # gate refuses a reader that accepts a fallback, so there is nowhere
+            # for an unset value to land.
+            - name: YADGAR_ADMIN_RATE_LIMIT
+              value: {{ .Values.adminLimits.attributed | quote }}
+            - name: YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT
+              value: {{ .Values.adminLimits.unattributed | quote }}
             - name: RUST_LOG
               value: "info"
             {{- if .Values.trustUnauthenticatedHeaders }}

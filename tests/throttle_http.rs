@@ -124,6 +124,21 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
                 burst: 600.0,
             },
         },
+        // WIDE, AND NEVER REACHED: nothing in this file posts to an /admin
+        // path. Present because `AppState` holds it.
+        admin_limits: CredentialLimits {
+            attributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
+        // DISABLED, which is the shipped default until the chart mounts the
+        // Secret, and nothing here exercises the bootstrap path.
+        bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
     });
 
     let (first, _, _) = call(Arc::clone(&state), &user).await;

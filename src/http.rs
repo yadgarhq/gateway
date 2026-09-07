@@ -27,12 +27,14 @@ use tonic::transport::Channel;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
+use crate::admin::{Authority, Bootstrap, BootstrapToken, Verb};
 use crate::attest::{self, Attestation, Claimed, Credentials};
 use crate::limit::{Bucket, Decision, Limiter};
 use crate::mcp::{self, codes, headers, meta_keys};
 use crate::pb::yadgar::common::v1::Idempotency;
 use crate::pb::yadgar::iam::v1::{
-    iam_service_client::IamServiceClient, LoginRequest, RedeemEnrolmentRequest,
+    iam_service_client::IamServiceClient, CreateUserRequest, IssueEnrolmentRequest, LoginRequest,
+    RedeemEnrolmentRequest, SetUserAdminRequest,
 };
 use crate::source::{PeerAddr, Source, TrustBoundary};
 use crate::tools;
@@ -58,6 +60,32 @@ const AUTH_ENROL: &str = "auth/enrol";
 /// both, because the operator's question — "is the cache answering?" — is the
 /// same for both and splitting it would halve every count.
 const AUTH_MODULE: &str = "auth";
+
+/// The three administrative endpoints' labels (ADR-0492, D73, ledger 638).
+///
+/// PATHS rather than MCP methods, for [`AUTH_LOGIN`]'s reason — that is what they
+/// are — and `&'static` and closed for D67's.
+///
+/// **THREE VALUES AND NOT ONE, because these ARE the throttle keys.** [`guard`]
+/// passes `endpoint` straight to `Limiter::check_source`, so one label across the
+/// three verbs would be one bucket across them: an administrator's ordinary work
+/// would spend the budget that bounds a bootstrap-token brute force, and the
+/// operator watching that budget could not tell the two apart.
+const ADMIN_CREATE_USER: &str = "admin/create-user";
+const ADMIN_ISSUE_ENROLMENT: &str = "admin/issue-enrolment";
+const ADMIN_SET_USER_ADMIN: &str = "admin/set-user-admin";
+
+/// Where a caller presents D73's bootstrap token.
+///
+/// **ITS OWN HEADER, NOT `Authorization`**, and the separation is what makes §6's
+/// "no actor on the bootstrap path" structural rather than remembered. A request
+/// carrying this header is a BOOTSTRAP request and is judged by the bootstrap
+/// rules alone — there is no arm in which it falls back to the attested path, so
+/// there is no arm in which it acquires an identity that could be stamped by
+/// accident. Sharing `Authorization` would have made "which mechanism admitted
+/// this?" a question about the value's shape, which is the kind of question that
+/// gets answered wrongly under a rewrite.
+const BOOTSTRAP_HEADER: &str = "x-yadgar-bootstrap-token";
 
 /// How long an unauthenticated request waits on `iam` before being answered
 /// without it.
@@ -148,6 +176,22 @@ pub struct AppState {
     /// What bounds the two unauthenticated endpoints (task 497). See
     /// [`CredentialLimits`].
     pub credential_limits: CredentialLimits,
+    /// What bounds the three administrative endpoints (§3.2).
+    ///
+    /// **A THIRD AND FOURTH BUCKET RATHER THAN A SHARE OF
+    /// [`Self::credential_limits`].** Sharing login's would make an
+    /// administrator's ordinary work consume a budget sized for password
+    /// attempts, and would make a bootstrap-token brute force spend a bucket an
+    /// operator reads as login pressure. Same TYPE, because the attributed and
+    /// unattributed split is the same split for the same reason — see
+    /// [`CredentialLimits`], whose whole argument applies here unchanged.
+    pub admin_limits: CredentialLimits,
+    /// D73's bootstrap token as this deployment holds it (ADR-0492).
+    ///
+    /// [`BootstrapToken::disabled`] where no Secret is mounted, which disables
+    /// the bootstrap path and NOTHING else — see the type for why that is
+    /// serve-and-disable rather than ADR-0569's refuse-to-start.
+    pub bootstrap: BootstrapToken,
 }
 
 /// The two buckets that bound `/auth/login` and `/auth/enrol` (task 497).
@@ -211,6 +255,32 @@ pub fn router(state: Arc<AppState>) -> Router {
         // it is reachable by anyone who can reach the port, and an unbounded body
         // on it would be the same defect twice.
         .route("/auth/enrol", post(enrol).fallback(method_not_allowed))
+        // THE ADMINISTRATIVE SURFACE (ADR-0492, D73, ledger 638), and ABOVE
+        // `.layer(...)` for exactly the reason written on `/auth/login` — with
+        // one difference worth spelling out, because it is what makes the same
+        // mistake cost more here. On the two lines above, a route that slipped
+        // below the layer would be an unauthenticated endpoint accepting a body
+        // of any size. On these three it would be that on the one surface whose
+        // prize is an administrator.
+        //
+        // **NOT MCP TOOLS, AND STRUCTURALLY INCAPABLE OF BECOMING ONE.**
+        // ADR-0492 rules that an administrative verb never appears as an MCP
+        // tool. These are axum routes: no name of theirs is in `tools::SERVED`,
+        // so `tools::call` cannot dispatch to one and `tools::definitions`
+        // cannot advertise one. Nothing here is added to that array, and nothing
+        // here is reachable through `/`.
+        .route(
+            "/admin/create-user",
+            post(admin_create_user).fallback(method_not_allowed),
+        )
+        .route(
+            "/admin/issue-enrolment",
+            post(admin_issue_enrolment).fallback(method_not_allowed),
+        )
+        .route(
+            "/admin/set-user-admin",
+            post(admin_set_user_admin).fallback(method_not_allowed),
+        )
         .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
         .with_state(state)
 }
@@ -266,7 +336,8 @@ async fn login(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(refusal) = guard(&state, AUTH_LOGIN, peer, &headers).await {
+    if let Some(refusal) = guard(&state, AUTH_LOGIN, state.credential_limits, peer, &headers).await
+    {
         return refusal;
     }
     // Started before the work, and NOT carrying an identity: nothing has been
@@ -431,7 +502,8 @@ async fn enrol(
     // path pays TWO Argon2id operations per attempt rather than one — the
     // contract requires the refusal to cost what the success costs — so it is the
     // cheaper of the two surfaces to amplify with.
-    if let Some(refusal) = guard(&state, AUTH_ENROL, peer, &headers).await {
+    if let Some(refusal) = guard(&state, AUTH_ENROL, state.credential_limits, peer, &headers).await
+    {
         return refusal;
     }
     // NOT carrying an identity, for the same reason `login`'s does not: nothing
@@ -549,6 +621,640 @@ async fn enrol(
     text(StatusCode::OK, &rendered)
 }
 
+// ---------------------------------------------------------------------------
+// The administrative surface (ADR-0492, D73, ledger 638)
+// ---------------------------------------------------------------------------
+
+/// `iam.CreateUser`, behind an administrator or the bootstrap token.
+///
+/// The FIRST of D73's three administrative verbs and the one the bootstrap token
+/// exists for: the first administrator has to exist before anyone can log in to
+/// promote one.
+///
+/// Body: `external_id` and `display_name` (both required), and an optional
+/// `is_admin` which DEFAULTS TO FALSE — an ordinary account, which is the
+/// fail-closed reading of an omitted flag and, for a bootstrap caller, a refusal
+/// rather than a surprise administrator.
+///
+/// Answers `{"user_id": ...}` from `CreateUserResponse.meta.id`. That is the same
+/// identifier space `ResolveCredential` returns and the same one
+/// [`admin_issue_enrolment`] and [`admin_set_user_admin`] consume — `iam-db`
+/// mints it as `yadgar:user:<uuidv7>` and stores it as `iam_user.id`, which is
+/// what `iam_credential.user_id` points at — so an administrator can drive the
+/// whole ceremony from what this returns. Handing back an id the next verb could
+/// not accept is §9's step-7 shape: an admin who can create users and not enrol
+/// them, every status green.
+async fn admin_create_user(
+    State(state): State<Arc<AppState>>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // FIRST, BEFORE THE BODY, exactly as on `/auth/*` — see [`guard`] for why an
+    // `/admin` route that skipped it would have no `Origin` check and no
+    // throttle, on the surface where a cross-origin POST buys an administrator.
+    if let Some(refusal) = guard(
+        &state,
+        ADMIN_CREATE_USER,
+        state.admin_limits,
+        peer,
+        &headers,
+    )
+    .await
+    {
+        return refusal;
+    }
+    let request_id = crate::request_id();
+    let call = Call::start(
+        SERVICE,
+        ADMIN_CREATE_USER,
+        Kind::Write,
+        tel(request_id.clone()),
+    );
+
+    let Some(req) = parsed(&body) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);
+    };
+    let (Some(external_id), Some(display_name)) = (
+        req.get("external_id").and_then(Value::as_str),
+        req.get("display_name").and_then(Value::as_str),
+    ) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"`external_id` and `display_name` are required"}"#,
+        );
+    };
+    // ABSENT MEANS FALSE, and false is an ordinary account. A bootstrap caller
+    // who omits it is refused by `accepts_bootstrap` rather than quietly creating
+    // one, which is the direction an omitted flag must fail in.
+    let is_admin = req
+        .get("is_admin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let authority = match authorise(
+        &state,
+        ADMIN_CREATE_USER,
+        Verb::CreateUser,
+        is_admin,
+        &headers,
+        request_id.clone(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(refusal) => {
+            call.fail(refusal.label);
+            return refusal.response;
+        }
+    };
+
+    let mut client = IamServiceClient::new(state.iam.clone());
+    let rpc = client.create_user(CreateUserRequest {
+        // MINTED HERE, PER INBOUND REQUEST, and it buys what `enrol`'s buys and
+        // no more: this gateway's own retry to `iam` is safe; a CLIENT's retry is
+        // a second inbound request and a second key. See `crate::idempotency_key`.
+        idempotency: Some(Idempotency {
+            key: crate::idempotency_key(),
+        }),
+        external_id: external_id.to_string(),
+        display_name: display_name.to_string(),
+        is_admin,
+        // ADR-0534's relay, and `None` on the bootstrap path. See
+        // `admin::Authority::actor` — an empty actor would reach `iam-db`'s
+        // `<unattributed>` by the wrong route and hide a dropped id.
+        unverified_actor: authority.actor(),
+    });
+    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => return admin_failure(call, ADMIN_CREATE_USER, e),
+        Err(_elapsed) => return admin_timeout(call, ADMIN_CREATE_USER),
+    };
+
+    let rendered = json!({ "user_id": resp.meta.map(|m| m.id).unwrap_or_default() }).to_string();
+    call.finish(Outcome {
+        status: "OK",
+        encoded_bytes: Some(rendered.len() as u64),
+        rows: 1,
+        ..Default::default()
+    });
+    text(StatusCode::OK, &rendered)
+}
+
+/// `iam.IssueEnrolment`, behind an administrator and NEVER the bootstrap token.
+///
+/// The second step of ADR-0492's ceremony: the administrator receives the blob
+/// the person redeems at `/auth/enrol`, and never learns the password they
+/// choose.
+///
+/// **The bootstrap token is excluded here, and this is the exclusion a reader is
+/// most likely to argue with** — handing the new administrator their enrolment
+/// blob looks like the obvious next step. `admin::Verb::accepts_bootstrap`
+/// carries the argument: an enrolment redeems into a credential for an arbitrary
+/// user id, so a bootstrap token that reached this verb could mint a login for
+/// anybody who already exists. That is account takeover with an unattributable
+/// credential, not bootstrap.
+async fn admin_issue_enrolment(
+    State(state): State<Arc<AppState>>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = guard(
+        &state,
+        ADMIN_ISSUE_ENROLMENT,
+        state.admin_limits,
+        peer,
+        &headers,
+    )
+    .await
+    {
+        return refusal;
+    }
+    let request_id = crate::request_id();
+    let call = Call::start(
+        SERVICE,
+        ADMIN_ISSUE_ENROLMENT,
+        Kind::Write,
+        tel(request_id.clone()),
+    );
+
+    let Some(req) = parsed(&body) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);
+    };
+    let Some(user_id) = req.get("user_id").and_then(Value::as_str) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"`user_id` is required"}"#,
+        );
+    };
+
+    let authority = match authorise(
+        &state,
+        ADMIN_ISSUE_ENROLMENT,
+        Verb::IssueEnrolment,
+        // NO FLAG ON THIS REQUEST, and `false` is not a value being set — it is
+        // the absence of one. `accepts_bootstrap` refuses this verb on EVERY
+        // value, so nothing about the argument admits anything.
+        false,
+        &headers,
+        request_id.clone(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(refusal) => {
+            call.fail(refusal.label);
+            return refusal.response;
+        }
+    };
+
+    let mut client = IamServiceClient::new(state.iam.clone());
+    let rpc = client.issue_enrolment(IssueEnrolmentRequest {
+        // SENT, AND NOT SUPPRESSED. `iam-db` discards this key today (ledger 668)
+        // and step 1's sensor exists to say so out loud on the day a caller
+        // starts sending one. Sending an EMPTY key to keep the sensor quiet would
+        // be this gateway asserting a per-RPC exception to D9 it has no authority
+        // to make, and would leave a mutating RPC carrying no key at all.
+        idempotency: Some(Idempotency {
+            key: crate::idempotency_key(),
+        }),
+        user_id: user_id.to_string(),
+        unverified_actor: authority.actor(),
+    });
+    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
+        Ok(Ok(r)) => r.into_inner(),
+        Ok(Err(e)) => return admin_failure(call, ADMIN_ISSUE_ENROLMENT, e),
+        Err(_elapsed) => return admin_timeout(call, ADMIN_ISSUE_ENROLMENT),
+    };
+
+    let rendered = json!({
+        "token": resp.token,
+        "enrolment_id": resp.enrolment_id,
+    })
+    .to_string();
+    call.finish(Outcome {
+        status: "OK",
+        encoded_bytes: Some(rendered.len() as u64),
+        // DELIBERATELY EMPTY, exactly as on `login` and `enrol`. `payload` is
+        // stored in the wide event and this payload carries a single-use secret;
+        // copying `measured`'s idiom would write every enrolment token this
+        // system issues into the telemetry store.
+        rows: 1,
+        ..Default::default()
+    });
+    text(StatusCode::OK, &rendered)
+}
+
+/// `iam.SetUserAdmin` — promote or demote (D73).
+///
+/// `is_admin` is REQUIRED and must be a real boolean: an absent flag defaulting
+/// to `false` would make a malformed request a demotion.
+///
+/// **Two rules meet here and neither is `iam`'s.** The bootstrap token reaches
+/// only the promotion half (`admin::Verb::accepts_bootstrap`), and an
+/// administrator cannot clear their own flag (`admin::is_self_demotion`, which
+/// carries D73's citation and the last-administrator argument).
+async fn admin_set_user_admin(
+    State(state): State<Arc<AppState>>,
+    PeerAddr(peer): PeerAddr,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = guard(
+        &state,
+        ADMIN_SET_USER_ADMIN,
+        state.admin_limits,
+        peer,
+        &headers,
+    )
+    .await
+    {
+        return refusal;
+    }
+    let request_id = crate::request_id();
+    let call = Call::start(
+        SERVICE,
+        ADMIN_SET_USER_ADMIN,
+        Kind::Write,
+        tel(request_id.clone()),
+    );
+
+    let Some(req) = parsed(&body) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);
+    };
+    let (Some(user_id), Some(is_admin)) = (
+        req.get("user_id").and_then(Value::as_str),
+        // REQUIRED, and `as_bool` rather than a truthiness reading: `"false"` and
+        // `0` are not booleans, and guessing what a caller meant on the verb that
+        // removes administrators is not a kindness.
+        req.get("is_admin").and_then(Value::as_bool),
+    ) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"`user_id` and a boolean `is_admin` are required"}"#,
+        );
+    };
+
+    let authority = match authorise(
+        &state,
+        ADMIN_SET_USER_ADMIN,
+        Verb::SetUserAdmin,
+        is_admin,
+        &headers,
+        request_id.clone(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(refusal) => {
+            call.fail(refusal.label);
+            return refusal.response;
+        }
+    };
+
+    // D73'S EXCLUSION, AND THE LAST-ADMINISTRATOR GUARD IN ONE. `iam.proto:664`
+    // defers it here by name, because it is "a rule about who may call this" and
+    // the only caller identity `iam` has is the one ADR-0534 forbids authorising
+    // on. See `admin::is_self_demotion` for why this plus the bootstrap token's
+    // promote-only grant is what keeps the administrator count above zero, and
+    // for the cached-flag race it does NOT close.
+    if crate::admin::is_self_demotion(&authority, user_id, is_admin) {
+        call.fail("PERMISSION_DENIED");
+        return text(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"an administrator cannot remove their own administrative flag"}"#,
+        );
+    }
+
+    let mut client = IamServiceClient::new(state.iam.clone());
+    let rpc = client.set_user_admin(SetUserAdminRequest {
+        idempotency: Some(Idempotency {
+            key: crate::idempotency_key(),
+        }),
+        user_id: user_id.to_string(),
+        is_admin,
+        unverified_actor: authority.actor(),
+    });
+    match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return admin_failure(call, ADMIN_SET_USER_ADMIN, e),
+        Err(_elapsed) => return admin_timeout(call, ADMIN_SET_USER_ADMIN),
+    }
+
+    let rendered = json!({ "user_id": user_id, "is_admin": is_admin }).to_string();
+    call.finish(Outcome {
+        status: "OK",
+        encoded_bytes: Some(rendered.len() as u64),
+        rows: 1,
+        ..Default::default()
+    });
+    text(StatusCode::OK, &rendered)
+}
+
+/// Parse one administrative body. `None` is unparseable JSON.
+fn parsed(body: &Bytes) -> Option<Value> {
+    serde_json::from_slice::<Value>(body).ok()
+}
+
+/// A refusal one administrative handler must return, with the D67 label it is
+/// recorded under.
+///
+/// **BOXED at every use, and clippy's `result_large_err` is why rather than
+/// taste.** `Response` is 144 bytes here, and a `Result` carrying it in its error
+/// variant moves that on every return — including the successful ones, which are
+/// the common case on this path. A named struct rather than a boxed tuple so the
+/// two fields cannot be swapped at a call site.
+struct Refusal {
+    /// The bounded `outcome` label (D67). Every value here is one
+    /// `yadgar_telemetry::grpc::status_name` produces, per ADR-0558.
+    label: &'static str,
+    response: Response,
+}
+
+impl Refusal {
+    fn new(label: &'static str, response: Response) -> Box<Self> {
+        Box::new(Self { label, response })
+    }
+}
+
+/// Who admitted one administrative request, or the refusal and its D67 label.
+///
+/// # The bootstrap header decides the PATH, and there is no fallback
+///
+/// A request carrying [`BOOTSTRAP_HEADER`] is a BOOTSTRAP request. It is judged
+/// by the bootstrap rules and refused if they do not admit it — it never falls
+/// through to the attested branch, and an attested administrator who also sends
+/// the header is still on the bootstrap path. That is deliberate and it is what
+/// makes §6's property structural: there is no arm in which a bootstrap request
+/// holds an identity, so there is no id available to stamp on one by accident.
+///
+/// # Order, and each step is a different refusal
+///
+/// 1. **Is the path configured at all?** An absent Secret disables it, whatever
+///    was presented and whatever verb was asked for — §7.2's rule 1, and the
+///    Secret's own manifest states it in the same words. No comparison runs.
+/// 2. **Does the token reach this verb, at this value?** Refused BEFORE the
+///    secret is compared, so an excluded verb is not even a comparison oracle.
+/// 3. **Does it match?** `BootstrapToken::check`, whose `None` arm returns above
+///    rather than defaulting to `""` — §7.2's rule 2.
+///
+/// # The attested branch, and why its refusal is 403 rather than 401
+///
+/// A caller with NO credential is 401: they have not said who they are. A caller
+/// whose credential `iam` resolved, answering `is_admin: false`, has said who
+/// they are and the answer is that they may not do this — which is 403, and it is
+/// the row §9 names as the only thing that makes the plumbed flag load-bearing.
+/// Routing it through [`attest_answer`] would render it as the 401 that arm
+/// produces, and would send an administrator's colleague to re-authenticate
+/// against a condition re-authenticating cannot fix.
+async fn authorise(
+    state: &AppState,
+    endpoint: &'static str,
+    verb: Verb,
+    wants_admin: bool,
+    headers: &HeaderMap,
+    request_id: String,
+) -> Result<Authority, Box<Refusal>> {
+    // PRESENT-AND-UNREADABLE IS PRESENT, for `readable`'s reason: treating a
+    // header that arrived intact and could not be decoded as ABSENT would send
+    // the one bootstrap attempt nobody could read down the attested path.
+    match readable(headers, BOOTSTRAP_HEADER) {
+        Err(_) => {
+            return Err(Refusal::new(
+                "PERMISSION_DENIED",
+                text(
+                    StatusCode::FORBIDDEN,
+                    r#"{"error":"the bootstrap token is not accepted here"}"#,
+                ),
+            ))
+        }
+        Ok(Some(presented)) => {
+            return bootstrap_authority(state, endpoint, verb, wants_admin, presented)
+        }
+        Ok(None) => {}
+    }
+
+    let attested = match attest::attest(
+        &state.attestation,
+        &state.iam,
+        &state.credentials,
+        header(headers, axum::http::header::AUTHORIZATION.as_str()),
+        Claimed {
+            // NOT PASSED, exactly as on `tools_call`: a self-asserted username is
+            // forgeable by anyone holding any valid token, so the bearer token is
+            // what names the caller. Under `TrustedHeaders` it is read, and under
+            // `TrustedHeaders` `is_admin` is false — so the header buys no
+            // authority there either.
+            user_id: header(headers, "x-yadgar-user"),
+            // REQUIRED HERE FOR THE SAME REASON IT IS ON `tools/call`, and NOT
+            // invented. `Attested` carries a `Scope`, `Scope` carries a
+            // workspace, and the gateway does not have one to supply — a
+            // placeholder would write a workspace nobody named into the type
+            // ADR-0511 keeps to what this gateway mints. An absent header is
+            // `MissingWorkspace`, which `attest_answer` renders as a 400 naming
+            // the header rather than as a credential failure.
+            project_id: header(headers, "x-yadgar-project"),
+            instance_id: header(headers, "x-yadgar-instance"),
+        },
+        request_id,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            // THE ONLY PLACE THE REAL REASON IS WRITTEN DOWN, the same split
+            // every other handler here makes.
+            tracing::warn!(error = %e, endpoint, "administrative attestation failed");
+            let answer = attest_answer(&e);
+            return Err(Refusal::new(
+                answer.label,
+                text(
+                    answer.status,
+                    &json!({ "error": answer.message }).to_string(),
+                ),
+            ));
+        }
+    };
+
+    // **THE READ THAT MAKES STEP 3 LOAD-BEARING.** Without it the flag is carried
+    // into `Attested` by a plumbing change every test passes, and every
+    // administrative route is open to every caller holding any credential.
+    if !attested.is_admin {
+        tracing::warn!(
+            endpoint,
+            user_id = %attested.scope.user_id,
+            "a non-administrator was refused an administrative verb"
+        );
+        return Err(Refusal::new(
+            "PERMISSION_DENIED",
+            text(
+                StatusCode::FORBIDDEN,
+                r#"{"error":"this endpoint requires an administrator"}"#,
+            ),
+        ));
+    }
+    Ok(Authority::Administrator(attested.scope.user_id))
+}
+
+/// The bootstrap branch of [`authorise`]. See that function for the order.
+fn bootstrap_authority(
+    state: &AppState,
+    endpoint: &'static str,
+    verb: Verb,
+    wants_admin: bool,
+    presented: &str,
+) -> Result<Authority, Box<Refusal>> {
+    // RULE 1 FIRST, AND FOR EVERY VERB. "An absent or empty bootstrap secret
+    // DISABLES the bootstrap path. The consumer refuses every request on that
+    // path with a status naming the missing configuration — NEVER a comparison
+    // against a missing or empty value."
+    //
+    // A DISTINCT BODY, because the operator problem is distinct: a deployment
+    // whose Secret is not mounted has nothing to fix about permissions, and
+    // collapsing this into the refusal a wrong token gets would leave them
+    // hunting one. 503 rather than 403 for the same reason — nothing the caller
+    // did is wrong.
+    if !state.bootstrap.is_configured() {
+        tracing::warn!(
+            endpoint,
+            "a bootstrap request arrived and no bootstrap token is configured, so the bootstrap \
+             path is disabled; mount the `admin-bootstrap-token` Secret to enable it"
+        );
+        return Err(Refusal::new(
+            "FAILED_PRECONDITION",
+            text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"the bootstrap token is not configured"}"#,
+            ),
+        ));
+    }
+    // THE EXCLUSION BEFORE THE COMPARISON. An excluded verb is refused without
+    // the secret being looked at, so it cannot be used as an oracle for it — and
+    // more importantly, the exclusion cannot be reached by a comparison that
+    // succeeded.
+    if !verb.accepts_bootstrap(wants_admin) {
+        tracing::warn!(
+            endpoint,
+            "the bootstrap token was presented on a verb ADR-0492 does not grant it"
+        );
+        return Err(Refusal::new(
+            "PERMISSION_DENIED",
+            text(
+                StatusCode::FORBIDDEN,
+                r#"{"error":"the bootstrap token may only create an administrator or promote one"}"#,
+            ),
+        ));
+    }
+    match state.bootstrap.check(presented) {
+        Bootstrap::Accepted => {
+            // **§6.1'S THIRD CHANGE, AND IT IS NOT AN AUDIT TRAIL.** ADR-0492's
+            // risk acceptance for leaving this credential live is that a leak "is
+            // loud and lands in the audit trail". There is no audit store on this
+            // boundary — `iam-db` writes an attribution line for exactly one verb
+            // and it is not one of these three — so a leaked token today buys a
+            // SILENT administrator. This line is the only observability available
+            // on the one path that has no actor to relay, and it is cheap. It
+            // does NOT close the gap: a log line is not an audit trail, and
+            // §7.3.4 remains the operator's ruling.
+            tracing::warn!(
+                endpoint,
+                "THE BOOTSTRAP TOKEN WAS ACCEPTED. This credential is unattributable by \
+                 construction (D73), so no actor is recorded for this act and nothing else \
+                 records it either — see ADR-0492 and plan §6.1"
+            );
+            Ok(Authority::Bootstrap)
+        }
+        Bootstrap::Refused => Err(Refusal::new(
+            "PERMISSION_DENIED",
+            text(
+                StatusCode::FORBIDDEN,
+                r#"{"error":"the bootstrap token is not accepted here"}"#,
+            ),
+        )),
+        // UNREACHABLE THROUGH THE GUARD ABOVE, and answered rather than
+        // `unreachable!()`: the two are checked from one place today, and a later
+        // edit that moved the guard must meet the disabled answer rather than a
+        // panic on the administrative path.
+        Bootstrap::NotConfigured => Err(Refusal::new(
+            "FAILED_PRECONDITION",
+            text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"the bootstrap token is not configured"}"#,
+            ),
+        )),
+    }
+}
+
+/// What an administrative caller is told when `iam` refuses or fails.
+///
+/// **`FAILED_PRECONDITION` GETS ITS OWN BODY (§2), AND NOT ITS OWN STATUS.**
+/// `iam`'s `EnrolmentConfig::from_env` takes an argued exception to ADR-0569
+/// (`iam/src/service.rs:490`): an absent `ENROLMENT_GATEWAY` leaves the process
+/// SERVING and makes `IssueEnrolment` refuse with `FAILED_PRECONDITION` naming
+/// the variable. So a correctly-deployed `/admin` route can meet that code from a
+/// perfectly healthy `iam`, every pod Ready and every probe green, and the
+/// administrator gets "create a user, then fail to enrol them" — §9's step-7 row
+/// exactly. Collapsing it into the opaque "unavailable" body would tell them
+/// nothing is available when nothing is wrong.
+///
+/// The STATUS stays whatever [`opaque_status`] says, which for this code is 503.
+/// Adding an arm there is the change that reopens the oracle on `/auth/login` and
+/// `/auth/enrol` at once, and that function's own comment says there is
+/// deliberately nowhere obvious to put one. §2 asks for a distinct MESSAGE and
+/// this is one.
+///
+/// Everything else is opaque, from a `tonic::Code` and a constant — never
+/// `e.to_string()` — for [`login_failure`]'s reason.
+fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status) -> Response {
+    // THE ONLY PLACE THE REAL CODE AND MESSAGE ARE WRITTEN DOWN, and they go to
+    // the log rather than to the caller.
+    tracing::warn!(code = ?e.code(), message = e.message(), endpoint, "an administrative RPC was refused or failed");
+    let code = e.code();
+    call.fail(if code == tonic::Code::Unauthenticated {
+        "UNAUTHENTICATED"
+    } else if code == tonic::Code::FailedPrecondition {
+        "FAILED_PRECONDITION"
+    } else {
+        "UNAVAILABLE"
+    });
+    if code == tonic::Code::FailedPrecondition {
+        return text(
+            opaque_status(code),
+            r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#,
+        );
+    }
+    let (status, body) = opaque_answer(
+        code,
+        r#"{"error":"refused"}"#,
+        r#"{"error":"the administrative service is unavailable"}"#,
+    );
+    text(status, body)
+}
+
+/// An `iam` that accepted the connection and then stalled.
+///
+/// Through the SAME opaque body as any other upstream problem, so a stall is not
+/// a third answer somebody has to remember to keep opaque.
+fn admin_timeout(call: Call, endpoint: &'static str) -> Response {
+    tracing::warn!(
+        timeout_ms = AUTH_DEADLINE.as_millis(),
+        endpoint,
+        "an administrative RPC timed out waiting for iam"
+    );
+    call.fail("UNAVAILABLE");
+    text(
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":"the administrative service is unavailable"}"#,
+    )
+}
+
 /// A JSON response whose body is already rendered.
 ///
 /// Separate from [`reply`], which takes a `Value` and a bare `u16`: rendering
@@ -650,9 +1356,21 @@ fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
     state.allowed_origins.iter().any(|a| a == origin)
 }
 
-/// What both unauthenticated endpoints pass before they read a body (task 497).
+/// What every non-MCP endpoint passes before it reads a body (task 497).
 ///
 /// `Some` is a response the caller must be sent; `None` means carry on.
+///
+/// **FIVE CALLERS NOW AND THIS COMMENT USED TO SAY TWO**, which is how an
+/// enumeration that reads as complete stops being one — the failure `login`'s
+/// "the two 400s" already cost this file once. `/auth/login` and `/auth/enrol`
+/// are the two UNAUTHENTICATED ones; `/admin/create-user`,
+/// `/admin/issue-enrolment` and `/admin/set-user-admin` are the three
+/// administrative ones, and they call it for a reason that is not symmetry.
+/// `origin_ok` lives here rather than in a layer, so an `/admin` route that
+/// skipped this would have no `Origin` check and no throttle — reproducing the
+/// bug this function was written to fix, on the surface where a cross-origin POST
+/// buys an administrator. The `limits` parameter is why the three do not thereby
+/// share login's budget.
 ///
 /// # Everything decided here is decided WITHOUT the body, and that is the point
 ///
@@ -682,6 +1400,7 @@ fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
 async fn guard(
     state: &AppState,
     endpoint: &'static str,
+    limits: CredentialLimits,
     peer: Option<IpAddr>,
     headers: &HeaderMap,
 ) -> Option<Response> {
@@ -744,8 +1463,13 @@ async fn guard(
     let bucket = match source {
         // See `CredentialLimits`: which of the two applies is decided by whether
         // the address names a client or the hop in front of everybody.
-        Source::Attributed(_) => state.credential_limits.attributed,
-        Source::Observed(_) | Source::Unknown => state.credential_limits.unattributed,
+        //
+        // WHICH PAIR is the caller's, not this function's: `/auth/*` passes
+        // `state.credential_limits` and `/admin/*` passes `state.admin_limits`.
+        // A pair read from `state` here would have made the admin surface share
+        // login's budget silently, which is §3.2's named defect.
+        Source::Attributed(_) => limits.attributed,
+        Source::Observed(_) | Source::Unknown => limits.unattributed,
     };
 
     match state.limiter.check_source(addr, endpoint, bucket).await {
@@ -782,7 +1506,11 @@ async fn guard(
     }
 }
 
-/// The 429 both credential endpoints answer with.
+/// The 429 every endpoint behind [`guard`] answers with.
+///
+/// **FIVE, NOT TWO** — the two credential endpoints and the three administrative
+/// ones. See [`guard`] for why the count is spelled out rather than left as
+/// "both".
 ///
 /// **OPAQUE, and deliberately more so than [`refusal`].** That one names the
 /// module and the kind because it answers an ATTESTED caller who is entitled to

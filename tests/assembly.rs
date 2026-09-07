@@ -117,6 +117,14 @@ fn generation() -> Generation {
             "valkey-password".to_string(),
             "sentinel-of-the-cache-password\n".to_string(),
         ),
+        // AND D73'S BOOTSTRAP TOKEN (ADR-0492), on the same ground as the two
+        // above and with one addition of its own: `main.rs` keeps only the
+        // DIGEST, so a rotated file is even less visible from inside the process
+        // than a password held verbatim would be.
+        (
+            "admin-bootstrap-token".to_string(),
+            "sentinel-of-the-bootstrap-token\n".to_string(),
+        ),
     ]
 }
 
@@ -339,6 +347,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
+    let bootstrap_token = mount.path("admin-bootstrap-token");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
     assert_eq!(
@@ -347,6 +356,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             Some(&iam),
             Some(&broker),
             Some(&cache_password),
+            Some(&bootstrap_token),
             &config,
         )
         .watched(),
@@ -357,12 +367,13 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             mount.path("iam-ca.pem").as_path(),
             mount.path("nats-password").as_path(),
             mount.path("valkey-password").as_path(),
+            mount.path("admin-bootstrap-token").as_path(),
             config.path(),
         ],
-        "a fully configured `gateway` reads seven files at boot: a bundle per upstream, the \
+        "a fully configured `gateway` reads eight files at boot: a bundle per upstream, the \
          one client identity it presents to both (ADR-0516), the broker password (D72), the \
-         cache password (D74), and the mounted configuration document every service now \
-         watches (step 2a)"
+         cache password (D74), D73's administrative bootstrap token (ADR-0492), and the \
+         mounted configuration document every service now watches (step 2a)"
     );
 }
 
@@ -383,12 +394,14 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
+    let bootstrap_token = mount.path("admin-bootstrap-token");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
     let inputs = rotate::watch_set(
         Some(&task),
         Some(&iam),
         Some(&broker),
         Some(&cache_password),
+        Some(&bootstrap_token),
         &config,
     );
 
@@ -423,7 +436,7 @@ fn each_configured_half_contributes_on_its_own() {
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
     assert_eq!(
-        rotate::watch_set(None, None, None, None, &config).watched(),
+        rotate::watch_set(None, None, None, None, None, &config).watched(),
         vec![config.path()],
         "with both upstreams cleartext and neither password configured, the mounted \
          configuration document is the only thing watched — it is unconditional, unlike \
@@ -432,7 +445,7 @@ fn each_configured_half_contributes_on_its_own() {
 
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     assert_eq!(
-        rotate::watch_set(Some(&task), None, None, None, &config).watched(),
+        rotate::watch_set(Some(&task), None, None, None, None, &config).watched(),
         vec![
             mount.path("task-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
@@ -444,7 +457,7 @@ fn each_configured_half_contributes_on_its_own() {
 
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     assert_eq!(
-        rotate::watch_set(None, Some(&iam), None, None, &config).watched(),
+        rotate::watch_set(None, Some(&iam), None, None, None, &config).watched(),
         vec![
             mount.path("iam-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
@@ -470,7 +483,7 @@ fn each_configured_half_contributes_on_its_own() {
     .expect("a complete configuration")
     .expect("the flag is set");
     assert_eq!(
-        rotate::watch_set(Some(&server_only), None, None, None, &config).watched(),
+        rotate::watch_set(Some(&server_only), None, None, None, None, &config).watched(),
         vec![mount.path("task-ca.pem").as_path(), config.path()],
         "an encrypted hop with no identity watches the bundle, the mounted document, and \
          nothing else"
@@ -483,7 +496,7 @@ fn each_configured_half_contributes_on_its_own() {
     // invalidation is consumed — so a revoked credential keeps working until its
     // cache entry ages out, with no exit and no recovery but a restart.
     assert_eq!(
-        rotate::watch_set(None, None, Some(&broker(&mount)), None, &config).watched(),
+        rotate::watch_set(None, None, Some(&broker(&mount)), None, None, &config).watched(),
         vec![mount.path("nats-password").as_path(), config.path()],
         "the broker password is a member on its own, exactly as `iam`'s already is"
     );
@@ -499,11 +512,43 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             Some(&mount.path("valkey-password")),
+            None,
             &config
         )
         .watched(),
         vec![mount.path("valkey-password").as_path(), config.path()],
         "the cache password is a member on its own"
+    );
+
+    // THE BOOTSTRAP TOKEN ON ITS OWN (ADR-0492, ledger 638). Its rotation has the
+    // `present-and-wrong` shape ADR-0596 names: the token is held as a DIGEST for
+    // the life of the process, so a Secret rotated underneath a running pod
+    // leaves this gateway comparing against the value it booted with, and no
+    // existence check tells the two apart. Watching it is what turns an operator's
+    // rotation into a restart.
+    assert_eq!(
+        rotate::watch_set(
+            None,
+            None,
+            None,
+            None,
+            Some(&mount.path("admin-bootstrap-token")),
+            &config
+        )
+        .watched(),
+        vec![mount.path("admin-bootstrap-token").as_path(), config.path()],
+        "the administrative bootstrap token is a member on its own"
+    );
+
+    // AND ABSENT IT CONTRIBUTES NOTHING, which is the deployment running today:
+    // the chart mounts no Secret yet, so the bootstrap path is disabled and there
+    // is no file. A path invented here would sit unreadable for ever on
+    // `yadgar_rotation_watched_files_unreadable`, which is a gauge an operator
+    // reads as a fault.
+    assert_eq!(
+        rotate::watch_set(None, None, None, None, None, &config).watched(),
+        vec![config.path()],
+        "an unmounted bootstrap token names no file, so there is no file to watch"
     );
 
     // A BROKER THAT DEMANDS NO CREDENTIAL — an off-reference deployment rather
@@ -515,7 +560,7 @@ fn each_configured_half_contributes_on_its_own() {
             .expect("a broker that asks for no credential is a complete configuration")
             .expect("the url is set");
     assert_eq!(
-        rotate::watch_set(None, None, Some(&open_broker), None, &config).watched(),
+        rotate::watch_set(None, None, Some(&open_broker), None, None, &config).watched(),
         vec![config.path()],
         "a broker that demands no credential named no file, so there is no file to watch — \
          and inventing one would report it unreadable for ever"
@@ -544,6 +589,7 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
 
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
+    let bootstrap_token = mount.path("admin-bootstrap-token");
 
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();
@@ -553,6 +599,7 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
             Some(&iam),
             Some(&broker),
             Some(&cache_password),
+            Some(&bootstrap_token),
             &config,
         )
         .export_not_after()
@@ -625,12 +672,14 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
+    let bootstrap_token = mount.path("admin-bootstrap-token");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
     let inputs = rotate::watch_set(
         Some(&task),
         Some(&iam),
         Some(&broker),
         Some(&cache_password),
+        Some(&bootstrap_token),
         &config,
     );
 

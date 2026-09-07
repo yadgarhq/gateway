@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use yadgar_gateway::attest::Attestation;
 use yadgar_gateway::http::{router, AppState, CredentialLimits};
+use yadgar_gateway::limit::Bucket;
 use yadgar_gateway::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 
 fn state() -> Arc<AppState> {
@@ -59,6 +60,21 @@ fn state() -> Arc<AppState> {
                 burst: 600.0,
             },
         },
+        // WIDE, AND NEVER REACHED: nothing in this file posts to an /admin
+        // path. Present because `AppState` holds it.
+        admin_limits: CredentialLimits {
+            attributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
+        // DISABLED, which is the shipped default until the chart mounts the
+        // Secret, and nothing here exercises the bootstrap path.
+        bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
     })
 }
 
