@@ -1159,9 +1159,9 @@ fn bootstrap_authority(
             // loud and lands in the audit trail". There is no audit store on this
             // boundary — `iam-db` writes an attribution line for exactly one verb
             // and it is not one of these three — so a leaked token today buys a
-            // SILENT administrator. This line is the only observability available
-            // on the one path that has no actor to relay, and it is cheap. It
-            // does NOT close the gap: a log line is not an audit trail, and
+            // SILENT administrator. This line is the only observability WITH ANY
+            // DETAIL on the one path that has no actor to relay, and it is cheap.
+            // It does NOT close the gap: a log line is not an audit trail, and
             // §7.3.4 remains the operator's ruling.
             tracing::warn!(
                 endpoint,
@@ -1169,6 +1169,43 @@ fn bootstrap_authority(
                  construction (D73), so no actor is recorded for this act and nothing else \
                  records it either — see ADR-0492 and plan §6.1"
             );
+            // **AND THE LINE ABOVE DIES WITH THE POD, WHICH IS WHY THIS EXISTS.**
+            // The estate runs a Prometheus server and NO log shipper — `deploy`'s
+            // `infra/prometheus.yaml` says so in as many words, "no promtail,
+            // loki, fluent-bit or vector" — so that `warn` reaches `kubectl logs`
+            // and an operator who has already guessed the answer. The only record
+            // that a stranger became an administrator did not survive the event it
+            // recorded. This counter is the same conversion `iam`'s invalidation
+            // signal already made: an ERROR nobody reads becomes a series with an
+            // alerting rule on it. The `warn` stays, because it carries the
+            // `endpoint` and the metric deliberately carries nothing.
+            //
+            // **REGISTRATION IS LAZY, AND THAT IS THE WHOLE DESIGN.**
+            // `metrics::counter!` registers a name with the recorder ONLY when the
+            // macro executes. Until the first bootstrap token is accepted, this
+            // process has never run this line, so `yadgar_gateway_bootstrap_
+            // accepted_total` is ABSENT from `/metrics` — not present at `0`. That
+            // is correct here rather than a defect (see `admin::ACCEPTED` for why a
+            // security counter has no meaningful zero to publish), but it is NOT
+            // free, and it dictates how the alert must be written:
+            //
+            //  - The SERIES APPEARING IS THE SIGNAL. A rule of the shape
+            //    `max_over_time(<name>[24h]) > 0` fires on the first scrape after
+            //    the first acceptance, because a series that exists at all here
+            //    already means it happened.
+            //  - `increase(<name>[..]) > 0` IS WRONG and would be the natural
+            //    thing to write. Prometheus takes the first sample in the range as
+            //    the baseline, so a counter going absent -> 1 shows an increase of
+            //    ~0: such a rule catches the SECOND acceptance and misses the
+            //    FIRST, which is exactly backwards for this event.
+            //  - `absent(<name>)` IS ALSO WRONG, for the reason
+            //    `infra/prometheus.yaml` already argues at length: a name that
+            //    never appears fires never.
+            //
+            // The rule lives in `deploy` at `infra/prometheus.yaml`, named
+            // `BootstrapTokenAccepted`, and repeats this reasoning where an
+            // operator reading the rule will meet it.
+            metrics::counter!(crate::admin::ACCEPTED).increment(1);
             Ok(Authority::Bootstrap)
         }
         Bootstrap::Refused => Err(Refusal::new(

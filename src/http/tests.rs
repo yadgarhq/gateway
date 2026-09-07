@@ -2246,6 +2246,129 @@ async fn a_wrong_bootstrap_token_is_refused_on_a_granted_verb() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// The acceptance counter is emitted when the token is ACCEPTED, and only then.
+///
+/// **BOTH DIRECTIONS, because either half alone is worthless.** A test that only
+/// watched the accepted case would pass against a counter incremented
+/// unconditionally at the top of `bootstrap_authority` — a series that fires on
+/// every wrong guess, which is an alert nobody can leave enabled. A test that
+/// only watched the refused case would pass against a counter that is never
+/// emitted at all, which is the shape `gateway`#59's own review found elsewhere
+/// in this estate: a metric that could be DELETED OUTRIGHT with every suite
+/// still green.
+///
+/// That matters more here than an ordinary missing assertion would. ADR-0492's
+/// risk acceptance rests on a leak being noticed; the log line that used to be
+/// the whole of "noticed" dies with the pod; and `deploy`'s
+/// `BootstrapTokenAccepted` rule is written against this series EXISTING. A
+/// counter nobody emits renders as a deployment where the bootstrap token has
+/// never been accepted — indistinguishable, to an operator, from one where it
+/// has.
+///
+/// MUTATION THIS CATCHES: delete the `metrics::counter!` line at the
+/// `Bootstrap::Accepted` arm. Nothing else in this repository reds.
+#[test]
+fn an_accepted_bootstrap_token_is_counted_and_a_refused_one_is_not() {
+    // The accepted half. `create-user` with `is_admin: true` is one of
+    // ADR-0492's two grants, so `authorise` reaches the `Bootstrap::Accepted`
+    // arm. This state's `iam` points at nothing, so the call fails AFTER the
+    // authorisation decision — which is the point rather than a limitation: the
+    // counter records the DECISION, not the outcome of the work it authorised.
+    let (accepted, status, answer) = count_bootstrap_acceptances(|| {
+        bootstrap_post(
+            "/admin/create-user",
+            r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        )
+    });
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the token matched, so this request must not be refused: {answer}"
+    );
+    assert_eq!(
+        accepted, 1,
+        "an accepted bootstrap token must leave a record that outlives the pod"
+    );
+
+    // The refused half — the SAME granted verb and the same body, so the only
+    // difference between the two runs is whether the presented token matched.
+    let (refused, status, answer) = count_bootstrap_acceptances(|| async {
+        admin_post(
+            state_bootstrapped(BOOTSTRAP_SECRET),
+            "/admin/create-user",
+            r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+            &[(BOOTSTRAP_HEADER_NAME, "not-the-token")],
+        )
+        .await
+    });
+    // **THE BODY, NOT MERELY THE STATUS**, because a 403 on this path is NOT
+    // proof that the secret was ever compared. `bootstrap_authority` refuses an
+    // EXCLUDED VERB with a 403 before it looks at the secret at all — the
+    // unconfigured refusals are 503 rather than 403, so the excluded verb is the
+    // only pre-comparison case that collides here, and one is enough. Asserting
+    // the status alone would let the `== 0` below pass against a gateway that
+    // never reached the comparison, and then this half would prove nothing about
+    // the counter. The two bodies are what separate them: the pre-comparison
+    // refusal says "the bootstrap token may only create an administrator or
+    // promote one", and this one is the `Bootstrap::Refused` arm's own.
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        answer.get("error"),
+        Some(&json!("the bootstrap token is not accepted here")),
+        "the request must reach the comparison and be refused BY it"
+    );
+    assert_eq!(
+        refused, 0,
+        "a wrong token is a refusal, not an acceptance: a counter that fired on both would page \
+         on every guess and could not be left enabled"
+    );
+}
+
+/// Drive one administrative request under a LOCAL recorder, and report how many
+/// times [`crate::admin::ACCEPTED`] was incremented, beside the answer.
+///
+/// A local recorder rather than `metrics::set_global_recorder`, and a plain
+/// `#[test]` driving a current-thread runtime rather than `#[tokio::test]`:
+/// `with_local_recorder` is THREAD-LOCAL and this binary runs its tests in
+/// parallel, so a global one would race every other emitter.
+fn count_bootstrap_acceptances<F, Fut>(request: F) -> (u64, StatusCode, Value)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = (StatusCode, Value)>,
+{
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (status, answer) =
+        metrics::with_local_recorder(&recorder, || rt.block_on(async { request().await }));
+
+    // ONE SNAPSHOT. `Snapshotter::snapshot` DRAINS the registry, so a second call
+    // would look at nothing.
+    let emitted = snapshotter.snapshot().into_vec();
+    // LENGTH FIRST, for the reason the origin-refusal test in this file gives: a
+    // `metrics-util` resolving against another `metrics` major links a SECOND
+    // facade, and then this snapshot is empty and everything built on it passes
+    // vacuously — including, and most dangerously, the `== 0` assertion.
+    assert!(
+        !emitted.is_empty(),
+        "the recorder saw no metric at all, which is what a second metrics facade in the tree \
+         looks like"
+    );
+
+    let counted = emitted
+        .iter()
+        .filter(|(key, _, _, _)| key.key().name() == crate::admin::ACCEPTED)
+        .map(|(_, _, _, value)| match value {
+            metrics_util::debugging::DebugValue::Counter(n) => *n,
+            other => panic!("{} is a counter, got {other:?}", crate::admin::ACCEPTED),
+        })
+        .sum();
+    (counted, status, answer)
+}
+
 /// A bootstrap request NEVER falls back to the attested path.
 ///
 /// If it did, "no actor on the bootstrap path" would stop being structural: a
