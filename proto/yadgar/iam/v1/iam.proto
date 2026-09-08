@@ -163,6 +163,14 @@ message LoginRequest {
   string password = 2;
   // Free text naming the machine, so a person can tell their laptop's
   // credential from their desktop's when revoking one.
+  //
+  // BOUNDED AT 255 CHARACTERS, counted as characters and not as bytes, because
+  // this and `RedeemEnrolmentRequest.label` and `IssueCredentialRequest.label`
+  // are one field landing in one `label VARCHAR(255)` column on utf8mb4
+  // (`iam-db/src/schema.rs:186`). Enforced in `iam` at
+  // `iam/src/service.rs:87` (`MAX_LABEL_CHARS`) and
+  // `iam/src/service.rs:1043` (`check_label`), and a second time at the
+  // gateway, `gateway/src/http.rs:100` and `:613`.
   string label = 3;
 }
 message LoginResponse {
@@ -364,6 +372,9 @@ message RedeemEnrolmentRequest {
 
   // Free text naming the machine, exactly as LoginRequest.label. The credential
   // this call returns is the person's first, and it needs a name like any other.
+  //
+  // Bounded the same 255 characters as `LoginRequest.label` — see that field
+  // for where the bound is stated and enforced.
   string label = 3;
 
   // Retries of ONE redemption attempt, and what makes this RPC retry-safe
@@ -461,6 +472,9 @@ message IssueCredentialRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string user_id = 2;
   // Free text for a human: which machine, which purpose. Not a key.
+  //
+  // Bounded the same 255 characters as `LoginRequest.label` — see that field
+  // for where the bound is stated and enforced.
   string label = 3;
   // Zero means no expiry.
   int64 expires_in_seconds = 4;
@@ -914,6 +928,13 @@ message SetInheritedSettingResponse {
 
 message CreateUserRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
+  // Bounded at 484 BYTES, counted as bytes and not as characters, because
+  // `iam` encrypts this before it reaches `iam-db`'s
+  // `external_id_ciphertext VARBINARY(512)` and 512 minus the cipher's 12-byte
+  // nonce and 16-byte tag is 484. Enforced in `iam` at
+  // `iam/src/service.rs:142` (`MAX_ENCRYPTED_FIELD_BYTES`) and
+  // `iam/src/service.rs:1112` (`check_stored_names`). `display_name` below
+  // shares the same bound for the same reason.
   string external_id = 2; // how an operator names this person
   string display_name = 3;
 
