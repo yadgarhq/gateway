@@ -690,6 +690,100 @@ adminLimits:
   # arrives when the operator declares the boundary.
   unattributed: "1:30"
 
+# D73'S BOOTSTRAP TOKEN — the credential that lets the FIRST administrator exist
+# before an administrator exists to create one (ADR-0492, ledger 638).
+#
+# It reaches exactly two acts, create-an-administrator and promote-one, and it is
+# checked at this gateway rather than inside `iam`: no administrative RPC on that
+# service carries a credential of any kind, because a second authentication
+# mechanism there would be a second place for it to be wrong, holding the same
+# secret twice.
+#
+# ONE VALUE, NOT A BOOLEAN BESIDE A NAME. Naming the Secret IS the switch, the
+# same shape rateLimit.passwordSecret, nats.passwordSecret, task.tls.caSecret and
+# clientCertificate.secret already have. An `enabled` flag beside a name is two
+# knobs that can disagree, and the disagreement renders a manifest that is wrong
+# in one of two ways nothing in Helm can refuse.
+#
+# WHAT ABSENCE MEANS, AND IT IS A SUPPORTED POSTURE RATHER THAN A GAP. Cleared,
+# this renders no YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE and no mount; the binary's
+# `bootstrap_token()` returns DISABLED; the process serves MCP, /auth/login,
+# /auth/enrol and the administrator-authenticated half of /admin exactly as
+# before, and every request presenting a bootstrap token is answered
+# `503 {"error":"the bootstrap token is not configured"}`. `main.rs` marks that
+# read ADR-0569-EXCEPTION for precisely this reason: refusing to START over one
+# administrative knob is an outage priced far above the gap.
+#
+# EMPTY BY DEFAULT, AND THE REFERENCE DEPLOYMENT TURNS IT ON (D80). An earlier
+# revision of this comment defaulted it to `admin-bootstrap-token` and argued that
+# it HAD to, on the grounds that `yadgarhq/argocd`'s ApplicationSet enumerates
+# modules rather than listing them (D54) and so could carry no per-module value.
+# **That was false, and the file it named refutes it.**
+# `applicationsets/modules.yaml` already carries `sourceAddress.trustedProxyHops`
+# in its shared `values:` block, under a comment reading:
+#
+#   CONSUMED ONLY BY `gateway`, and inert everywhere else — helm ignores a value
+#   a chart does not read. It sits in this shared block because D54's generator
+#   enumerates modules rather than listing them, so there is nowhere to put a
+#   per-module value that would not reintroduce the central list D54 exists to
+#   delete.
+#
+# So the mechanism exists and is already in use for a gateway-only value. D54
+# forbids a central per-module LIST; a gateway-only value in the shared block is
+# how that constraint is already resolved, and the file states the resolution
+# itself. **One entry in that block is what enables this in the reference
+# deployment**, and until it lands the surface stays disabled and answers 503 —
+# the safe direction, which outages nothing.
+#
+# WITH THAT MECHANISM AVAILABLE, EMPTY IS STRICTLY BETTER, and the asymmetry with
+# the two passwords above is what decides it. `nats.passwordSecret` and
+# `rateLimit.passwordSecret` are default-set because a broker password and a cache
+# password are REQUIRED for correct operation. **An absent bootstrap token leaves
+# the system correct** — which is precisely why `main.rs` marks its read
+# ADR-0569-EXCEPTION, naming that ADR's own revisit trigger, "a knob whose absence
+# leaves the system correct". Defaulting this ON would turn a designed-optional
+# capability into a boot dependency for every adopter, to buy something one line
+# in the reference deployment already buys.
+#
+# **BECAUSE SET-BUT-ABSENT FAILS THE BOOT.** The mount is `optional: true`, so a
+# Secret this chart is told to mount and cannot find is an empty directory rather
+# than a stuck pod — the file is not there, and gateway EXITS naming
+# /var/run/secrets/admin-bootstrap/token. That is deliberate, and it is the same
+# shape `nats.passwordSecret` and `rateLimit.passwordSecret` have: the binary
+# tells "not configured", which disables one path and serves, apart from
+# "configured and broken", which refuses the boot. Empty here is what stops an
+# adopter reaching the second state by upgrading.
+#
+# SO TO TURN IT ON, set this to the name of the Secret holding the token —
+# `admin-bootstrap-token` in the reference deployment. Do that only where that
+# Secret exists.
+#
+# AN ADOPTER SUPPLIES IT HOWEVER THEY LIKE (D80). This chart names a Secret and
+# mounts one key from it, so Vault, External Secrets, SOPS or a cloud secret
+# manager substitute for however the reference deployment creates it, and the
+# chart is unchanged.
+adminBootstrap:
+  # EMPTY, which renders no YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE, no mount and no
+  # volume — the bootstrap path disabled, everything else serving.
+  #
+  # `admin-bootstrap-token` is the value the reference deployment sets: the Secret
+  # `yadgarhq/deploy` creates, in namespace `yadgar`, generated only-if-absent by
+  # a Job. It is ADR-0517's human-facing generated credential, NOT a
+  # `make secrets` block and NOT a fifth credential under ADR-0580, whose count
+  # stays at four.
+  #
+  # RETRIEVING IT is the mechanism ADR-0517 requires, and the command lives in
+  # this repository's MIGRATION_NOTES.md as well as in that manifest. A cluster
+  # rebuild mints a DIFFERENT token while the old one still looks valid in an
+  # operator's notes, so retrieve it again after every recreate.
+  tokenSecret: ""
+  # The key inside that Secret which holds the token, mounted as `token`. Named
+  # rather than assumed, for the same reason the passwords and CA keys above are:
+  # a Secret assembled by hand is free to call it something else. Read through
+  # `required` in the template, so naming a Secret and clearing this fails at
+  # RENDER time rather than at boot.
+  tokenSecretKey: token
+
 preStopSleepSeconds: 5
 
 # THE WHOLE BUDGET FOR A POD'S DEATH: the sleep above, then SIGTERM, then the

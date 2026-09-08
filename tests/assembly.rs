@@ -540,9 +540,15 @@ fn each_configured_half_contributes_on_its_own() {
         "the administrative bootstrap token is a member on its own"
     );
 
-    // AND ABSENT IT CONTRIBUTES NOTHING, which is the deployment running today:
-    // the chart mounts no Secret yet, so the bootstrap path is disabled and there
-    // is no file. A path invented here would sit unreadable for ever on
+    // AND ABSENT IT CONTRIBUTES NOTHING, which is still the deployment running
+    // today — but for a different reason than when this was written, and the
+    // difference is worth the line. The chart can now mount the
+    // `admin-bootstrap-token` Secret; `adminBootstrap.tokenSecret` simply defaults
+    // to `""`, which renders no variable and no mount, and the reference
+    // deployment turns it on with one entry in `yadgarhq/argocd`. So this is the
+    // DEFAULT posture rather than an unbuilt one, and the case above is what a
+    // deployment that has set the value watches. Both are supported and both stay
+    // asserted. A path invented here would sit unreadable for ever on
     // `yadgar_rotation_watched_files_unreadable`, which is a gauge an operator
     // reads as a fault.
     assert_eq!(
