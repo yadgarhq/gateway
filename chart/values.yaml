@@ -714,48 +714,69 @@ adminLimits:
 # read ADR-0569-EXCEPTION for precisely this reason: refusing to START over one
 # administrative knob is an outage priced far above the gap.
 #
-# SET BY DEFAULT, AND THE REFERENCE DEPLOYMENT IS WHY IT HAS TO BE. D80 puts the
-# opinions in the reference deployment, but this one has nowhere to put them:
-# `yadgarhq/argocd`'s `applicationsets/modules.yaml` enumerates modules rather
-# than listing them (D54), so its `helm.values` block is UNIFORM across every
-# module — `autoscaling` and the generated version file, and nothing per-module.
-# There is no file in which to switch this on for gateway alone without
-# reintroducing the central list D54 exists to delete. So a default of `""` would
-# mean the administrative surface is unreachable in the reference deployment for
-# ever, which is the whole of what ledger 638 asks for. This follows
-# nats.passwordSecret and rateLimit.passwordSecret, both of which are likewise
-# set here and likewise created by `yadgarhq/deploy`.
+# EMPTY BY DEFAULT, AND THE REFERENCE DEPLOYMENT TURNS IT ON (D80). An earlier
+# revision of this comment defaulted it to `admin-bootstrap-token` and argued that
+# it HAD to, on the grounds that `yadgarhq/argocd`'s ApplicationSet enumerates
+# modules rather than listing them (D54) and so could carry no per-module value.
+# **That was false, and the file it named refutes it.**
+# `applicationsets/modules.yaml` already carries `sourceAddress.trustedProxyHops`
+# in its shared `values:` block, under a comment reading:
 #
-# **AND A CLUSTER WITHOUT THAT SECRET FAILS THE BOOT, WHICH IS THE PRICE.** The
-# mount is `optional: true`, so a missing Secret is an empty directory rather
+#   CONSUMED ONLY BY `gateway`, and inert everywhere else — helm ignores a value
+#   a chart does not read. It sits in this shared block because D54's generator
+#   enumerates modules rather than listing them, so there is nowhere to put a
+#   per-module value that would not reintroduce the central list D54 exists to
+#   delete.
+#
+# So the mechanism exists and is already in use for a gateway-only value. D54
+# forbids a central per-module LIST; a gateway-only value in the shared block is
+# how that constraint is already resolved, and the file states the resolution
+# itself. **One entry in that block is what enables this in the reference
+# deployment**, and until it lands the surface stays disabled and answers 503 —
+# the safe direction, which outages nothing.
+#
+# WITH THAT MECHANISM AVAILABLE, EMPTY IS STRICTLY BETTER, and the asymmetry with
+# the two passwords above is what decides it. `nats.passwordSecret` and
+# `rateLimit.passwordSecret` are default-set because a broker password and a cache
+# password are REQUIRED for correct operation. **An absent bootstrap token leaves
+# the system correct** — which is precisely why `main.rs` marks its read
+# ADR-0569-EXCEPTION, naming that ADR's own revisit trigger, "a knob whose absence
+# leaves the system correct". Defaulting this ON would turn a designed-optional
+# capability into a boot dependency for every adopter, to buy something one line
+# in the reference deployment already buys.
+#
+# **BECAUSE SET-BUT-ABSENT FAILS THE BOOT.** The mount is `optional: true`, so a
+# Secret this chart is told to mount and cannot find is an empty directory rather
 # than a stuck pod — the file is not there, and gateway EXITS naming
-# /var/run/secrets/admin-bootstrap/token. Loud, and a boot failure rather than a
-# degraded start. That is nats.passwordSecret's accepted shape, with one
-# difference worth naming rather than glossing: a broker password is needed for
-# correct operation, while an absent bootstrap token leaves the system correct.
-# Defaulting this ON therefore turns a designed-optional capability into a boot
-# dependency, and the off-switch below is what makes that reversible in one edit.
+# /var/run/secrets/admin-bootstrap/token. That is deliberate, and it is the same
+# shape `nats.passwordSecret` and `rateLimit.passwordSecret` have: the binary
+# tells "not configured", which disables one path and serves, apart from
+# "configured and broken", which refuses the boot. Empty here is what stops an
+# adopter reaching the second state by upgrading.
 #
-# SO THE OFF-SWITCH, stated plainly because an adopter needs it: set
-# `adminBootstrap.tokenSecret: ""`. That removes the variable and the mount
-# together and restores the designed-disabled state exactly. Do that rather than
-# deploying this against a cluster where the Secret does not exist.
+# SO TO TURN IT ON, set this to the name of the Secret holding the token —
+# `admin-bootstrap-token` in the reference deployment. Do that only where that
+# Secret exists.
 #
 # AN ADOPTER SUPPLIES IT HOWEVER THEY LIKE (D80). This chart names a Secret and
 # mounts one key from it, so Vault, External Secrets, SOPS or a cloud secret
 # manager substitute for however the reference deployment creates it, and the
 # chart is unchanged.
 adminBootstrap:
-  # `admin-bootstrap-token` is the Secret `yadgarhq/deploy` creates, in namespace
-  # `yadgar`, generated only-if-absent by a Job — ADR-0517's human-facing
-  # generated credential, NOT a `make secrets` block and NOT a fifth credential
-  # under ADR-0580, whose count stays at four.
+  # EMPTY, which renders no YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE, no mount and no
+  # volume — the bootstrap path disabled, everything else serving.
+  #
+  # `admin-bootstrap-token` is the value the reference deployment sets: the Secret
+  # `yadgarhq/deploy` creates, in namespace `yadgar`, generated only-if-absent by
+  # a Job. It is ADR-0517's human-facing generated credential, NOT a
+  # `make secrets` block and NOT a fifth credential under ADR-0580, whose count
+  # stays at four.
   #
   # RETRIEVING IT is the mechanism ADR-0517 requires, and the command lives in
   # this repository's MIGRATION_NOTES.md as well as in that manifest. A cluster
   # rebuild mints a DIFFERENT token while the old one still looks valid in an
   # operator's notes, so retrieve it again after every recreate.
-  tokenSecret: admin-bootstrap-token
+  tokenSecret: ""
   # The key inside that Secret which holds the token, mounted as `token`. Named
   # rather than assumed, for the same reason the passwords and CA keys above are:
   # a Secret assembled by hand is free to call it something else. Read through
