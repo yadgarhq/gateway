@@ -63,7 +63,7 @@ prost-types = "0.14"
 # upstreams.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
-yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.9" }
+yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.10" }
 # HOW THIS PROCESS DIALS, for BOTH upstreams. Client-side balancing over task's
 # headless Service (D23), and — since the `iam` hop stopped building an
 # `Endpoint` of its own — the single implementation of ADR-0514's rule that the
@@ -82,11 +82,11 @@ yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v
 # records the full 40-character revision it resolved to. The pin stays exact and
 # auditable, and the git dependency finally states a version it had no way to
 # state before.
-yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.5" }
+yadgar-dial = { git = "https://github.com/yadgarhq/dial.git", tag = "v0.2.6" }
 
 # The shared instrumentation seam (D67). Pinned by release tag like every other
 # in-org crate — a branch is a moving target, a published tag is not.
-yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.9", features = [
+yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v0.1.10", features = [
   "grpc",
 ] }
 
