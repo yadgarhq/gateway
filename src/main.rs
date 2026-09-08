@@ -135,23 +135,29 @@ fn env_required_allow_empty(key: &str) -> Result<String, String> {
 /// | `Configuration::schedule` | `rotate::ScheduleError` | no. Its `#[error]` already interpolates `({source})`, so walking prints the inner text TWICE — and there is no further layer to gain: `serde_norway` 0.9.42's `Error::source()` forwards to `ErrorImpl::source()`, which answers `Some` only for `Io`/`FromUtf8`/`Shared`, and malformed YAML yields `Message` or `Libyaml`, both `None`. `Unreadable`'s `io::Error` has no source either. Settled, not deferred. |
 /// | `TrustBoundary::parse` | `source::TrustBoundaryError` | no. Two variants, neither with a source. |
 ///
-/// **The cost this accepts, stated rather than discovered.** `BalanceError` has
-/// TEN variants, of which exactly SIX carry `#[source]` — and ALL SIX also
-/// interpolate `{source}` into their own `#[error]` string, `Tls` INCLUDED
-/// (`dial` v0.2.1 `src/lib.rs:1172-1264`, `Tls` at `:1259`). So the walk appends
-/// a duplicate tail on every one of them: `... (os error 2). TLS was requested
-/// ...: No such file or directory (os error 2)`.
+/// **The duplication this paragraph used to describe is gone as of `dial`
+/// v0.2.5 (ledger 737).** `BalanceError` still has TEN variants, of which
+/// exactly SIX carry `#[source]` — `Dns`, `CaUnreadable`, `CaUnparsable`,
+/// `ClientCertificateUnreadable`, `ClientKeyUnreadable`, `Tls` — but none of
+/// the six interpolates `{source}` into its own `#[error]` string any more
+/// (`dial` v0.2.5 `src/lib.rs:1172-1264`, `Tls` at `:1259`, now
+/// `#[error("TLS could not be configured")]` with no inlined cause). The
+/// chain walk supplies the cause instead of the message printing it twice,
+/// which is what the item title says.
 ///
-/// `Tls` is not an exception to that and the worked example above shows it —
-/// `TLS could not be configured: transport error: transport error: invalid dns
-/// name` says `transport error` twice for exactly this reason. What makes `Tls`
-/// worth the walk anyway is not that it avoids the duplication but that a THIRD
-/// layer sits under it, and nothing else reaches that layer.
+/// `Tls` is the worked example. Before `v0.2.5` the walk rendered `TLS could
+/// not be configured: transport error: transport error: invalid dns name` —
+/// `transport error` twice, because `Tls` both interpolated tonic's error AND
+/// `chain` walked to it as `#[source]`. After `v0.2.5` it renders `TLS could
+/// not be configured: transport error: invalid dns name` — once. What still
+/// makes `Tls` worth the walk is unchanged: a THIRD layer sits under it, and
+/// nothing else reaches that layer.
 ///
-/// The duplication is noise on messages that were already complete, traded for
-/// the one message that was a dead end. The real fix is in `yadgar-dial`, whose
-/// `#[error]` strings should not inline a field they also mark `#[source]`;
-/// until then the walk is the only way that layer reaches an operator.
+/// The fix landed where this doc comment used to say it belonged: in
+/// `yadgar-dial`, whose `#[error]` strings no longer inline a field they also
+/// mark `#[source]`. The walk is still the only way the layer below
+/// `transport error` reaches an operator; it just no longer pays a duplicate
+/// tail to get there.
 fn refusal(error: &dyn std::error::Error) -> String {
     yadgar_telemetry::diagnose::chain(error)
 }
