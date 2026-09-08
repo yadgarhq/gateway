@@ -1,5 +1,84 @@
 # Migration notes
 
+## The bootstrap token is now MOUNTED, and the administrative surface is usable (ADR-0492, ledger 638, step 7)
+
+**This supersedes the "ships DISABLED" paragraph in the section below.** That
+section described the release that added the routes; this one describes the
+release that connects the credential they need.
+
+**Nothing to run against the cluster to deploy this.** The chart names the
+`admin-bootstrap-token` Secret by default, mounts one key from it, and points
+`YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE` at the mounted file. `yadgarhq/deploy`
+already creates that Secret — namespace `yadgar`, key `token`, generated
+only-if-absent by a Job — so the reference deployment has it before this chart
+rolls. An ordinary `helm upgrade` needs no operator action.
+
+**WHAT AN OPERATOR MUST DO TO ACTUALLY USE THE ADMINISTRATIVE SURFACE.** Deploying
+this changes nothing by itself: there are still ZERO administrators, because
+`is_admin` defaults to 0 for every user that exists (`iam-db` migration 8). Three
+steps, in this order.
+
+1. **Read the token out.** It is the only credential that reaches the surface
+   while no administrator exists, and ADR-0517 requires it be retrievable at least
+   once through a documented command. That command is `yadgarhq/deploy`'s, in this
+   repository so it is findable from the consumer side:
+
+   ```
+   kubectl -n yadgar get secret admin-bootstrap-token -o jsonpath='{.data.token}' | base64 -d; echo
+   ```
+
+   `yadgarhq/deploy`'s `MIGRATION_NOTES.md`, "The administrative bootstrap token",
+   is the runbook copy and carries the same warning. A cluster rebuild mints a
+   DIFFERENT token while the old one still looks valid in an operator's notes —
+   the Secret is never absent, only present-and-wrong — so retrieve it again after
+   every recreate and never reuse a value copied from before one.
+
+2. **Create the first administrator**, presenting that token in
+   `X-Yadgar-Bootstrap-Token` on `POST /admin/create-user` with `is_admin: true`.
+   The token reaches creating an administrator and promoting one, and nothing
+   else: it is refused on `/admin/issue-enrolment`, on a `create-user` that does
+   not set the flag, and on a `set-user-admin` that clears it.
+
+3. **From then on use the administrator**, not the token. `/admin/issue-enrolment`
+   is reachable only by an attested administrator, and the enrolment blob it mints
+   is what `yaadgaar enrol` redeems.
+
+**A cluster where the Secret does not exist FAILS THE BOOT, and the off-switch is
+one value.** The mount is `optional: true`, so a missing Secret is an empty
+directory rather than a stuck pod: the file is not there and gateway EXITS naming
+`/var/run/secrets/admin-bootstrap/token`. That is deliberate — the binary
+distinguishes "not configured", which disables one path and serves, from
+"configured and broken", which refuses the boot, and a Secret this chart was told
+to mount and cannot find is the second. It is the same shape
+`nats.passwordSecret` already has. To ask for the disabled posture instead, set
+
+```
+adminBootstrap:
+  tokenSecret: ""
+```
+
+which removes the variable and the mount together. Do that rather than upgrading
+against a cluster with no `admin-bootstrap-token`.
+
+**An operator values file that does not mention `adminBootstrap` needs no edit.**
+Helm coalesces `chart/values.yaml` beneath every `-f` file, so a user file lacking
+the block renders the chart defaults. The case that breaks is an explicit
+`adminBootstrap: null`, and it breaks in the safe direction: a RENDER-time nil
+pointer, so `helm upgrade` refuses before anything is applied and the running pods
+are untouched — the same behaviour `adminLimits: null` has.
+
+**Rotating the token restarts the pod, by design (ADR-0523).** The mount is a
+DIRECTORY, never `subPath`, so kubelet's swap reaches the container; the token is
+held as a digest for the life of the process, so a rotation that did not restart
+the pod would leave this gateway comparing against the value it booted with.
+Replacing the Secret ends the pod and the replacement boots on the new value,
+exactly as editing a CA bundle does.
+
+**No audit record, still.** None of the three verbs emits one; there is no audit
+store on this boundary. A `warn` line and a counter mark every accepted bootstrap
+token and that is the whole of the observability. Do not read ADR-0492's "a leak
+is loud and lands in the audit trail" as met.
+
 ## The administrative surface — three routes, two new required knobs, one Secret still unmounted (ADR-0492, ledger 638)
 
 **Nothing to run against the cluster from here.** The chart renders the two new
@@ -28,7 +107,9 @@ booted pod refusing to start. An operator who deliberately nulls the block wante
 something and should set the two values instead.
 
 **The bootstrap path ships DISABLED, and that is the design rather than a gap in
-it.** `YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE` is unset, no Secret is mounted, and
+it.** **SUPERSEDED — the section above mounts the Secret; what follows describes
+the release that added the routes, not the state of the chart today.**
+`YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE` is unset, no Secret is mounted, and
 every request presenting `X-Yadgar-Bootstrap-Token` is answered
 `503 {"error":"the bootstrap token is not configured"}`. MCP, `/auth/login`,
 `/auth/enrol` and the administrator-authenticated half of `/admin` are unaffected.

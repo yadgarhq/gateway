@@ -540,9 +540,13 @@ fn each_configured_half_contributes_on_its_own() {
         "the administrative bootstrap token is a member on its own"
     );
 
-    // AND ABSENT IT CONTRIBUTES NOTHING, which is the deployment running today:
-    // the chart mounts no Secret yet, so the bootstrap path is disabled and there
-    // is no file. A path invented here would sit unreadable for ever on
+    // AND ABSENT IT CONTRIBUTES NOTHING. This used to be "the deployment running
+    // today", and it is not any more: the chart mounts the `admin-bootstrap-token`
+    // Secret by default and names the file, so the case above is the reference
+    // deployment and this one is the OFF-SWITCH — `adminBootstrap.tokenSecret: ""`,
+    // which removes the variable and the mount together and leaves the bootstrap
+    // path disabled. It stays asserted because it is a supported posture, not a
+    // superseded one. A path invented here would sit unreadable for ever on
     // `yadgar_rotation_watched_files_unreadable`, which is a gauge an operator
     // reads as a fault.
     assert_eq!(

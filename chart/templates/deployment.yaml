@@ -25,6 +25,40 @@
   reverted state leaves nothing behind.
 */}}
 {{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled) -}}
+{{/*
+  WHETHER D73'S BOOTSTRAP TOKEN IS MOUNTED AT ALL (ADR-0492, ledger 638).
+
+  ONE VALUE GATES THREE SITES — the environment variable, the mount and the
+  volume — and it is hoisted here for the reason `$presentsIdentity` above is:
+  the three sites are far apart in this file, and either half missing is the
+  mistake to watch for. Here the two halves fail DIFFERENTLY, and that asymmetry
+  is why this is one expression rather than three copies of a condition:
+
+    - THE VARIABLE WITHOUT THE VOLUME IS A CRASHLOOP ON EVERY REPLICA.
+      `main.rs`'s `bootstrap_token()` reads YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE
+      and, finding a path it cannot read, EXITS naming it — "a path that cannot
+      be read is a configuration that was ATTEMPTED and failed". That is right in
+      the binary and catastrophic here, because it takes MCP, /auth/login and
+      /auth/enrol down with it over one administrative knob.
+    - THE VOLUME WITHOUT THE VARIABLE IS A SILENTLY DISABLED PATH. The Secret is
+      mounted, nothing names it, `bootstrap_token()` returns disabled, and every
+      request presenting a bootstrap token is answered 503 while the manifest
+      shows the credential sitting right there in the pod.
+
+  A SINGLE `$` VARIABLE IS AS CLOSE AS THIS LANGUAGE GETS, and saying so is more
+  useful than claiming the pairing is enforced. Helm cannot bind an env entry to
+  a volume: they are three list items in three places, so neither unpaired state
+  is unrenderable. What the variable buys is that the three sites read ONE
+  expression, so turning this on or off is one edit rather than three that can
+  disagree. The residual hole is a later edit deleting one of the three blocks,
+  and REVIEW is what catches that — nothing in the template can.
+
+  THE HALF THAT IS ENFORCED IS THE KEY. `adminBootstrap.tokenSecretKey` is read
+  through `required` inside `items:` below, so naming a Secret and no key fails
+  at RENDER time: `helm upgrade` refuses and the pods already running are
+  untouched. That is the same shape the four Secret mounts below already have.
+*/}}
+{{- $bootstrapTokenSecret := .Values.adminBootstrap.tokenSecret -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -469,6 +503,38 @@ spec:
               value: {{ .Values.adminLimits.attributed | quote }}
             - name: YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT
               value: {{ .Values.adminLimits.unattributed | quote }}
+            {{- if $bootstrapTokenSecret }}
+            # D73'S BOOTSTRAP TOKEN — the credential that lets the FIRST
+            # administrator exist before an administrator exists to create one
+            # (ADR-0492, ledger 638). It reaches creating an administrator and
+            # promoting one, and nothing else.
+            #
+            # RENDERED ONLY WITH THE MOUNT, and the two are one expression at the
+            # top of this file precisely because the unpaired states are the
+            # hazard — see the comment there. Absent, `bootstrap_token()` returns
+            # DISABLED, the process serves everything else, and each request
+            # presenting a bootstrap token is answered 503 naming the missing
+            # configuration. That is a supported posture rather than a fault.
+            #
+            # NOT REQUIRED IN THE BINARY, and it is the only knob here that is
+            # not. `main.rs` marks the read `ADR-0569-EXCEPTION` because absence
+            # is a state the design needs — ADR-0569's own revisit trigger, "a
+            # knob whose absence leaves the system correct". Every other variable
+            # above reads through `env_required` and fails the boot without one.
+            #
+            # A PATH, never the value (D80). A token in the environment is a token
+            # in `kubectl describe pod`; a file is readable only inside the
+            # container.
+            #
+            # THERE IS NO SILENT MIDDLE STATE ONCE IT IS SET. A path naming no
+            # readable file fails the pod at boot naming the path — `NOT
+            # CONFIGURED` and `CONFIGURED WITH A BROKEN PATH` are different
+            # states and only the first serves. So do not set
+            # adminBootstrap.tokenSecret against a cluster where that Secret does
+            # not exist; clear the value instead. See values.yaml.
+            - name: YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE
+              value: /var/run/secrets/admin-bootstrap/token
+            {{- end }}
             - name: RUST_LOG
               value: "info"
             {{- if .Values.trustUnauthenticatedHeaders }}
@@ -696,6 +762,25 @@ spec:
               mountPath: /var/run/secrets/client-cert
               readOnly: true
             {{- end }}
+            {{- if $bootstrapTokenSecret }}
+            # A DIRECTORY MOUNT, never subPath — the same rule the two password
+            # mounts above state, and here it is what makes a ROTATION reach this
+            # process at all. A subPath mount is a one-time copy kubelet never
+            # refreshes.
+            #
+            # THE TOKEN IS HELD AS A DIGEST FOR THE LIFE OF THE PROCESS, so a
+            # Secret replaced underneath a running pod would leave this gateway
+            # comparing against the value it booted with, and no existence check
+            # tells the two apart — the Secret's own manifest warns that a cluster
+            # rebuild mints a DIFFERENT token while the old one still looks valid
+            # in an operator's notes. `main.rs` marks the read
+            # `ADR-0523-WATCHED: bootstrap_token` and folds this path into the
+            # watch set, so a rotation ENDS the pod and the replacement boots on
+            # the new value. That only works because this is a directory.
+            - name: admin-bootstrap-token
+              mountPath: /var/run/secrets/admin-bootstrap
+              readOnly: true
+            {{- end }}
       volumes:
         # The two ConfigMaps `yadgarhq/config` renders, same reasoning as the
         # mounts above: unconditional, a directory each, never optional.
@@ -804,4 +889,37 @@ spec:
             items:
               - key: {{ required "iam.tls.caSecretKey names the key inside iam.tls.caSecret that holds the CA bundle and must be set whenever iam.tls.enabled is; see the chart's values.yaml" .Values.iam.tls.caSecretKey | quote }}
                 path: ca.pem
+        {{- end }}
+        {{- if $bootstrapTokenSecret }}
+        - name: admin-bootstrap-token
+          secret:
+            secretName: {{ $bootstrapTokenSecret | quote }}
+            # OPTIONAL, and it means here exactly what it means on the two
+            # passwords above: which ERROR the operator gets, never whether the
+            # pod may run without the credential. A required mount that cannot be
+            # satisfied leaves the pod in ContainerCreating with a FailedMount
+            # event about a volume. An optional one mounts an empty directory, the
+            # binary finds no file at YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE, and it
+            # EXITS naming that path. Neither starts; only one of them explains
+            # itself.
+            #
+            # AND THAT EXIT IS THE POINT RATHER THAN A REGRETTABLE SIDE EFFECT.
+            # The binary distinguishes "not configured" from "configured and
+            # broken": the first disables one path and serves, the second refuses
+            # the boot. A Secret this chart was told to mount and cannot find is
+            # the SECOND. The way to ask for the first is to clear
+            # adminBootstrap.tokenSecret, which removes the variable and the mount
+            # together.
+            optional: true
+            # ONE KEY, renamed to the `token` the environment names above, so
+            # whatever the Secret's author called it does not travel into the
+            # binary's configuration. `yadgarhq/deploy` calls it `token`.
+            #
+            # `required` HERE IS THE ONE HALF OF THE PAIRING THE TEMPLATE CAN
+            # ENFORCE: a Secret named with no key fails at render, so
+            # `helm upgrade` refuses before anything is applied and the running
+            # pods are untouched.
+            items:
+              - key: {{ required "adminBootstrap.tokenSecretKey names the key inside adminBootstrap.tokenSecret that holds the bootstrap token and must be set whenever adminBootstrap.tokenSecret is; see the chart's values.yaml" .Values.adminBootstrap.tokenSecretKey | quote }}
+                path: token
         {{- end }}
