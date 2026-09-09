@@ -22,7 +22,7 @@ repos:
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.2
+    rev: v1.18.3
     hooks:
       - id: gitleaks
       - id: prettier
@@ -36,6 +36,42 @@ repos:
       - id: actionlint
       - id: cargo-fmt
       - id: cargo-clippy
+      # LEDGER 659, and the largest adoption in the estate: this repository was
+      # over the FILE ceiling on nine files and over the FUNCTION ceiling on five
+      # when the ids were added. It is under both now, on real seams, and the PR
+      # that did it records each one. Adopting a limit already breached would
+      # have meant starting with an exemption list, which is how a limit stops
+      # meaning anything.
+      #
+      # `cargo-clippy-complexity` was NOT clean here, unlike in the four sibling
+      # repositories that adopted before this one: four functions in
+      # `src/invalidate.rs` were over cognitive complexity 25 on the tree this
+      # branch started from. That is the case the pair exists for — a line count
+      # cannot see nesting, and cognitive complexity cannot see a 2000-line file
+      # of short functions.
+      #
+      # THE REV BUMP TO v1.18.3 IS LOAD-BEARING HERE, and in the four sibling
+      # repositories that adopted before this one it was not. v1.18.3 exempts a
+      # file NAMED `tests.rs`/`test.rs` that carries a real `#[test]`; v1.18.2
+      # measures one as production. Measured 2026-09-09 with each rev's own
+      # `hooks/complexity.py` over `git ls-files '*.rs'`:
+      #
+      #   - `src/http/tests.rs` was ALREADY 2626 lines on main, so the v1.18.2
+      #     script fails on this repository's PRE-EXISTING layout, before this
+      #     branch changes anything.
+      #   - `src/attest/tests.rs` is 1047 lines of unit tests moved out of
+      #     `src/attest.rs` by this branch, and v1.18.2 fails on that too.
+      #   - the finished tree exits 0 under v1.18.3 and 1 under v1.18.2. Those
+      #     are the script's own codes, from invoking it directly on the file
+      #     list; `complexity.py` ends `return 1 if problems else 0` and can
+      #     return nothing else. A run that pipes the list through `xargs`
+      #     reports 123, which is xargs' code for a nonzero child rather than
+      #     anything the hook said.
+      #
+      # `git diff --stat v1.18.2 v1.18.3` is `hooks/complexity.py` and its test
+      # file and nothing else, so no other hook in this block changes behaviour.
+      - id: complexity
+      - id: cargo-clippy-complexity
       - id: cargo-deny
       - id: observe-coverage
       - id: helm-lint

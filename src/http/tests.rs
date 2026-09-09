@@ -11,6 +11,12 @@ use axum::http::{Method, Request as HttpRequest, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
+// `http.rs` is a directory module now, so the items these tests drive live in
+// its submodules. The GLOBS are what keep every test body below unchanged: this
+// is the only edit the split made to this file.
+use super::answer::*;
+use super::authority::*;
+use super::dispatch::*;
 use super::*;
 use crate::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 
