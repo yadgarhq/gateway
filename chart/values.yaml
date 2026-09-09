@@ -401,11 +401,17 @@ rateLimit:
   #
   # SET BY DEFAULT, unlike `task.tls` above, and the difference is worth the
   # paragraph. That value is off by default because turning it on against a
-  # server which cannot answer BREAKS the hop. This one is on by default because
-  # the reference deployment has nowhere else to put it: `yadgarhq/argocd`'s
-  # ApplicationSet enumerates modules rather than listing them (D54), so its Helm
-  # values are uniform across every module and cannot carry a per-module Secret
-  # name. The module's own values.yaml is the override point that comment names.
+  # server which cannot answer BREAKS the hop. This one is on by default
+  # because a cache password is REQUIRED for correct operation (ledger 782
+  # corrects an earlier revision of this comment, which argued the opposite
+  # reason — that argocd had nowhere else to put it. That was false: D54's
+  # generator enumerates modules rather than listing them, but its shared
+  # `values:` block already carries gateway-only entries —
+  # `sourceAddress.trustedProxyHops` and `adminBootstrap.tokenSecret` below
+  # are both examples, measured in `yadgarhq/argocd`'s
+  # `applicationsets/modules.yaml` — so a per-module Secret name is available
+  # there too, same as it is here). The module's own values.yaml is simply
+  # the override point that comment names.
   #
   # AN ADOPTER WHOSE CACHE HAS NO PASSWORD CLEARS THIS, and empty is a fully
   # supported state: the chart then sends the binary no password variable, and it

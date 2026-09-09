@@ -708,6 +708,122 @@ async fn every_login_failure_is_opaque_in_body_and_headers() {
     );
 }
 
+/// A fresh [`Call`], cheap enough to build on every iteration below.
+///
+/// **Not refactored into a pure `code -> Response` shape the way
+/// [`login_failure`] was (ledger 781).** `login_failure` moved to that shape
+/// because its `Call` had nowhere cheap to come from in a test that does not
+/// drive a full request through [`router`]. `Call::start` takes no network and
+/// no server — real telemetry machinery, backed by nothing but a clock and a
+/// `tracing::Span` — so building one here costs nothing a pure signature would
+/// have saved, and `admin_failure` keeps its call site's `call.fail(status)` at
+/// the exact point it decides the status, which a split into "caller fails,
+/// then builds a body" would move apart for no gain. `admin_failure` consumes
+/// its `Call`, so each code below needs its own.
+fn admin_call() -> Call {
+    Call::start(
+        SERVICE,
+        ADMIN_CREATE_USER,
+        Kind::Write,
+        tel(crate::request_id()),
+    )
+}
+
+/// `admin_failure`'s `FAILED_PRECONDITION` body is DISTINCT from every other
+/// code's, and nothing pinned that before this test (ledger 781).
+///
+/// [`login_failure`] was refactored into a pure `code -> Response` shape and
+/// covered by `every_login_failure_is_opaque_in_body_and_headers` above;
+/// `admin_failure` still takes a [`Call`], so the refactor never reached it and
+/// its FAILED_PRECONDITION arm — the one `admin_failure`'s own doc comment
+/// spends a paragraph justifying — shipped with no test asserting the body it
+/// argues for.
+///
+/// Three properties, mirroring the login test above:
+///
+/// - `FAILED_PRECONDITION` alone gets the enrolment-specific body, at the
+///   SAME 503 [`opaque_status`] gives every other non-`UNAUTHENTICATED` code —
+///   the distinction the doc comment makes is in the BODY, not the status;
+/// - every other non-`UNAUTHENTICATED` code answers ONE identical
+///   `(status, body)` pair, the generic "administrative service unavailable";
+/// - `UNAUTHENTICATED` alone answers 401 with the generic "refused" body.
+#[tokio::test]
+async fn admin_failure_failed_precondition_gets_a_distinct_body() {
+    let mut generic_answers = std::collections::BTreeSet::new();
+    let mut precondition_answers = std::collections::BTreeSet::new();
+    let mut refusals = 0;
+
+    for code in ALL_CODES {
+        let status = tonic::Status::new(code, "an upstream message that must not leak");
+        let resp = admin_failure(admin_call(), ADMIN_CREATE_USER, status);
+        let resp_status = resp.status();
+
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "{code:?} must answer JSON"
+        );
+
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read the body");
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+
+        // THE BODY MUST NOT CARRY THE UPSTREAM'S WORDS. `admin_failure` logs
+        // `e.message()` and never returns it — this asserts the signature is
+        // doing its job rather than that the author was careful.
+        assert!(
+            !body.contains("upstream message"),
+            "{code:?} leaked the upstream message into the body: {body}"
+        );
+
+        if code == tonic::Code::Unauthenticated {
+            refusals += 1;
+            assert_eq!(resp_status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body, r#"{"error":"refused"}"#);
+        } else if code == tonic::Code::FailedPrecondition {
+            precondition_answers.insert((resp_status.as_u16(), body));
+        } else {
+            generic_answers.insert((resp_status.as_u16(), body));
+        }
+    }
+
+    assert_eq!(refusals, 1, "exactly one code is a refusal");
+    assert_eq!(
+        generic_answers.len(),
+        1,
+        "every non-refusal, non-FAILED_PRECONDITION code must answer one identical status AND \
+         body; got {generic_answers:?}"
+    );
+    assert_eq!(
+        generic_answers.into_iter().next().expect("one answer"),
+        (
+            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            r#"{"error":"the administrative service is unavailable"}"#.to_string()
+        )
+    );
+
+    assert_eq!(
+        precondition_answers.len(),
+        1,
+        "FAILED_PRECONDITION must answer one fixed status AND body; got {precondition_answers:?}"
+    );
+    let (precondition_status, precondition_body) =
+        precondition_answers.into_iter().next().expect("one answer");
+    assert_eq!(
+        precondition_status,
+        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+        "FAILED_PRECONDITION's distinct body is not a distinct STATUS — opaque_status gives it \
+         the same 503 as every other non-UNAUTHENTICATED code"
+    );
+    assert_eq!(
+        precondition_body,
+        r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#
+    );
+}
+
 // ---------------------------------------------------------------------------
 // POST /auth/login (D75). The handler, through the real router.
 // ---------------------------------------------------------------------------
