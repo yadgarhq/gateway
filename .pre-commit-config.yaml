@@ -61,7 +61,12 @@ repos:
       #     branch changes anything.
       #   - `src/attest/tests.rs` is 1047 lines of unit tests moved out of
       #     `src/attest.rs` by this branch, and v1.18.2 fails on that too.
-      #   - the finished tree exits 0 under v1.18.3 and 123 under v1.18.2.
+      #   - the finished tree exits 0 under v1.18.3 and 1 under v1.18.2. Those
+      #     are the script's own codes, from invoking it directly on the file
+      #     list; `complexity.py` ends `return 1 if problems else 0` and can
+      #     return nothing else. A run that pipes the list through `xargs`
+      #     reports 123, which is xargs' code for a nonzero child rather than
+      #     anything the hook said.
       #
       # `git diff --stat v1.18.2 v1.18.3` is `hooks/complexity.py` and its test
       # file and nothing else, so no other hook in this block changes behaviour.

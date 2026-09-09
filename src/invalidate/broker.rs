@@ -287,11 +287,6 @@ pub(super) fn on_event(event: async_nats::Event, refused: &tokio::sync::watch::S
     }
 }
 
-/// The broker events this module only REPORTS.
-///
-/// Separate from [`on_event`] because none of these changes a decision: the
-/// refusal flag `start` answers off is set in [`on_server_error`] and nowhere
-/// else, and keeping the reporting arms apart is what makes that readable.
 /// The pair that marks the window in which nothing is consumed.
 ///
 /// Its own function because the two arms are ONE fact read together: the
@@ -316,6 +311,11 @@ fn report_connection(event: async_nats::Event) {
     }
 }
 
+/// The broker events this module only REPORTS.
+///
+/// Separate from [`on_event`] because none of these changes a decision: the
+/// refusal flag `start` answers off is set in [`on_server_error`] and nowhere
+/// else, and keeping the reporting arms apart is what makes that readable.
 fn report(event: async_nats::Event) {
     match event {
         async_nats::Event::ClientError(e) => {
