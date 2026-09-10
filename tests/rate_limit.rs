@@ -17,18 +17,19 @@
 //! that the naive version over-grants would be a flaky test asserting a
 //! probability.
 //!
-//! # These tests do not run in CI today, and CANNOT quietly stay that way
+//! # These tests run in CI now, and the panic keeps that from quietly stopping
 //!
-//! The shared workflow (`yadgarhq/actions`, `ci-pr.yaml`) supplies MariaDB to
-//! every Rust repository and no Valkey, so `YADGAR_TEST_VALKEY` is unset there.
-//! Locally that is a loud skip. **On a runner it is a failure** — see
-//! `common::resolve`. A skip printed into a green run is a control only while
-//! somebody reads it, and after merge nobody does; the panic is what makes the
-//! gap impossible to carry silently past the day the shared workflow gains a
-//! Valkey, or past a later change that takes it away again. The fix is that
-//! Valkey service, the YAML is in `MIGRATION_NOTES.md`, and the workflow's own
-//! comment already argues for running one in every Rust repository rather than
-//! detecting which need it.
+//! This module predicted that the shared workflow (`yadgarhq/actions`,
+//! `ci-pr.yaml`) supplying MariaDB to every Rust repository, and no Valkey,
+//! would leave `YADGAR_TEST_VALKEY` unset with nothing to say so. **That changed
+//! on 2026-09-01**: `yadgarhq/actions` PR #30 (`b92944f`) added a Valkey service
+//! to `ci-pr.yaml`, unconditionally, for every Rust repository, so
+//! `YADGAR_TEST_VALKEY` is set on every runner and these tests run there. Locally
+//! an absent Valkey is still a loud skip. **On a runner it is still a failure** —
+//! see `common::resolve` — and that is what would catch a later change to
+//! `ci-pr.yaml` that took the Valkey away again, silently or otherwise. A skip
+//! printed into a green run is a control only while somebody reads it, and after
+//! merge nobody does.
 //!
 //! Run locally with:
 //!

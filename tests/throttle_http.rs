@@ -9,8 +9,9 @@
 //! gives: a global metrics recorder can be installed once per process, so it
 //! cannot share one with the rest of the suite.
 //!
-//! Needs a real Valkey and therefore does not run in CI today — see the module
-//! comment on `rate_limit.rs` for how to run it, and why an absent Valkey is a
+//! Needs a real Valkey. `yadgarhq/actions` PR #30 (`b92944f`) added a Valkey
+//! service to `ci-pr.yaml`, so this runs in CI now — see the module comment on
+//! `rate_limit.rs` for how to run it locally, and why an absent Valkey is a
 //! skip locally and a failure on a runner.
 
 use std::sync::Arc;

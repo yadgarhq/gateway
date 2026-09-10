@@ -16,7 +16,8 @@
 //!
 //! # No Valkey, on purpose
 //!
-//! `throttle_http.rs` needs a real one and does not run in CI. This file points
+//! `throttle_http.rs` needs a real one; CI has supplied one since `yadgarhq/actions`
+//! PR #30 (`b92944f`), so that file now runs there too. This file points
 //! the limiter at a closed port, so every call takes D74's degraded path and is
 //! held to this replica's own in-process floor — which is deterministic, needs no
 //! server, and exercises the same `guard` wiring. What is measured is WHICH
