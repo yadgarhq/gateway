@@ -19,12 +19,16 @@ pub fn addr() -> Option<String> {
 /// **Locally the absence of a Valkey is a skip; in CI it is a failure.** The two
 /// are different situations and one answer would be wrong for one of them. A
 /// developer with no container running should still be able to run the rest of
-/// the suite. CI is the opposite case: the day the shared workflow
-/// (`yadgarhq/actions`, `ci-pr.yaml`) gains a Valkey beside its MariaDB, nothing
-/// would say these tests had started running — and nothing would say if a later
-/// change to that workflow stopped them again. After merge, the one defect this
-/// module exists to prevent would have no automated coverage at all while seven
-/// green test names said otherwise, which is the D76 shape.
+/// the suite. CI is the opposite case: this module predicted that the day the
+/// shared workflow (`yadgarhq/actions`, `ci-pr.yaml`) gained a Valkey beside its
+/// MariaDB, nothing would say these tests had started running. **That day came**
+/// on 2026-09-01, when `yadgarhq/actions` PR #30 (`b92944f`) added the Valkey
+/// service, unconditionally, for every Rust repository — these tests have run in
+/// CI since, and nothing announced it. The panic below is the mechanism that says
+/// so now, and the one that would say if a later change to that workflow took the
+/// Valkey away again. After merge, the one defect this module exists to prevent
+/// would have no automated coverage at all while seven green test names said
+/// otherwise, which is the D76 shape.
 ///
 /// **Printing the skip loudly is not enough on its own**, and this is the
 /// correction to what this file used to argue. The `SKIPPED —` lines do reach the
