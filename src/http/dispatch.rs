@@ -111,6 +111,18 @@ pub(super) async fn handle(
     match request.method.as_str() {
         DISCOVER => measured(DISCOVER, || discover(&id)),
         TOOLS_LIST => measured(TOOLS_LIST, || tools_list(&id)),
+        // observe-coverage: exempt — every path out of `tools_call` records, or is
+        // unrecorded by the same rule as the unknown-method arm above. An unresolved
+        // tool name (dispatch.rs:238, from `resolved_tool`) records NOTHING,
+        // deliberately: its only label is the caller-invented name, and D67's
+        // cardinality rule forbids minting a Prometheus series from it. An
+        // attestation failure (dispatch.rs:266) is recorded by `attest_refusal`
+        // (call.rs:16), which opens its own `Call::start(...).fail(...)` because the
+        // success path's `Call` cannot open until there is an attested scope to
+        // carry. A throttle refusal (dispatch.rs:290) is recorded by
+        // `record_throttled` (dispatch.rs:289). Every other path is recorded by the
+        // `Call` `tools_call` opens once the label is bounded (dispatch.rs:293). No
+        // syntactic rule can see any of this, so it is a judgement.
         "tools/call" => tools_call(state, &id, &request.params, &headers).await,
         // NO record for an unknown method, deliberately. Its only available label
         // is the string the caller invented, and D67's cardinality rule means a
