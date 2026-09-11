@@ -88,7 +88,10 @@ pub use yadgar_lifecycle::rotate::{
     CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
 };
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use yadgar_lifecycle::rotate::CONFIG_DIR;
 
 use crate::invalidate::Broker;
 use crate::upstream::UpstreamTls;
@@ -148,6 +151,189 @@ impl Material for UpstreamTls {
     }
 }
 
+/// The document under [`CONFIG_DIR`] holding settings only THIS service reads.
+const GATEWAY_DOCUMENT: &str = "gateway/gateway.yaml";
+
+const TOOLS_POLL_LEAF: &str = "intervalSeconds";
+const TOOLS_POLL_KNOB: &str = "toolsPoll.intervalSeconds";
+
+/// This gateway's OWN configuration document — `chart/config/gateway.yaml` in
+/// `yadgarhq/config`, mounted at `gateway/gateway.yaml` under [`CONFIG_DIR`].
+///
+/// **DISTINCT FROM [`Configuration`], which is `shared.yaml`.** `shared.yaml`'s
+/// own header states the dividing line: a knob every service reads with the
+/// same value goes there, and a knob only one service reads belongs in that
+/// service's own file. `tools/list`'s poll interval is read by no other
+/// service — `iam`, `task`, `iam-db` and `task-db` never build the response —
+/// so it is the first knob in `gateway.yaml`, which existed, mounted and empty,
+/// for exactly this day.
+///
+/// **`chart/config/gateway.yaml` DOES NOT ENFORCE `deny_unknown_fields`, on
+/// purpose, for the same reason `yadgar-lifecycle`'s `Document` does not**:
+/// this document will hold more than one section over time, and a parser that
+/// refused an unrecognised key would make the second gateway-only knob a
+/// breaking change for the first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatewayDocument {
+    path: PathBuf,
+}
+
+impl GatewayDocument {
+    /// The document where the chart mounts it.
+    pub fn mounted() -> Self {
+        Self::under(CONFIG_DIR)
+    }
+
+    /// The same, under any root — the seam that makes this testable without a
+    /// cluster.
+    pub fn under(root: impl AsRef<Path>) -> Self {
+        Self {
+            path: root.as_ref().join(GATEWAY_DOCUMENT),
+        }
+    }
+
+    /// The file a refusal names.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// How often a client should re-poll `tools/list` for a changed catalogue.
+    ///
+    /// # Errors
+    ///
+    /// Every way this file can fail to state the knob: absent, unreadable,
+    /// unparsable as YAML, missing the knob, holding it empty, holding
+    /// something that is not a whole number of seconds, or naming zero. None
+    /// of them has a fallback (ADR-0569) — see [`ToolsPollError`].
+    pub fn tools_poll_interval(&self) -> Result<Duration, ToolsPollError> {
+        let where_ = || self.path.display().to_string();
+        // ADR-0523-WATCHED: GatewayDocument
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ToolsPollError::Absent { path: where_() })
+            }
+            Err(source) => {
+                return Err(ToolsPollError::Unreadable {
+                    path: where_(),
+                    source,
+                })
+            }
+        };
+
+        // `Option<Mapping>` rather than a typed field, for the reason
+        // `yadgar_lifecycle::rotate::Document` gives: an explicit YAML `null`
+        // and an absent key both deserialise to `None` on a typed field, and
+        // "present but empty" is a different, more useful fault to report than
+        // "not there at all".
+        #[derive(serde::Deserialize)]
+        struct Document {
+            #[serde(rename = "toolsPoll")]
+            tools_poll: Option<serde_norway::Mapping>,
+        }
+        let document: Option<Document> =
+            serde_norway::from_str(&text).map_err(|source| ToolsPollError::Malformed {
+                path: where_(),
+                source,
+            })?;
+        let section = document.and_then(|d| d.tools_poll).unwrap_or_default();
+        let raw = match section.get(TOOLS_POLL_LEAF).cloned() {
+            None => return Err(ToolsPollError::Missing { path: where_() }),
+            Some(serde_norway::Value::Null) => {
+                return Err(ToolsPollError::Empty { path: where_() })
+            }
+            Some(other) => match other.as_u64() {
+                Some(n) => n,
+                None => {
+                    let raw = other
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| serde_norway::to_string(&other).unwrap_or_default());
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return Err(ToolsPollError::Empty { path: where_() });
+                    }
+                    trimmed
+                        .parse()
+                        .map_err(|source| ToolsPollError::Unparsable {
+                            path: where_(),
+                            value: raw,
+                            source,
+                        })?
+                }
+            },
+        };
+        if raw == 0 {
+            return Err(ToolsPollError::Zero { path: where_() });
+        }
+        Ok(Duration::from_secs(raw))
+    }
+}
+
+impl Material for GatewayDocument {
+    fn files(&self) -> Vec<File<'_>> {
+        vec![File::read(&self.path)]
+    }
+}
+
+/// A poll interval a deployment stated and this process cannot use, or did not
+/// state at all.
+///
+/// **EVERY VARIANT REFUSES THE BOOT AND NAMES A FILE (ADR-0569).** There is no
+/// compiled-in default behind any of them — an installation that never sets
+/// [`TOOLS_POLL_KNOB`] does not silently ship a number nobody chose.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolsPollError {
+    #[error(
+        "{path} does not exist, so no configuration was read. It is `gateway`'s own document \
+         in the configuration chart in yadgarhq/config, mounted from the ConfigMap `gateway`. \
+         There is no default to fall back to (ADR-0569)."
+    )]
+    Absent { path: String },
+
+    #[error("reading {path} failed")]
+    Unreadable {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "{path} is not parseable as YAML, or `toolsPoll` within it is not a mapping of knobs."
+    )]
+    Malformed {
+        path: String,
+        #[source]
+        source: serde_norway::Error,
+    },
+
+    #[error(
+        "{TOOLS_POLL_KNOB} is not defined in {path}. There is no compiled-in default and no \
+         fallback (ADR-0569) — add the line to the document."
+    )]
+    Missing { path: String },
+
+    #[error(
+        "{TOOLS_POLL_KNOB} is present in {path} and has no value. That is different from being \
+         missing entirely, and is reported separately on purpose."
+    )]
+    Empty { path: String },
+
+    #[error("{TOOLS_POLL_KNOB} in {path} is {value:?}, which is not a whole number of seconds.")]
+    Unparsable {
+        path: String,
+        value: String,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+
+    #[error(
+        "{TOOLS_POLL_KNOB} in {path} is 0. A client cannot poll at an interval of zero, so this \
+         is refused rather than read as \"never\" or \"always\"."
+    )]
+    Zero { path: String },
+}
+
 /// Everything this deployment read at boot, hashed as it was read.
 ///
 /// **THE LIST IS THE ASSERTION.** TLS is opt-in and read PER UPSTREAM so the two
@@ -195,15 +381,23 @@ impl Material for UpstreamTls {
 /// a [`Material`] on, and inventing one to satisfy the shape would be a
 /// restructuring rather than a fix.
 ///
-/// **THE MOUNTED CONFIGURATION DOCUMENT IS THE LAST MEMBER (step 2a).**
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS MEMBER SIX (step 2a).**
 /// `config` is `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared`
-/// ConfigMap, and it is a [`Material`] like the other four: `Configuration`
+/// ConfigMap, and it is a [`Material`] like the others: `Configuration`
 /// implements the trait by returning the one file it read its schedule from
 /// (`yadgar_lifecycle::rotate::Configuration::files`), so folding it in here
 /// joins the document to the ADR-0523 watch set through the exact same
 /// `Inputs::also` path the CA bundles and the client leaf already take. An
 /// operator editing `shared.yaml` restarts this pod exactly as editing a CA
 /// bundle would.
+///
+/// **`gateway.yaml` IS MEMBER SEVEN, and the first one this service ever
+/// watched.** Until the `tools/list` poll interval, `config-gateway` was
+/// mounted and unread — see `chart/templates/deployment.yaml`'s volume-mount
+/// comment, which named this exact gap and said the fix belongs in the same
+/// pull request as the first gateway-only knob. This is that pull request:
+/// [`GatewayDocument`] is a [`Material`] on the same terms as [`Configuration`],
+/// so an operator editing `gateway.yaml` now restarts this pod too.
 ///
 /// Called from `main.rs` INSIDE boot and BEFORE the dials: every entry is hashed
 /// as it is added, so the baseline is the bytes the process actually loaded.
@@ -217,6 +411,7 @@ pub fn watch_set(
     cache_password: Option<&Path>,
     bootstrap_token: Option<&Path>,
     config: &Configuration,
+    gateway_config: &GatewayDocument,
 ) -> Inputs {
     Inputs::of(
         SERVICE,
@@ -227,6 +422,7 @@ pub fn watch_set(
             &cache_password,
             &bootstrap_token,
             config,
+            gateway_config,
         ],
     )
 }

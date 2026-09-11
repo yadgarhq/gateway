@@ -80,6 +80,12 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         // `state_bootstrapped` is what the tests about a CONFIGURED token reach
         // for.
         bootstrap: crate::admin::BootstrapToken::disabled(),
+        // THE SHIPPED VALUE, and not the one the poll-interval test asserts
+        // against — `tools_list_reports_the_gateways_chosen_poll_interval`
+        // overrides this field on its own state rather than reusing this
+        // default, precisely so this number is never the thing that test
+        // proves.
+        tools_poll_interval: std::time::Duration::from_secs(600),
     })
 }
 
@@ -1518,6 +1524,7 @@ async fn state_resolving_to(
         credential_limits: unlimited_credentials(),
         admin_limits: unlimited_credentials(),
         bootstrap: crate::admin::BootstrapToken::disabled(),
+        tools_poll_interval: std::time::Duration::from_secs(600),
     });
     (state, resolves)
 }
@@ -1932,6 +1939,49 @@ async fn discover_reports_the_stamped_version_rather_than_the_manifest() {
     assert_ne!(
         reported, "0.0.0",
         "the manifest placeholder must never reach a client"
+    );
+}
+
+/// `tools/list` REPORTS THE INTERVAL THIS DEPLOYMENT WAS CONFIGURED WITH, NOT A
+/// NUMBER COMPILED INTO THE BINARY.
+///
+/// The operator ruled that the GATEWAY names how often `yadgar-client` should
+/// poll `tools/list`, rather than the client carrying its own constant — so
+/// the value has to travel from `gateway.yaml` (`rotate::GatewayDocument`)
+/// through `AppState` into this response, and this test is what proves the
+/// wiring rather than the arithmetic. `437` is deliberately not a number this
+/// binary could produce by accident: it is neither the real shipped value
+/// (600) nor `state`'s test default (also 600, chosen to look production-like
+/// specifically so a passing generic test could never be mistaken for this
+/// one). A future compiled-in fallback that happened to read 600 would still
+/// go red here.
+///
+/// **MUTATION THIS CATCHES:** deleting the `_meta` object `tools_list` builds
+/// turns this red (the key is simply absent). Renaming the literal inside
+/// [`meta_keys::TOOLS_POLL_INTERVAL_SECONDS`] independently turns
+/// `the_strings_a_client_has_to_spell_exactly_are_pinned_as_literals` red in
+/// `mcp/tests.rs` — this test alone cannot see a rename, because it reads
+/// through the same constant the production code writes through.
+#[tokio::test]
+async fn tools_list_reports_the_gateways_chosen_poll_interval() {
+    let mut state = state(Vec::new());
+    Arc::get_mut(&mut state)
+        .expect("the state is not shared yet")
+        .tools_poll_interval = std::time::Duration::from_secs(437);
+
+    let req = post()
+        .body(Body::from(envelope(TOOLS_LIST, Some(1)).to_string()))
+        .expect("request");
+    let (status, body) = send(state, req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let reported = body["result"]["_meta"][meta_keys::TOOLS_POLL_INTERVAL_SECONDS]
+        .as_u64()
+        .expect("_meta carries the poll interval, as a number of seconds");
+
+    assert_eq!(
+        reported, 437,
+        "the gateway must report the interval THIS deployment was configured with"
     );
 }
 

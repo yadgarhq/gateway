@@ -199,6 +199,18 @@ fn the_strings_a_client_has_to_spell_exactly_are_pinned_as_literals() {
     );
     assert_eq!(meta_keys::CLIENT_INFO, "io.modelcontextprotocol/clientInfo");
     assert_eq!(meta_keys::SERVER_INFO, "io.modelcontextprotocol/serverInfo");
+    // `io.yadgarhq/...` — THIS ESTATE'S OWN NAMESPACE, established here rather
+    // than borrowed from `io.modelcontextprotocol` above. Pinned as a literal
+    // for the same reason every key above is: `tools_list_reports_the_gateways_
+    // chosen_poll_interval` in `http/tests.rs` reads the response through the
+    // SAME constant `dispatch::tools_list` writes through, so a rename that
+    // kept both sides consistent would pass that test green while every real
+    // client silently stopped matching. This line is what a rename has to
+    // survive instead.
+    assert_eq!(
+        meta_keys::TOOLS_POLL_INTERVAL_SECONDS,
+        "io.yadgarhq/toolsPollIntervalSeconds"
+    );
     assert_eq!(headers::PROTOCOL_VERSION, "mcp-protocol-version");
     assert_eq!(headers::METHOD, "mcp-method");
     assert_eq!(headers::NAME, "mcp-name");

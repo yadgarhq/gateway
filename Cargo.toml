@@ -136,6 +136,11 @@ tokio-stream = "0.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# For `rotate::GatewayDocument` — this process's OWN read of `gateway.yaml`,
+# alongside `yadgar-lifecycle`'s read of `shared.yaml`. `serde_norway` RATHER
+# THAN `serde_yaml`, matching `yadgar-lifecycle`'s own choice: `serde_yaml` is
+# unmaintained and RUSTSEC-2024-0320 turns that advisory into a failing gate.
+serde_norway = "0.9"
 tokio = { version = "1", features = [
   "macros",
   "rt-multi-thread",

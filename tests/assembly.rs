@@ -38,7 +38,8 @@ use rcgen::{
 
 use yadgar_gateway::invalidate::Broker;
 use yadgar_gateway::rotate::{
-    self, Configuration, Presented, CERTIFICATE_NOT_AFTER, WATCHED_FILES_UNREADABLE,
+    self, Configuration, GatewayDocument, Presented, CERTIFICATE_NOT_AFTER,
+    WATCHED_FILES_UNREADABLE,
 };
 use yadgar_gateway::upstream::{self, UpstreamTls};
 
@@ -262,6 +263,24 @@ fn configuration(body: &str) -> Configuration {
     Configuration::under(root)
 }
 
+/// The same shape as [`configuration`], for `gateway.yaml` — this service's OWN
+/// document, distinct from `shared.yaml` and mounted from a separate ConfigMap
+/// under a separate directory in the real deployment.
+fn gateway_config(body: &str) -> GatewayDocument {
+    let root = std::env::temp_dir().join(format!(
+        "yadgar-gateway-assembly-gateway-config-{}",
+        unique()
+    ));
+    std::fs::create_dir_all(root.join("gateway")).unwrap();
+    std::fs::write(root.join("gateway").join("gateway.yaml"), body).unwrap();
+    GatewayDocument::under(root)
+}
+
+/// The body every case in this file passes to [`gateway_config`], naming a
+/// deliberately odd interval so a test asserting against it can never be
+/// satisfied by a compiled-in number.
+const GATEWAY_CONFIG_BODY: &str = "toolsPoll:\n  intervalSeconds: 437\n";
+
 /// How one upstream is verified, and who this gateway says it is on that hop.
 ///
 /// **THE SAME CLIENT LEAF FOR BOTH**, which is what the chart mounts: one
@@ -349,6 +368,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+    let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
 
     assert_eq!(
         rotate::watch_set(
@@ -358,6 +378,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             Some(&cache_password),
             Some(&bootstrap_token),
             &config,
+            &gw_config,
         )
         .watched(),
         vec![
@@ -369,11 +390,13 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             mount.path("valkey-password").as_path(),
             mount.path("admin-bootstrap-token").as_path(),
             config.path(),
+            gw_config.path(),
         ],
-        "a fully configured `gateway` reads eight files at boot: a bundle per upstream, the \
+        "a fully configured `gateway` reads nine files at boot: a bundle per upstream, the \
          one client identity it presents to both (ADR-0516), the broker password (D72), the \
-         cache password (D74), D73's administrative bootstrap token (ADR-0492), and the \
-         mounted configuration document every service now watches (step 2a)"
+         cache password (D74), D73's administrative bootstrap token (ADR-0492), the shared \
+         configuration document every service watches (step 2a), and this service's OWN \
+         document — the first knob it ever held made this pull request add it here"
     );
 }
 
@@ -396,6 +419,7 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+    let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
     let inputs = rotate::watch_set(
         Some(&task),
         Some(&iam),
@@ -403,6 +427,7 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
         Some(&cache_password),
         Some(&bootstrap_token),
         &config,
+        &gw_config,
     );
 
     assert_eq!(inputs.not_after(Presented::Client), Some(CLIENT_NOT_AFTER));
@@ -434,35 +459,38 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
 fn each_configured_half_contributes_on_its_own() {
     let mount = Mount::new(&generation());
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+    let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
 
     assert_eq!(
-        rotate::watch_set(None, None, None, None, None, &config).watched(),
-        vec![config.path()],
-        "with both upstreams cleartext and neither password configured, the mounted \
-         configuration document is the only thing watched — it is unconditional, unlike \
-         everything either side of it"
+        rotate::watch_set(None, None, None, None, None, &config, &gw_config).watched(),
+        vec![config.path(), gw_config.path()],
+        "with both upstreams cleartext and neither password configured, the two mounted \
+         configuration documents are the only thing watched — both are unconditional, unlike \
+         everything either side of them"
     );
 
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     assert_eq!(
-        rotate::watch_set(Some(&task), None, None, None, None, &config).watched(),
+        rotate::watch_set(Some(&task), None, None, None, None, &config, &gw_config).watched(),
         vec![
             mount.path("task-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
             mount.path("client-key.pem").as_path(),
             config.path(),
+            gw_config.path(),
         ],
-        "one upstream: its bundle, plus the identity pair, plus the mounted document"
+        "one upstream: its bundle, plus the identity pair, plus both mounted documents"
     );
 
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     assert_eq!(
-        rotate::watch_set(None, Some(&iam), None, None, None, &config).watched(),
+        rotate::watch_set(None, Some(&iam), None, None, None, &config, &gw_config).watched(),
         vec![
             mount.path("iam-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
             mount.path("client-key.pem").as_path(),
             config.path(),
+            gw_config.path(),
         ],
         "the other upstream on its own names a DIFFERENT bundle, which is what makes \
          dropping either from the list observable"
@@ -483,9 +511,22 @@ fn each_configured_half_contributes_on_its_own() {
     .expect("a complete configuration")
     .expect("the flag is set");
     assert_eq!(
-        rotate::watch_set(Some(&server_only), None, None, None, None, &config).watched(),
-        vec![mount.path("task-ca.pem").as_path(), config.path()],
-        "an encrypted hop with no identity watches the bundle, the mounted document, and \
+        rotate::watch_set(
+            Some(&server_only),
+            None,
+            None,
+            None,
+            None,
+            &config,
+            &gw_config
+        )
+        .watched(),
+        vec![
+            mount.path("task-ca.pem").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
+        "an encrypted hop with no identity watches the bundle, both mounted documents, and \
          nothing else"
     );
 
@@ -496,8 +537,21 @@ fn each_configured_half_contributes_on_its_own() {
     // invalidation is consumed — so a revoked credential keeps working until its
     // cache entry ages out, with no exit and no recovery but a restart.
     assert_eq!(
-        rotate::watch_set(None, None, Some(&broker(&mount)), None, None, &config).watched(),
-        vec![mount.path("nats-password").as_path(), config.path()],
+        rotate::watch_set(
+            None,
+            None,
+            Some(&broker(&mount)),
+            None,
+            None,
+            &config,
+            &gw_config
+        )
+        .watched(),
+        vec![
+            mount.path("nats-password").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
         "the broker password is a member on its own, exactly as `iam`'s already is"
     );
 
@@ -513,10 +567,15 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             Some(&mount.path("valkey-password")),
             None,
-            &config
+            &config,
+            &gw_config
         )
         .watched(),
-        vec![mount.path("valkey-password").as_path(), config.path()],
+        vec![
+            mount.path("valkey-password").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
         "the cache password is a member on its own"
     );
 
@@ -533,10 +592,15 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             Some(&mount.path("admin-bootstrap-token")),
-            &config
+            &config,
+            &gw_config
         )
         .watched(),
-        vec![mount.path("admin-bootstrap-token").as_path(), config.path()],
+        vec![
+            mount.path("admin-bootstrap-token").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
         "the administrative bootstrap token is a member on its own"
     );
 
@@ -552,8 +616,8 @@ fn each_configured_half_contributes_on_its_own() {
     // `yadgar_rotation_watched_files_unreadable`, which is a gauge an operator
     // reads as a fault.
     assert_eq!(
-        rotate::watch_set(None, None, None, None, None, &config).watched(),
-        vec![config.path()],
+        rotate::watch_set(None, None, None, None, None, &config, &gw_config).watched(),
+        vec![config.path(), gw_config.path()],
         "an unmounted bootstrap token names no file, so there is no file to watch"
     );
 
@@ -566,8 +630,17 @@ fn each_configured_half_contributes_on_its_own() {
             .expect("a broker that asks for no credential is a complete configuration")
             .expect("the url is set");
     assert_eq!(
-        rotate::watch_set(None, None, Some(&open_broker), None, None, &config).watched(),
-        vec![config.path()],
+        rotate::watch_set(
+            None,
+            None,
+            Some(&open_broker),
+            None,
+            None,
+            &config,
+            &gw_config
+        )
+        .watched(),
+        vec![config.path(), gw_config.path()],
         "a broker that demands no credential named no file, so there is no file to watch — \
          and inventing one would report it unreadable for ever"
     );
@@ -596,6 +669,7 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
+    let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
 
     let recorder = DebuggingRecorder::new();
     let snapshotter: Snapshotter = recorder.snapshotter();
@@ -607,6 +681,7 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
             Some(&cache_password),
             Some(&bootstrap_token),
             &config,
+            &gw_config,
         )
         .export_not_after()
     });
@@ -680,6 +755,7 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+    let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
     let inputs = rotate::watch_set(
         Some(&task),
         Some(&iam),
@@ -687,6 +763,7 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
         Some(&cache_password),
         Some(&bootstrap_token),
         &config,
+        &gw_config,
     );
 
     let recorder = DebuggingRecorder::new();
@@ -796,6 +873,35 @@ fn the_chart_mounts_the_shared_configmap_where_this_binary_looks_for_it() {
             .any(|line| line.trim() == format!("mountPath: {shared_dir}")),
         "yadgar_lifecycle::rotate::Configuration::mounted() reads {}, but no volumeMount in \
          this chart's deployment.yaml names {shared_dir} as its mountPath — a pod would exit \
+         at boot naming a path this chart never mounts",
+        mounted.path().display()
+    );
+}
+
+/// THE SAME AGREEMENT, FOR THIS SERVICE'S OWN DOCUMENT.
+///
+/// `config-gateway` has been mounted since step 2a with nothing behind it to
+/// disagree with; this is the day it gains a reader, so this is the day the
+/// same coupling test that guards `shared.yaml` starts guarding `gateway.yaml`
+/// too. Derived from `GatewayDocument::mounted()` — the exact call
+/// `boot::wiring` makes — for the same reason the case above derives rather
+/// than restates: a rename here would agree with a copy of itself.
+#[test]
+fn the_chart_mounts_the_gateway_configmap_where_this_binary_looks_for_it() {
+    let mounted = GatewayDocument::mounted();
+    let gateway_dir = mounted
+        .path()
+        .parent()
+        .expect("the mounted document has a parent directory")
+        .display()
+        .to_string();
+
+    assert!(
+        DEPLOYMENT
+            .lines()
+            .any(|line| line.trim() == format!("mountPath: {gateway_dir}")),
+        "yadgar_gateway::rotate::GatewayDocument::mounted() reads {}, but no volumeMount in \
+         this chart's deployment.yaml names {gateway_dir} as its mountPath — a pod would exit \
          at boot naming a path this chart never mounts",
         mounted.path().display()
     );
