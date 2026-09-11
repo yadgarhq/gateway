@@ -683,14 +683,17 @@ message IssueEnrolmentResponse {
   google.protobuf.Timestamp expires_at = 3;
 }
 
-// D73's BOOTSTRAP TOKEN reaches CreateUser and SetUserAdmin below and nothing
-// else — create an admin, or promote one — which is how "it can do exactly one
-// thing" is enforced. IT IS CHECKED AT THE GATEWAY, and there is deliberately
-// no bootstrap RPC on this service: no administrative RPC here carries a
-// credential of any kind, because `iam` is not reachable from outside and the
-// gateway is the one place identity is attested (ADR-0488). A second
-// authentication mechanism inside `iam` would be a second place for it to be
-// wrong, holding the same secret twice.
+// D73's BOOTSTRAP TOKEN reaches CreateUser and SetUserAdmin below — create an
+// admin, or promote one — and, since ADR-0655 (amended by ADR-0656), also
+// IssueEnrolment, but ONLY for a target that is an administrator AND holds
+// zero credentials; that predicate is enforced inside `iam-db`'s write, never
+// checked here or at the gateway first. CreateUser and SetUserAdmin stay
+// CHECKED AT THE GATEWAY, and there is deliberately no bootstrap RPC on this
+// service: no administrative RPC here carries a credential of any kind,
+// because `iam` is not reachable from outside and the gateway is the one
+// place identity is attested (ADR-0488). A second authentication mechanism
+// inside `iam` would be a second place for it to be wrong, holding the same
+// secret twice.
 message SetUserAdminRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string user_id = 2;
@@ -757,10 +760,12 @@ message SetRateLimitOverrideResponse {}
 // is attested (ADR-0488). NEVER AN MCP TOOL, on the same grounds as
 // SetRateLimitOverride.
 //
-// **D73's BOOTSTRAP TOKEN DOES NOT REACH THIS VERB.** It reaches CreateUser and
-// SetUserAdmin and nothing else. Extending the bootstrap path here would let a
-// token that exists to create the FIRST admin rewrite the read policy for the
-// whole deployment before an admin exists to notice.
+// **D73's BOOTSTRAP TOKEN DOES NOT REACH THIS VERB.** It reaches CreateUser,
+// SetUserAdmin, and — since ADR-0655, amended by ADR-0656 — IssueEnrolment,
+// narrowly, for a target that is already an administrator and holds zero
+// credentials. Extending the bootstrap path here would let a token that
+// exists to create the FIRST admin rewrite the read policy for the whole
+// deployment before an admin exists to notice.
 //
 // **THE GAP, STATED RATHER THAN LEFT TO BE FOUND — AND HALF OF IT IS NOW
 // CLOSED.** The request carries no attested identity, in common with every
