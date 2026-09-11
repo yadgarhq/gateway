@@ -699,11 +699,13 @@ adminLimits:
 # D73'S BOOTSTRAP TOKEN — the credential that lets the FIRST administrator exist
 # before an administrator exists to create one (ADR-0492, ledger 638).
 #
-# It reaches exactly two acts, create-an-administrator and promote-one, and it is
-# checked at this gateway rather than inside `iam`: no administrative RPC on that
-# service carries a credential of any kind, because a second authentication
-# mechanism there would be a second place for it to be wrong, holding the same
-# secret twice.
+# It reaches three acts — create-an-administrator, promote-one, and (ADR-0655,
+# as amended by ADR-0656) issue-an-enrolment for an administrator holding zero
+# credentials — and it is checked at this gateway rather than inside `iam`: no
+# administrative RPC on that service carries a credential of any kind, because
+# a second authentication mechanism there would be a second place for it to be
+# wrong, holding the same secret twice. The zero-credential predicate on the
+# third act is enforced inside `iam-db`'s write, not here.
 #
 # ONE VALUE, NOT A BOOLEAN BESIDE A NAME. Naming the Secret IS the switch, the
 # same shape rateLimit.passwordSecret, nats.passwordSecret, task.tls.caSecret and
