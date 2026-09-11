@@ -185,6 +185,34 @@ pub(crate) fn bootstrap_token() -> Result<(BootstrapToken, Option<PathBuf>), Str
     Ok((BootstrapToken::from_secret(&raw), Some(PathBuf::from(path))))
 }
 
+/// The boot log's own account of what [`bootstrap_token`] resolved — pulled
+/// out of the log line so a test can pin the literal without booting a
+/// process (ledger 868, ADR-0599).
+///
+/// **THREE VERBS, NOT TWO.** The ENABLED sentence used to end "and nothing
+/// else" after `admin::Verb::accepts_bootstrap`'s `IssueEnrolment` arm flipped
+/// from `false` to `true`, and nothing asserted the literal, so the false
+/// sentence shipped and stayed green. The reach is NOT unconditional: the
+/// enrolment half is narrowed by ADR-0655's zero-credential predicate, as
+/// amended by ADR-0656, and that predicate is enforced INSIDE `iam-db`'s
+/// write — never at this gateway. See `admin::Verb::accepts_bootstrap` for the
+/// argument.
+pub(crate) fn bootstrap_path_message(configured: bool) -> &'static str {
+    if configured {
+        "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
+         and it reaches creating an administrator, promoting one, and — under a \
+         predicate enforced inside iam-db's write, never at this gateway — issuing an \
+         enrolment for an administrator holding zero credentials (ADR-0492, ADR-0655, \
+         ADR-0656)"
+    } else {
+        "the administrative bootstrap path is DISABLED: no bootstrap token is configured, \
+         so every request presenting one is refused naming the missing configuration. \
+         /auth/login, /auth/enrol, MCP and the administrator-authenticated half of \
+         /admin are unaffected. Set YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE to the mounted \
+         `admin-bootstrap-token` Secret to enable it."
+    }
+}
+
 /// **AN ARGUED EXCEPTION TO ADR-0569, and the only one in this binary.**
 ///
 /// It is a named function rather than a bare fallback at the call site precisely

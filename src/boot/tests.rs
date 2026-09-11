@@ -1,4 +1,6 @@
-use super::{env_required, env_required_allow_empty, refusal, trusted_proxy_hops};
+use super::{
+    bootstrap_path_message, env_required, env_required_allow_empty, refusal, trusted_proxy_hops,
+};
 
 // Each test owns a UNIQUE key. `std::env` is process-global and `cargo test`
 // runs these on threads of one process, so tests sharing a variable name
@@ -58,6 +60,28 @@ fn allow_empty_accepts_empty_but_still_refuses_absence() {
     );
     let err = env_required_allow_empty("YADGAR_TEST_ALLOW_EMPTY_ABSENT").unwrap_err();
     assert!(err.contains("YADGAR_TEST_ALLOW_EMPTY_ABSENT"), "got: {err}");
+}
+
+/// **PINS THE LITERAL THAT SHIPPED FALSE.** Ledger 868: the ENABLED boot-log
+/// sentence used to end "and nothing else" after ADR-0655 (amended by
+/// ADR-0656) admitted the bootstrap token to `IssueEnrolment`, and nothing
+/// asserted the literal — `git grep -ln 'reaches creating an administrator'
+/// origin/main -- src tests` matched only the sentence's own file, which is
+/// why it shipped through CI green. Hand-typed here, never routed through
+/// `bootstrap_path_message`'s own return value on both sides, per ADR-0599.
+///
+/// MUTATION: restore the old "and nothing else \n (ADR-0492)" wording in
+/// `bootstrap_path_message` and this goes red.
+#[test]
+fn the_enabled_message_names_all_three_verbs_and_the_predicate() {
+    assert_eq!(
+        bootstrap_path_message(true),
+        "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
+         and it reaches creating an administrator, promoting one, and — under a \
+         predicate enforced inside iam-db's write, never at this gateway — issuing an \
+         enrolment for an administrator holding zero credentials (ADR-0492, ADR-0655, \
+         ADR-0656)"
+    );
 }
 
 /// The argued exception keeps its fallback, and the test says so out loud so

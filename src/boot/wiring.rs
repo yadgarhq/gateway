@@ -19,7 +19,7 @@ use yadgar_gateway::invalidate::Broker;
 use yadgar_gateway::rotate;
 use yadgar_gateway::upstream;
 
-use super::{bootstrap_token, env_required, refusal};
+use super::{bootstrap_path_message, bootstrap_token, env_required, refusal};
 
 type Boxed = Box<dyn std::error::Error>;
 
@@ -111,19 +111,9 @@ pub async fn wiring(
     // window where a kubelet swap quietly becomes the baseline.
     let (bootstrap, bootstrap_file) = bootstrap_token()?;
     if bootstrap.is_configured() {
-        tracing::info!(
-            "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
-             and it reaches creating an administrator and promoting one and nothing else \
-             (ADR-0492)"
-        );
+        tracing::info!("{}", bootstrap_path_message(true));
     } else {
-        tracing::warn!(
-            "the administrative bootstrap path is DISABLED: no bootstrap token is configured, \
-             so every request presenting one is refused naming the missing configuration. \
-             /auth/login, /auth/enrol, MCP and the administrator-authenticated half of \
-             /admin are unaffected. Set YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE to the mounted \
-             `admin-bootstrap-token` Secret to enable it."
-        );
+        tracing::warn!("{}", bootstrap_path_message(false));
     }
 
     let watch_inputs = rotate::watch_set(

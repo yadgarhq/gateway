@@ -239,11 +239,13 @@ The `user_id` `/admin/create-user` returns is the one the other two take.
   caller who is not one gets `403`; a caller presenting no credential gets `401`.
   `x-yadgar-project` is required, exactly as on `tools/call`.
 - **D73's bootstrap token**, presented in `X-Yadgar-Bootstrap-Token`. It reaches
-  **exactly two things — create an administrator, or promote one** — so
-  `/admin/create-user` only with `is_admin: true`, `/admin/set-user-admin` only
-  when setting it to `true`, and `/admin/issue-enrolment` never. A request
-  carrying the header is judged by these rules alone and never falls back to the
-  attested path.
+  **three things — create an administrator, promote one, or issue an
+  enrolment** — so `/admin/create-user` only with `is_admin: true`,
+  `/admin/set-user-admin` only when setting it to `true`, and
+  `/admin/issue-enrolment` only for an administrator holding zero credentials
+  (ADR-0655, as amended by ADR-0656). That last predicate is enforced inside
+  `iam-db`'s write, never at this gateway. A request carrying the header is
+  judged by these rules alone and never falls back to the attested path.
 
 **An absent or empty bootstrap Secret DISABLES the bootstrap path**, answering
 `503 {"error":"the bootstrap token is not configured"}` — never a comparison

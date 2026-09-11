@@ -13,9 +13,13 @@
 //!    accepts a presented one, INCLUDING the two ways that question is not a
 //!    comparison at all (see the type).
 //! 2. **[`Verb::accepts_bootstrap`]** — which verbs the bootstrap token reaches,
-//!    under which condition. ADR-0492 grants it two and `iam.proto:650-656`
-//!    states the same exclusion from `iam`'s side: "create an admin, or promote
-//!    one … IT IS CHECKED AT THE GATEWAY".
+//!    under which condition. ADR-0492 grants it `CreateUser` and the promotion
+//!    half of `SetUserAdmin`; ADR-0655, as amended by ADR-0656, admits
+//!    `IssueEnrolment` too, narrowed by a zero-credential predicate enforced
+//!    inside `iam-db`'s write rather than here. `iam.proto:687-688` states the
+//!    two-verb half of this from `iam`'s side: "create an admin, or promote
+//!    one … IT IS CHECKED AT THE GATEWAY" — that sentence predates ADR-0655 and
+//!    is a `proto` repo carrier of the same stale claim, tracked separately.
 //! 3. **[`Authority::actor`]** — what ADR-0534's relay carries, and on which path
 //!    it carries nothing.
 //! 4. **[`is_self_demotion`]** — D73's exclusion, which `iam.proto:664` defers to
@@ -100,7 +104,10 @@ pub enum Verb {
     /// reaches when — and only when — the user being created is an admin.
     CreateUser,
     /// `iam.IssueEnrolment`. Mints the blob a person redeems at `/auth/enrol`.
-    /// **The bootstrap token never reaches it.**
+    /// **The bootstrap token reaches it under ADR-0655's zero-credential
+    /// predicate** (as amended by ADR-0656) — never unconditionally, and the
+    /// predicate is enforced inside `iam-db`'s write, not here. See
+    /// [`Verb::accepts_bootstrap`]'s doc comment for the argument.
     IssueEnrolment,
     /// `iam.SetUserAdmin`. Promote or demote. The bootstrap token reaches the
     /// promotion half only.
