@@ -651,6 +651,28 @@ message IssueEnrolmentRequest {
   // service cannot verify it and MUST NOT authorise on it. The rule is stated
   // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
   yadgar.common.v1.UnverifiedActor unverified_actor = 3;
+
+  // THE BOOTSTRAP-ENROLMENT DEMAND (ADR-0655, amended by ADR-0656), RELAYED
+  // VERBATIM. The gateway sets this field IF AND ONLY IF the caller is the
+  // bootstrap token; this service NEVER populates it itself and passes it
+  // through unchanged to
+  // yadgar.iamdb.v1.CreateEnrolmentRequest.require_zero_credential_admin,
+  // where it is enforced — see that field for the ADR-0656 definition of
+  // "zero credentials" (no `iam_password` row and no `iam_credential` row of
+  // any liveness, revoked rows included) and for the single-refusal
+  // semantics this service's relay depends on: `iam-db` answers ONE
+  // `PERMISSION_DENIED` with one constant body for either failed conjunct,
+  // and this service passes that code through untouched, carrying no
+  // message that names the conjunct.
+  //
+  // A DEMAND, NOT AN IDENTITY CLAIM — there is nothing to trust about who
+  // sent it, so nothing here authorises on it. A direct in-cluster caller who
+  // sets this field on a request that never came from the gateway's
+  // bootstrap path gets the SAME predicate enforced at `iam-db`, exactly as
+  // the bootstrap token does: the field only NARROWS what an insert can
+  // succeed against, never grants anything, so it is safe to enforce
+  // identically regardless of who set it.
+  bool require_zero_credential_admin = 4;
 }
 message IssueEnrolmentResponse {
   // base64(EnrolmentToken) — the whole of what the admin hands over. `iam`

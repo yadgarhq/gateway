@@ -76,6 +76,25 @@ struct Received {
     /// step 1's sensor exists to say so; suppressing it here to keep that sensor
     /// quiet would be this gateway asserting an exception to D9 it cannot make.
     has_idempotency_key: bool,
+    /// ADR-0655's demand, AS IT ARRIVED, and `None` means something different
+    /// here than it does on `actor`.
+    ///
+    /// **`None` = THE REQUEST SHAPE HAS NO SUCH FIELD**, which is true of
+    /// `CreateUserRequest` and `SetUserAdminRequest`. `actor`'s `None` is an
+    /// absent message on a shape that HAS the field; this one is the field not
+    /// existing. Flattening the two into one `bool` would record `false` for
+    /// two verbs that can never carry a demand, which reads as "the demand was
+    /// not set" and is a claim this stub has no business making.
+    ///
+    /// **AND THIS IS THE ONLY THING THAT CATCHES THE HEADLINE FALSE GREEN.**
+    /// `require_zero_credential_admin` is a proto3 `bool`, so an arm that
+    /// flipped `Verb::accepts_bootstrap` while the handler never set the field
+    /// puts the bootstrap token on `IssueEnrolment` carrying NO demand — a
+    /// deployed `iam-db` reads the proto3 default, takes the ORDINARY path, and
+    /// the unrestricted grant is live with every status-code test in this
+    /// repository green. The only way to assert a message is absent is to look
+    /// at the one that arrived.
+    demands_zero_credential_admin: Option<bool>,
 }
 
 #[derive(Default)]
@@ -99,6 +118,13 @@ struct AdminIam {
     answer: ResolveCredentialResponse,
     log: Arc<Log>,
     resolves: Arc<AtomicUsize>,
+    /// A `tonic::Status` this stub answers `IssueEnrolment` with instead of a
+    /// token, so the gateway's rendering of an upstream REFUSAL is reachable.
+    refuse_issue_enrolment: Option<tonic::Status>,
+    /// The same for `CreateUser`, and it exists for the SECOND DIRECTION of the
+    /// endpoint-scoping property: the enrolment refusal's body must be
+    /// unreachable from a verb that is not an enrolment.
+    refuse_create_user: Option<tonic::Status>,
 }
 
 /// Write the stub's whole `IamService` impl: four real methods and nine refusals.
@@ -131,7 +157,11 @@ macro_rules! admin_iam_service {
                     verb: "CreateUser",
                     actor: r.unverified_actor,
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
+                    demands_zero_credential_admin: None,
                 });
+                if let Some(refusal) = self.refuse_create_user.clone() {
+                    return Err(refusal);
+                }
                 Ok(tonic::Response::new(CreateUserResponse {
                     meta: Some(Meta {
                         id: CREATED_ID.to_string(),
@@ -150,7 +180,14 @@ macro_rules! admin_iam_service {
                     verb: "IssueEnrolment",
                     actor: r.unverified_actor,
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
+                    demands_zero_credential_admin: Some(r.require_zero_credential_admin),
                 });
+                // RECORDED BEFORE THE REFUSAL, deliberately: a refusing stub
+                // must still let a test read what arrived, or the refusal path
+                // could never be checked for the demand as well as the body.
+                if let Some(refusal) = self.refuse_issue_enrolment.clone() {
+                    return Err(refusal);
+                }
                 Ok(tonic::Response::new(IssueEnrolmentResponse {
                     // NOT BASE64-SHAPED, deliberately. The real blob is
                     // base64(EnrolmentToken) and a fixture that looked like one
@@ -174,6 +211,7 @@ macro_rules! admin_iam_service {
                     verb: "SetUserAdmin",
                     actor: r.unverified_actor,
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
+                    demands_zero_credential_admin: None,
                 });
                 Ok(tonic::Response::new(SetUserAdminResponse {}))
             }
@@ -220,8 +258,29 @@ fn resolved(is_admin: bool) -> ResolveCredentialResponse {
     }
 }
 
-/// A gateway attesting against a stub `iam`, plus the log of what reached it.
+/// A gateway attesting against a stub `iam` that answers every administrative
+/// verb, plus the log of what reached it.
 async fn gateway(answer: ResolveCredentialResponse) -> (Arc<AppState>, Arc<Log>) {
+    gateway_with(answer, Refusals::default()).await
+}
+
+/// Which administrative verbs the stub `iam` refuses, and with what status.
+///
+/// **PER VERB AND NOT ONE SHARED STATUS**, because the property under test is
+/// that the gateway's new enrolment refusal body is scoped BY ENDPOINT: a single
+/// knob could not express "refuse create-user and not issue-enrolment", which is
+/// the direction that catches a code-only match.
+#[derive(Default, Clone)]
+struct Refusals {
+    issue_enrolment: Option<tonic::Status>,
+    create_user: Option<tonic::Status>,
+}
+
+/// [`gateway`], with a stub `iam` that REFUSES the named verbs.
+async fn gateway_with(
+    answer: ResolveCredentialResponse,
+    refusals: Refusals,
+) -> (Arc<AppState>, Arc<Log>) {
     let log = Arc::new(Log::default());
     let incoming =
         tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
@@ -234,6 +293,8 @@ async fn gateway(answer: ResolveCredentialResponse) -> (Arc<AppState>, Arc<Log>)
                 answer,
                 log: served,
                 resolves: Arc::new(AtomicUsize::new(0)),
+                refuse_issue_enrolment: refusals.issue_enrolment,
+                refuse_create_user: refusals.create_user,
             }))
             .serve_with_incoming(incoming)
             .await
@@ -576,5 +637,211 @@ async fn create_user_answers_with_the_id_the_other_verbs_take() {
     assert!(
         answer["token"].as_str().is_some_and(|t| !t.is_empty()),
         "and the enrolment blob comes back for the administrator to hand over"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0655's grant, measured on the wire, and its refusal rendered (§4 step 4,
+// §7.2 of `plans/the-bootstrap-enrolment-predicate.md`)
+// ---------------------------------------------------------------------------
+
+/// The ONE body the gateway answers for EITHER failed conjunct (ADR-0657).
+///
+/// **A LITERAL, never `super`'s constant.** A test that read the constant it is
+/// pinning passes under any rewording of it (ADR-0599), which is the whole class
+/// this repository keeps out — and this string is a contract two other repos'
+/// probes are written against.
+const ENROLMENT_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only enrol an administrator who has never held a credential"}"#;
+
+/// A message the implementation could not plausibly contain, so if it appears in
+/// a response body the only way it got there is interpolation of `e.message()`.
+const UPSTREAM_SENTINEL: &str = "sentinel-upstream-text-that-must-not-appear";
+
+/// **THE HEADLINE ASSERTION OF STEP 4, and the only thing in this repository
+/// that reds on the false green the whole design exists to refuse.**
+///
+/// `require_zero_credential_admin` is a proto3 `bool`. Flip
+/// `Verb::accepts_bootstrap`'s `IssueEnrolment` arm and forget the handler, and
+/// the bootstrap token reaches the verb carrying NO demand: a deployed `iam-db`
+/// reads the proto3 default, takes the ORDINARY unrestricted path, and the grant
+/// ADR-0655's own rationale refuses is live while every status-code test in this
+/// repository stays green. Asserting a 200 does not catch it. Asserting the
+/// handler's intention does not catch it. This asserts the message that ARRIVED.
+#[tokio::test]
+async fn the_bootstrap_path_demands_a_zero_credential_admin_on_the_wire() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, answer) = post(
+        state,
+        "/admin/issue-enrolment",
+        &format!(r#"{{"user_id":"{OTHER_ID}"}}"#),
+        &[(BOOTSTRAP_HEADER, BOOTSTRAP_SECRET)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ADR-0655 admits the bootstrap token to this verb; got {answer}"
+    );
+
+    let received = log.drain();
+    assert_eq!(
+        received.len(),
+        1,
+        "issue-enrolment reached iam exactly once"
+    );
+    assert_eq!(
+        received[0].demands_zero_credential_admin,
+        Some(true),
+        "the bootstrap path must SEND the demand. A request that arrives without it is enforced \
+         by nobody: `iam-db` reads proto3's `false` and takes the ordinary path, which is the \
+         unrestricted grant"
+    );
+    assert_eq!(
+        received[0].actor, None,
+        "and the bootstrap path still stamps no actor — this change touches the demand and \
+         nothing else about the message"
+    );
+}
+
+/// **THE MIRROR, AND IT IS NOT OPTIONAL.** One arm alone proves only that the
+/// test is connected to something.
+///
+/// An attested administrator's re-enrolment is the FORGOTTEN-PASSWORD RECOVERY
+/// path (`iam.proto` states it; §8.1 names it). It targets a user who ALREADY
+/// HOLDS a credential by definition, so a handler that set the demand
+/// unconditionally would refuse every recovery — and no other gateway test
+/// notices, because none of them enrols a credentialed user.
+#[tokio::test]
+async fn an_attested_administrator_demands_nothing_on_the_wire() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, answer) = post(
+        state,
+        "/admin/issue-enrolment",
+        &format!(r#"{{"user_id":"{OTHER_ID}"}}"#),
+        &as_admin(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {answer}");
+
+    let received = log.drain();
+    assert_eq!(
+        received.len(),
+        1,
+        "issue-enrolment reached iam exactly once"
+    );
+    assert_eq!(
+        received[0].demands_zero_credential_admin,
+        Some(false),
+        "an ATTESTED administrator must demand nothing: the demand only narrows, and narrowing \
+         this path breaks re-enrolment as forgotten-password recovery"
+    );
+}
+
+/// An upstream `PERMISSION_DENIED` on enrolment renders as ONE 403 with ONE
+/// constant body (ADR-0657, §5.1).
+///
+/// Two properties, and the second is the one a body-equality assertion alone
+/// would certify green:
+///
+/// 1. The status is 403 and the body is §5.1's sentence byte-for-byte. Without
+///    the arm this is `opaque_status`'s catch-all 503 "the administrative service
+///    is unavailable" — which tells an operator the service is down when it
+///    refused correctly.
+/// 2. **The UPSTREAM's words are nowhere in the body.** The stub refuses with a
+///    sentinel rather than with §5.1's sentence on purpose: a stub that spoke the
+///    expected sentence would let a handler which interpolated `e.message()` pass
+///    the equality assertion — and that handler is the ADR-0657 disclosure
+///    channel, certified green by the test written to refuse it.
+///
+/// There is deliberately NO message-dependent branch and no second body per
+/// conjunct: ADR-0657 rules that distinct refusals per conjunct are an
+/// administrator-set enumeration oracle naming exactly the administrators who
+/// have never logged in, which is the set this grant can still take over.
+#[tokio::test]
+async fn an_upstream_permission_denied_on_enrolment_is_one_403_with_one_body() {
+    let (state, log) = gateway_with(
+        resolved(true),
+        Refusals {
+            issue_enrolment: Some(tonic::Status::permission_denied(UPSTREAM_SENTINEL)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, answer) = post(
+        state,
+        "/admin/issue-enrolment",
+        &format!(r#"{{"user_id":"{OTHER_ID}"}}"#),
+        &[(BOOTSTRAP_HEADER, BOOTSTRAP_SECRET)],
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a refusal is 403, not the 503 every other upstream code collapses into; got {answer}"
+    );
+    let body = answer.to_string();
+    assert_eq!(
+        body, ENROLMENT_REFUSAL_BODY,
+        "the refusal answers §5.1's single sentence, byte for byte"
+    );
+    assert!(
+        !body.contains(UPSTREAM_SENTINEL),
+        "the upstream's own message must not reach the caller: naming the failed conjunct is the \
+         oracle ADR-0657 exists to refuse. Got {body}"
+    );
+
+    // AND THE DEMAND STILL TRAVELLED. A refusal reached by never sending the
+    // demand would satisfy the two assertions above and prove nothing.
+    let received = log.drain();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].demands_zero_credential_admin, Some(true));
+}
+
+/// **THE ENDPOINT SCOPE, IN THE DIRECTION THAT CATCHES A CODE-ONLY MATCH.**
+///
+/// `admin_failure` renders all three administrative endpoints. An arm keyed on
+/// `Code::PermissionDenied` ALONE would answer "the bootstrap token may only
+/// enrol an administrator who has never held a credential" to a caller who was
+/// creating a USER — a message about a verb the call was not, which is precisely
+/// the class §5.4's rewording exists to remove, re-introduced by the same pull
+/// request that removes it.
+///
+/// What create-user renders instead is whatever it renders TODAY — the opaque
+/// catch-all — because nothing in this change gives `iam` a new reason to refuse
+/// that verb, and inventing a body for a case that does not exist would be
+/// widening by guess.
+#[tokio::test]
+async fn the_enrolment_refusal_body_is_unreachable_from_create_user() {
+    let (state, _log) = gateway_with(
+        resolved(true),
+        Refusals {
+            create_user: Some(tonic::Status::permission_denied(UPSTREAM_SENTINEL)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, answer) = post(
+        state,
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        &[(BOOTSTRAP_HEADER, BOOTSTRAP_SECRET)],
+    )
+    .await;
+
+    let body = answer.to_string();
+    assert_ne!(
+        body, ENROLMENT_REFUSAL_BODY,
+        "create-user must never be told about enrolment: the body names a verb this call was not"
+    );
+    assert!(!body.contains(UPSTREAM_SENTINEL), "got {body}");
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"the administrative service is unavailable"}"#
+        ),
+        "unchanged from today: this change gives `iam` no new reason to refuse create-user, so \
+         the opaque catch-all stays rather than a body invented for a case that does not exist"
     );
 }

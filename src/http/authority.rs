@@ -255,7 +255,17 @@ pub(super) fn bootstrap_authority(
             "PERMISSION_DENIED",
             text(
                 StatusCode::FORBIDDEN,
-                r#"{"error":"the bootstrap token may only create an administrator or promote one"}"#,
+                // **REWORDED BY ADR-0655, SAME CONSTANT, SAME TWO REMAINING
+                // ARMS.** The old sentence — "may only create an administrator or
+                // promote one" — became FALSE the moment `IssueEnrolment` was
+                // admitted, and it was still the right refusal for the two cases
+                // that keep producing it: a `create-user` whose `is_admin` is
+                // false or absent, and a `set-user-admin` demotion. So the text
+                // stops overclaiming rather than the refusal moving. It is no
+                // longer returned on `issue-enrolment` at all — the only refusals
+                // on that path now come from the predicate at `iam-db` and render
+                // through `admin_failure`.
+                r#"{"error":"the bootstrap token may only create an administrator, promote one, or enrol one who has never held a credential"}"#,
             ),
         ));
     }
@@ -303,6 +313,33 @@ pub(super) fn bootstrap_authority(
 /// deliberately nowhere obvious to put one. §2 asks for a distinct MESSAGE and
 /// this is one.
 ///
+/// # `PERMISSION_DENIED` ON ENROLMENT IS 403 (ADR-0655, ADR-0657)
+///
+/// `iam-db` evaluates ADR-0655's zero-credential predicate inside the enrolment
+/// insert and refuses with `PERMISSION_DENIED`; `iam` relays the code untouched.
+/// Without an arm here that refusal renders as [`opaque_status`]'s catch-all 503
+/// "the administrative service is unavailable" — telling an operator the service
+/// is down at the moment it refused them correctly.
+///
+/// **ONE CODE, ONE CONSTANT BODY, AND NO BRANCH ON THE UPSTREAM MESSAGE.**
+/// ADR-0657 rules that a refusal on an authorization path whose predicate has
+/// more than one conjunct answers the SAME body whichever conjunct failed:
+/// distinct bodies would let a holder of a leaked bootstrap token tell "not an
+/// administrator" from "administrator who already holds a credential", which
+/// enumerates the administrator set and specifically names the administrators who
+/// have NEVER LOGGED IN — exactly the set this grant can still take over. Which
+/// conjunct failed is recorded at `iam-db`, in a log line and a closed-set
+/// counter label, joined to this 403 by the request id.
+///
+/// **SCOPED BY ENDPOINT, AND THAT IS NOT A BRANCH ON THE MESSAGE.** This function
+/// renders all three administrative endpoints. An arm keyed on the CODE alone
+/// would answer a sentence about enrolment to a caller who was creating a user —
+/// the same overclaiming that made the exclusion message above false,
+/// re-introduced by the change that fixes it. `create-user` and `set-user-admin`
+/// keep the opaque catch-all they answer today, because nothing in ADR-0655 gives
+/// `iam` a new reason to refuse them and a body invented for a case that does not
+/// exist would be a widening by guess.
+///
 /// Everything else is opaque, from a `tonic::Code` and a constant — never
 /// `e.to_string()` — for [`login_failure`]'s reason.
 pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status) -> Response {
@@ -310,13 +347,36 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
     // the log rather than to the caller.
     tracing::warn!(code = ?e.code(), message = e.message(), endpoint, "an administrative RPC was refused or failed");
     let code = e.code();
+    // THE ENROLMENT PREDICATE'S REFUSAL, and only on the endpoint it can come
+    // from. Computed once so the label and the body cannot disagree about which
+    // case this is.
+    let enrolment_refusal =
+        code == tonic::Code::PermissionDenied && endpoint == ADMIN_ISSUE_ENROLMENT;
     call.fail(if code == tonic::Code::Unauthenticated {
         "UNAUTHENTICATED"
     } else if code == tonic::Code::FailedPrecondition {
         "FAILED_PRECONDITION"
+    } else if enrolment_refusal {
+        // **AND NOT `UNAVAILABLE`.** D67's `outcome` label is what an operator
+        // aggregates on, and recording a refusal as an unavailability would make
+        // the one signal that says "the predicate held" read as an outage. Legal
+        // on this surface: `authorise` already emits this exact label, and every
+        // value here is one `yadgar_telemetry::grpc::status_name` produces
+        // (ADR-0558).
+        "PERMISSION_DENIED"
     } else {
         "UNAVAILABLE"
     });
+    if enrolment_refusal {
+        return text(
+            StatusCode::FORBIDDEN,
+            // ONE BODY FOR BOTH CONJUNCTS (ADR-0657). If a later edit finds
+            // itself wanting to name which conjunct failed, that is the oracle
+            // the ADR exists to refuse — the conjunct lives in `iam-db`'s log
+            // line and its closed-set counter label, reachable by request id.
+            r#"{"error":"the bootstrap token may only enrol an administrator who has never held a credential"}"#,
+        );
+    }
     if code == tonic::Code::FailedPrecondition {
         return text(
             opaque_status(code),
