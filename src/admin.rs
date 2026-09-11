@@ -31,7 +31,18 @@ use sha2::{Digest, Sha256};
 use crate::pb::yadgar::common::v1::UnverifiedActor;
 
 /// Every time this deployment's bootstrap token was ACCEPTED — every time a
-/// stranger holding a shared secret became, or promoted, an administrator.
+/// stranger holding a shared secret became, promoted, or ENROLLED an
+/// administrator.
+///
+/// **ALL THREE VERBS, AND ADR-0655'S THIRD ONE NEEDS NO NEW METRIC.** The
+/// counter is incremented at the `Bootstrap::Accepted` arm, which every admitted
+/// bootstrap request crosses — so admitting `IssueEnrolment` extends this series'
+/// meaning for free and `deploy`'s `BootstrapTokenAccepted` rule keeps firing on
+/// the first acceptance of any of the three. That is stated here rather than
+/// assumed, because the closed-set reasoning below enumerates the verbs and a
+/// third one appearing silently would make that enumeration wrong. (`iam-db`'s
+/// per-conjunct refusal counter under ADR-0655 is a DIFFERENT signal — refusals,
+/// not acceptances — and replaces nothing here.)
 ///
 /// # Why a metric exists for something a log line already says
 ///
@@ -55,10 +66,10 @@ use crate::pb::yadgar::common::v1::UnverifiedActor;
 ///
 /// D67 forbids a label a caller can influence, which rules out the token, the
 /// presented value and anything derived from either. It does not rule out
-/// `verb`, whose only two reachable values here are closed by [`Verb`] —
-/// `CreateUser` and `SetUserAdmin`, the two ADR-0492 grants. That label is
-/// omitted anyway, because **it would not change what the operator does**:
-/// either value sends them to enumerate the administrators `iam` holds and to
+/// `verb`, whose only three reachable values here are closed by [`Verb`] —
+/// `CreateUser`, `SetUserAdmin` and, since ADR-0655, `IssueEnrolment`. That label
+/// is omitted anyway, because **it would not change what the operator does**:
+/// any of the three sends them to enumerate the administrators `iam` holds and to
 /// rotate the Secret, and the split buys a dashboard nobody has. The scrape
 /// already attaches `pod` and `namespace`, which is what an operator needs to
 /// reach the log line while that pod still lives.
@@ -117,14 +128,40 @@ impl Verb {
     /// here would let a token that exists to create the FIRST admin rewrite the
     /// read policy for the whole deployment before an admin exists to notice."
     ///
-    /// **`IssueEnrolment` is the exclusion a reader is most likely to argue
-    /// with**, because handing the new admin their enrolment blob is the obvious
-    /// next step in the ceremony. It is still excluded: an enrolment token
-    /// redeems into a credential for an ARBITRARY user id, so a bootstrap token
-    /// that reached it could mint a login for anybody who already exists, admin
-    /// or not. That is not "create an admin"; it is account takeover with an
-    /// unattributable credential. The ceremony's second step is taken by the
-    /// administrator the first step created, logging in first.
+    /// # `IssueEnrolment` IS ADMITTED, and the narrowing is NOT here
+    ///
+    /// **This arm used to be `false`, and the argument it carried was correct
+    /// about the danger and wrong about the remedy.** The argument was: an
+    /// enrolment token redeems into a credential for an ARBITRARY user id, so a
+    /// bootstrap token reaching this verb could mint a login for anybody who
+    /// already exists — account takeover with an unattributable credential, not
+    /// bootstrap. The danger is real and nothing below denies it.
+    ///
+    /// What the exclusion cost is that ADR-0492's ceremony COULD NOT BE STARTED.
+    /// It is circular, and the circle closes on the FIRST administrator only: an
+    /// enrolment is issued only to an attested administrator; an attested
+    /// administrator needs a credential; a credential is minted only by
+    /// redeeming an enrolment. `SetUserAdmin` is not a way round — promoting
+    /// needs an existing ENROLLED user, and on a fresh deployment there is none.
+    ///
+    /// ADR-0655 (amending ADR-0492), as amended by ADR-0656, admits the token to
+    /// this verb and answers the takeover argument with a PREDICATE rather than
+    /// with an exclusion: the target must be an administrator who holds ZERO
+    /// CREDENTIALS — no `iam_password` row and no `iam_credential` row of ANY
+    /// LIVENESS, revoked rows included. Such a user is one this token itself
+    /// just made, and a row is never deleted (only tombstoned per D26), so once
+    /// a user has ever held a credential they are permanently outside the grant.
+    ///
+    /// **THE PREDICATE IS NOT ENFORCED HERE AND CANNOT BE.** It is evaluated
+    /// INSIDE THE WRITE at `iam-db`, in the same transaction as the enrolment
+    /// insert — carried as `IssueEnrolmentRequest.require_zero_credential_admin`,
+    /// relayed verbatim by `iam`. A read this gateway performed first would be
+    /// true when it ran and stale when it was used, which is the race ADR-0655
+    /// puts the predicate in the transaction to close. So this function's job is
+    /// only to stop refusing, and `super::http::admin_issue_enrolment`'s job is
+    /// to SET the demand — a flipped arm with an unset demand is the false green
+    /// the whole design exists to refuse, because proto3 reads the absent bool
+    /// as `false` and `iam-db` then takes the ordinary unrestricted path.
     pub fn accepts_bootstrap(self, wants_admin: bool) -> bool {
         match self {
             // ONLY WITH THE FLAG SET. `false` here is an ordinary account, which
@@ -135,8 +172,16 @@ impl Verb {
             // the exact denial-of-service an unattributable credential must not
             // be able to cause.
             Verb::SetUserAdmin => wants_admin,
-            // NEVER, on any value of anything. See the doc comment above.
-            Verb::IssueEnrolment => false,
+            // **UNCONDITIONALLY, AND `wants_admin` IS DELIBERATELY IGNORED.**
+            // `wants_admin` is the request's own `is_admin` field and AN
+            // ENROLMENT REQUEST HAS NO SUCH FIELD — `admin_issue_enrolment`
+            // passes `false` because there is no value being set, not because it
+            // is asking for something lesser. So `Verb::IssueEnrolment =>
+            // wants_admin` would refuse EVERY real enrolment while reading like
+            // a narrowing, and there is no flag here to narrow with anyway. The
+            // narrowing that ADR-0655 actually buys is the zero-credential
+            // predicate at `iam-db`, inside the write; see the doc comment.
+            Verb::IssueEnrolment => true,
         }
     }
 }
@@ -334,6 +379,41 @@ impl Authority {
                 user_id: user_id.clone(),
             }),
             Authority::Bootstrap => None,
+        }
+    }
+
+    /// ADR-0655's demand for this call:
+    /// `IssueEnrolmentRequest.require_zero_credential_admin`.
+    ///
+    /// **`true` ON THE BOOTSTRAP PATH AND `false` ON THE ATTESTED ONE, and the
+    /// `false` half is the load-bearing one.** An attested administrator's
+    /// re-enrolment is the FORGOTTEN-PASSWORD RECOVERY path the contract
+    /// documents (`iam.proto`: "a FRESH enrolment for an EXISTING user, redeemed,
+    /// sets the password unconditionally"), and its target holds a credential by
+    /// definition. Setting the demand there would refuse every recovery — and no
+    /// gateway test would notice, because none of them enrols a credentialed
+    /// user. The wire assertion in `tests/admin_http.rs` is the mirror that does.
+    ///
+    /// # A method rather than a `matches!` at the call site
+    ///
+    /// [`Authority`]'s own doc comment states the idiom this keeps: "every
+    /// downstream difference follows from the VARIANT rather than from a flag
+    /// somebody has to remember to read". The demand is such a difference, so it
+    /// belongs beside [`Authority::actor`] where the next person adding a variant
+    /// meets both at once — and it gives the property a unit-level assertion
+    /// that does not need an HTTP request to reach it.
+    ///
+    /// # What this is NOT
+    ///
+    /// It is not an authorisation input and it is not an identity claim. The
+    /// field only ever NARROWS what an insert can succeed against, so `iam-db`
+    /// enforces it identically whoever set it — which is why the contract can
+    /// say a direct in-cluster caller who sets it gets the same predicate rather
+    /// than having to trust its sender.
+    pub fn demands_zero_credential_admin(&self) -> bool {
+        match self {
+            Authority::Bootstrap => true,
+            Authority::Administrator(_) => false,
         }
     }
 }

@@ -2314,15 +2314,24 @@ async fn bootstrap_post(path: &str, body: &str) -> (StatusCode, Value) {
 }
 
 /// A negative test per EXCLUDED verb, which is the §9 row verbatim.
+///
+/// **RENAMED FROM `..._on_every_verb_outside_its_two`, AND THE ISSUE-ENROLMENT
+/// ROW MOVED RATHER THAN DELETED.** ADR-0655 admits the bootstrap token to
+/// `IssueEnrolment`, so its row stopped being a refusal — but the row could not
+/// stay here even as a positive one: this file points `iam` at a CLOSED PORT, so
+/// an admitted enrolment now reaches the upstream, fails to connect, and renders
+/// the opaque 503. Asserting that would pin a transport failure rather than a
+/// grant. The row's replacement is the pair in `tests/admin_http.rs`, against a
+/// stub `iam` that answers — `the_bootstrap_path_demands_a_zero_credential_admin_on_the_wire`
+/// and `an_upstream_permission_denied_on_enrolment_is_one_403_with_one_body` —
+/// which is strictly stronger, because it asserts the DEMAND that travelled and
+/// not merely the status that came back.
+///
+/// The two rows below SURVIVE UNCHANGED and are the must-not-break proofs: the
+/// token still cannot create an ordinary account, and still cannot demote.
 #[tokio::test]
-async fn the_bootstrap_token_is_refused_on_every_verb_outside_its_two() {
+async fn the_bootstrap_token_is_refused_an_ordinary_account_and_a_demotion() {
     for (path, body, why) in [
-        (
-            "/admin/issue-enrolment",
-            r#"{"user_id":"yadgar:user:x"}"#,
-            "an enrolment mints a credential for an ARBITRARY user, which is takeover rather than \
-             bootstrap",
-        ),
         (
             "/admin/create-user",
             r#"{"external_id":"ada","display_name":"Ada","is_admin":false}"#,
@@ -2431,8 +2440,10 @@ fn an_accepted_bootstrap_token_is_counted_and_a_refused_one_is_not() {
     // the status alone would let the `== 0` below pass against a gateway that
     // never reached the comparison, and then this half would prove nothing about
     // the counter. The two bodies are what separate them: the pre-comparison
-    // refusal says "the bootstrap token may only create an administrator or
-    // promote one", and this one is the `Bootstrap::Refused` arm's own.
+    // refusal says "the bootstrap token may only create an administrator, promote
+    // one, or enrol one who has never held a credential" (reworded by ADR-0655,
+    // which admitted the third verb and left the sentence overclaiming), and this
+    // one is the `Bootstrap::Refused` arm's own.
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
         answer.get("error"),
@@ -2497,12 +2508,25 @@ where
 /// request carrying both credentials could acquire an identity and stamp it, and
 /// which mechanism admitted a call would depend on which check happened to run
 /// first.
+///
+/// **THE EXCLUDED VERB IS NOW A DEMOTION, AND THE BODY IS ASSERTED.** This test
+/// used to drive `/admin/issue-enrolment`, which ADR-0655 admits — an admitted
+/// verb reaches the closed-port `iam` and renders the opaque 503, so the verb had
+/// to change. `set-user-admin` with `is_admin: false` is still excluded from the
+/// bootstrap token (only the promotion half is granted) and is the natural
+/// replacement.
+///
+/// Asserting the STATUS alone would not have proved the property even before:
+/// this file attests through `TrustedHeaders`, where `is_admin` is `false` by
+/// construction, so a fallback to the attested path answers 403 as well. The two
+/// refusals are told apart only by their bodies, and this is the bootstrap verb
+/// gate's own.
 #[tokio::test]
 async fn a_bootstrap_request_never_falls_back_to_the_attested_path() {
-    let (status, _) = admin_post(
+    let (status, answer) = admin_post(
         state_bootstrapped(BOOTSTRAP_SECRET),
-        "/admin/issue-enrolment",
-        r#"{"user_id":"yadgar:user:x"}"#,
+        "/admin/set-user-admin",
+        r#"{"user_id":"yadgar:user:x","is_admin":false}"#,
         &[
             (BOOTSTRAP_HEADER_NAME, BOOTSTRAP_SECRET),
             ("x-yadgar-user", "ada"),
@@ -2516,6 +2540,15 @@ async fn a_bootstrap_request_never_falls_back_to_the_attested_path() {
         StatusCode::FORBIDDEN,
         "the bootstrap header decides the path; presenting a credential beside it must not open \
          the verb the token is excluded from"
+    );
+    assert_eq!(
+        answer.get("error"),
+        Some(&json!(
+            "the bootstrap token may only create an administrator, promote one, or enrol one who \
+             has never held a credential"
+        )),
+        "and it must be the BOOTSTRAP verb gate that refused it, not the attested path's \
+         non-administrator refusal — the two are both 403 and the body is what separates them"
     );
 }
 

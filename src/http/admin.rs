@@ -164,19 +164,34 @@ pub(super) async fn admin_create_user(
     text(StatusCode::OK, &rendered)
 }
 
-/// `iam.IssueEnrolment`, behind an administrator and NEVER the bootstrap token.
+/// `iam.IssueEnrolment`, behind an administrator OR the bootstrap token under
+/// ADR-0655's predicate.
 ///
 /// The second step of ADR-0492's ceremony: the administrator receives the blob
 /// the person redeems at `/auth/enrol`, and never learns the password they
 /// choose.
 ///
-/// **The bootstrap token is excluded here, and this is the exclusion a reader is
-/// most likely to argue with** — handing the new administrator their enrolment
-/// blob looks like the obvious next step. `admin::Verb::accepts_bootstrap`
-/// carries the argument: an enrolment redeems into a credential for an arbitrary
-/// user id, so a bootstrap token that reached this verb could mint a login for
-/// anybody who already exists. That is account takeover with an unattributable
-/// credential, not bootstrap.
+/// # Two authorities reach this verb, and they send DIFFERENT MESSAGES
+///
+/// **The bootstrap token used to be excluded here, and ADR-0655 admits it**
+/// because the exclusion made ADR-0492's ceremony unstartable — the circle is
+/// argued in `admin::Verb::accepts_bootstrap`. The takeover the exclusion
+/// prevented is prevented instead by a PREDICATE: the target must be an
+/// administrator holding zero credentials (ADR-0656's definition: no
+/// `iam_password` row and no `iam_credential` row of any liveness).
+///
+/// **THE PREDICATE IS A DEMAND THIS HANDLER SENDS, AND ITS ABSENCE IS SILENT.**
+/// `require_zero_credential_admin` is a proto3 `bool`, so a request that omits
+/// it is indistinguishable at `iam-db` from one that asked for the ORDINARY
+/// unrestricted path. Flipping the verb arm and forgetting this field is
+/// therefore not a broken feature but a live unrestricted grant with every
+/// status-code test green — which is why `tests/admin_http.rs` asserts the
+/// message that ARRIVED rather than the answer that came back.
+///
+/// On the ATTESTED path the demand stays `false`, which is what keeps
+/// re-enrolment working as the forgotten-password recovery the contract
+/// documents. `admin::Authority::demands_zero_credential_admin` is the whole
+/// rule and carries the reasoning.
 pub(super) async fn admin_issue_enrolment(
     State(state): State<Arc<AppState>>,
     PeerAddr(peer): PeerAddr,
@@ -219,8 +234,11 @@ pub(super) async fn admin_issue_enrolment(
         ADMIN_ISSUE_ENROLMENT,
         Verb::IssueEnrolment,
         // NO FLAG ON THIS REQUEST, and `false` is not a value being set — it is
-        // the absence of one. `accepts_bootstrap` refuses this verb on EVERY
-        // value, so nothing about the argument admits anything.
+        // the absence of one. `accepts_bootstrap` IGNORES the argument on this
+        // verb (it admits the token unconditionally, ADR-0655), so nothing about
+        // what is passed here admits or refuses anything. That is why the `false`
+        // is safe AND why the arm must not be written `=> wants_admin`: it would
+        // read this absence as a refusal and break every enrolment.
         false,
         &headers,
         request_id.clone(),
@@ -246,6 +264,11 @@ pub(super) async fn admin_issue_enrolment(
         }),
         user_id: user_id.to_string(),
         unverified_actor: authority.actor(),
+        // **FROM THE AUTHORITY, NEVER FROM THE REQUEST BODY.** There is no JSON
+        // field for this and there deliberately never will be: a caller who could
+        // clear it would turn ADR-0655's narrow grant back into the unrestricted
+        // one. The variant is the only input.
+        require_zero_credential_admin: authority.demands_zero_credential_admin(),
     });
     let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
         Ok(Ok(r)) => r.into_inner(),

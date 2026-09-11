@@ -95,10 +95,19 @@ fn the_acceptance_counter_is_named_the_thing_an_operator_alerts_on() {
 /// ADR-0492's grant, and every excluded cell around it.
 ///
 /// **The exclusions are the contract; the inclusions are the feature.** A
-/// suite asserting only the two `true` rows passes against a gateway that
-/// accepts the bootstrap token everywhere.
+/// suite asserting only the `true` rows passes against a gateway that accepts
+/// the bootstrap token everywhere.
+///
+/// **`IssueEnrolment` IS NOW ADMITTED, ON EVERY VALUE OF THE FLAG** (ADR-0655
+/// as amended by ADR-0656). Both `IssueEnrolment` rows below are therefore
+/// POSITIVE, and BOTH of them are load-bearing rather than one being a
+/// duplicate of the other: `admin_issue_enrolment` passes `wants_admin: false`
+/// because an enrolment request carries no `is_admin` field at all, so an arm
+/// written `Verb::IssueEnrolment => wants_admin` would refuse every real
+/// enrolment while the `(true)` row below still passed. The `(false)` row is
+/// what reds on that mutation.
 #[test]
-fn the_bootstrap_token_reaches_exactly_create_an_admin_and_promote_to_admin() {
+fn the_bootstrap_token_reaches_create_an_admin_promote_one_and_enrol_one() {
     assert!(
         Verb::CreateUser.accepts_bootstrap(true),
         "create an admin: ADR-0492's first grant"
@@ -117,13 +126,15 @@ fn the_bootstrap_token_reaches_exactly_create_an_admin_and_promote_to_admin() {
         "demotion would let a shared secret remove every administrator in the deployment"
     );
     assert!(
-        !Verb::IssueEnrolment.accepts_bootstrap(true),
-        "an enrolment mints a credential for an ARBITRARY user, which is takeover and not \
-         bootstrap"
+        Verb::IssueEnrolment.accepts_bootstrap(true),
+        "ADR-0655's grant: the token may enrol the administrator it just created, because the \
+         zero-credential predicate at `iam-db` is what keeps that from being takeover"
     );
     assert!(
-        !Verb::IssueEnrolment.accepts_bootstrap(false),
-        "and it is excluded on every value of the flag, not only on one"
+        Verb::IssueEnrolment.accepts_bootstrap(false),
+        "and it is admitted on EVERY value of the flag, because an enrolment request carries no \
+         flag — the handler passes `false`, so a `wants_admin`-gated arm would refuse every real \
+         enrolment and this is the row that says so"
     );
 }
 
@@ -135,6 +146,27 @@ fn the_bootstrap_path_stamps_no_actor_at_all() {
         None,
         "an empty actor reaches iam-db's `<unattributed>` by the WRONG route and hides a \
          dropped id"
+    );
+}
+
+/// ADR-0655's demand follows the VARIANT, in both directions.
+///
+/// **BOTH ROWS, because either alone is worthless.** The `true` row alone passes
+/// against a handler that demands the predicate unconditionally — which refuses
+/// every forgotten-password recovery (§8.1). The `false` row alone passes against
+/// one that never demands it — which is the live unrestricted grant, because
+/// proto3 reads the absent bool as `false` and `iam-db` takes the ordinary path.
+#[test]
+fn only_the_bootstrap_path_demands_a_zero_credential_admin() {
+    assert!(
+        Authority::Bootstrap.demands_zero_credential_admin(),
+        "the bootstrap token's enrolment is admitted ONLY under the predicate, so the demand is \
+         what makes ADR-0655's grant narrow rather than total"
+    );
+    assert!(
+        !Authority::Administrator("yadgar:user:abc".to_string()).demands_zero_credential_admin(),
+        "an attested administrator demands nothing: their re-enrolment is the documented \
+         forgotten-password recovery and its target holds a credential by definition"
     );
 }
 
