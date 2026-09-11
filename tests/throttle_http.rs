@@ -140,6 +140,8 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // DISABLED, which is the shipped default until the chart mounts the
         // Secret, and nothing here exercises the bootstrap path.
         bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
+        // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
+        tools_poll_interval: std::time::Duration::from_secs(600),
     });
 
     let (first, _, _) = call(Arc::clone(&state), &user).await;

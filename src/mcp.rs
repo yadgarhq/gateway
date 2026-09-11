@@ -39,6 +39,21 @@ pub mod meta_keys {
     pub const CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
     pub const CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
     pub const SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+    /// How often, in whole seconds, a client should re-poll `tools/list` for a
+    /// changed catalogue. Carried in the `tools/list` RESULT's `_meta`, not the
+    /// request's — this is the gateway telling the client, never the reverse.
+    ///
+    /// **`io.yadgarhq/...`, and this is the first key under it.** The four
+    /// keys above are `io.modelcontextprotocol/...` because they belong to the
+    /// spec; this is OURS, and no `_meta` key of this estate's own existed
+    /// before it to set a convention. `io.yadgarhq` mirrors
+    /// `io.modelcontextprotocol`'s own shape — a reverse-DNS-style prefix
+    /// naming who defines the key — over this org's own name rather than the
+    /// spec's, so a future yadgar-owned key has an established home instead of
+    /// inventing its own namespace. See the PR body: this establishes the
+    /// convention, and does not squat on the spec's.
+    pub const TOOLS_POLL_INTERVAL_SECONDS: &str = "io.yadgarhq/toolsPollIntervalSeconds";
 }
 
 /// JSON-RPC and MCP error codes.

@@ -334,6 +334,8 @@ async fn gateway_with(
         credential_limits: wide(),
         admin_limits: wide(),
         bootstrap: BootstrapToken::from_secret(BOOTSTRAP_SECRET),
+        // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
+        tools_poll_interval: std::time::Duration::from_secs(600),
     });
     (state, log)
 }

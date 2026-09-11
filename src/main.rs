@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bootstrap,
         watch_inputs,
         schedule,
+        tools_poll_interval,
         task,
         iam,
     } = boot::wiring(&broker, &valkey_password).await?;
@@ -132,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         credential_limits,
         admin_limits,
         bootstrap,
+        tools_poll_interval,
     });
 
     boot::start_invalidation(broker, ttl, Arc::clone(&state)).await;

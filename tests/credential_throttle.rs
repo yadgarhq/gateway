@@ -118,6 +118,8 @@ fn state_with_admin(
         // authority is judged, so a throttled request is a 429 either way — but a
         // test that could not tell the two apart would be measuring nothing.
         bootstrap: yadgar_gateway::admin::BootstrapToken::from_secret(BOOTSTRAP),
+        // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
+        tools_poll_interval: std::time::Duration::from_secs(600),
     })
 }
 

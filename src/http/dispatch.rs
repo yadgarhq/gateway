@@ -110,7 +110,7 @@ pub(super) async fn handle(
 
     match request.method.as_str() {
         DISCOVER => measured(DISCOVER, || discover(&id)),
-        TOOLS_LIST => measured(TOOLS_LIST, || tools_list(&id)),
+        TOOLS_LIST => measured(TOOLS_LIST, || tools_list(&id, state.tools_poll_interval)),
         // observe-coverage: exempt — every path out of `tools_call` records, or is
         // unrecorded by the same rule as the unknown-method arm above. An unresolved
         // tool name (dispatch.rs:238, from `resolved_tool`) records NOTHING,
@@ -141,7 +141,15 @@ pub(super) async fn handle(
 }
 
 /// The `tools/list` payload.
-pub(super) fn tools_list(id: &Value) -> Value {
+///
+/// `poll_interval` is what the client should be told to poll `tools/list`
+/// again at, so it can notice a changed catalogue — a decision the OPERATOR
+/// makes (ADR ledger: the gateway names the interval, not a client constant),
+/// resolved from `gateway.yaml` and carried on [`AppState`](super::AppState)
+/// rather than compiled in. `yadgar-client` falls back to 10 minutes when this
+/// key is absent, so this addition is safe if it lands before or after that
+/// client's own change.
+pub(super) fn tools_list(id: &Value, poll_interval: std::time::Duration) -> Value {
     mcp::result(
         id,
         as_object(json!({
@@ -151,6 +159,9 @@ pub(super) fn tools_list(id: &Value) -> Value {
             // asking.
             "ttlMs": 300_000,
             "cacheScope": "public",
+            "_meta": {
+                meta_keys::TOOLS_POLL_INTERVAL_SECONDS: poll_interval.as_secs(),
+            },
         })),
     )
 }

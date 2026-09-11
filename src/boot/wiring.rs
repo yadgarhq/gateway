@@ -28,6 +28,10 @@ pub struct Wiring {
     pub bootstrap: BootstrapToken,
     pub watch_inputs: rotate::Inputs,
     pub schedule: rotate::Schedule,
+    /// How often a client should re-poll `tools/list`, resolved from
+    /// `gateway.yaml`'s `toolsPoll.intervalSeconds` (ADR-0569/0570). Carried on
+    /// [`AppState`](crate::http::AppState) rather than re-read per request.
+    pub tools_poll_interval: std::time::Duration,
     pub task: Channel,
     pub iam: Channel,
 }
@@ -66,6 +70,17 @@ pub async fn wiring(
     // MIGRATION_NOTES.md, steps 2a and 2b — NOT this repository's, which has no
     // such section.
     let config = rotate::Configuration::mounted();
+
+    // THE FIRST KNOB IN `gateway.yaml` (this service's OWN document, distinct
+    // from `shared.yaml` above). `chart/templates/deployment.yaml` has mounted
+    // `config-gateway` since step 2a with nothing reading or watching it; this
+    // is the knob that gives it a reader, and `gateway_config` below joins it
+    // to the watch set two lines down so the gap that comment named is closed
+    // in the same pull request that opened it. See `rotate::GatewayDocument`.
+    let gateway_config = rotate::GatewayDocument::mounted();
+    let tools_poll_interval = gateway_config
+        .tools_poll_interval()
+        .map_err(|e| e.to_string())?;
 
     // THE WATCH SET, ASSEMBLED FROM THE RESOLVED CONFIGURATION AND BEFORE THE
     // DIALS (ADR-0523). The baseline is the bytes each file held when this
@@ -123,6 +138,7 @@ pub async fn wiring(
         valkey_password.as_ref().map(|(_, file)| file.as_path()),
         bootstrap_file.as_deref(),
         &config,
+        &gateway_config,
     );
 
     // READ FROM THE SAME DOCUMENT THE WATCH SET JUST JOINED, whether or not any
@@ -138,6 +154,7 @@ pub async fn wiring(
         bootstrap,
         watch_inputs,
         schedule,
+        tools_poll_interval,
         task,
         iam,
     })
