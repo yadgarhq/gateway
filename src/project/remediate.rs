@@ -23,15 +23,19 @@
 //! answering with an availability failure would hide a correctness one — the
 //! caller would retry for ever against a condition retrying cannot fix.
 //!
-//! **WHAT THE PINNED CONTRACT CANNOT YET SUPPLY.**
-//! `ProjectServiceResolveProjectResponse` carries `resolved_path`, `exact`,
-//! `via_alias` and `status` at `PROTO_VERSION` v1.12.1 — and no `source_repo`.
-//! `plans/project-validation.md`'s stage 2 adds it; v1.13.0 added the field to
-//! `RegisterProjectRequest` only, which is the store's write side. So
-//! [`sentence`] takes the source repository as a parameter and BOTH of its
-//! branches are exercised by [`super::tests`], while the wire path below supplies
-//! `None` until the contract carries it. That is a one-line change here, and it
-//! is named rather than left as a surprise.
+//! **THE DATUM ARRIVES ON THE ANSWER, AND AN EMPTY STRING IS ITS ABSENCE.**
+//! `ProjectServiceResolveProjectResponse` carries `source_repo` from
+//! `PROTO_VERSION` v1.15.0, so [`compose`] passes the resolver's own value to
+//! [`sentence`] and BOTH of that function's branches are now reached over the
+//! wire rather than only from a test that hands them arguments.
+//!
+//! That field is a bare proto3 `string`, which has no presence bit, so a row
+//! with no source repository arrives as `""` and not as nothing at all. Reading
+//! it as a value would compose "open a pull request against , which governs this
+//! namespace" — an empty interpolation inside a remediation, which is worse than
+//! the degraded sentence it replaced. [`present`] is the ONE place that decision
+//! is made, for every string field of the answer, and its own comment says why it
+//! is one place.
 
 use tonic::transport::Channel;
 
@@ -68,12 +72,60 @@ pub(super) async fn compose(project: &Channel, refusal: Refusal) -> Denied {
         reason: refusal.reason,
         prose: sentence(
             refusal.reason,
-            Some(resolved.as_deref().unwrap_or(anchor)),
-            // THE FIELD THE CONTRACT DOES NOT CARRY YET — see this module's
-            // header. When it lands, this is where the answer's own value goes.
-            None,
+            // THE ANCHOR THIS GATEWAY WALKED TO IS THE FALLBACK, for a resolver
+            // that answered nothing as much as for one that could not be
+            // reached: the classification was already made from the loaded set.
+            Some(resolved.path.as_deref().unwrap_or(anchor)),
+            resolved.source_repo.as_deref(),
         ),
     }
+}
+
+/// What the resolver said, with proto3's empty strings already read as absence.
+///
+/// A struct rather than a pair because each field carries a different meaning of
+/// `None` and each needs saying: this module's voice names its data, and
+/// `(Option<String>, Option<String>)` at the call site would put the reader on
+/// tuple order instead.
+struct Resolved {
+    /// The row the tier's own resolver names, which is the authority on aliases
+    /// and on the column's collation.
+    path: Option<String>,
+    /// The repository whose pull-request flow governs that row's namespace.
+    source_repo: Option<String>,
+}
+
+impl Resolved {
+    /// The answer for a resolver that said nothing usable.
+    ///
+    /// ONE VALUE FOR BOTH FAILURES AND FOR A ROW THAT SIMPLY HAS NEITHER FIELD:
+    /// the caller composes the degraded sentence from the anchor either way, so
+    /// distinguishing them here would be a distinction no reader of the prose can
+    /// observe. The log lines below are where the difference is recorded.
+    fn absent() -> Self {
+        Self {
+            path: None,
+            source_repo: None,
+        }
+    }
+}
+
+/// A proto3 `string` read as presence: empty is ABSENT, never a value.
+///
+/// **THIS IS WHERE THAT IS DECIDED, and it is deliberately the only place.**
+/// Neither `resolved_path` nor `source_repo` is declared `optional`, so neither
+/// carries a presence bit and an unpopulated one arrives as `""`. Every reader of
+/// the answer therefore has to make this call, and a reader that made it
+/// differently would interpolate an empty string into a sentence a person is
+/// meant to act on.
+///
+/// `project.proto` states the same contract from the producer's side: an empty
+/// `source_repo` means the resolved row HAS no source repository, either because
+/// the row is private-class — `ck_project_class` gives such a row
+/// `owner_user_id` and never `source_repo` — or because the store predates the
+/// column being populated. Neither is an error, and neither may be rendered.
+fn present(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// Ask the store's resolver which row the claim actually lands on.
@@ -81,16 +133,22 @@ pub(super) async fn compose(project: &Channel, refusal: Refusal) -> Denied {
 /// **THE ANSWER IS CONFIRMATION, NEVER THE DECISION.** The classification is
 /// already made, from the loaded set; what this adds is the row as the tier's own
 /// resolver names it — which is the authority on aliases and on the column's
-/// collation — plus, once the contract carries it, the repository the
-/// remediation names. `None` means the tier could not be reached, and the caller
-/// above falls back to the anchor this gateway walked to.
-async fn resolve(project: &Channel, anchor: &str) -> Option<String> {
+/// collation — plus the repository the remediation names. [`Resolved::absent`]
+/// means the tier could not be reached, and the caller above falls back to the
+/// anchor this gateway walked to.
+async fn resolve(project: &Channel, anchor: &str) -> Resolved {
     let mut client = ProjectServiceClient::new(project.clone());
     let rpc = client.resolve_project(ProjectServiceResolveProjectRequest {
         candidate_path: anchor.to_string(),
     });
     match tokio::time::timeout(FALLBACK_DEADLINE, rpc).await {
-        Ok(Ok(answer)) => Some(answer.into_inner().resolved_path),
+        Ok(Ok(answer)) => {
+            let answer = answer.into_inner();
+            Resolved {
+                path: present(answer.resolved_path),
+                source_repo: present(answer.source_repo),
+            }
+        }
         // BOTH FAILURES ARE THE SAME FAILURE HERE, and neither changes the
         // status the caller gets. The reason goes to the log, where an operator
         // can read it; the caller gets the 400 its request had already earned.
@@ -100,7 +158,7 @@ async fn resolve(project: &Channel, anchor: &str) -> Option<String> {
                 "the project registry could not be reached to name the repository this refusal \
                  should point at; answering the refusal with degraded prose"
             );
-            None
+            Resolved::absent()
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -108,7 +166,7 @@ async fn resolve(project: &Channel, anchor: &str) -> Option<String> {
                 "the project registry did not answer within the fallback deadline; answering the \
                  refusal with degraded prose"
             );
-            None
+            Resolved::absent()
         }
     }
 }
