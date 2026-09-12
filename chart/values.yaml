@@ -155,7 +155,13 @@ iam:
 # budget without changing anything, and takes login and health down with it.
 project:
   host: project
-  port: 50051
+  # 50052, THE MODULE PORT — NOT 50051, WHICH IS `project-db`'s (ledger 890).
+  # This shipped as 50051 for a release. Nothing failed: the name resolves, the
+  # dial is lazy, the pod is Ready and Argo is Healthy, while every connection
+  # to a `project` pod is refused and the registry never loads. `task.port` and
+  # `iam.port` above are the same 50052, and both of those hops work;
+  # `tests/chart_upstream_ports.rs` asserts the rule over all three.
+  port: 50052
 
   # The TRANSPORT to that service. Same shape as `task.tls` and `iam.tls`, and
   # configured independently of both so the three can be cut over one at a time.

@@ -126,18 +126,21 @@ fn the_chart_renders_a_load_cadence_this_binary_accepts() {
     );
 }
 
-/// The registry hop is configured, and its port is the one `project` serves.
+/// The registry hop names the Service `project` publishes.
 ///
-/// A `PROJECT_PORT` naming a port nothing listens on is not a boot failure — the
-/// dial is lazy — so the symptom would be a registry that never loads on a
+/// A `PROJECT_HOST` naming something that does not resolve is not a boot failure —
+/// the dial is lazy — so the symptom would be a registry that never loads on a
 /// cluster where everything is deployed and healthy.
+///
+/// **THE PORT IS NOT ASSERTED HERE ANY MORE, AND THAT IS LEDGER 890'S WHOLE
+/// LESSON.** This test used to pin the bare literal `50051` with a comment saying
+/// "`project`'s own chart serves 50051". It does not: `svc/project` serves 50052
+/// and 50051 is `project-db`'s. The assertion was green for as long as the defect
+/// shipped, because a literal restating the value it checks certifies whatever the
+/// author believed. The port is pinned in `tests/chart_upstream_ports.rs` instead,
+/// as the convention `task` and `iam` already embody — one rule over every
+/// upstream, so the next block copied out of a store's values reds too.
 #[test]
-fn the_chart_points_at_the_port_project_serves() {
+fn the_chart_points_at_the_host_project_serves() {
     assert_eq!(nested_scalar("project", "host"), "project");
-    assert_eq!(
-        nested_scalar("project", "port"),
-        "50051",
-        "`project`'s own chart serves 50051; a mismatch here is a registry that never loads on \
-         a cluster with nothing wrong with it"
-    );
 }
