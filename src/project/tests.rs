@@ -606,11 +606,12 @@ fn the_load_cadence_has_no_compiled_in_default() {
 /// The org remediation names the repository WHEN THE DATA IS THERE, and says it
 /// could not be named when it is not.
 ///
-/// Both branches are asserted here because the wire path can only supply the
-/// second today: `ProjectServiceResolveProjectResponse` carries no `source_repo`
-/// at `PROTO_VERSION` v1.12.1 (the plan's stage 2 adds it). A branch reachable
-/// only from a contract that does not exist yet would otherwise be a branch no
-/// test can red.
+/// **THIS ASSERTS THE PURE FUNCTION AND NOTHING ABOUT THE WIRE.** It stays green
+/// for a [`remediate::compose`] that passes `None` for the source repository for
+/// ever, which is what it did before `PROTO_VERSION` v1.15.0 carried the field —
+/// so the two tests below drive `compose` against a SERVED `ProjectService`
+/// instead. This one is kept for what it does cover: the branch selection itself,
+/// with no transport in the way.
 #[test]
 fn the_org_remediation_is_composed_from_data_and_degrades_without_it() {
     let composed = remediate::sentence(
@@ -674,6 +675,185 @@ fn a_refusal_stands_when_the_fallback_rpc_cannot_be_reached() {
     assert!(
         denied.prose.contains("could not be reached"),
         "the prose degrades and says so: {}",
+        denied.prose
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The same prose, composed OVER THE WIRE.
+//
+// **WHY A SERVED STUB AND NOT THE PURE FUNCTION.** Every assertion above this
+// line either hands `remediate::sentence` its arguments or points the fallback at
+// a closed port, so all of them stay green for a `compose` that passes `None` for
+// the source repository for ever — which is exactly what it did before
+// `PROTO_VERSION` v1.15.0 carried the field. A test that cannot red for the
+// mutation "stop reading the answer" is not measuring the wire.
+//
+// **THE PATTERN IS `http::tests`'s AND THE STUB IS NECESSARILY NEW.** `stub_iam`
+// there is private to that module and answers `IamService`, so nothing about it
+// is shareable; what is reused is its mechanism — `TcpIncoming::bind` on port 0,
+// which takes an ephemeral port and KEEPS the listener so there is no window
+// between discovering the port and serving on it.
+// ---------------------------------------------------------------------------
+
+/// A `ProjectService` answering `ResolveProject` with one canned response.
+///
+/// `ListProjects` is refused rather than implemented: the registry these tests
+/// classify against is built by `Registry::loaded_with`, so a test that reached
+/// the boot load would be asserting something this stub was never built to say.
+struct StubProject {
+    answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
+}
+
+#[tonic::async_trait]
+impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for StubProject {
+    async fn resolve_project(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse>,
+        tonic::Status,
+    > {
+        Ok(tonic::Response::new(self.answer.clone()))
+    }
+
+    async fn list_projects(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceListProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceListProjectsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "this stub answers ResolveProject and nothing else",
+        ))
+    }
+}
+
+/// Serve one `ResolveProject` answer, and return a channel pointed at it.
+async fn stub_project(
+    answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
+) -> tonic::transport::Channel {
+    let incoming = tonic::transport::server::TcpIncoming::bind(
+        "127.0.0.1:0".parse().expect("a loopback address"),
+    )
+    .expect("the stub binds");
+    let addr = incoming.local_addr().expect("a bound port");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                crate::pb::yadgar::project::v1::project_service_server::ProjectServiceServer::new(
+                    StubProject { answer },
+                ),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("a URI")
+        .connect_lazy()
+}
+
+/// One `ResolveProject` answer for the anchor these tests refuse beneath.
+///
+/// **THE LITERAL IS EXHAUSTIVE ON PURPOSE.** A `..Default::default()` here would
+/// absorb the next field the contract grows, silently, in the one fixture whose
+/// job is to say what the resolver answered.
+fn answered(
+    resolved_path: &str,
+    source_repo: &str,
+) -> crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse {
+    crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse {
+        resolved_path: resolved_path.to_string(),
+        exact: true,
+        via_alias: false,
+        status: crate::pb::yadgar::project::v1::ProjectStatus::Active as i32,
+        source_repo: source_repo.to_string(),
+    }
+}
+
+/// THE REMEDIATION NAMES THE REPOSITORY THE SERVED ANSWER CARRIED.
+///
+/// The mutation this exists to red is "pass `None` for the third argument of
+/// `sentence`" — the shape `compose` had while the contract had no field. Every
+/// other assertion in this file survives it.
+#[tokio::test]
+async fn the_served_source_repo_reaches_the_composed_remediation() {
+    let project = stub_project(answered("yadgarhq", "yadgarhq/estate")).await;
+    let denied = remediate::compose(&project, Refusal::under_anchor("yadgarhq")).await;
+
+    assert_eq!(
+        denied.reason.token(),
+        "PROJECT_UNREGISTERED_ORG",
+        "the reason is the one the loaded set decided"
+    );
+    assert!(
+        denied.prose.contains("yadgarhq/estate"),
+        "the repository the resolver named must reach the prose: {}",
+        denied.prose
+    );
+    assert!(
+        denied.prose.contains("open a pull request against"),
+        "and it is the COMPOSED branch that names it, not a coincidental substring: {}",
+        denied.prose
+    );
+}
+
+/// AN EMPTY `source_repo` IS ABSENT, AND THE PROSE DEGRADES RATHER THAN
+/// INTERPOLATING NOTHING.
+///
+/// **THE DEFECT THIS EXISTS TO RED IS A ONE-LINE NAIVE FIX.** `source_repo` is a
+/// bare proto3 `string` with no presence bit, so `Some(&answer.source_repo)` takes
+/// the COMPOSED branch for a row that has no repository and emits "open a pull
+/// request against , which governs this namespace". Both assertions below red for
+/// that output: the first because the composed branch never says "could not be
+/// reached", the second because the empty interpolation is inside the composed
+/// branch's own literal.
+///
+/// The registry serves this legitimately — `ck_project_class` gives a
+/// private-class row `owner_user_id` and never `source_repo` — so this is a
+/// normal answer and not a malformed one.
+#[tokio::test]
+async fn an_empty_served_source_repo_degrades_instead_of_interpolating_nothing() {
+    let project = stub_project(answered("yadgarhq", "")).await;
+    let denied = remediate::compose(&project, Refusal::under_anchor("yadgarhq")).await;
+
+    assert!(
+        denied
+            .prose
+            .contains("the registry could not be reached to name the repository"),
+        "an empty source_repo is the ABSENT case, so the degraded sentence is composed: {}",
+        denied.prose
+    );
+    assert!(
+        !denied.prose.contains("which governs this namespace"),
+        "the composed branch must not be reached with nothing to interpolate: {}",
+        denied.prose
+    );
+    assert!(
+        denied.prose.contains("yadgarhq"),
+        "the namespace is still named, so the caller knows who to ask: {}",
+        denied.prose
+    );
+}
+
+/// AN EMPTY `resolved_path` IS ABSENT TOO, and the anchor this gateway walked to
+/// is what the sentence names.
+///
+/// The field one along from the one this change is about, and a bare proto3
+/// `string` for the same reason. Without the same reading, `Some("")` reaches
+/// `sentence` as the namespace and composes "The namespace  is registered" — the
+/// identical empty interpolation, in the branch meant to be the safe one.
+#[tokio::test]
+async fn an_empty_served_resolved_path_falls_back_to_the_walked_anchor() {
+    let project = stub_project(answered("", "")).await;
+    let denied = remediate::compose(&project, Refusal::under_anchor("yadgarhq")).await;
+
+    assert!(
+        denied
+            .prose
+            .contains("The namespace yadgarhq is registered"),
+        "an empty resolved_path falls back to the anchor rather than being interpolated: {}",
         denied.prose
     );
 }

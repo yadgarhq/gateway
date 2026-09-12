@@ -80,6 +80,27 @@ message RegisterProjectRequest {
   // `yadgar.iam.v1.CreateUserRequest.external_id` in `iam.proto`. Stated here
   // as what the code does, not as a character bound, because it is not one.
   string display_name = 4;
+
+  // The repository whose PR flow governs an ORG namespace — NOT `path`,
+  // which is a namespace and may name no repository of its own.
+  //
+  // REQUIRED for an organisation registration (`<org>/...`) and MUST be
+  // absent for a personal one (`local/...`). `project-db`'s
+  // `ck_project_class` CHECK enforces exactly that at the engine — exactly
+  // one of `source_repo` / `owner_user_id` is non-null — so an org row sent
+  // without this field, or a personal row sent with it, is refused by the
+  // database rather than only by a service-layer guard.
+  //
+  // THE SINGLE-SEGMENT ORG ROOT sends the seed repository that governs the
+  // whole namespace. A root's path (e.g. `yadgarhq`) IS the namespace, not a
+  // repository, so this field carries the repository the namespace's PR
+  // flow lives in — never the root row's own path.
+  //
+  // Canonical form: `plans/project-validation.md`'s spec for a git address
+  // — host excluded, transport stripped, one trailing `.git` stripped,
+  // lowercased. Referenced rather than restated here, to keep one
+  // definition.
+  string source_repo = 5;
 }
 message RegisterProjectResponse {
   yadgar.common.v1.Meta meta = 1;
@@ -103,6 +124,25 @@ message ResolveProjectResponse {
   // Set when candidate_path matched an alias rather than a live path.
   bool via_alias = 3;
   ProjectStatus status = 4;
+
+  // The repository whose PR flow governs the RESOLVED row's namespace — NOT
+  // necessarily `resolved_path` itself, which may be a namespace anchor and
+  // may name no repository of its own (ADR-0673).
+  //
+  // THE STORE-FACING HOP. `project-db` reads this straight off the resolved
+  // row (`ck_project_class`, `src/schema.rs:164`) and returns it here;
+  // `project`'s `ResolveProject` relay (`src/service.rs:315`) passes it
+  // straight through onto `ProjectServiceResolveProjectResponse.source_repo`,
+  // which the gateway composes its `PROJECT_UNREGISTERED_ORG` remediation
+  // from (`plans/project-validation.md`).
+  //
+  // EMPTY MEANS ABSENT, NOT UNKNOWN — proto3 gives a bare `string` no
+  // presence bit. An empty value means the resolver has no source repository
+  // for the resolved row: either the row is PRIVATE-class (`ck_project_class`
+  // gives it `owner_user_id`, never `source_repo`), or this store predates
+  // the column being populated. A caller MUST treat empty as absent and MUST
+  // NOT interpolate it into prose.
+  string source_repo = 5;
 }
 
 message GetProjectRequest {
@@ -288,14 +328,22 @@ message ProjectServiceListProjectsResponse {
   // a registration at `local/home`, which is well-formed, registrable, and the
   // ancestor of every deeper private path of every other account.
   //
-  // AND THE WALK FOLDS ASCII CASE. `project.path` is `utf8mb4` with no
-  // `COLLATE`, so it takes the server default — measured
-  // `utf8mb4_uca1400_ai_ci` on MariaDB 11.8 — and the store's comparisons are
-  // folded and are required to stay the SAME comparison as each other
-  // (`project-db/src/path.rs`, `project-db/src/read.rs`). A walk over this set
-  // is one more of them, and a byte-exact one answers a different path than
-  // `ResolveProject` below answers for the same candidate. The segment alphabet
-  // is `[A-Za-z0-9._-]`, so ASCII case is the whole of what that collation
+  // AND THE WALK FOLDS ASCII CASE. `project.path` is PINNED to
+  // `COLLATE utf8mb4_general_ci` (`project-db/src/schema.rs`, migration 1's
+  // `create_project`, folding forward migration 4's `pin_the_path_collation`)
+  // — NOT the server default, and the pin is load-bearing rather than
+  // cosmetic: measured on MariaDB 11.8.9, under `utf8mb4_bin` the
+  // `ck_project_class_path` CHECK's `LIKE 'local/%'` turns case-sensitive, so
+  // it ACCEPTS an org row at `LOCAL/jaguar/thing` (which should be refused as
+  // inside the reserved private root) and REFUSES a legitimate owner row
+  // whose path spells the same segment in a different case.
+  // `utf8mb4_general_ci` folds ASCII case so both directions come out right,
+  // and the store's comparisons are folded and are required to stay the SAME
+  // comparison as each other (`project-db/src/path.rs`,
+  // `project-db/src/read.rs`). A walk over this set is one more of them, and
+  // a byte-exact one answers a different path than `ResolveProject` below
+  // answers for the same candidate. The segment alphabet is
+  // `[A-Za-z0-9._-]`, so ASCII case is the whole of what that collation
   // folds here.
   repeated RegisteredPath paths = 1;
 
@@ -353,6 +401,25 @@ message ProjectServiceResolveProjectResponse {
   bool via_alias = 3;
 
   ProjectStatus status = 4;
+
+  // The repository whose PR flow governs the RESOLVED row's namespace — NOT
+  // necessarily `resolved_path` itself, which may be a namespace anchor and
+  // may name no repository of its own (ADR-0673).
+  //
+  // Populated for an ORG-class row (`<org>/...`) and EMPTY for a personal one
+  // (`local/...`). `project-db`'s `ck_project_class` CHECK makes those two
+  // classes mutually exclusive at the engine: exactly one of `source_repo` /
+  // `owner_user_id` is non-null on the underlying row, never both and never
+  // neither.
+  //
+  // AN EMPTY VALUE IS A LEGITIMATE ANSWER, NOT AN ERROR. ADR-0674's degraded
+  // prose path depends on a caller handling absence rather than treating it
+  // as a failure: the registry may simply not have this data yet.
+  //
+  // See ADR-0673 for why a namespace anchor row is read THROUGH and never
+  // landed on — this field is why a caller reads through it at all: it is
+  // what lets a refusal name the repository that would fix it.
+  string source_repo = 5;
 }
 
 // The registry's PUBLIC API — what the gateway calls (D4). Holds no store, and
