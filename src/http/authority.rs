@@ -92,6 +92,7 @@ pub(super) async fn authorise(
         &state.attestation,
         &state.iam,
         &state.credentials,
+        &state.projects,
         header(headers, axum::http::header::AUTHORIZATION.as_str()),
         Claimed {
             // NOT PASSED, exactly as on `tools_call`: a self-asserted username is

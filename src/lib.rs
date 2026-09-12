@@ -16,6 +16,7 @@ pub mod http;
 pub mod invalidate;
 pub mod limit;
 pub mod mcp;
+pub mod project;
 pub mod rotate;
 pub mod source;
 pub mod tools;
@@ -58,6 +59,24 @@ pub mod pb {
         pub mod iam {
             pub mod v1 {
                 include!(concat!(env!("OUT_DIR"), "/yadgar.iam.v1.rs"));
+            }
+        }
+        pub mod project {
+            /// **THE LINT IS ALLOWED FOR THE GENERATED FILE AND FOR NOTHING
+            /// ELSE.** `project.proto` documents its two tiers with bulleted
+            /// lists whose items wrap, and `prost` re-emits each comment line as
+            /// `///  ` with a single leading space — which `clippy::doc_lazy_continuation`
+            /// reads as an unindented continuation and refuses, 26 times, in a
+            /// file no hand can edit. The alternatives are worse than the allow:
+            /// `disable_comments` would drop the contract's own prose out of the
+            /// generated types, where it is the only documentation a reader of
+            /// this crate has for them, and re-indenting the lists in
+            /// `yadgarhq/proto` would shape another repository's contract around
+            /// one style lint in this one. Nothing hand-written is covered — the
+            /// attribute sits on the module that holds only the `include!`.
+            #[allow(clippy::doc_lazy_continuation)]
+            pub mod v1 {
+                include!(concat!(env!("OUT_DIR"), "/yadgar.project.v1.rs"));
             }
         }
     }

@@ -23,6 +23,17 @@
 //!     in a rule.
 //!   - `project_id` — CLAIMED, and legitimately so. It is a workspace fact, it
 //!     changes as a person moves between checkouts, and a token cannot carry it.
+//!
+//!     **CLAIMED IS NO LONGER UNEXAMINED (ledger 881).** The value is still the
+//!     caller's own and is still what this scope carries — but it is now CHECKED
+//!     against the registry [`crate::project`] loaded from `ProjectService`, and
+//!     the outcome is counted under
+//!     `yadgar_gateway_project_refusal_total{reason}`. In the shipped `counting`
+//!     mode that check refuses nobody and changes nothing about this scope; the
+//!     resolved path replaces the claim when the deployment flips to
+//!     `enforcing`, which is the one behaviour change `plans/project-validation.md`
+//!     gates. So this bullet says CLAIMED rather than RESOLVED on purpose:
+//!     claiming the opposite before the flip would be the more dangerous error.
 //!   - `instance_id` — CLAIMED, for the same reason, and it is a session marker
 //!     rather than an identity.
 //!
@@ -141,6 +152,24 @@ pub enum AttestError {
 
     #[error("the resolved credential carries a rate limit this gateway cannot enforce: {0}")]
     Unenforceable(#[from] ConfigError),
+
+    /// The claimed workspace resolved to nothing that may be worked in, and this
+    /// deployment enforces (ledger 881).
+    ///
+    /// **UNREACHABLE IN THE SHIPPED CONFIGURATION, and that is the release rather
+    /// than an oversight.** `crate::project::Mode::Counting` — the value the
+    /// chart sets — records every terminal state and returns `Ok`, so this
+    /// variant is constructed only where an operator has read the flip gate in
+    /// `plans/project-validation.md` and named `enforcing`.
+    ///
+    /// **A SEPARATE VARIANT FROM [`MissingWorkspace`](AttestError::MissingWorkspace),
+    /// for that variant's own reason.** "No workspace was named" and "the
+    /// workspace you named is not registered" are different failures with
+    /// different remediations, and collapsing them would repeat the defect
+    /// ledger 739 fixed one level up — a caller sent to fix the thing that is
+    /// not wrong.
+    #[error("the claimed workspace was refused: {0}")]
+    Project(#[from] crate::project::Denied),
 }
 
 /// How this process decided who the caller is. Chosen ONCE at boot.

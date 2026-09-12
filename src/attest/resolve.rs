@@ -31,7 +31,44 @@ use super::{AttestError, Attestation, Attested, Claimed, RESOLVE_DEADLINE};
 /// **`cache` IS ONLY REACHED ON THE `Iam` PATH**, because it is the only path that
 /// resolves anything. A trusted header is not a credential and there is nothing to
 /// remember about it.
+///
+/// **THE WORKSPACE IS CHECKED LAST, AFTER THE IDENTITY IS ESTABLISHED, and the
+/// order is deliberate rather than incidental.** Two properties come out of it.
+/// The population that reaches [`crate::project::Validator::check`] is exactly
+/// the population whose calls WOULD BE SERVED, which is the population the
+/// counter must measure if it is to say anything about what enforcement would
+/// break. And no existing refusal changes: hoisting the check above the
+/// credential would answer a request carrying neither a token nor a workspace
+/// with a workspace complaint, where today it is a 401 — a behaviour change
+/// nobody asked for, inside a release whose whole claim is that it changes none.
 pub async fn attest(
+    how: &Attestation,
+    iam: &Channel,
+    cache: &Credentials,
+    projects: &crate::project::Validator,
+    credential: Option<&str>,
+    claimed: Claimed<'_>,
+    request_id: String,
+) -> Result<Attested, AttestError> {
+    let attested = attested(how, iam, cache, credential, claimed, request_id).await?;
+    // COUNTED ALWAYS, REFUSED ONLY WHERE THE DEPLOYMENT SAYS SO. In the shipped
+    // `counting` mode this returns `Ok` for every claim, having recorded which
+    // terminal state it reached — see `crate::project`, whose whole subject is
+    // why the counted stage exists before the enforcing one.
+    projects
+        .check(&attested.scope.project_id)
+        .await
+        .map_err(AttestError::Project)?;
+    Ok(attested)
+}
+
+/// The identity half, unchanged: everything [`attest`] did before the workspace
+/// was checked against anything.
+///
+/// Split out so the check above sits on ONE path rather than at the end of two
+/// arms, which is the same argument [`scope`] makes for itself: a rule applied in
+/// two places can only be asserted, and a single site can be read.
+async fn attested(
     how: &Attestation,
     iam: &Channel,
     cache: &Credentials,

@@ -261,6 +261,10 @@ pub(super) fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
         // 500 rather than 503, because retrying cannot help. The body names the
         // class of problem and none of the numbers: those are one person's private
         // limits, and they stay in the log.
+        // LEDGER 881. Its own function, for the file's function-length ceiling
+        // and because the mapping is a three-way decision per field — see
+        // [`project_answer`].
+        attest::AttestError::Project(denied) => project_answer(denied),
         attest::AttestError::Unenforceable(_) => AttestAnswer {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: codes::INTERNAL_ERROR,
@@ -268,6 +272,63 @@ pub(super) fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
             message: "a rate limit configured for this credential cannot be applied".to_string(),
             data: None,
         },
+    }
+}
+
+/// What a caller is told when the workspace they claimed resolves to nothing.
+///
+/// **UNREACHABLE IN THE SHIPPED CONFIGURATION.** The chart sets
+/// `crate::project::Mode::Counting`, which records the terminal state and serves
+/// the call, so nothing constructs `AttestError::Project` until an operator names
+/// `enforcing` — see `crate::project`, whose module comment is the argument for
+/// why a counted stage exists before an enforcing one.
+///
+/// **THE SAME 400 AS A MISSING WORKSPACE, AND FOR THE SAME REASON.** The
+/// credential is fine; a fact about the REQUEST is wrong. 400 rather than 404
+/// keeps the distinction [`attest_answer`]'s `MissingWorkspace` arm argues for:
+/// the registry's `NOT_FOUND` means "the workspace you named does not exist" as a
+/// STORE answer, and this gateway answers its own caller in the protocol that
+/// caller speaks.
+///
+/// **ONE CONDITION IS NOT THE CALLER'S FAULT (ADR-0674).** A gateway that has
+/// never loaded the registry cannot check a claim, so it answers 503 with a
+/// retryable label: 400 would tell a caller to fix a request that is correct, and
+/// would stop them retrying something worth retrying. That is why all three fields
+/// branch rather than only the prose.
+///
+/// **THE REASON IS THE MACHINE TOKEN, from a closed set the type system holds**
+/// (`crate::project::Reason`, ADR-0558): a client branches on
+/// `error.data.reason`, and the sentence beside it is for a person. The
+/// remediation rides in the MESSAGE rather than in a second structured field,
+/// because it is something to do and not a value to branch on. What it never
+/// contains is the caller's own claimed value — see `crate::project::remediate`.
+fn project_answer(denied: &crate::project::Denied) -> AttestAnswer {
+    let unavailable = matches!(denied.reason, crate::project::Reason::RegistryUnavailable);
+    AttestAnswer {
+        status: if unavailable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        // INTERNAL_ERROR when it is not a caller error, for the reason the
+        // `Upstream` arm above gives: a client told its request was invalid stops
+        // retrying something worth retrying.
+        code: if unavailable {
+            codes::INTERNAL_ERROR
+        } else {
+            codes::INVALID_REQUEST
+        },
+        // FROM THE SAME CLOSED SET AS EVERY OTHER LABEL HERE (ADR-0558): the two
+        // values `yadgar_telemetry`'s `status_name` produces for these
+        // conditions, so a dashboard counts them where it already counts their
+        // kind.
+        label: if unavailable {
+            "UNAVAILABLE"
+        } else {
+            "INVALID_ARGUMENT"
+        },
+        message: denied.prose.clone(),
+        data: Some(json!({ "reason": denied.reason.token() })),
     }
 }
 
@@ -287,11 +348,14 @@ pub(super) struct AttestAnswer {
     /// The machine-readable reason, for the answers where the status alone does
     /// not carry it.
     ///
-    /// **PRESENT ON EXACTLY ONE ARM TODAY, and absent on the rest deliberately.**
-    /// Everything derived from `iam` answers a CONSTANT message behind a status
-    /// that was made opaque on purpose, and a structured reason beside it would
-    /// reopen the channel the constant closes. The one arm that carries it is
-    /// decided HERE, before anything was sent, so it discloses nothing.
+    /// **PRESENT ON THE ARMS DECIDED AT THIS BOUNDARY, and absent on the rest
+    /// deliberately.** Everything derived from `iam` answers a CONSTANT message
+    /// behind a status that was made opaque on purpose, and a structured reason
+    /// beside it would reopen the channel the constant closes. The arms that DO
+    /// carry one are decided HERE, before anything was sent, so they disclose
+    /// nothing: `MissingWorkspace`, and since ledger 881 the four refusal classes
+    /// and the availability answer [`project_answer`] renders. The rule is the
+    /// same one, now covering two arms rather than one.
     pub(super) data: Option<Value>,
 }
 

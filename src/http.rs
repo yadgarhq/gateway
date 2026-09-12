@@ -209,6 +209,15 @@ pub struct AppState {
     /// restarts the pod via `rotate::GatewayDocument`'s membership in the
     /// ADR-0523 watch set rather than being re-read per request.
     pub tools_poll_interval: std::time::Duration,
+    /// The project registry, the validation mode, and the channel a refusal is
+    /// composed over (ledger 881).
+    ///
+    /// Held here for the reason [`Self::credentials`] is: the loaded set is
+    /// process state, and one built per request would resolve against nothing.
+    /// **In the shipped `counting` mode it refuses nobody** — see
+    /// [`crate::project`], whose module comment is the argument for why a counted
+    /// stage exists before an enforcing one.
+    pub projects: Arc<crate::project::Validator>,
 }
 
 /// The two buckets that bound `/auth/login` and `/auth/enrol` (task 497).

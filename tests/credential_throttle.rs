@@ -120,6 +120,17 @@ fn state_with_admin(
         bootstrap: yadgar_gateway::admin::BootstrapToken::from_secret(BOOTSTRAP),
         // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
         tools_poll_interval: std::time::Duration::from_secs(600),
+        // LEDGER 881'S VALIDATOR, in the SHIPPED configuration: `Mode::Counting`
+        // counts which terminal state a claim reached and serves the call anyway,
+        // and the registry has never loaded — the deployed state until `project`
+        // answers (ADR-0674). So every assertion in this file holds WITH project
+        // validation in the path, which is how the claim that counting mode
+        // changes no existing answer is asserted rather than stated.
+        projects: std::sync::Arc::new(yadgar_gateway::project::Validator::new(
+            yadgar_gateway::project::Registry::never_loaded(),
+            yadgar_gateway::project::Mode::Counting,
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        )),
     })
 }
 

@@ -86,6 +86,17 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         // default, precisely so this number is never the thing that test
         // proves.
         tools_poll_interval: std::time::Duration::from_secs(600),
+        // LEDGER 881, AND IT IS THE SHIPPED CONFIGURATION. `Mode::Counting`
+        // records which terminal state each claim reached and serves the call
+        // anyway, and the registry has never loaded — which is also the deployed
+        // state until `project` answers. Every status code this file asserts is
+        // therefore asserted WITH validation in the path, which is the honest
+        // form of the claim that counting mode changes no existing answer.
+        projects: std::sync::Arc::new(crate::project::Validator::new(
+            crate::project::Registry::never_loaded(),
+            crate::project::Mode::Counting,
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        )),
     })
 }
 
@@ -1525,6 +1536,17 @@ async fn state_resolving_to(
         admin_limits: unlimited_credentials(),
         bootstrap: crate::admin::BootstrapToken::disabled(),
         tools_poll_interval: std::time::Duration::from_secs(600),
+        // LEDGER 881, AND IT IS THE SHIPPED CONFIGURATION. `Mode::Counting`
+        // records which terminal state each claim reached and serves the call
+        // anyway, and the registry has never loaded — which is also the deployed
+        // state until `project` answers. Every status code this file asserts is
+        // therefore asserted WITH validation in the path, which is the honest
+        // form of the claim that counting mode changes no existing answer.
+        projects: std::sync::Arc::new(crate::project::Validator::new(
+            crate::project::Registry::never_loaded(),
+            crate::project::Mode::Counting,
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        )),
     });
     (state, resolves)
 }
@@ -2712,4 +2734,243 @@ async fn set_user_admin_requires_a_real_boolean_flag() {
             "guessing what {body} meant on the verb that removes administrators is not a kindness"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ledger 881: the project a caller claims, resolved end to end.
+// ---------------------------------------------------------------------------
+
+/// The paths stage 3 will seed a corner of: one namespace ANCHOR and one project
+/// beneath it.
+///
+/// Spelled here rather than shared with `crate::project::tests`, because what
+/// this file asserts is the ANSWER a caller reads, and a fixture shared with the
+/// classifier's own tests would let one edit move both.
+const SEEDED: [&str; 2] = ["yadgarhq", "yadgarhq/docs"];
+
+/// A state whose registry is loaded, under a chosen validation mode.
+fn state_validating(mode: crate::project::Mode) -> Arc<AppState> {
+    let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
+    Arc::get_mut(&mut state)
+        .expect("the state is not shared yet")
+        .projects = Arc::new(crate::project::Validator::new(
+        crate::project::Registry::loaded_with(SEEDED.iter().map(|p| (*p).to_string())),
+        mode,
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+    ));
+    state
+}
+
+/// One `tools/call` naming `project`, against a state whose registry is loaded.
+fn call_claiming(mode: crate::project::Mode, project: &str) -> (StatusCode, Value, Snapshot) {
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "_meta": {
+                meta_keys::PROTOCOL_VERSION: PROTOCOL_VERSION,
+                meta_keys::CLIENT_CAPABILITIES: {},
+            },
+            "name": "find_tasks",
+            "arguments": {},
+        }
+    });
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (status, answer) = metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            let req = post()
+                .header(headers::METHOD, "tools/call")
+                .header(headers::NAME, "find_tasks")
+                .header("x-yadgar-user", "max")
+                .header("x-yadgar-project", project)
+                .header("x-yadgar-instance", "i-1")
+                .body(Body::from(body.to_string()))
+                .expect("request");
+            send(state_validating(mode), req).await
+        })
+    });
+    (status, answer, reasons(snapshotter))
+}
+
+/// Which `{name, label}` pairs the recorder saw for the two project series.
+type Snapshot = std::collections::BTreeSet<(String, String)>;
+
+fn reasons(snapshotter: metrics_util::debugging::Snapshotter) -> Snapshot {
+    let emitted = snapshotter.snapshot().into_vec();
+    // LENGTH FIRST, for the reason every other snapshot in this file gives: a
+    // `metrics-util` resolving against another `metrics` major links a SECOND
+    // facade, and then the set below is empty and the absence assertions pass
+    // vacuously.
+    assert!(
+        !emitted.is_empty(),
+        "the recorder saw no metric at all, which is what a second metrics facade in the tree \
+         looks like"
+    );
+    emitted
+        .iter()
+        .flat_map(|(key, _, _, _)| {
+            key.key()
+                .labels()
+                .map(|l| (key.key().name().to_string(), l.value().to_string()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// **THE PROPERTY THIS RELEASE SHIPS, THROUGH THE REAL ROUTER.** A `tools/call`
+/// whose project would be refused gets the SAME answer as one whose project
+/// resolves, and the counter says it would have been refused.
+///
+/// `yadgarhq/gateway` is not a hypothetical: ledger 829 records it as
+/// unregistered, with 18 of 19 repositories absent. So this is the answer the
+/// estate's own calls get from the gateway that ships this change, and if it were
+/// a 400 the change would take the estate down.
+///
+/// MUTATION THIS CATCHES: ship `Mode::Enforcing`, or read an absent knob as
+/// enforcing, and this reds on the status.
+#[test]
+fn a_tools_call_naming_an_unregistered_project_is_answered_exactly_as_a_registered_one() {
+    let (refused_status, refused_body, counted) =
+        call_claiming(crate::project::Mode::Counting, "yadgarhq/gateway");
+    let (served_status, _, resolved) =
+        call_claiming(crate::project::Mode::Counting, "yadgarhq/docs");
+
+    assert_eq!(
+        refused_status, served_status,
+        "counting mode must answer an unregistered project exactly as a registered one"
+    );
+    assert_eq!(
+        refused_status,
+        StatusCode::OK,
+        "and the answer is the one this harness has always given a tools/call"
+    );
+    assert_eq!(
+        refused_body.pointer("/error/data/reason"),
+        None,
+        "nothing about the project reaches the caller in counting mode: {refused_body}"
+    );
+    assert!(
+        counted.contains(&(
+            "yadgar_gateway_project_refusal_total".to_string(),
+            "PROJECT_UNREGISTERED_ORG".to_string()
+        )),
+        "the would-be refusal is counted: {counted:?}"
+    );
+    assert!(
+        resolved.contains(&(
+            "yadgar_gateway_project_resolution_total".to_string(),
+            "exact".to_string()
+        )),
+        "and a legitimate call moves the OTHER series, which is the gate's traffic leg: \
+         {resolved:?}"
+    );
+}
+
+/// The same request under enforcement: 400, the machine token, and no echo.
+///
+/// Unreachable in the shipped chart — this drives the mode directly. It is what
+/// makes the flip a tested change rather than a hope, and it pins the answer
+/// `plans/project-validation.md`'s stage 5 promises.
+#[test]
+fn under_enforcement_the_same_call_is_refused_with_its_reason_token() {
+    let (status, body, counted) =
+        call_claiming(crate::project::Mode::Enforcing, "yadgarhq/gateway");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/data/reason"),
+        Some(&json!("PROJECT_UNREGISTERED_ORG")),
+        "a client branches on the token rather than on English: {body}"
+    );
+    assert!(
+        counted.contains(&(
+            "yadgar_gateway_project_refusal_total".to_string(),
+            "PROJECT_UNREGISTERED_ORG".to_string()
+        )),
+        "the same series increments across the flip, so a dashboard reads continuously: \
+         {counted:?}"
+    );
+}
+
+/// A MALFORMED WORKSPACE IS NEVER ECHOED BACK.
+///
+/// `project-db`'s `validate` refuses an over-long value without repeating it, on
+/// the ground that a caller must not decide how large this service's log lines
+/// are — and a value that failed the grammar may hold anything at all. The rule
+/// applies at this boundary too, and this is the assertion that keeps it.
+#[test]
+fn a_malformed_workspace_is_refused_without_echoing_it() {
+    let (status, body, counted) = call_claiming(
+        crate::project::Mode::Enforcing,
+        "sentinel not a path/at all",
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.pointer("/error/data/reason"),
+        Some(&json!("PROJECT_INVALID"))
+    );
+    assert!(
+        !body.to_string().contains("sentinel"),
+        "the caller's value must not come back: {body}"
+    );
+    assert!(
+        counted.contains(&(
+            "yadgar_gateway_project_refusal_total".to_string(),
+            "PROJECT_INVALID".to_string()
+        )),
+        "{counted:?}"
+    );
+}
+
+/// A GATEWAY WITH NO REGISTRY ANSWERS 503 UNDER ENFORCEMENT, not 400 (ADR-0674).
+///
+/// The distinction is the ADR's requirement: an operator must be able to tell
+/// "your project is unregistered" from "this gateway has no registry yet", and a
+/// caller told 400 would stop retrying something worth retrying.
+#[test]
+fn with_no_registry_an_enforcing_gateway_answers_an_availability_failure() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (status, body) = rt.block_on(async {
+        // BUILT INSIDE THE RUNTIME: `connect_lazy` registers with the tokio
+        // reactor and panics outside one.
+        let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
+        Arc::get_mut(&mut state)
+            .expect("the state is not shared yet")
+            .projects = Arc::new(crate::project::Validator::new(
+            crate::project::Registry::never_loaded(),
+            crate::project::Mode::Enforcing,
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        ));
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "_meta": {
+                    meta_keys::PROTOCOL_VERSION: PROTOCOL_VERSION,
+                    meta_keys::CLIENT_CAPABILITIES: {},
+                },
+                "name": "find_tasks",
+                "arguments": {},
+            }
+        });
+        let req = post()
+            .header(headers::METHOD, "tools/call")
+            .header(headers::NAME, "find_tasks")
+            .header("x-yadgar-user", "max")
+            .header("x-yadgar-project", "yadgarhq/docs")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        send(state, req).await
+    });
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body.pointer("/error/data/reason"),
+        Some(&json!("PROJECT_REGISTRY_UNAVAILABLE")),
+        "and the reason is distinct from every refusal reason: {body}"
+    );
 }

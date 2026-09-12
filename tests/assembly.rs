@@ -85,6 +85,21 @@ fn generation() -> Generation {
     );
     let other = CertifiedIssuer::self_signed(other_params, other_key).unwrap();
 
+    // A THIRD authority, for `project` (ledger 881), on the same argument the
+    // second one carries: three byte-identical bundles would make dropping any
+    // ONE upstream from the watch set an equivalent mutant, and the per-half
+    // cases below exist precisely to kill that edit.
+    let third_key = KeyPair::generate().unwrap();
+    let mut third_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    third_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    third_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    third_params.not_after = date_time_ymd(2037, 6, 15);
+    third_params.distinguished_name.push(
+        DnType::CommonName,
+        "yadgar-gateway assembly test authority 3",
+    );
+    let third = CertifiedIssuer::self_signed(third_params, third_key).unwrap();
+
     // THE CLIENT LEAF, issued for `client auth` rather than `server auth`
     // (ADR-0516): a peer verifying a client chain refuses a leaf naming the
     // wrong purpose even though it trusts the issuer perfectly well.
@@ -100,6 +115,7 @@ fn generation() -> Generation {
     vec![
         ("task-ca.pem".to_string(), ca.pem()),
         ("iam-ca.pem".to_string(), other.pem()),
+        ("project-ca.pem".to_string(), third.pem()),
         (
             "client.pem".to_string(),
             format!("{}{}", client_leaf.pem(), ca.pem()),
@@ -364,6 +380,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
     let mount = Mount::new(&generation());
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
+    let project = upstream_tls(&mount, upstream::PROJECT, "project-ca.pem");
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
@@ -374,6 +391,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
         rotate::watch_set(
             Some(&task),
             Some(&iam),
+            Some(&project),
             Some(&broker),
             Some(&cache_password),
             Some(&bootstrap_token),
@@ -386,17 +404,18 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             mount.path("client.pem").as_path(),
             mount.path("client-key.pem").as_path(),
             mount.path("iam-ca.pem").as_path(),
+            mount.path("project-ca.pem").as_path(),
             mount.path("nats-password").as_path(),
             mount.path("valkey-password").as_path(),
             mount.path("admin-bootstrap-token").as_path(),
             config.path(),
             gw_config.path(),
         ],
-        "a fully configured `gateway` reads nine files at boot: a bundle per upstream, the \
-         one client identity it presents to both (ADR-0516), the broker password (D72), the \
-         cache password (D74), D73's administrative bootstrap token (ADR-0492), the shared \
-         configuration document every service watches (step 2a), and this service's OWN \
-         document — the first knob it ever held made this pull request add it here"
+        "a fully configured `gateway` reads ten files at boot: a bundle per upstream — three \
+         of them since ledger 881 added `project` — the one client identity it presents to \
+         all of them (ADR-0516), the broker password (D72), the cache password (D74), D73's \
+         administrative bootstrap token (ADR-0492), the shared configuration document every \
+         service watches (step 2a), and this service's OWN document"
     );
 }
 
@@ -415,6 +434,7 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
     let mount = Mount::new(&generation());
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
+    let project = upstream_tls(&mount, upstream::PROJECT, "project-ca.pem");
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
@@ -423,6 +443,7 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
     let inputs = rotate::watch_set(
         Some(&task),
         Some(&iam),
+        Some(&project),
         Some(&broker),
         Some(&cache_password),
         Some(&bootstrap_token),
@@ -462,7 +483,7 @@ fn each_configured_half_contributes_on_its_own() {
     let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
 
     assert_eq!(
-        rotate::watch_set(None, None, None, None, None, &config, &gw_config).watched(),
+        rotate::watch_set(None, None, None, None, None, None, &config, &gw_config).watched(),
         vec![config.path(), gw_config.path()],
         "with both upstreams cleartext and neither password configured, the two mounted \
          configuration documents are the only thing watched — both are unconditional, unlike \
@@ -471,7 +492,17 @@ fn each_configured_half_contributes_on_its_own() {
 
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     assert_eq!(
-        rotate::watch_set(Some(&task), None, None, None, None, &config, &gw_config).watched(),
+        rotate::watch_set(
+            Some(&task),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &config,
+            &gw_config
+        )
+        .watched(),
         vec![
             mount.path("task-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
@@ -484,7 +515,17 @@ fn each_configured_half_contributes_on_its_own() {
 
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     assert_eq!(
-        rotate::watch_set(None, Some(&iam), None, None, None, &config, &gw_config).watched(),
+        rotate::watch_set(
+            None,
+            Some(&iam),
+            None,
+            None,
+            None,
+            None,
+            &config,
+            &gw_config
+        )
+        .watched(),
         vec![
             mount.path("iam-ca.pem").as_path(),
             mount.path("client.pem").as_path(),
@@ -517,6 +558,7 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             None,
+            None,
             &config,
             &gw_config
         )
@@ -530,6 +572,37 @@ fn each_configured_half_contributes_on_its_own() {
          nothing else"
     );
 
+    // THE THIRD UPSTREAM ON ITS OWN (ledger 881). `project` is dialled by the
+    // registry loader and by the refusal path, so a rotated bundle for that hop
+    // must end this process exactly as a rotated `task` bundle does — and a
+    // bundle NOBODY watches is the one whose rotation is silent until the next
+    // load fails with a certificate error nothing explains. It names a THIRD
+    // authority, so dropping this entry from the list cannot be an equivalent
+    // mutant.
+    let project_only = upstream_tls(&mount, upstream::PROJECT, "project-ca.pem");
+    assert_eq!(
+        rotate::watch_set(
+            None,
+            None,
+            Some(&project_only),
+            None,
+            None,
+            None,
+            &config,
+            &gw_config
+        )
+        .watched(),
+        vec![
+            mount.path("project-ca.pem").as_path(),
+            mount.path("client.pem").as_path(),
+            mount.path("client-key.pem").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
+        "the registry hop on its own names its own bundle, plus the identity pair this gateway \
+         presents to every upstream"
+    );
+
     // THE BROKER PASSWORD ON ITS OWN. A cleartext gateway that consumes D72's
     // invalidation still reads one file at boot, and a rotation of it is the one
     // with no other signal at all: the broker answers `AuthorizationViolation`,
@@ -538,6 +611,7 @@ fn each_configured_half_contributes_on_its_own() {
     // cache entry ages out, with no exit and no recovery but a restart.
     assert_eq!(
         rotate::watch_set(
+            None,
             None,
             None,
             Some(&broker(&mount)),
@@ -562,6 +636,7 @@ fn each_configured_half_contributes_on_its_own() {
     // refused until somebody restarts the pod.
     assert_eq!(
         rotate::watch_set(
+            None,
             None,
             None,
             None,
@@ -591,6 +666,7 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             None,
+            None,
             Some(&mount.path("admin-bootstrap-token")),
             &config,
             &gw_config
@@ -616,7 +692,7 @@ fn each_configured_half_contributes_on_its_own() {
     // `yadgar_rotation_watched_files_unreadable`, which is a gauge an operator
     // reads as a fault.
     assert_eq!(
-        rotate::watch_set(None, None, None, None, None, &config, &gw_config).watched(),
+        rotate::watch_set(None, None, None, None, None, None, &config, &gw_config).watched(),
         vec![config.path(), gw_config.path()],
         "an unmounted bootstrap token names no file, so there is no file to watch"
     );
@@ -631,6 +707,7 @@ fn each_configured_half_contributes_on_its_own() {
             .expect("the url is set");
     assert_eq!(
         rotate::watch_set(
+            None,
             None,
             None,
             Some(&open_broker),
@@ -664,6 +741,7 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
     let mount = Mount::new(&generation());
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
+    let project = upstream_tls(&mount, upstream::PROJECT, "project-ca.pem");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
 
     let broker = broker(&mount);
@@ -677,6 +755,7 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
         rotate::watch_set(
             Some(&task),
             Some(&iam),
+            Some(&project),
             Some(&broker),
             Some(&cache_password),
             Some(&bootstrap_token),
@@ -751,6 +830,7 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
     let mount = Mount::new(&generation());
     let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
+    let project = upstream_tls(&mount, upstream::PROJECT, "project-ca.pem");
     let broker = broker(&mount);
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
@@ -759,6 +839,7 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
     let inputs = rotate::watch_set(
         Some(&task),
         Some(&iam),
+        Some(&project),
         Some(&broker),
         Some(&cache_password),
         Some(&bootstrap_token),

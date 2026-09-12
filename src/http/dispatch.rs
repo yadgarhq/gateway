@@ -262,6 +262,7 @@ pub(super) async fn tools_call(
         &state.attestation,
         &state.iam,
         &state.credentials,
+        &state.projects,
         header(headers, axum::http::header::AUTHORIZATION.as_str()),
         Claimed {
             user_id: header(headers, "x-yadgar-user"),

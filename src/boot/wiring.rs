@@ -34,6 +34,15 @@ pub struct Wiring {
     pub tools_poll_interval: std::time::Duration,
     pub task: Channel,
     pub iam: Channel,
+    /// The registry, the validation mode, and the channel a refusal is composed
+    /// over (ledger 881).
+    ///
+    /// **THE LOAD IS ALREADY RUNNING BEHIND THIS VALUE, and the boot is not
+    /// gated on it (ADR-0674).** `Registry::start` publishes its gauge, spawns
+    /// the loader and returns; a gateway whose `project` is unreachable therefore
+    /// still binds, still logs in, and — in the shipped `counting` mode — still
+    /// serves every scoped call.
+    pub projects: Arc<yadgar_gateway::project::Validator>,
 }
 
 /// PHASE 3. TLS, the bootstrap token, the ADR-0523 watch set, and the two dials.
@@ -46,18 +55,7 @@ pub async fn wiring(
     broker: &Option<Broker>,
     valkey_password: &Option<(String, PathBuf)>,
 ) -> Result<Wiring, Boxed> {
-    // OPT-IN, OFF unless a deployment asks for it, and read PER UPSTREAM so the
-    // two can be cut over one at a time. Nothing configured means the cleartext
-    // dial this gateway has always done — no module serves TLS yet, so the
-    // cut-over is a later change that can be reverted on its own.
-    //
-    // `.to_string()` on the way out, for the reason `Limits::parse` above gives:
-    // `main` returns `Box<dyn Error>`, which Rust prints with DEBUG, so a bare
-    // `?` would put `NoCaFile("TASK")` on the operator's terminal instead of the
-    // sentence naming the missing variable and saying why cleartext is not the
-    // answer.
-    let task_tls = upstream::UpstreamTls::from_env(upstream::TASK).map_err(|e| e.to_string())?;
-    let iam_tls = upstream::UpstreamTls::from_env(upstream::IAM).map_err(|e| e.to_string())?;
+    let (task_tls, iam_tls, project_tls) = transports()?;
 
     // STEP 2A OF THE ROTATION-KNOB CUT-OVER (ADR-0569, ADR-0570). The document
     // `yadgarhq/config` renders into the `shared` ConfigMap, mounted at
@@ -134,6 +132,7 @@ pub async fn wiring(
     let watch_inputs = rotate::watch_set(
         task_tls.as_ref(),
         iam_tls.as_ref(),
+        project_tls.as_ref(),
         broker.as_ref(),
         valkey_password.as_ref().map(|(_, file)| file.as_path()),
         bootstrap_file.as_deref(),
@@ -149,7 +148,11 @@ pub async fn wiring(
     // cut-over.
     let schedule = config.schedule().map_err(|e| e.to_string())?;
 
-    let (task, iam) = upstreams(task_tls.as_ref(), iam_tls.as_ref()).await?;
+    let (task, iam, project) =
+        upstreams(task_tls.as_ref(), iam_tls.as_ref(), project_tls.as_ref()).await?;
+
+    let projects = validation(project)?;
+
     Ok(Wiring {
         bootstrap,
         watch_inputs,
@@ -157,7 +160,77 @@ pub async fn wiring(
         tools_poll_interval,
         task,
         iam,
+        projects,
     })
+}
+
+/// What transport each of the three hops uses, as this deployment configured it.
+///
+/// **OPT-IN, OFF UNLESS A DEPLOYMENT ASKS FOR IT, AND READ PER UPSTREAM so the
+/// three can be cut over one at a time.** Nothing configured means the cleartext
+/// dial this gateway has always done — no module serves TLS yet, so the cut-over
+/// is a later change that can be reverted on its own, one hop at a time.
+///
+/// `.to_string()` on the way out, for the reason `Limits::parse` gives: `main`
+/// returns `Box<dyn Error>`, which Rust prints with DEBUG, so a bare `?` would put
+/// `NoCaFile("TASK")` on the operator's terminal instead of the sentence naming
+/// the missing variable and saying why cleartext is not the answer.
+///
+/// Its own function since ledger 881 made it three reads rather than two, which
+/// took [`wiring`] past the function-length ceiling. The seam is the one the
+/// ceiling pointed at: these three are configuration, and everything after them
+/// is a resource.
+type Transports = (
+    Option<upstream::UpstreamTls>,
+    Option<upstream::UpstreamTls>,
+    Option<upstream::UpstreamTls>,
+);
+
+fn transports() -> Result<Transports, Boxed> {
+    Ok((
+        upstream::UpstreamTls::from_env(upstream::TASK).map_err(|e| e.to_string())?,
+        upstream::UpstreamTls::from_env(upstream::IAM).map_err(|e| e.to_string())?,
+        upstream::UpstreamTls::from_env(upstream::PROJECT).map_err(|e| e.to_string())?,
+    ))
+}
+
+/// Ledger 881's two knobs, and the registry load they start.
+///
+/// Its own function for [`wiring`]'s function-length ceiling, and it is a real
+/// seam rather than a split for the gate: everything here is about the PROJECT
+/// registry, and none of it is about transport.
+///
+/// **NO COMPILED-IN DEFAULT BEHIND EITHER KNOB (ADR-0569).** They are environment
+/// variables on this gateway's own deployment rather than lines in
+/// `gateway.yaml`, and `plans/project-validation.md` licenses exactly that:
+/// ADR-0569's template mechanism — the seed repository — is unbuilt, so until it
+/// exists, keeping the mode in this chart makes the flip a one-line,
+/// one-repository change with a diffable history that cannot happen by omission.
+///
+/// **THE LOAD IS RUNNING BY THE TIME THIS RETURNS, AND NOTHING WAITED FOR IT.**
+/// `Registry::start` publishes its gauge, spawns the loader and returns — so an
+/// unreachable `project` costs a degraded window rather than a boot that never
+/// finishes (ADR-0674).
+///
+/// **ONE CHANNEL, CLONED.** The set is filled over it and the refusal path dials
+/// `ResolveProject` over it. A second dial would be a second address for one
+/// service, which is the confusion the deleted `YADGAR_IAM_ADDR` was — and a
+/// `tonic::transport::Channel` clone shares the connection rather than opening
+/// another.
+fn validation(project: Channel) -> Result<Arc<yadgar_gateway::project::Validator>, Boxed> {
+    let mode = yadgar_gateway::project::Mode::from_env().map_err(|e| e.to_string())?;
+    let poll = yadgar_gateway::project::poll_from_env().map_err(|e| e.to_string())?;
+    tracing::info!(
+        ?mode,
+        registry_poll_secs = poll.as_secs(),
+        "project validation is configured; `counting` refuses nobody and only counts \
+         (plans/project-validation.md)"
+    );
+    Ok(Arc::new(yadgar_gateway::project::Validator::new(
+        yadgar_gateway::project::Registry::start(project.clone(), poll),
+        mode,
+        project,
+    )))
 }
 
 /// PHASE 5. Start consuming D72's invalidation.
@@ -300,7 +373,8 @@ pub async fn serve(
 async fn upstreams(
     task_tls: Option<&upstream::UpstreamTls>,
     iam_tls: Option<&upstream::UpstreamTls>,
-) -> Result<(Channel, Channel), Boxed> {
+    project_tls: Option<&upstream::UpstreamTls>,
+) -> Result<(Channel, Channel, Channel), Boxed> {
     let task_host = env_required("TASK_HOST")?;
     let task_port: u16 = env_required("TASK_PORT")?.parse()?;
     let task = upstream::connect_task(&task_host, task_port, task_tls)
@@ -369,5 +443,21 @@ async fn upstreams(
         tls = iam_tls.is_some(),
         "iam channel ready (connects on first use)"
     );
-    Ok((task, iam))
+    // THE REGISTRY'S LOGIC TIER (ledger 881), lazy for the reason the two above
+    // are and for one more: `project` is the newest service in the estate, so a
+    // cluster without it is the ordinary case rather than the exceptional one,
+    // and ADR-0674 rules that its absence must cost a degraded window rather
+    // than a front door that never opens.
+    let project_host = env_required("PROJECT_HOST")?;
+    let project_port: u16 = env_required("PROJECT_PORT")?.parse()?;
+    let project = upstream::connect_project(&project_host, project_port, project_tls)
+        .await
+        .map_err(|e| refusal(&e))?;
+    tracing::info!(
+        host = %project_host,
+        port = project_port,
+        tls = project_tls.is_some(),
+        "project channel ready (connects on first use)"
+    );
+    Ok((task, iam, project))
 }

@@ -1,5 +1,70 @@
 # Migration notes
 
+## Project validation — three new required variables, and the chart and the image must move together (ledger 881)
+
+**What this release does: it resolves every claimed workspace, counts what it
+would refuse, and refuses NOTHING.** `projectValidation.mode` ships as
+`counting`. Do not change it as part of this rollout.
+
+**The manual step is the ORDER, and it is the same trap D74's buckets were.**
+This image refuses to boot without three variables the previous chart does not
+render — `PROJECT_HOST`, `PROJECT_PORT`, `YADGAR_PROJECT_VALIDATION_MODE` and
+`YADGAR_PROJECT_REGISTRY_POLL_SECONDS` (the host and port are one pair). All four
+come from this chart, so **land the chart before or with the image, never after**.
+A pod that gets this image under the old chart exits at boot naming the missing
+variable, which is the intended ADR-0569 behaviour and is still an outage.
+
+**`project` does NOT have to exist first.** The dial is lazy and the load runs
+behind the boot (ADR-0674), so installing this against a cluster with no
+`project` Deployment costs exactly one observable:
+
+```
+yadgar_gateway_project_registry_loaded 0
+```
+
+and, because the mode is `counting`, nothing else — every scoped call is served
+exactly as before. Two series appear beside it as soon as traffic arrives:
+`yadgar_gateway_project_refusal_total{reason}` and
+`yadgar_gateway_project_resolution_total{outcome}`. With no registry loaded every
+call counts under `reason="PROJECT_REGISTRY_UNAVAILABLE"`, which is the state to
+expect until `project` is deployed AND the registry is seeded.
+
+### How to read the gauge and the counters without a shell
+
+This image is distroless (D63) — there is no shell to exec into. Read the metrics
+endpoint from another pod, or port-forward it:
+
+```bash
+kubectl -n yadgar port-forward deploy/gateway 9090:9090
+curl -s localhost:9090/metrics | grep -E 'yadgar_gateway_project_(registry_loaded|refusal_total|resolution_total)'
+```
+
+### Do NOT flip the mode yet
+
+Ledger 829 records `yadgarhq/docs` as the ONLY registered project, with 18
+repositories absent, so `enforcing` today refuses essentially every call in the
+estate. The gate is `plans/project-validation.md` and it has three legs, in this
+order:
+
+1. One deliberate probe per reason class, BEFORE the observation window opens,
+   each observed to move its own label — a gate whose counter cannot move measures
+   nothing.
+2. Then, over the window: `increase(yadgar_gateway_project_refusal_total[window])`
+   is zero.
+3. And over the SAME window:
+   `increase(yadgar_gateway_project_resolution_total[window])` is nonzero.
+
+Alert on the first occurrence after any flip with `max_over_time`, never
+`increase` — ADR-0620's proved rule for a lazily registered counter.
+
+**One thing to settle before the flip that this release does not settle.** The
+administrative routes (`/admin/create-user` and the other two) attest through the
+same path, so they are in the counted population too. Under `enforcing` an
+administrative call from an unregistered repository is refused — and the
+administrative path is how an operator repairs the registry. The plan's second
+requested ruling (the admin exception) is where that belongs; until it is ruled,
+the flip has an unexamined circular dependency.
+
 ## The bootstrap token CAN now be mounted, and one value in `yadgarhq/argocd` turns it on (ADR-0492, ledger 638, step 7)
 
 **This supersedes the "ships DISABLED" paragraph in the section below.** That
