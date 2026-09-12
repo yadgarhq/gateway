@@ -1,13 +1,19 @@
 //! Wiring, and the one thing that must happen before the listener binds.
 //!
-//! **Attestation is resolved first, and it can no longer fail.** It used to exit
+//! **THE METRICS RECORDER IS INSTALLED FIRST, BEFORE ANY OTHER PHASE
+//! (ADR-0677).** A `gauge!` or `counter!` reached before it is discarded with no
+//! error and no log line, so a component wired above that call publishes a boot
+//! value nobody can ever see. The constraint is stated at the call itself, and
+//! `tests/boot_ordering.rs` asserts it rather than trusting the sentence.
+//!
+//! **Attestation is resolved next, and it can no longer fail.** It used to exit
 //! the process when neither identity source was configured, because the only
 //! available default was trusting the caller — D69's rule for a missing
 //! capability, applied to identity. iam-backed attestation is implemented now, so
 //! an unset environment selects THAT, and a deployment reaches the trusting path
 //! only by naming it. There is no unconfigured state left to refuse. Resolving it
-//! first is still worth the line: the log below says which source this process
-//! will use, before it accepts anything.
+//! ahead of the rest of the wiring is still worth the line: the log below says
+//! which source this process will use, before it accepts anything.
 //!
 //! The upstream connection is NOT gated the same way, deliberately — same
 //! reasoning as `task`: the twin's own boot is gated, so an unreachable `task`
@@ -74,6 +80,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // PHASE 0: THE METRICS RECORDER, BEFORE EVERY OTHER PHASE (ADR-0677).
+    //
+    // NOTHING BELOW THIS LINE MAY MOVE ABOVE IT. `metrics::gauge!` and
+    // `metrics::counter!` are accepted whenever no recorder is installed and
+    // then DISCARDED SILENTLY — no error, no log line, no panic. A component
+    // wired before this call therefore publishes its boot value into nothing,
+    // and the series never registers at all.
+    //
+    // THAT IS NOT HYPOTHETICAL. This call used to sit seven lines BELOW the
+    // `boot::wiring` await. `Registry::start` sets
+    // `yadgar_gateway_project_registry_loaded` to `0` from inside that await, so
+    // the gauge reached a scrape ONLY once the registry had loaded and a replica
+    // whose registry had never loaded was indistinguishable from one nobody
+    // scraped — the exact failure that gauge's own comment forbids. The absent
+    // series is also why the gateway spent a release dialling `project` on
+    // `project-db`'s port with nothing saying so. `tests/boot_ordering.rs` is
+    // the guard; a scrape of a replica that never loaded is the proof.
+    //
+    // FIRST, rather than merely above `boot::wiring`, because "above the one
+    // phase that publishes at boot today" has to be re-derived every time a
+    // phase is added — and stating the constraint at one call site demonstrably
+    // did not generalise to the next one. Nothing here depends on a boot phase:
+    // the address is one environment variable, and `install_prometheus` binds a
+    // listener and installs the global recorder. Two consequences, both
+    // accepted: "metrics endpoint listening" is now the first line of the boot
+    // log, and an unparseable METRICS_LISTEN fails the boot before the
+    // attestation source is resolved.
+    //
+    // The BINARY installs the exporter, never the library — a library that
+    // installs one picks the backend for every service linking it. A failure is
+    // logged and ignored: telemetry must never fail a call (D25), and that rule
+    // covers the metrics endpoint too.
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
+        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
+    }
+
     let (attestation, credentials, ttl, broker) = boot::identity()?;
 
     let (limiter, valkey_password) = boot::rate_limiting()?;
@@ -87,15 +130,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         iam,
         projects,
     } = boot::wiring(&broker, &valkey_password).await?;
-
-    // The BINARY installs the exporter, never the library — a library that
-    // installs one picks the backend for every service linking it. A failure is
-    // logged and ignored: telemetry must never fail a call (D25), and that rule
-    // covers the metrics endpoint too.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
-    if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
-        tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
-    }
 
     // AFTER THE EXPORTER, NEVER BEFORE IT. A value recorded before there is a
     // recorder is a value nobody ever sees. This process serves no certificate,
