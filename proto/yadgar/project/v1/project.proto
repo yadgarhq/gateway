@@ -1,0 +1,406 @@
+// The project registry (D52). A project id is a hierarchical path with meaning
+// (D53), so this module is what says which paths are real and what an
+// unregistered path resolves to.
+syntax = "proto3";
+
+package yadgar.project.v1;
+
+import "google/protobuf/timestamp.proto";
+import "yadgar/common/v1/common.proto";
+
+enum ProjectStatus {
+  PROJECT_STATUS_UNSPECIFIED = 0;
+  PROJECT_STATUS_ACTIVE = 1;
+  PROJECT_STATUS_ARCHIVED = 2;
+}
+
+// WHAT A PROJECT DOES NOT DECLARE, AND WHY THAT IS A DECISION RATHER THAN AN
+// OMISSION (ledger 644). There is no owner on this message and no visibility.
+//
+// `project-db/src/path.rs` describes two classes sharing one namespace and told
+// apart by the FIRST SEGMENT alone — an organisation project `<org>/<repo>`
+// "visible to everyone", and a private one beneath the reserved `local` segment
+// "visible only to the account that owns it". NOTHING CAN ENFORCE EITHER. The
+// merged table (`project-db/src/schema.rs`, migration 1) carries `created_by`
+// and `updated_by` and no third identity column, and D12 names those two as
+// AUDIT identity, distinct from ownership.
+//
+// Declaring the fields here would not close that, because what is missing is
+// three rulings rather than two columns:
+//
+// - D27 is one deployment and one organisation, and D12 draws the consequence
+//   in as many words: no `org_id` field exists, because hosting several
+//   organisations in one deployment is the multi-tenant SaaS D27 rules out. A
+//   model whose central distinction is a DEFINED organisation against an
+//   undefined one needs the concept those two decisions deleted on purpose.
+// - D12 already puts `visibility` on every user-facing entity, so a second
+//   ladder on the project row is a second answer to one question. D27's
+//   "personal scope is a `visibility` value on shared infrastructure" may
+//   settle which RUNG; it does not settle which TABLE.
+// - Ledger 651: the private class leaks one level DOWN. A legitimate
+//   registration at `local/home` becomes the nearest registered ancestor of
+//   every deeper private path belonging to every other account, and each of
+//   them is then stamped with it. Reserving the BARE segment does not touch
+//   that case, and reading the reservation as its fix is the mistake this
+//   paragraph exists to prevent.
+//
+// A contract that guessed at an authorisation model would be worse than one
+// that omits it. These fields are additive on the day the rulings land; a wrong
+// shape is one every consumer has already compiled against.
+message Project {
+  yadgar.common.v1.Meta meta = 1;
+
+  // The canonical hierarchical path: "quinyx/forecast", or
+  // "quinyx/qwfm/forecast" for a service inside a monorepo (D53). This is the
+  // value that lands in every other entity's Meta.project_id.
+  string path = 16;
+
+  string display_name = 17;
+  ProjectStatus status = 18;
+
+  // Debounced, not written per request (D52). Its only consumer is D47's notice
+  // expiry, which reasons in days.
+  google.protobuf.Timestamp last_seen_at = 19;
+
+  // Former paths that still resolve here. A rename is an alias, never a rewrite
+  // of every record carrying the old path (D53).
+  repeated string aliases = 20;
+}
+
+message RegisterProjectRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  yadgar.common.v1.Scope scope = 2;
+  string path = 3;
+  // Refused past 255, enforced in BYTES today
+  // (`project-db/src/write.rs:58,116`, `MAX_DISPLAY_NAME`) against a column
+  // that is `display_name VARCHAR(255)` on utf8mb4 and so bounds CHARACTERS
+  // (`project-db/src/schema.rs:78`) — the same byte/character gap `iam` found
+  // and fixed on its own VARCHAR(255)-on-utf8mb4 columns, see
+  // `yadgar.iam.v1.LoginRequest.label` and
+  // `yadgar.iam.v1.CreateUserRequest.external_id` in `iam.proto`. Stated here
+  // as what the code does, not as a character bound, because it is not one.
+  string display_name = 4;
+}
+message RegisterProjectResponse {
+  yadgar.common.v1.Meta meta = 1;
+}
+
+// THE load-bearing rpc. Every scoped write resolves its candidate path here
+// first. An unregistered path returns its nearest registered ancestor rather
+// than an error, so a typo lands in a real parent and a new service directory
+// works before anyone registers it (D52 as amended by D53). Nothing is ever
+// auto-created.
+message ResolveProjectRequest {
+  yadgar.common.v1.Scope scope = 1;
+  string candidate_path = 2;
+}
+message ResolveProjectResponse {
+  // The path that will actually be stamped on the record.
+  string resolved_path = 1;
+  // False when candidate_path had no row of its own and an ancestor was used.
+  // The caller surfaces this as a D39 notice naming the id to register.
+  bool exact = 2;
+  // Set when candidate_path matched an alias rather than a live path.
+  bool via_alias = 3;
+  ProjectStatus status = 4;
+}
+
+message GetProjectRequest {
+  yadgar.common.v1.Scope scope = 1;
+  string path = 2;
+}
+message GetProjectResponse {
+  Project project = 1;
+}
+
+message ListProjectsRequest {
+  yadgar.common.v1.Scope scope = 1;
+  // Empty lists every project. Otherwise lists this subtree.
+  string under_path = 2;
+  optional ProjectStatus status = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+message ListProjectsResponse {
+  repeated Project projects = 1;
+  string next_page_token = 2;
+}
+
+// Debounced upstream in Valkey and flushed periodically (D52). Never called
+// once per request.
+message TouchProjectsRequest {
+  yadgar.common.v1.Scope scope = 1;
+  repeated string paths = 2;
+  google.protobuf.Timestamp seen_at = 3;
+}
+message TouchProjectsResponse {}
+
+// Adds the old path to aliases and moves the project. Records are untouched.
+message RenameProjectRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  yadgar.common.v1.Scope scope = 2;
+  string from_path = 3;
+  string to_path = 4;
+  uint64 expect_version = 5;
+}
+message RenameProjectResponse {
+  yadgar.common.v1.Meta meta = 1;
+}
+
+message ArchiveProjectRequest {
+  yadgar.common.v1.Idempotency idempotency = 1;
+  yadgar.common.v1.Scope scope = 2;
+  string path = 3;
+  uint64 expect_version = 4;
+}
+message ArchiveProjectResponse {
+  yadgar.common.v1.Meta meta = 1;
+}
+
+// Registration is administrative — GitOps or CLI, like configuration (D43).
+// Agents resolve and read; they never mint a partition key.
+//
+// THE SURFACE THAT SENTENCE NAMES DOES NOT EXIST, recorded here because a
+// contract naming an unreachable surface reads as though the surface is there.
+// ADR-0492 puts the administrative API on a gateway path of its own. The
+// gateway serves three routes — MCP, `/auth/login` and `/auth/enrol`
+// (`gateway/src/http.rs`) — and none of them is administrative, so
+// `RegisterProject` is reached by port-forwarding the service, exactly as
+// `CreateUser` and `IssueEnrolment` are. That is ledger 638, inherited here
+// rather than solved. The other half of the pointer does not resolve either:
+// `yadgarhq/config` writes ConfigMaps a process reads at boot and never rows,
+// so "GitOps" names no mechanism that can hold a registry row. `RegisterProject`
+// is implemented in `project-db` and has no caller, and that is the accurate
+// description of it today.
+service ProjectDbService {
+  rpc RegisterProject(RegisterProjectRequest) returns (RegisterProjectResponse);
+  rpc ResolveProject(ResolveProjectRequest) returns (ResolveProjectResponse);
+  rpc GetProject(GetProjectRequest) returns (GetProjectResponse);
+  rpc ListProjects(ListProjectsRequest) returns (ListProjectsResponse);
+  rpc TouchProjects(TouchProjectsRequest) returns (TouchProjectsResponse);
+  rpc RenameProject(RenameProjectRequest) returns (RenameProjectResponse);
+  rpc ArchiveProject(ArchiveProjectRequest) returns (ArchiveProjectResponse);
+}
+
+// ---------------------------------------------------------------------------
+// THE LOGIC TIER. Everything below is `ProjectService`, served by `project`;
+// everything above it is `ProjectDbService`, served by `project-db`.
+//
+// WHY BOTH HALVES SHARE ONE FILE, when `taskapi.proto` tells the next module to
+// do the opposite. That file rules that the LOGIC service goes in
+// `yadgar/<module>/v1` and the storage boundary in `yadgar/<module>db/v1`, and
+// says `yadgar.taskapi.v1` exists only because the `-db` contract took
+// `yadgar.task.v1` first — an order that was discovered rather than planned.
+// `project` inherited the same accident: the storage boundary is already here,
+// tagged, and implemented, so moving it is the breaking change D16's gate
+// refuses. That leaves a second `*api` package or a second service in this
+// file, and `plans/project-registry-callers.md` §1 rules the second.
+//
+// THE TWO TIERS SHARE NO MESSAGE, and buf enforces that rather than the
+// convention asking for it: `RPC_REQUEST_RESPONSE_UNIQUE` refuses to let two
+// rpcs share a request or response type. Every type below therefore carries
+// the service name as a prefix — `<ServiceName><RpcName>Request`, the second
+// form `RPC_REQUEST_STANDARD_NAME` accepts — which is also what stops a reader
+// of a package holding two `ResolveProject` rpcs having to guess which tier a
+// message belongs to.
+//
+// WHAT THE TIER ADDS, because a pass-through would earn nothing over the store
+// it wraps: it answers in a shape a caller that is NOT A REQUEST can satisfy,
+// it publishes the registry-change events a loaded set is invalidated by, and
+// it owns the `last_seen_at` flush timer that calls `TouchProjects` above.
+// Only the first of the three is in this release.
+// ---------------------------------------------------------------------------
+
+// One registered path, and the three fields a resolution walk reads.
+//
+// NOT `Project`, AND THE DEVIATION IS RULED RATHER THAN PREFERRED.
+// `plans/project-registry-callers.md` §1 names what the load returns — "every
+// live path, its status, and its aliases" — which is exactly these three, and
+// the estate's own precedent points the other way (`FindTasksResponse` returns
+// the storage entity `yadgar.task.v1.Task`). The second reason is the one that
+// would otherwise arrive by surprise: `Project` carries `Meta`, and who OWNS a
+// project is unresolved — see the note above that message. A load shape that
+// echoed the row would begin shipping an ownership answer to every caller on
+// the day the column lands, before anything ruled what it means.
+message RegisteredPath {
+  string path = 1;
+
+  // THE SET IS NOT FILTERED BY STATUS, AND MUST NOT BE. The store's resolution
+  // walks live paths and aliases without consulting status
+  // (`project-db/src/read.rs`) and reports the status it found. A caller that
+  // dropped archived rows from its own walk would therefore resolve a candidate
+  // to a different ancestor than the fallback rpc below resolves it to — two
+  // answers for one path, differing only in which route the caller took.
+  ProjectStatus status = 2;
+
+  // A rename is an ALIAS and never a rewrite (D53), so a walk consulting live
+  // paths only would strand every descendant of a renamed parent — the rewrite
+  // the alias exists to avoid, arriving as a resolution failure instead. The
+  // store binds its ancestor chain against live paths AND aliases for that
+  // reason (`project-db/src/read.rs`); a walk over this set is the same walk
+  // and needs the same two inputs.
+  repeated string aliases = 3;
+}
+
+// The registry LOAD: every registered path, so a caller answers "what does this
+// resolve to" in memory rather than over the network on every request.
+//
+// NO Scope, AND THAT IS WHY THIS RPC IS NOT `ProjectDbService.ListProjects`.
+// Its caller is a BOOT LOAD, which holds no bearer token, no project header and
+// no request — so there is no Scope to attest and none to forward. A Scope is
+// minted once, at the gateway, out of a request (ADR-0488's minting rule, which
+// ADR-0511 kept), and a contract demanding one from a caller that cannot have
+// one is a contract that caller cannot satisfy.
+//
+// AND THE STORE STILL DEMANDS ONE, so this shape does not by itself make the
+// call possible. `project-db/src/read.rs` opens `list` with
+// `scope_of(&req.scope)?` and `project-db/src/sql.rs` refuses an absent Scope
+// with "scope is required and is attested by the gateway". The store half of
+// this contract is tagged and implemented and is NOT changed here, so whoever
+// builds `project` meets that wall on the hot-path verb rather than only on the
+// staged flush timer. Named rather than papered over.
+message ProjectServiceListProjectsRequest {
+  // A REQUEST, NOT A GUARANTEE, and a caller that has no number to pass sends
+  // none. The page a caller can actually be given is derived from BYTES rather
+  // than declared as a count (D56): gRPC's 4 MB message size is what binds, so
+  // the server returns what fits and says so in `next_page_token`. Inventing a
+  // number to put here would be inventing a configuration value nothing chose,
+  // which is what ADR-0569 exists to delete — and it would buy nothing, because
+  // the obligation on this rpc is to loop until the token is empty, at whatever
+  // page size that takes.
+  int32 page_size = 1;
+  string page_token = 2;
+}
+message ProjectServiceListProjectsResponse {
+  // THE BARE RESERVED SEGMENT IS NEVER IN THIS SET, and emitting it is this
+  // tier's half of a guard the store can only half-close. `local` is reserved
+  // because the private class of project ids lives beneath it
+  // (`project-db/src/path.rs`): a row at the bare segment becomes the nearest
+  // registered ancestor of every private path in the estate, so one partition
+  // key swallows the class. The store refuses to mint such a row and DROPS the
+  // segment from its ancestor chain (`project-db/src/read.rs`) — a code-only
+  // guard, which does not delete a row an earlier build already accepted, which
+  // is why the walk rather than the table is what it closes. A caller walking
+  // this set performs a SECOND walk, and one carrying a `local` row re-opens
+  // exactly what the first closed.
+  //
+  // IT DOES NOT CLOSE LEDGER 651. Reserving the bare segment says nothing about
+  // a registration at `local/home`, which is well-formed, registrable, and the
+  // ancestor of every deeper private path of every other account.
+  //
+  // AND THE WALK FOLDS ASCII CASE. `project.path` is `utf8mb4` with no
+  // `COLLATE`, so it takes the server default — measured
+  // `utf8mb4_uca1400_ai_ci` on MariaDB 11.8 — and the store's comparisons are
+  // folded and are required to stay the SAME comparison as each other
+  // (`project-db/src/path.rs`, `project-db/src/read.rs`). A walk over this set
+  // is one more of them, and a byte-exact one answers a different path than
+  // `ResolveProject` below answers for the same candidate. The segment alphabet
+  // is `[A-Za-z0-9._-]`, so ASCII case is the whole of what that collation
+  // folds here.
+  repeated RegisteredPath paths = 1;
+
+  // THE CALLER LOOPS UNTIL THIS COMES BACK EMPTY. A caller that keeps the first
+  // page holds a registry silently truncated at one page size, and every path
+  // past that boundary then resolves to an ancestor and is STAMPED: the value
+  // is bound into a row (`task-db/src/write.rs`), and D58 gives each `-db` its
+  // own database instance, so no cross-module pass can ever merge those rows
+  // afterwards. A partial set is not a smaller registry; it is a wrong one.
+  string next_page_token = 2;
+}
+
+// THE FALLBACK, not the hot path — asked when the caller has no loaded set to
+// walk. The answer is the one `ProjectDbService.ResolveProject` gives: an
+// unregistered path resolves to its nearest registered ancestor, nothing is
+// ever auto-created, and only a path with no registered ancestor is refused
+// (D52 as amended by D53).
+//
+// THE SAME QUESTION IN A DIFFERENT REQUEST, and the difference is the point
+// rather than a duplication. The store's request carries a Scope; the gateway
+// asks this WHILE CONSTRUCTING one — the resolved path is an input to the
+// single construction site that repository defends by grep
+// (`gateway/src/attest.rs`) — so a Scope-carrying request would force a second,
+// provisional `Scope` literal, which is the thing that invariant exists to
+// prevent.
+//
+// WHAT IT DOES NOT CARRY, stated because the absence is a decision: no caller
+// identity. Resolution today is over ONE global namespace of paths, and no
+// field of this request could change the answer. The private class beneath
+// `local` is what changes that — a private path is owned, and resolving one for
+// the wrong account is ledger 651 — and closing that ruling adds the caller's
+// attested identity here as a new field. It is not declared in advance because
+// a field nothing reads, that LOOKS like an identity, is read later as a
+// verified one (ADR-0534).
+message ProjectServiceResolveProjectRequest {
+  string candidate_path = 1;
+}
+message ProjectServiceResolveProjectResponse {
+  // The path that will actually be stamped on the record.
+  string resolved_path = 1;
+
+  // False when candidate_path had no row of its own and an ancestor was used.
+  //
+  // NEITHER AN ERROR NOR A DETAIL: it is the whole safety property that makes
+  // resolving upward acceptable instead of refusing, and it is SILENT unless
+  // the caller surfaces it. D52 chose the upward resolution on the condition
+  // that "the soft failure is made visible rather than silent". The contracted
+  // delivery route is a D39 notice, `queue` has no implementation, so the first
+  // release carries this back in the tool result the caller is already reading
+  // (`plans/project-registry-callers.md` §4); the durable notice is added
+  // beside it later and does not replace it.
+  bool exact = 2;
+
+  // Set when candidate_path matched an alias rather than a live path.
+  bool via_alias = 3;
+
+  ProjectStatus status = 4;
+}
+
+// The registry's PUBLIC API — what the gateway calls (D4). Holds no store, and
+// reaches its data ONLY over `ProjectDbService`.
+//
+// TWO RPCS, AND THE OTHER FIVE ARE ABSENT FOR STATED REASONS rather than
+// pending. A logic tier implements what has a caller; mirroring seven verbs
+// one-for-one would be a proxy, and a proxy earns nothing over the store it
+// wraps.
+//
+// - `RegisterProject`, `RenameProject` and `ArchiveProject` are ADMINISTRATIVE.
+//   The surface meant to reach them is ADR-0492's administrative path on the
+//   gateway, which does not exist — see the note above `ProjectDbService` — so
+//   they are reached by port-forwarding `project-db` today. The last two answer
+//   `UNIMPLEMENTED` there in any case, and for a reason that is not the missing
+//   admin path: an alias keeps a stored `Meta.project_id` VALID but not
+//   CURRENT, and the job that retags records already carrying an old path does
+//   not exist. They return together with that job.
+// - `GetProject` has no caller. Inventing one to justify a verb is the shape
+//   this contract refuses.
+// - `TouchProjects` is storage maintenance, and its caller is this tier's OWN
+//   flush timer: `project` drains the debounced set and calls the store. So it
+//   is a call this tier MAKES and never a verb it EXPOSES. It is also staged
+//   behind `queue`, because D47's expiry is the only consumer `last_seen_at`
+//   has and that module has no implementation.
+service ProjectService {
+  rpc ListProjects(ProjectServiceListProjectsRequest) returns (ProjectServiceListProjectsResponse);
+
+  // NO REGISTERED ANCESTOR IS `NOT_FOUND`, which is the code the store already
+  // answers (`project-db/src/read.rs`), so one condition carries one code
+  // across both tiers.
+  //
+  // IT IS A CALLER ERROR AND MUST NOT BE RENDERED AS `401`. The credential is
+  // fine; a workspace fact is missing or names nothing. The rule is stated on
+  // THIS file because ADR-0512 puts it here — a consumer compiles against this
+  // contract and not against the store's half of it, so a rule written only
+  // over there is a rule that depends on reading a file the caller does not
+  // have. It does not depend on anyone having made the mistake yet.
+  //
+  // THE ADJACENT SHAPE TO READ CAREFULLY, and it is a hazard rather than a
+  // defect filed against another repository. An ABSENT `x-yadgar-project` is
+  // refused as `MissingIdentity` and mapped to `401` under the label
+  // `UNAUTHENTICATED` (`gateway/src/http.rs`). BOTH attestation arms refuse it
+  // and only one of them refuses it in plain sight: the trusted-headers arm
+  // inline, and the DEFAULT `iam` arm by delegating to `from_resolved`
+  // (`gateway/src/attest.rs`) — which is where a reader who checks the arm they
+  // opened concludes the other one is inert. Correcting the diagnosis is a
+  // one-arm change in an existing match and belongs to that repository rather
+  // than to this contract.
+  rpc ResolveProject(ProjectServiceResolveProjectRequest) returns (ProjectServiceResolveProjectResponse);
+}

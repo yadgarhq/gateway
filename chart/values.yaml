@@ -141,6 +141,77 @@ iam:
     # right. Set it only for a certificate issued for something else.
     domain: ""
 
+# WHERE THE PROJECT REGISTRY'S LOGIC TIER IS (ledger 881). The gateway LOADS the
+# registered set from `ProjectService.ListProjects` at boot and re-loads it on the
+# cadence below; the refusal path dials `ResolveProject` to name the repository a
+# remediation points at. Same shape as `task` and `iam` above.
+#
+# INSTALLING THIS BEFORE `project` EXISTS IS FINE, and it is the expected case
+# today. The dial is lazy and the load runs behind the boot, so a name that does
+# not resolve costs a gauge at zero — `yadgar_gateway_project_registry_loaded` —
+# and, in the `counting` mode below, nothing else at all: every scoped call is
+# still served. ADR-0674 is the ruling, and the reason it does not fail the boot
+# is ADR-0532's: a pod that crash-loops on an absent twin spends its restart
+# budget without changing anything, and takes login and health down with it.
+project:
+  host: project
+  port: 50051
+
+  # The TRANSPORT to that service. Same shape as `task.tls` and `iam.tls`, and
+  # configured independently of both so the three can be cut over one at a time.
+  tls:
+    # OFF, and it stays off until the servers can answer — `project` does not
+    # serve TLS yet, so turning this on today breaks the hop rather than securing
+    # it.
+    enabled: false
+    # The Secret holding the authority that signed project's certificate.
+    caSecret: project-tls
+    # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
+    caSecretKey: ca.crt
+    # The name project's certificate is verified against, when it is NOT
+    # `project.host`.
+    domain: ""
+
+# LEDGER 881: what happens to a call whose claimed workspace resolves to nothing.
+#
+# Neither value has a compiled-in default (ADR-0569) — the chart is the ONE source
+# and an absent value refuses the boot naming the variable. They live here rather
+# than in `yadgarhq/config`'s `gateway.yaml` because ADR-0569's template mechanism
+# (the seed repository) is unbuilt: until it exists, keeping the mode in this
+# deployment makes the flip a one-line, one-repository change with a diffable
+# history that cannot happen by omission. `plans/project-validation.md` licenses
+# exactly that placement.
+projectValidation:
+  # `counting` or `enforcing`.
+  #
+  # **`counting` RESOLVES, CLASSIFIES, COUNTS — AND REFUSES NOBODY.** It is the
+  # shipped value and the whole of what this release does: a claim that would be
+  # refused increments
+  # `yadgar_gateway_project_refusal_total{reason}` and the call is served exactly
+  # as it was before this gateway could resolve anything. `enforcing` answers
+  # those refusals — 400 with the reason token for the four caller classes, 503
+  # for a registry that has never loaded (ADR-0674).
+  #
+  # **DO NOT FLIP THIS BECAUSE THE COUNTER LOOKS QUIET.** Ledger 829 records 18 of
+  # 19 repositories unregistered, so enforcing before the registry is seeded
+  # refuses essentially every call in the estate. The gate is in
+  # plans/project-validation.md and has three legs, in order: one deliberate probe
+  # per reason class observed to move its own counter BEFORE the window opens;
+  # then, over the window, the refusal counter's increase is zero while
+  # `yadgar_gateway_project_resolution_total`'s increase is nonzero. The second
+  # leg is what stops a gateway with no traffic reading identically to one whose
+  # canonicalisation is perfect.
+  mode: counting
+  # How often the registered set is loaded: the retry after a failure and the
+  # refresh after a success. A newly registered project becomes resolvable within
+  # this interval, and an unreachable `project` is asked again at it.
+  #
+  # `project` publishes no registry-change event yet, so this poll is the only
+  # thing that notices a registration. Sixty seconds is short enough that a
+  # seeding operator sees the refusal counter respond while they watch it, and
+  # long enough that 19 repositories' worth of paths costs nothing to re-read.
+  registryPollSeconds: 60
+
 # D72's cache in front of `iam.ResolveCredential`, so identity is not a round trip
 # on every tools/call. Keyed on a hash of the bearer token, held IN EACH REPLICA'S
 # OWN MEMORY rather than in the shared cache (D21) — the reasoning is on

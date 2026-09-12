@@ -34,6 +34,23 @@ fn nowhere() -> Channel {
     tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy()
 }
 
+/// A validator that refuses nobody, which is the shipped configuration.
+///
+/// **EVERY CASE IN THIS FILE RUNS THROUGH IT, and that is the point rather than
+/// a convenience.** `crate::project::Mode::Counting` is what the chart sets, and
+/// the claim this release makes is that it changes NO existing answer — so the
+/// honest way to assert that claim is for the whole attestation suite to keep
+/// passing with the validator in the path. The registry is `never_loaded`, which
+/// is also the deployed state until `project` is reachable: it counts under its
+/// own reason and serves the call (ADR-0674).
+fn permissive() -> crate::project::Validator {
+    crate::project::Validator::new(
+        crate::project::Registry::never_loaded(),
+        crate::project::Mode::Counting,
+        nowhere(),
+    )
+}
+
 /// **`..Default::default()` rather than a full literal, deliberately.**
 /// `ResolveCredentialResponse` gained two fields at contract v1.6.0, and an
 /// exhaustive literal in a fixture turns the next additive contract change
@@ -276,6 +293,7 @@ async fn the_trusted_header_path_states_no_policy_rather_than_inventing_one() {
         &Attestation::TrustedHeaders,
         &nowhere(),
         &Credentials::new(TEST_TTL),
+        &permissive(),
         None,
         Claimed {
             user_id: Some("max"),
@@ -408,6 +426,7 @@ async fn scope_carries_the_request_id_it_was_given() {
         &Attestation::TrustedHeaders,
         &nowhere(),
         &Credentials::new(Duration::from_secs(30)),
+        &permissive(),
         None,
         Claimed {
             user_id: Some("max"),
@@ -434,6 +453,7 @@ async fn an_incomplete_claim_is_refused_rather_than_defaulted() {
         &Attestation::TrustedHeaders,
         &nowhere(),
         &Credentials::new(Duration::from_secs(30)),
+        &permissive(),
         None,
         Claimed {
             user_id: None,
@@ -469,6 +489,7 @@ async fn a_credentialless_request_under_iam_never_reaches_the_upstream() {
         &Attestation::Iam,
         &nowhere(),
         &Credentials::new(Duration::from_secs(30)),
+        &permissive(),
         None,
         Claimed {
             user_id: Some("forged-by-the-caller"),

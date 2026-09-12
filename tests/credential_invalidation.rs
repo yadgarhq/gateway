@@ -526,6 +526,14 @@ async fn present(iam: &Channel, cache: &Credentials, token: &str) {
         &Attestation::Iam,
         iam,
         cache,
+        // THE SHIPPED CONFIGURATION, which refuses nobody: this file is about the
+        // credential cache, and a validator that answered would refuse every
+        // resolution here on a registry that has never loaded.
+        &yadgar_gateway::project::Validator::new(
+            yadgar_gateway::project::Registry::never_loaded(),
+            yadgar_gateway::project::Mode::Counting,
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        ),
         Some(&format!("Bearer {token}")),
         Claimed {
             project_id: Some("zeta/invalidation"),

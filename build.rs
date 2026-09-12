@@ -119,6 +119,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/yadgar/task/v1/task.proto",
                 "proto/yadgar/taskapi/v1/taskapi.proto",
                 "proto/yadgar/iam/v1/iam.proto",
+                // THE REGISTRY (ledger 881). ONE FILE HOLDS BOTH TIERS —
+                // `ProjectService`, which this gateway calls, and
+                // `ProjectDbService`, which is `project`'s own upstream — so
+                // compiling it mints a client for a service nothing here dials.
+                // That is unavoidable rather than accepted lightly: prost
+                // generates per FILE, and the two tiers share one file because
+                // the storage boundary took the package first, which
+                // `project.proto` explains in its own words. The unused client
+                // costs generated code in `OUT_DIR` and nothing in behaviour;
+                // splitting the contract to avoid it is the breaking change
+                // D16's gate refuses.
+                "proto/yadgar/project/v1/project.proto",
             ],
             &includes[..],
         )?;

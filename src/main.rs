@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools_poll_interval,
         task,
         iam,
+        projects,
     } = boot::wiring(&broker, &valkey_password).await?;
 
     // The BINARY installs the exporter, never the library — a library that
@@ -134,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_limits,
         bootstrap,
         tools_poll_interval,
+        projects,
     });
 
     boot::start_invalidation(broker, ttl, Arc::clone(&state)).await;

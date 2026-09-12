@@ -26,3 +26,18 @@ yadgar/taskapi/v1
 # yadgar-telemetry, and a second generated copy would be a second type for one
 # concept.
 yadgar/iam/v1
+
+# The registry (ledger 881). This gateway is a CLIENT of `ProjectService`: it
+# LOADS the registered set with `ListProjects` at boot and dials `ResolveProject`
+# only on a refusal path, so it needs the service definition and not only the
+# messages — the same reason the two paths above are listed explicitly. The
+# import closure brings nothing new: `project.proto` imports
+# `yadgar/common/v1/common.proto`, already vendored through taskapi, and
+# `google/protobuf/timestamp.proto`, which `buf export` deliberately omits
+# because protoc supplies it.
+#
+# NOTHING HERE REACHES `ProjectDbService`, which shares this file. That is
+# `project`'s own upstream rather than this one's, exactly as `yadgar/iamdb/v1`
+# is `iam`'s — and `buf export` copies whole files, so the store half arrives in
+# the vendored copy and is deliberately not compiled into a client.
+yadgar/project/v1

@@ -110,6 +110,12 @@ pub const TASK: &str = "TASK";
 /// The other one. See [`TASK`].
 pub const IAM: &str = "IAM";
 
+/// The registry's logic tier (ledger 881). See [`TASK`].
+///
+/// A THIRD upstream and a third prefix, so the three can be cut over to TLS one
+/// at a time exactly as the first two can.
+pub const PROJECT: &str = "PROJECT";
+
 /// What a deployment got wrong about the transport, before anything is dialled.
 #[derive(Debug, thiserror::Error)]
 pub enum TlsConfigError {
@@ -409,6 +415,38 @@ pub async fn connect_task(
 /// authority and material that cannot be used — both configuration mistakes
 /// rather than outages, and D69's rule is the right one for those.
 pub async fn connect_iam(
+    host: &str,
+    port: u16,
+    tls: Option<&UpstreamTls>,
+) -> Result<Channel, yadgar_dial::BalanceError> {
+    match tls {
+        None => yadgar_dial::connect(host, port).await,
+        Some(tls) => yadgar_dial::connect_tls(host, port, &tls.options()).await,
+    }
+}
+
+/// Connect to `project`, the registry's logic tier (ledger 881).
+///
+/// **LAZY, LIKE THE OTHER TWO, AND HERE IT IS LOAD-BEARING RATHER THAN MERELY
+/// CONSISTENT.** ADR-0674 rules that a gateway whose registry load fails still
+/// boots and serves: unscoped surfaces — login, enrolment, health — need no
+/// project at all, and crash-looping on an absent twin spends the restart budget
+/// without changing anything. An eager dial with a `?` on it in `main` is exactly
+/// the six-crash-loop shape ADR-0532 removed, and `project` is the newest service
+/// in the estate — the one most likely not to be deployed yet on any given
+/// cluster.
+///
+/// What still fails the boot is what fails it for the other two: a host that is
+/// not a URI authority, and material that cannot be used.
+///
+/// **WHAT AN ABSENT `project` COSTS is one gauge at zero and a counter with a
+/// reason of its own.** `crate::project::registry` publishes
+/// `yadgar_gateway_project_registry_loaded` from boot, and in the shipped
+/// `counting` mode every scoped call is served regardless — so the degraded
+/// window is observable without being disruptive. Under `enforcing` it becomes a
+/// 503 per scoped call, which is the ADR's intended behaviour and the reason the
+/// flip is gated.
+pub async fn connect_project(
     host: &str,
     port: u16,
     tls: Option<&UpstreamTls>,

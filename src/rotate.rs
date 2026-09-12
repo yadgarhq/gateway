@@ -404,9 +404,20 @@ pub enum ToolsPollError {
 /// Collecting paths and reading them when the watcher first polls would put the
 /// rest of boot inside a window where a kubelet swap quietly becomes the
 /// baseline, and the real rotation would never be noticed.
+/// **EIGHT ARGUMENTS, AND THE ALTERNATIVE IS WORSE THAN THE LINT.** Grouping
+/// them into a struct is what clippy is asking for, and a struct that satisfied
+/// the call sites would carry `Default` — at which point `tests/assembly.rs`'s
+/// per-half cases could omit a member with `..Default::default()`, and a NEW
+/// member added later would be silently absent from every one of them. That is
+/// precisely the mutation this list exists to kill: the file's opening comment is
+/// "an upstream deleted from that list turns this red". Positional arguments make
+/// every call site name every member, so adding one is a visible edit everywhere
+/// it matters.
+#[allow(clippy::too_many_arguments)]
 pub fn watch_set(
     task: Option<&UpstreamTls>,
     iam: Option<&UpstreamTls>,
+    project: Option<&UpstreamTls>,
     broker: Option<&Broker>,
     cache_password: Option<&Path>,
     bootstrap_token: Option<&Path>,
@@ -418,6 +429,15 @@ pub fn watch_set(
         &[
             &task,
             &iam,
+            // THE THIRD UPSTREAM (ledger 881), IN THE SAME POSITION ITS DIAL
+            // TAKES. It is `None` on every deployment today — no module serves
+            // TLS yet, and TLS is opt-in per upstream so the three can be cut
+            // over one at a time — and `Option<M>: Material` folds an absent one
+            // to nothing. What it buys on the day the cut-over reaches
+            // `project`: a rotated bundle for that hop ends this process exactly
+            // as a rotated `task` bundle does, rather than being the one upstream
+            // whose rotation is silent.
+            &project,
             &broker,
             &cache_password,
             &bootstrap_token,
