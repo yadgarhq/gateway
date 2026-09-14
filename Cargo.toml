@@ -114,7 +114,7 @@ metrics = "0.24"
 # user who can choose their own name could otherwise search offline for one that
 # collides with somebody else's bucket and throttle them. Default features off:
 # no `std` detection of CPU features is needed for a 32-byte digest per request.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # THE BROKER (D22), for consuming D72's cache invalidation. The SAME version
 # `iam` publishes with: the two speak the NATS wire protocol through a server and
