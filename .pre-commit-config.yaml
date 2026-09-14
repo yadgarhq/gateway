@@ -22,7 +22,15 @@ repos:
   # at first install and never re-resolves it, so a moving tag would silently
   # freeze each machine at whatever it meant the day it first ran.
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.20.1
+    # THE REV MOVES FROM v1.20.1 TO v1.22.0 FOR THE `chart-baseline` ID BELOW,
+    # and the whole block comes with it because pre-commit resolves one rev per
+    # repository entry. `git diff --stat v1.20.1 v1.22.0 -- hooks/
+    # .pre-commit-hooks.yaml` is 1901 insertions and 0 deletions, touching only
+    # the new `hooks/chart_baseline.py` and the two manifest entries that
+    # publish it — so no hook already in this block changes behaviour. A second
+    # `repo:` entry pinning the same repository at a second rev was the
+    # alternative, and it is the drift the shared manifest exists to prevent.
+    rev: v1.22.0
     hooks:
       - id: gitleaks
       - id: prettier
@@ -91,3 +99,25 @@ repos:
       # with a reason. This repository had never run it before this PR.
       - id: boot-reads-watched
       - id: no-test-skips
+      # LEDGER 511, and this repository adopts ONE of the two halves ADR-0685
+      # split that gate into. `chart-baseline` asserts the three fields that are
+      # properties of the chart's own pod spec: the grace period against
+      # ADR-0601's floor, a dedicated ServiceAccount with no API token, and a
+      # hostname topology spread carrying `ScheduleAnyway` so it cannot hang a
+      # roll. ADR-0577 makes a published hook inert until a repository
+      # references it, so this line is what enforces those three here for the
+      # first time. Measured on this tree at v1.22.0: 1 chart, 1 judged, 29
+      # assertions evaluated, 0 findings.
+      #
+      # `chart-network-policy` IS DELIBERATELY ABSENT, AND THE ABSENCE IS THE
+      # WHOLE MECHANISM. This repository's ingress policy lives in
+      # `yadgarhq/deploy` as `infra/network-policies/gateway-ingress.yaml`,
+      # because its allow-list names the Envoy Gateway data plane and a policy
+      # validated against one ingress implementation does not belong in a module
+      # chart (D80). ADR-0685 split the gate on exactly that boundary rather
+      # than granting an exemption: an exemption keyed on `kind: HTTPRoute`
+      # encodes "ships an HTTPRoute" while the reason is "is edge-facing", so
+      # the next edge-facing module would inherit it with nothing red. There is
+      # therefore no skip, no exclude and no marker anywhere for it — not
+      # referencing the hook is the entire statement.
+      - id: chart-baseline
