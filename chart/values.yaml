@@ -262,6 +262,18 @@ projectValidation:
 # enforced by the services themselves and holds identically everywhere. The
 # NetworkPolicy still ships, as a second layer rather than as the choice.
 #
+# THAT PREMISE IS WITHDRAWN — ADR-0688 (2026-09-14). `kindest/kindnetd:
+# v20260528-9350166c` runs the kube-network-policies controller and was
+# measured enforcing ingress live in the `yadgar` namespace on 2026-09-12. A
+# NetworkPolicy protects this hop on kind too. ADR-0594, as amended by
+# ADR-0686, ranks mutual TLS and an ingress NetworkPolicy as EQUAL controls —
+# but only where both sides hold a leaf this deployment issued AND verifies.
+# On this hop that is not yet true: `iam` and `task`'s `serve.rs` present
+# server TLS only and leave `client_ca_root` unbuilt, so this certificate is
+# not checked by either upstream. Today the NetworkPolicy is the only BUILT
+# control on this hop; the certificate stays load-bearing for availability,
+# per the rest of this note, once the server side of mutual TLS lands.
+#
 # EMPTY, AND THAT IS ITS OWN LEVER. Turning either upstream's `tls.enabled` on
 # encrypts that hop and presents NO identity, exactly as before. Naming a Secret
 # here is a separate change that can be reverted on its own, which is the

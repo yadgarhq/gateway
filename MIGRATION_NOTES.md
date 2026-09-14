@@ -442,6 +442,12 @@ there instead.
   `infra/network-policies/shared-infrastructure.yaml`, whose 4222 rule named only
   `app: iam`. Nothing enforces NetworkPolicy on the reference cluster's CNI, so
   this is for the day one does.
+  **WITHDRAWN — ADR-0688 (2026-09-14):** that premise is false of
+  `kindest/kindnetd:v20260528-9350166c`, which runs the kube-network-policies
+  controller. Enforcement of this policy was measured live in the `yadgar`
+  namespace on 2026-09-12 (six module policies, each refusing an unallowed
+  peer at ~4s while an unpoliced control connected at 0s) — the day has
+  already come, and this rule has been protecting the hop since.
 
 Both, or neither: the pod exits at boot naming `/var/run/secrets/nats/password` if
 only one of `nats.passwordSecret` and `nats.user` is set, in either direction.
