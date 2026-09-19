@@ -736,9 +736,12 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
-            # THE CONFIGURATION REPOSITORY'S TWO CONFIGMAPS (ADR-0569, ADR-0570,
-            # step 2a): the knobs every service reads, and this service's own —
-            # empty today, mounted anyway so it is ready the day it is not.
+            # THE TWO CONFIGURATION DOCUMENTS THIS POD READS (ADR-0569,
+            # ADR-0570, ADR-0740): the knobs every service reads, and this
+            # service's own. They come from DIFFERENT REPOSITORIES now —
+            # `shared` is still rendered by `yadgarhq/config`, because six
+            # services read it; `gateway.yaml` is rendered by THIS chart
+            # (`templates/configmap.yaml`), because one service does.
             #
             # DIRECTORIES, NEVER `subPath`. A subPath mount is copied once at
             # container start and kubelet never updates it, so the file would be
@@ -748,26 +751,19 @@ spec:
             #
             # NO `optional: true`, unlike every Secret mount below. The default,
             # `false`, is what makes kubelet refuse to start this pod at all
-            # while `shared` or `gateway` is absent — `ContainerCreating` naming
-            # the missing ConfigMap — rather than starting it with an empty
-            # directory the binary would then refuse to read from anyway
-            # (ScheduleError::Absent).
+            # while either ConfigMap is absent — `ContainerCreating` naming the
+            # missing one — rather than starting it with an empty directory the
+            # binary would then refuse to read from anyway
+            # (ScheduleError::Absent, ToolsPollError::Absent).
             #
-            # **`gateway` IS MOUNTED, AND TODAY IT IS NEITHER READ NOR WATCHED.**
-            # `yadgar-lifecycle`'s `Configuration::under(root)` yields exactly one
-            # path, `root/shared/shared.yaml`; the crate has no API for a
-            # per-service document, so `config-gateway` is in no process's
-            # ADR-0523 watch set. Two things follow and both are deliberate. The
-            # `optional: false` reasoning above is true of `shared` and NOT of
-            # this one — an absent `gateway` ConfigMap blocks the pod for no
-            # functional benefit, which is accepted so that both mounts are
-            # governed by one rule rather than two. And the day this file gains
-            # its first knob, Argo will sync it and kubelet will swap it and NO
-            # POD WILL RESTART, so the new value never takes effect and nothing
-            # reports that — the exact failure ADR-0570 names for `envFrom`,
-            # reproduced through a file mount. THE MOUNT IS READY; JOINING THIS
-            # DOCUMENT TO THE WATCH SET IS A FURTHER CHANGE, and it belongs in
-            # the same pull request as the first gateway-only knob.
+            # **BOTH DOCUMENTS ARE READ AND BOTH ARE WATCHED.** The text here
+            # used to say `gateway` was neither, which stopped being true when
+            # `rotate::GatewayDocument` gained its first knob: `boot::wiring`
+            # reads it and passes it to `rotate::watch_set`, so a kubelet swap of
+            # this ConfigMap restarts the pod and the new value takes effect.
+            # That is what ADR-0523 asks for and what ADR-0570 names the failure
+            # of — a mounted document nothing watches accepts an edit and never
+            # acts on it, with nothing reporting the silence.
             - name: config-shared
               mountPath: /etc/yadgar/config/shared
               readOnly: true
@@ -852,14 +848,29 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
-        # The two ConfigMaps `yadgarhq/config` renders, same reasoning as the
-        # mounts above: unconditional, a directory each, never optional.
+        # The two configuration ConfigMaps, same reasoning as the mounts above:
+        # unconditional, a directory each, never optional.
+        #
+        # ONE COMES FROM `yadgarhq/config` AND ONE FROM THIS CHART (ADR-0740).
+        # `shared` is `config`'s and its name is `config`'s to choose.
+        # `gateway-knobs` is rendered by `templates/configmap.yaml` in this
+        # repository — READ THE `name:` REASONING THERE before changing it. It is
+        # not `gateway`, because `config` still renders a ConfigMap of that name
+        # until ADR-0740's second step, and two Argo Applications owning one
+        # object is a fight neither wins.
+        #
+        # **THE VOLUME NAME AND THE CONFIGMAP NAME ARE DIFFERENT THINGS.**
+        # `config-gateway` is this volume; `gateway-knobs` is the object it
+        # mounts. Get them out of step and kubelet holds the pod in
+        # `ContainerCreating` indefinitely naming a ConfigMap nothing renders —
+        # no error, no event that reads as a failure, no rollout.
+        # `tests/assembly.rs` asserts the two templates agree on the name.
         - name: config-shared
           configMap:
             name: shared
         - name: config-gateway
           configMap:
-            name: gateway
+            name: {{ .Chart.Name }}-knobs
         {{- if .Values.rateLimit.passwordSecret }}
         - name: valkey-password
           secret:

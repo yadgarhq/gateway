@@ -1,0 +1,88 @@
+{{/*
+THIS SERVICE'S OWN CONFIGURATION DOCUMENT, RENDERED BY THIS SERVICE'S OWN CHART
+(ADR-0740).
+
+`config/gateway.yaml` in this chart is the document; `/etc/yadgar/config/gateway`
+in `deployment.yaml` is where it is mounted; `yadgar_gateway::rotate::
+GatewayDocument` is the reader. All three are in THIS repository now, which is
+the whole of what ADR-0740 bought — the knob and the code reading it move in one
+pull request instead of two repositories and two releases apart.
+
+**THE NAME IS `<chart>-knobs` AND DELIBERATELY NOT `gateway`.** `yadgarhq/config`
+still renders a ConfigMap literally named `gateway` (its file name is its
+ConfigMap name) and will until ADR-0740's second step deletes that document. Two
+names were available and only one is safe:
+
+  - `gateway` COLLIDES, twice over. Measured 2026-09-19: the live ConfigMap
+    `gateway` in namespace `yadgar` carries `argocd.argoproj.io/tracking-id:
+    config:/ConfigMap:yadgar/gateway`, and this estate tracks ownership by that
+    annotation (`argocd/install/values.yaml`,
+    `application.resourceTrackingMethod: annotation`). The `config` Application
+    and this one BOTH target namespace `yadgar` with `automated: {prune: true,
+    selfHeal: true}`, so each reconcile would rewrite the other's annotation and
+    neither Application would ever read Synced. Separately, `yadgarhq/chart`
+    pins `config` AND `gateway` as dependencies of one release (ADR-0722), so one
+    `helm install` of the parent would carry two ConfigMaps of one name in one
+    namespace.
+  - `gateway-knobs` collides with nothing, in either direction, so this chart can
+    merge BEFORE `config` drops its copy — which is the order ADR-0740 requires,
+    because the volume below is `optional: false` and a pod whose ConfigMap is
+    absent sits in `ContainerCreating` indefinitely rather than failing.
+
+**NOT `gateway-config`, EITHER.** The volume that mounts this is named
+`config-gateway`. A ConfigMap called `gateway-config` beside a volume called
+`config-gateway` is two transposable names for two different things, and that
+confusion has already cost this estate time once.
+
+**THE NAME IS PERMANENT.** `config`'s copy going away in step two is not a reason
+to rename back: a rename is another rolled pod for no operator-visible gain, and
+the transposition hazard above does not expire.
+
+**THE DOCUMENT IS COPIED VERBATIM UNLESS THIS INSTALLATION OVERRIDES IT**
+(ADR-0721). A copy carries the reasoning written beside the number all the way
+into the cluster, which is the property ADR-0721 exists to protect; a merge
+cannot, because YAML comments do not survive a parse. So the merge runs only for
+an installation that supplies `.Values.toolsPoll`, and the rendered manifest says
+so for that document rather than for every one.
+*/}}
+{{- $file := "config/gateway.yaml" -}}
+{{- $body := .Files.Get $file -}}
+{{- if not $body -}}
+{{-   fail (printf "%s is missing from this chart. It is gateway's own configuration document (ADR-0740) and there is no default behind it (ADR-0569) — a chart packaged without it renders a ConfigMap with no knob in it and the pod exits at boot naming the mounted path." $file) -}}
+{{- end -}}
+{{- $supplied := .Values.toolsPoll | default dict -}}
+{{- if $supplied -}}
+{{-   $parsed := (fromYaml $body) | default dict -}}
+{{-   $over := dict "toolsPoll" $supplied -}}
+{{-   $body = printf "%s\n" (include "gateway.deepMerge" (dict "base" $parsed "over" $over)) -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Chart.Name }}-knobs
+  labels:
+    app: {{ .Chart.Name }}
+    app.kubernetes.io/component: configuration
+    app.kubernetes.io/part-of: yadgar
+data:
+  # THE INDENT IS THE ONLY THING THIS TEMPLATE ADDS. A block scalar needs one, and
+  # `indent` puts four spaces on EVERY line including the blank ones — which would
+  # write trailing whitespace into the mounted file and make it differ from the
+  # file in this repository for no reason anybody could see. The regex takes those
+  # back off, so what this process reads is what an operator wrote, plus an indent.
+{{- if $supplied }}
+  #
+  # EXCEPT THAT THIS INSTALLATION OVERRIDES IT. The document below is rendered from
+  # a DEEP MERGE of this chart's own `config/gateway.yaml` under this
+  # installation's `.Values.toolsPoll` (ADR-0721), so the keys are sorted rather
+  # than in the order the file had, and the reasoning written beside each number in
+  # the chart is NOT here. Read it in the chart version you pinned: `helm show
+  # chart` names the version, and the file is `config/gateway.yaml`.
+{{- end }}
+  # THE KEY IS THE FILE NAME THE BINARY OPENS. `rotate::GATEWAY_DOCUMENT` is
+  # `gateway/gateway.yaml` under `rotate::CONFIG_DIR`, the volume below mounts this
+  # ConfigMap as the DIRECTORY `/etc/yadgar/config/gateway`, and kubelet writes one
+  # file per key — so this key and that constant's file name must agree.
+  # `tests/assembly.rs` asserts they do.
+  gateway.yaml: |
+{{ regexReplaceAll "(?m)[ \t]+$" (indent 4 $body) "" }}
