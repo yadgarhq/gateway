@@ -69,12 +69,14 @@ pub async fn wiring(
     // such section.
     let config = rotate::Configuration::mounted();
 
-    // THE FIRST KNOB IN `gateway.yaml` (this service's OWN document, distinct
-    // from `shared.yaml` above). `chart/templates/deployment.yaml` has mounted
-    // `config-gateway` since step 2a with nothing reading or watching it; this
-    // is the knob that gives it a reader, and `gateway_config` below joins it
-    // to the watch set two lines down so the gap that comment named is closed
-    // in the same pull request that opened it. See `rotate::GatewayDocument`.
+    // THE ONE KNOB IN `gateway.yaml` (this service's OWN document, distinct from
+    // `shared.yaml` above). `chart/templates/deployment.yaml` mounts
+    // `config-gateway` at `/etc/yadgar/config/gateway`, and the ConfigMap behind
+    // that mount is rendered by THIS repository's chart rather than by
+    // `yadgarhq/config` — `chart/config/gateway.yaml` is the document and
+    // `chart/templates/configmap.yaml` renders it as `gateway-knobs` (ADR-0740).
+    // `gateway_config` joins it to the watch set below, so an operator editing
+    // the knob restarts this pod. See `rotate::GatewayDocument`.
     let gateway_config = rotate::GatewayDocument::mounted();
     let tools_poll_interval = gateway_config
         .tools_poll_interval()

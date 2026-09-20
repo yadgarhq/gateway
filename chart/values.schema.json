@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "yadgar/gateway",
+  "description": "THE KNOBS OF gateway's OWN CONFIGURATION DOCUMENT, AND A REFUSAL FOR EVERY OTHER KEY UNDER THEM. ADR-0740 moved `gateway.yaml` out of `yadgarhq/config` and into this chart, and its schema and bounds moved with it: this file is what makes an adopter's typo a REFUSAL NAMING THE KEY rather than a value merged into a document nothing reads it from. Helm enforces it in both `helm lint` and `helm template`, which is the `helm lint and render` pre-commit hook and therefore `ci / passed`, and it is also what an Argo sync meets.",
+  "$comment": "THE ROOT IS OPEN AND `toolsPoll` IS CLOSED, and that asymmetry is deliberate rather than an oversight. `yadgarhq/config`'s schema sets `additionalProperties: false` AT EVERY LEVEL because it declares every knob its chart has. This chart does not: `chart/values.yaml` is 898 lines of module knobs that predate this file and are undeclared, and `argocd/applicationsets/modules.yaml` supplies a further inline values block to the reference deployment (measured 2026-09-19: `autoscaling`, `sourceAddress`, `adminBootstrap`, `tls`, `iam`, `task`, `iamDb`, `taskDb`, `project`, `projectDb`). Closing the root would refuse every one of those and break the live sync, so THE WEAKENING IS REAL AND WORTH STATING: `toolsPoll: {intervalSecond: 600}` is refused by name, and a misspelling of `toolsPoll` ITSELF at the root is accepted and silently reads as no override — where `config`'s closed root would have refused it. Closing this root is a separate change that has to declare all 898 lines first. THE TYPE IS PART OF THE REFUSAL: a values file reaches helm through sigs.k8s.io/yaml, so `intervalSeconds: \"600\"` would arrive as a string and reach serde_norway as one, which fails the reader at boot instead of the render. REQUIRED-NESS IS NOT EXPRESSED HERE, and nothing here is required: `chart/config/gateway.yaml` carries the value, and `.Values.toolsPoll` exists ONLY as an override. A knob with a default in the document AND a default in values.yaml would be two sources for one value (ADR-0569), which is why `chart/values.yaml` states no `toolsPoll` at all.",
+  "type": "object",
+  "properties": {
+    "toolsPoll": {
+      "type": "object",
+      "description": "Overrides for chart/config/gateway.yaml's `toolsPoll` section — read only by `gateway`, which is the only service that builds the `tools/list` response.",
+      "additionalProperties": false,
+      "properties": {
+        "intervalSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How often, in whole seconds, `gateway` tells an MCP client to re-poll `tools/list` for a changed tool catalogue. `0` is refused here rather than read as `off`: `rotate::GatewayDocument::tools_poll_interval` returns `ToolsPollError::Zero` for it, so a zero that passed the render would only fail later, at boot."
+        }
+      }
+    }
+  }
+}

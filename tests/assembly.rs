@@ -987,3 +987,156 @@ fn the_chart_mounts_the_gateway_configmap_where_this_binary_looks_for_it() {
         mounted.path().display()
     );
 }
+
+/// The template that renders this service's OWN configuration document, read at
+/// COMPILE TIME for the reason [`DEPLOYMENT`] is.
+const CONFIGMAP: &str = include_str!("../chart/templates/configmap.yaml");
+
+/// The document that template renders, likewise — the chart's shipped default
+/// for `toolsPoll.intervalSeconds` (ADR-0740).
+const CHART_DOCUMENT: &str = include_str!("../chart/config/gateway.yaml");
+
+/// The value of an indented `<key>: <value>` line, at any indent, taken from a
+/// Helm template's SOURCE.
+///
+/// **ONE ANCHOR IS NOT ENOUGH, and the first version of this helper proved it.**
+/// `deployment.yaml` holds TWO `configMap:` blocks — `config-shared`'s and
+/// `config-gateway`'s — so anchoring on `configMap:` alone read `shared` and
+/// compared the wrong two names. `anchors` is therefore a TRAIL followed in
+/// order: each one is found after the previous, and `key` is read after the last.
+/// A trail whose links are each unique after the one before it is what makes this
+/// keep describing the chart rather than agreeing with itself.
+///
+/// **A MISSING ANCHOR OR KEY PANICS RATHER THAN DEFAULTING.** A parse that
+/// answers a fallback when it finds nothing passes after somebody deletes the
+/// field, which is the silence these chart tests exist to break.
+fn value_after(source: &str, label: &str, anchors: &[&str], key: &str) -> String {
+    let mut lines: Vec<&str> = source.lines().collect();
+    for anchor in anchors {
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == *anchor)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label}: no line reading `{anchor}` — the template this test describes has \
+                     been restructured and the test can no longer find what it compares"
+                )
+            });
+        lines = lines.split_off(at + 1);
+    }
+    let prefix = format!("{key}:");
+    let found = lines
+        .iter()
+        .find_map(|line| line.trim().strip_prefix(&prefix))
+        .unwrap_or_else(|| {
+            panic!("{label}: no `{key}:` line after {anchors:?}");
+        });
+    found.trim().to_string()
+}
+
+/// THE VOLUME'S `configMap.name` AND THE NAME THE CONFIGMAP TEMPLATE RENDERS
+/// MUST AGREE.
+///
+/// **THIS IS THE SILENT-HANG SEAM, and it is silent in the worst way.** The mount
+/// is `optional: false`, which is deliberate — see `deployment.yaml`. A volume
+/// naming a ConfigMap nothing renders therefore does not fail: kubelet holds the
+/// pod in `ContainerCreating` INDEFINITELY, naming a missing ConfigMap in an
+/// event nobody is watching, and the rollout simply never finishes. No exit code,
+/// no `CrashLoopBackOff`, no failing probe.
+///
+/// **NEITHER SIDE IS A LITERAL IN THIS TEST.** Both are read out of the two
+/// templates, so a rename in either one turns this red; a test naming
+/// `gateway-knobs` itself would agree with its own copy for ever. The name being
+/// `{{ .Chart.Name }}-knobs` rather than `gateway` is ADR-0740's migration
+/// ordering — `yadgarhq/config` still renders a ConfigMap called `gateway` and
+/// two Argo Applications owning one object is a fight neither wins — and this
+/// test does not care WHAT the name is, only that the two sites say the same
+/// thing.
+#[test]
+fn the_volume_names_the_configmap_this_chart_actually_renders() {
+    let rendered = value_after(
+        CONFIGMAP,
+        "chart/templates/configmap.yaml",
+        &["metadata:"],
+        "name",
+    );
+    // THE TRAIL IS `volumes:` THEN THE VOLUME THEN `configMap:`, and every link
+    // earns its place. `volumes:` skips the `volumeMounts:` list, which names
+    // `config-gateway` too; the volume name narrows to this one of the two
+    // ConfigMap volumes; `configMap:` reaches past the volume's own `- name:`
+    // line to the object it mounts.
+    let mounted = value_after(
+        DEPLOYMENT,
+        "chart/templates/deployment.yaml",
+        &["volumes:", "- name: config-gateway", "configMap:"],
+        "name",
+    );
+
+    assert_eq!(
+        rendered, mounted,
+        "configmap.yaml renders a ConfigMap named `{rendered}` and deployment.yaml's \
+         `config-gateway` volume mounts one named `{mounted}`. The mount is `optional: false`, \
+         so a pod built from these two templates sits in ContainerCreating for ever naming a \
+         ConfigMap nothing renders — no error, no failing probe, no finished rollout"
+    );
+}
+
+/// THE CONFIGMAP'S DATA KEY AND THE FILE NAME THIS BINARY OPENS MUST AGREE.
+///
+/// kubelet writes ONE FILE PER KEY into a directory-mounted ConfigMap, and
+/// [`GatewayDocument::mounted`] opens one path inside that directory. Get the key
+/// wrong and the directory mounts successfully with the wrong file name in it, so
+/// the pod starts and then EXITS naming a path it cannot find — louder than the
+/// case above, and still a rollout that never completes.
+///
+/// Derived from `GatewayDocument::mounted()` rather than restated, for the reason
+/// the `mountPath` cases above give.
+#[test]
+fn the_configmap_key_is_the_file_name_this_binary_opens() {
+    let mounted = GatewayDocument::mounted();
+    let file = mounted
+        .path()
+        .file_name()
+        .expect("the mounted document is a file")
+        .to_string_lossy()
+        .to_string();
+
+    assert!(
+        CONFIGMAP
+            .lines()
+            .any(|line| line.trim() == format!("{file}: |")),
+        "yadgar_gateway::rotate::GatewayDocument::mounted() opens {}, but no `data:` key in \
+         this chart's configmap.yaml is `{file}` — kubelet writes one file per key, so this pod \
+         would mount a directory holding a file under some other name and exit at boot",
+        mounted.path().display()
+    );
+}
+
+/// THE CHART'S SHIPPED DOCUMENT MUST SATISFY THIS BINARY'S OWN PARSER.
+///
+/// `chart/config/gateway.yaml` is the default `toolsPoll.intervalSeconds` for
+/// every installation that overrides nothing (ADR-0740), and it is thirty-odd
+/// lines of prose around one number. Nothing else in this repository reads it:
+/// the chart copies it verbatim into a ConfigMap and the binary parses it only in
+/// a cluster, so a document this parser refuses would ship green and refuse the
+/// boot of the very pod the chart built.
+///
+/// **THE PARSER IS THE REAL ONE, and the body is the real file.** Passing the
+/// chart's own bytes through [`gateway_config`] is what makes this a check on the
+/// chart rather than on a fixture — `GATEWAY_CONFIG_BODY` above deliberately
+/// names 437 so no test can be satisfied by a compiled-in number, and this case
+/// is the one place the SHIPPED number is read.
+#[test]
+fn the_charts_own_document_parses_as_a_poll_interval() {
+    let interval = gateway_config(CHART_DOCUMENT).tools_poll_interval().expect(
+        "chart/config/gateway.yaml must state toolsPoll.intervalSeconds as this binary's own \
+         parser reads it — a document it refuses ships green here and refuses the boot of the \
+         pod the chart built",
+    );
+
+    assert!(
+        interval.as_secs() >= 1,
+        "chart/config/gateway.yaml states {interval:?}; values.schema.json declares the leaf \
+         `minimum: 1` and ToolsPollError::Zero refuses zero at boot"
+    );
+}

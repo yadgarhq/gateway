@@ -158,15 +158,22 @@ const TOOLS_POLL_LEAF: &str = "intervalSeconds";
 const TOOLS_POLL_KNOB: &str = "toolsPoll.intervalSeconds";
 
 /// This gateway's OWN configuration document — `chart/config/gateway.yaml` in
-/// `yadgarhq/config`, mounted at `gateway/gateway.yaml` under [`CONFIG_DIR`].
+/// THIS repository, rendered into the `gateway-knobs` ConfigMap by this
+/// repository's own chart and mounted at `gateway/gateway.yaml` under
+/// [`CONFIG_DIR`].
 ///
-/// **DISTINCT FROM [`Configuration`], which is `shared.yaml`.** `shared.yaml`'s
-/// own header states the dividing line: a knob every service reads with the
-/// same value goes there, and a knob only one service reads belongs in that
-/// service's own file. `tools/list`'s poll interval is read by no other
-/// service — `iam`, `task`, `iam-db` and `task-db` never build the response —
-/// so it is the first knob in `gateway.yaml`, which existed, mounted and empty,
-/// for exactly this day.
+/// **IT USED TO COME FROM `yadgarhq/config` AND NO LONGER DOES (ADR-0740).** A
+/// configuration document lives in the chart of the service that reads it when
+/// exactly one service reads it; `config` keeps only what more than one service
+/// reads. So the knob and this reader are one repository and one release apart
+/// instead of two, which is the drift ADR-0740 exists to close.
+///
+/// **DISTINCT FROM [`Configuration`], which is `shared.yaml` and still comes
+/// from `yadgarhq/config`.** `shared.yaml`'s own header states the dividing
+/// line: a knob every service reads with the same value goes there, and a knob
+/// only one service reads belongs in that service's own file. `tools/list`'s
+/// poll interval is read by no other service — `iam`, `task`, `iam-db` and
+/// `task-db` never build the response.
 ///
 /// **`chart/config/gateway.yaml` DOES NOT ENFORCE `deny_unknown_fields`, on
 /// purpose, for the same reason `yadgar-lifecycle`'s `Document` does not**:
@@ -285,9 +292,10 @@ impl Material for GatewayDocument {
 #[derive(Debug, thiserror::Error)]
 pub enum ToolsPollError {
     #[error(
-        "{path} does not exist, so no configuration was read. It is `gateway`'s own document \
-         in the configuration chart in yadgarhq/config, mounted from the ConfigMap `gateway`. \
-         There is no default to fall back to (ADR-0569)."
+        "{path} does not exist, so no configuration was read. It is `gateway`'s own document, \
+         `chart/config/gateway.yaml` in yadgarhq/gateway, mounted from the ConfigMap \
+         `gateway-knobs` this service's own chart renders (ADR-0740). There is no default to \
+         fall back to (ADR-0569)."
     )]
     Absent { path: String },
 

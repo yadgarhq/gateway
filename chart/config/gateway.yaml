@@ -1,0 +1,38 @@
+# gateway.yaml — settings read only by `gateway`, and rendered by `gateway`'s
+# own chart (ADR-0740).
+#
+# THIS FILE USED TO LIVE IN `yadgarhq/config`. ADR-0740 moved it: a
+# configuration document lives in the chart of the service that reads it when
+# exactly one service reads it, and `config` keeps only what MORE THAN ONE
+# service reads. `shared.yaml` stays there because six services read it; this
+# document has one reader, which is the binary in this repository.
+#
+# WHAT BELONGS HERE: a value only `gateway` reads. Its rate-limit buckets, its
+# trusted-proxy hop count, its upstream timeouts — each of those is a gateway
+# setting and none of them is a setting for `iam`.
+#
+# WHAT DOES NOT: anything every service reads with the same value. That is
+# `shared.yaml` in `yadgarhq/config`, still mounted beside this document at
+# `/etc/yadgar/config/shared`. A knob has ONE source (ADR-0569) — stating a key
+# here that `shared.yaml` also states is the fault `config`'s
+# `scripts/one_source_per_knob.py` refuses on its own side, and nothing in this
+# repository can see across the seam to refuse the other half. See the pull
+# request that moved this file for what a replacement gate would have to read.
+
+# How often, in whole seconds, `gateway` tells an MCP client to re-poll
+# `tools/list` for a changed tool catalogue (see `yadgar-client`'s own poll
+# loop, which falls back to 600 on its own when a server names no interval —
+# so this knob is additive and nothing breaks if this change lands before or
+# after that client's).
+#
+# GATEWAY-ONLY, not `shared.yaml`, on `shared.yaml`'s own rule: only `gateway`
+# builds the `tools/list` response, so only `gateway` reads this. `iam`,
+# `task`, `iam-db`, `task-db` and `project-db` never touch it.
+#
+# THERE IS NO DEFAULT BEHIND THIS (ADR-0569). Delete the line and `gateway`
+# refuses to start, naming this file — see `yadgar_gateway::rotate::
+# GatewayDocument::tools_poll_interval` and its `no_compiled_in_defaults.sh`
+# gate. `chart/values.yaml` deliberately does NOT carry it either: a default
+# stated in two files is a value nobody wrote.
+toolsPoll:
+  intervalSeconds: 600
