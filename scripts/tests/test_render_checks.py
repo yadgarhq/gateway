@@ -388,10 +388,24 @@ def exercise_one_pair_per_declared_check(
         # case rewritten straight to a bare `render(chart)` is caught here instead of
         # silently reverting to the bare render
         # `test_a_bare_render_refuses_too_and_that_is_the_renderers_reason` exists to
-        # keep out. AT ONE CHECK — WHICH IS THIS CHART — THAT IS THE ONLY ASSERTION
-        # THAT CATCHES IT: a bare render still exits non-zero and still names the one
-        # operator there is, so `returncode` and the stderr assertions below all stay
-        # green over a red case that proves nothing.
+        # keep out. `returncode` and the stderr assertions below do NOT catch that
+        # rewrite: a bare render still exits non-zero, and at one declared check it
+        # still names the one operator there is.
+        #
+        # IT IS NOT THE ONLY ASSERTION THAT CATCHES IT, AND THE OTHER ONE WORKS AT
+        # EVERY COUNT — ONE INCLUDED. The `--api-versions` COUNT ASSERTION BELOW
+        # catches the same deletion independently, in THIS CHART'S OWN red case, at
+        # one declared check as well as at two or more. A red argv that lost the
+        # filler carries one fewer group than `len(declared)`, and at one check that
+        # is zero against one.
+        #
+        # MEASURED AT ONE DECLARED CHECK — WHICH IS THIS CHART — on helm 3.18.4 and
+        # 4.3.0 with identical output. `+ FILLER_API_VERSIONS`, both tripwires here
+        # and `test_the_red_argv_builder_keeps_the_filler_at_one_check` were deleted
+        # together. The chart's own red case went red on `the red render for KEDA
+        # passed --api-versions 0 times; 1 is the whole construction`. An earlier
+        # revision of this comment asserted the opposite and was wrong. That is a
+        # strengthening, not a licence to drop either.
         #
         # EVERY CLAUSE IS PHRASED OVER SOMETHING `red_api_versions` DID NOT PRODUCE —
         # the module-level filler literal, the group under test, and the groups read
@@ -530,21 +544,28 @@ def test_the_red_argv_builder_keeps_the_filler_at_one_check():
     """THE ARGV TRIPWIRES' OWN META-TEST, and the counterpart of the count's.
 
     `test_deleting_a_check_from_the_chart_reddens_the_count` is the meta-test for the
-    COUNT. The two `red.args` membership tripwires inside
-    `exercise_one_pair_per_declared_check` had none, and at ONE check — which is this
-    chart — they are what tells a red case apart from a bare render BY NAME: a bare
-    render still exits non-zero and still names the one operator there is. So a builder
-    who meets a red suite while adding a second check and does exactly what the
-    docstrings above warn against — deletes `+ FILLER_API_VERSIONS` from
-    `red_api_versions` AND both tripwires — meets this case.
+    COUNT. The two `red.args` tripwires inside `exercise_one_pair_per_declared_check`
+    had none. A builder who deletes `+ FILLER_API_VERSIONS` from `red_api_versions`
+    AND both tripwires turns every red case the CHART has into a bare render, and
+    `returncode` and the stderr assertions do not notice: a bare render still exits
+    non-zero, and at one declared check it still names the one operator there is. This
+    case is what that builder meets instead.
 
-    THEY ARE NOT THE ONLY WITNESS, AND THE THIRD ONE SITS FIVE LINES BELOW THEM.
-    `assert red.args.count("--api-versions") == len(declared)` reddens under that same
-    deletion AT EVERY CHART COUNT, this chart's own one included: with the filler gone,
-    the red argv for the only declared check carries `--api-versions` ZERO times while
-    `len(declared)` is one, so it fails `0 == 1` on the chart itself — not on a
-    fixture. The suite goes fully green only when that assertion is deleted too. A
-    sentence calling these two tripwires the only witness would be false, and was.
+    THE TRIPWIRES ARE NOT THE ONLY WITNESS AT ANY COUNT, AND THAT IS A MEASUREMENT
+    RATHER THAN A CAUTION. Two other assertions redden under the SAME deletion.
+    `test_the_construction_is_correct_at_two_checks` runs the same function over a
+    fixture declaring TWO checks whatever the chart declares, so its `--api-versions`
+    count assertion reddens at every chart count. The count assertion inside
+    `exercise_one_pair_per_declared_check` is a THIRD witness, also at every chart
+    count — ONE included, where a red argv that lost the filler carries zero groups
+    against a `len(declared)` of one.
+
+    MEASURED AT ONE DECLARED CHECK, WHICH IS THIS CHART, on helm 3.18.4 and 4.3.0 with
+    identical output. The filler, both tripwires and this case were deleted together,
+    nothing else changed. The chart's own red case went red on `the red render for KEDA
+    passed --api-versions 0 times; 1 is the whole construction`, and the suite reported
+    2 failed. An earlier revision of this docstring was wrong here: it said that
+    deletion measures a fully green suite. The count assertion refutes it.
 
     IT IS NOT THE BUILDER COMPARED WITH ITSELF, which is the objection those
     tripwires' own comment raises against `set(red_api_versions(...)) <= set(red.args)`.
