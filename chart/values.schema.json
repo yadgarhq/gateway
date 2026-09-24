@@ -16,6 +16,36 @@
           "description": "How often, in whole seconds, `gateway` tells an MCP client to re-poll `tools/list` for a changed tool catalogue. `0` is refused here rather than read as `off`: `rotate::GatewayDocument::tools_poll_interval` returns `ToolsPollError::Zero` for it, so a zero that passed the render would only fail later, at boot."
         }
       }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "description": "The ingress allow-list rendered by chart/templates/networkpolicy.yaml. DECLARED HERE BECAUSE THIS CHART'S `clients` IS TYPED DIFFERENTLY FROM ITS SIBLINGS': every other module chart takes a list of workload NAMES and renders `podSelector: {app: <name>}` for each, while this one takes `from` PEERS, because the pods that dial this module's serving port carry `app.kubernetes.io/name` rather than `app` and run in their own namespace. A list of names pasted from a sibling chart is valid YAML that helm renders happily and only the API server rejects — a silent failure until apply. Typing the items as objects converts it into a refusal naming this key, at render time.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether to render the policy at all. False by default on asymmetric cost: a wrong policy on an enforcing CNI is an outage, and an absent one is no worse than today."
+        },
+        "clients": {
+          "type": "array",
+          "description": "The `from` peers admitted to the serving port, written as the NetworkPolicy API writes them. Empty while `enabled` is true is REFUSED by the template rather than rendered, because an empty or missing `from` matches ALL sources (ADR-0664).",
+          "items": {
+            "type": "object",
+            "description": "One NetworkPolicyPeer. Selectors written in ONE entry are an AND; the same two written as two entries are an OR and admit far more."
+          }
+        },
+        "scrapeFrom": {
+          "type": "object",
+          "description": "Where the metrics scrape comes from. Absent renders no rule for the metrics port at all.",
+          "additionalProperties": false,
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "description": "The one namespace admitted to the metrics port. The metrics port serves without authentication, so ADR-0770 scopes it by namespace rather than leaving it open to the cluster."
+            }
+          }
+        }
+      }
     }
   }
 }
