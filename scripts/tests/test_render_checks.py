@@ -530,14 +530,21 @@ def test_the_red_argv_builder_keeps_the_filler_at_one_check():
     """THE ARGV TRIPWIRES' OWN META-TEST, and the counterpart of the count's.
 
     `test_deleting_a_check_from_the_chart_reddens_the_count` is the meta-test for the
-    COUNT. The two `red.args` tripwires inside `exercise_one_pair_per_declared_check`
-    had none, and at ONE check — which is this chart — they are the ONLY witness that
-    the red case is not a bare render: a bare render still exits non-zero and still
-    names the one operator there is. So a builder who meets a red suite while adding a
-    second check and does exactly what the docstrings above warn against — deletes
-    `+ FILLER_API_VERSIONS` from `red_api_versions` AND both tripwires — measures a
-    fully green suite, and from then on every red case in this chart is a bare render
-    proving nothing. This case is what that builder meets instead.
+    COUNT. The two `red.args` membership tripwires inside
+    `exercise_one_pair_per_declared_check` had none, and at ONE check — which is this
+    chart — they are what tells a red case apart from a bare render BY NAME: a bare
+    render still exits non-zero and still names the one operator there is. So a builder
+    who meets a red suite while adding a second check and does exactly what the
+    docstrings above warn against — deletes `+ FILLER_API_VERSIONS` from
+    `red_api_versions` AND both tripwires — meets this case.
+
+    THEY ARE NOT THE ONLY WITNESS, AND THE THIRD ONE SITS FIVE LINES BELOW THEM.
+    `assert red.args.count("--api-versions") == len(declared)` reddens under that same
+    deletion AT EVERY CHART COUNT, this chart's own one included: with the filler gone,
+    the red argv for the only declared check carries `--api-versions` ZERO times while
+    `len(declared)` is one, so it fails `0 == 1` on the chart itself — not on a
+    fixture. The suite goes fully green only when that assertion is deleted too. A
+    sentence calling these two tripwires the only witness would be false, and was.
 
     IT IS NOT THE BUILDER COMPARED WITH ITSELF, which is the objection those
     tripwires' own comment raises against `set(red_api_versions(...)) <= set(red.args)`.
@@ -685,10 +692,22 @@ def test_the_checks_are_unreachable_at_the_chart_defaults():
     defaults, so no check was reached.
 
     THE ASSERTION IS SCOPED TO THE CHECKED GROUPS, NEVER A CENSUS OF EVERY GROUP
-    RENDERED. A census would demand a check for every CRD-backed group the defaults
-    render, and `gateway.enabled` is true by default — so the only way to green a
-    census is a Gateway API check, which a default-true toggle forbids. The rule is
-    about the toggle's DEFAULT, not about the API group.
+    RENDERED, so this case cannot see a NEW CRD-backed object added to this chart with
+    no render check beside it. That gap is named here rather than argued away.
+
+    A CENSUS IS NOT IMPOSSIBLE IN THIS ESTATE, AND SAYING SO WOULD BE FALSE. One is
+    DEPLOYED on the assembled tree: `yadgarhq/chart`'s
+    `test_parent_chart.py::test_the_defaults_render_exactly_one_crd_bearing_resource`
+    asserts an equality against the one-entry list
+    `[("gateway.networking.k8s.io/v1", "HTTPRoute", "gateway")]`, over an ALLOWLIST of
+    built-in groups so an unknown group fails safe as CRD-bearing. What a default-true
+    toggle forbids is the EMPTY-exemption form — `gateway.enabled` is the one such
+    toggle in this estate, and the HTTPRoute it renders is what a one-entry exemption
+    exists for. The rule is about the toggle's DEFAULT, not about the API group.
+
+    AND THAT DEPLOYED CENSUS CANNOT SEE THIS CHART'S SCALED OBJECT EITHER, because it
+    runs on the DEFAULT render, where `autoscaling.enabled` is false and no object of a
+    checked group exists. A census over the toggled-ON render is step 9's obligation.
     """
     defaults = render(CHART)
     assert defaults.returncode == 0, defaults.stderr

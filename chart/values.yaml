@@ -589,7 +589,12 @@ autoscaling:
   # the suite reads the invocation's arguments off the template;
   # `test_autoscaling.py::test_the_render_check_names_the_group_the_values_file_records`
   # is the gate that keeps the two one.
-  keda:
+  #
+  # NAMED `kedaOperator` RATHER THAN `keda`, so one concept has one spelling inside one
+  # file. The `-db` charts record theirs at `database.mariadbOperator.apiVersion`, and
+  # the chart that carries both keys carries them in a SINGLE values file an adopter
+  # reads top to bottom. `<operator>Operator.apiVersion` is that one spelling.
+  kedaOperator:
     apiVersion: keda.sh/v1alpha1
   minReplicas: 2
   # At least two, always (D55) — the floor is a correctness property, not a

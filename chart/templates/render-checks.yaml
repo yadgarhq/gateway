@@ -18,8 +18,8 @@ nothing else, so there is no sibling specification a check could name by mistake
 unlike the Gateway API, which several implementations register. The string is a
 LITERAL here because `scripts/tests/test_render_checks.py` reads these arguments off
 the template to count and exercise the checks; it is RECORDED a second time in
-`values.yaml` under `autoscaling.keda.apiVersion`, beside the toggle, and the gate
-that keeps the two one is
+`values.yaml` under `autoscaling.kedaOperator.apiVersion`, beside the toggle, and the
+gate that keeps the two one is
 `test_autoscaling.py::test_the_render_check_names_the_group_the_values_file_records`.
 
 THIS CHART DECLARES NO GATEWAY API CHECK, and that absence is a decision rather than

@@ -66,7 +66,7 @@ KEDA_KIND = "ScaledObject"
 # The group-and-version string the render check names, recorded in `values.yaml`
 # beside the toggle so an operator upgrade that moved the version turns the check red
 # rather than silently weakening it.
-RECORDED_GROUP_PATH = ("autoscaling", "keda", "apiVersion")
+RECORDED_GROUP_PATH = ("autoscaling", "kedaOperator", "apiVersion")
 
 API_VERSIONS_FOR_THE_SCALED_OBJECT = ("--api-versions", KEDA_API_VERSION)
 
@@ -189,12 +189,17 @@ def test_the_scaled_object_is_the_group_the_check_guards():
     — the ScaledObject's own group going unchecked is the apply-time `no matches for
     kind` the check exists to turn into a render-time refusal.
 
-    SCOPED TO THE SCALED OBJECT, NEVER A CENSUS OF EVERY RENDERED GROUP. The census
-    form would demand a check for every CRD-backed group this chart renders, and
-    `gateway.enabled` is the one toggle in this estate that is true by default — so
-    the only way to green a census is a Gateway API check behind a default-true
-    toggle, which would refuse every offline render in the estate. The rule is about
-    the toggle's DEFAULT, not about the API group.
+    SCOPED TO THE SCALED OBJECT, NEVER A CENSUS OF EVERY RENDERED GROUP — so this case
+    cannot see a second CRD-backed object added to this chart with no check beside it.
+    The census form is NOT unimplementable, and a docstring claiming it was would be
+    refuted by a green test on `yadgarhq/chart`'s own default branch:
+    `test_parent_chart.py::test_the_defaults_render_exactly_one_crd_bearing_resource`
+    runs a census over the assembled tree against a ONE-ENTRY exemption list. What a
+    default-true toggle forbids is the EMPTY-exemption form, `gateway.enabled` being
+    the one such toggle in this estate. That deployed census runs on the DEFAULT
+    render, where `autoscaling.enabled` is false, so it cannot see this object either —
+    covering the toggled-ON render is step 9's obligation. The rule is about the
+    toggle's DEFAULT, not about the API group.
     """
     rendered = objects(render_with_the_scaled_object().stdout)
     (scaled_object,) = scaled_objects(rendered)
