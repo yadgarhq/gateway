@@ -1,0 +1,181 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+  `compact` BEFORE THE EMPTINESS TEST, and that is not defensive noise. Helm
+  parses `--set networkPolicy.clients={}` into a list holding ONE EMPTY STRING,
+  not an empty list — measured, not assumed (ADR-0664) — so a bare truthiness
+  test passes and the `toYaml` below renders `from: - ""`. `compact` drops empty
+  and nil entries so both shapes reach the refusal, and a blank entry beside a
+  real peer is dropped rather than rendered for the same reason.
+*/}}
+{{- $clients := compact (.Values.networkPolicy.clients | default list) }}
+{{- if not $clients }}
+{{- fail "networkPolicy.enabled is true but networkPolicy.clients names no ingress source. This template refuses to render rather than emit a rule with an empty `from`, because an empty or missing `from` does NOT deny — the Kubernetes API defines it as matching ALL sources, so the rendered policy would open port 8080 to every pod in the cluster while still listing and describing as a control (ADR-0664). Name the peers that may reach gateway on 8080 — this chart ships NO default, and chart/values.yaml carries the block the reference deployment supplies — or set networkPolicy.enabled to false." }}
+{{- end }}
+# ONE INGRESS POLICY FOR `gateway`. It admits the ingress implementation's data
+# plane on 8080 and, when a scrape source is named, Prometheus on 9090.
+# Everything else that reaches these pods is dropped.
+#
+# THIS IS THE MODULE INGRESS POLICY OF THE EDGE, AND IT DIFFERS FROM ITS
+# SIBLINGS ON RULE 1 ALONE. Every other module chart's policy takes a list of
+# WORKLOAD NAMES and renders `podSelector: {app: <name>}` for each. That shape
+# cannot express this module's caller, and the reason is measured rather than
+# stylistic: the pods that dial `gateway:8080` are the ingress implementation's
+# data plane, which carries `app.kubernetes.io/name` and not `app`, and which
+# runs in ITS OWN namespace rather than beside this release. A bare
+# `podSelector` with no `namespaceSelector` matches THIS namespace only, so the
+# sibling shape would render a selector that matches no pod — accepted, listed
+# and describable, protecting nothing. `networkPolicy.clients` therefore holds
+# ingress PEERS here, written as the API writes them. Rule 2 is the siblings'
+# second rule unchanged.
+#
+# WHY THIS CHART CARRIES A POLICY AT ALL, GIVEN ADR-0685. That decision placed
+# the edge's allow-list in the repository that also declares the `Gateway`
+# object its selector is DERIVED from, on coupling locality. That copy stays
+# where it is FOR NOW — this template does not replace it and does not change
+# it — but not as a resting state: ADR-0774 owes an ordered train that retires
+# it once this chart's render is proved live. What ships here is ADR-0685's own
+# recorded viable alternative: "the template would carry no
+# ingress-implementation literal", because the `from` block arrives from values.
+#
+# WHAT AUTHORISES THIS PLACEMENT IS ADR-0774, NOT THAT SHAPE. The operator's
+# ruling of 2026-09-22 postdates ADR-0685 and names this object: everything
+# above the third-party operators must be deployable by the charts, so an
+# adopter with no access to this estate's deployment repository still gets an
+# allow-list. A values-supplied `from` does NOT defeat ADR-0685's rejection.
+# That rejection was on COUPLING LOCALITY; ADR-0685 had already conceded the
+# portability point in its own rationale, so defeating it leaves the rejection
+# standing. ADR-0774 accepts the coupling cost with its price named: the
+# `Gateway` name and the allow-list naming it sit in separate repositories,
+# chart-local placement makes that hazard WORSE rather than better, and nothing
+# refuses a selector that matches no pod. ADR-0774 carries that as an open
+# obligation — only a negative test finds it — and carries the retirement train
+# in its required order.
+#
+# WHY THIS DEFAULTS OFF, AND IT IS NOT THE REASON `autoscaling.enabled` IS OFF.
+# That default exists because KEDA's CRD may be absent and the chart would then
+# not install at all. A NetworkPolicy is core API and installs everywhere, so
+# that arm of D80 does not reach it; D80's fail-closed rule, read alone, argues
+# for `true`. The reason is ASYMMETRIC COST: a wrong policy on an enforcing CNI
+# is an outage, and an absent one is no worse than today. The allow-list is an
+# assertion about somebody else's topology on any other deployment. An adopter
+# with an enforcing CNI turns it on with one value and gets the whole baseline;
+# an adopter whose topology differs is not handed a silent partition on first
+# install.
+#
+# THE ALLOW-LIST IS A VALUE, NEVER A PATCH (D80 — configuration is the seam).
+#
+# NO EGRESS RULE, AND `policyTypes` IS WRITTEN OUT. Module egress policies are
+# declined: nothing here constrains this pod's own outbound traffic to task, iam
+# or kube-dns. `policyTypes: [Ingress]` is stated rather than inferred because
+# an omitted `policyTypes` derives the type set from which rule blocks happen to
+# be present — behaviour that changes when somebody adds a block, and exactly
+# the kind of implicit rule that makes a policy hard to reason about a year
+# later.
+#
+# THIS ADDS NO NAMESPACE-WIDE DEFAULT-DENY. Each policy covers only the pods its
+# own `podSelector` matches; a pod matched by no policy stays fully reachable.
+#
+# THE KUBELET EXEMPTION IS LOAD-BEARING HERE RATHER THAN MERELY REASSURING, and
+# ADR-0770 asks that the difference be stated. This pod's `readinessProbe` is a
+# `tcpSocket` on `http`, which IS port 8080 — the port rule 1 restricts. Kubelet
+# probe traffic originates on the NODE and a pod-selector ingress rule never
+# applies to it (ADR-0592), and that exemption is measured on this estate's CNI
+# against a policy whose enforcement is established independently (ADR-0688,
+# ADR-0770). ADR-0592's consequences assert the exemption "holds on any CNI";
+# that generality is UNMEASURED here and is not disproven — this estate holds no
+# measurement of any other CNI in either direction. An adopter whose CNI
+# subjects node-sourced traffic to pod-selector rules sees every replica go
+# NotReady and the EndpointSlice empty within seconds, which is the loudest way
+# for this to be wrong.
+#
+# WHAT A NETWORK CONTROL BUYS HERE THAT AUTHENTICATION CANNOT (ADR-0685). The
+# pre-authentication login throttle is keyed on the TCP peer address whenever
+# the trust boundary is undeclared, so a pod that can dial this port directly is
+# its own peer and receives its own fresh budget. The only control that can
+# constrain who becomes a peer is a network-layer one. ADR-0770 governs the
+# shape: 9090 serves metrics without authentication and is scoped by namespace
+# below, never left open to the cluster, and 8080 ships tighter than that.
+#
+# BEFORE YOU LABEL A PROBE POD TO TEST THIS, READ THE SERVICE SELECTOR. A label
+# this policy permits may ALSO be a Service's selector: `svc/gateway` selects
+# exactly `{"app":"gateway"}`. A throwaway pod wearing `app=gateway` is ADDED AS
+# A LIVE ENDPOINT of that Service — with no readinessProbe it is Ready at once —
+# and starts taking real front-door traffic, which is not a denial test but an
+# outage. Check `kubectl get svc/<name> -o jsonpath='{.spec.selector}'` first
+# and pick a label no Service selects.
+#
+# HOW A WRONG POLICY SHOWS UP: as a TIMEOUT, never a refusal. A drop logs
+# nothing, moves no counter and changes no object's state. Every pod stays
+# `1/1 Running` at restart count 0 and the Argo Application Healthy while every
+# external call fails. A real request through the edge is the only check that
+# sees it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  # `<chart>-ingress`, the name every module ingress policy in this estate
+  # carries.
+  name: {{ .Chart.Name }}-ingress
+  labels:
+    app: {{ .Chart.Name }}
+spec:
+  # WHOSE INGRESS THIS GOVERNS. `app: gateway` is exactly what this chart's
+  # Service selects and what its Deployment stamps on the pods, so the policy
+  # and the Service cannot come to cover different pods. A typo here produces a
+  # policy that is accepted, listed and described while matching NO pod —
+  # everything keeps working and nothing is protected, which is the quietest way
+  # for this file to be wrong. `scripts/tests/test_ingress_policy.py` compares
+  # this selector with the pod labels the SAME RENDER produces.
+  podSelector:
+    matchLabels:
+      app: {{ .Chart.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # THE CALLERS, ON THE SERVING PORT. 8080 is pinned by a literal here because
+    # it is the CONTAINER port — a NetworkPolicy port is the packet's
+    # destination port, so it must follow `containerPort` and `LISTEN`, which
+    # `templates/deployment.yaml` also pins as literals, and NOT
+    # `service.port`. Those two happen to be the same number today and a
+    # Service that translated them would make the difference decide the rule.
+    # The suite asserts this against the Deployment's own `containerPort` from
+    # the same render rather than against a second literal.
+    - ports:
+        - protocol: TCP
+          port: 8080
+      # EACH ENTRY IS ONE `from` PEER AND THE ENTRIES ARE AN **OR**, so a peer
+      # that names both a `namespaceSelector` and a `podSelector` in ONE entry
+      # is an AND and is narrower than the same two written as two entries.
+      # That distinction is the whole correctness of this block: two entries
+      # admit "any pod in that namespace" OR "any pod anywhere with those
+      # labels", which reads as correct and is far broader than intended.
+      from:
+        {{- toYaml $clients | nindent 8 }}
+    {{- if .Values.networkPolicy.scrapeFrom.namespace }}
+    # THE SCRAPE, ON THE METRICS PORT. Omitted entirely unless a source is
+    # named, because the source is deployment-specific and no chart default
+    # could be right. Getting this wrong is the quietest failure in the set:
+    # Prometheus targets for this module simply go down, nothing else changes,
+    # and KEDA's queries then return no data and its ScaledObjects stop
+    # tracking. Assert `up{...}` after enabling — a series COUNT matching the
+    # replica count, each value 1. An empty result set has no zeros in it
+    # either.
+    #
+    # 9090 IS NOT A DECLARED `containerPort`, AND THAT CHANGES NOTHING. A
+    # NetworkPolicy port is the packet's destination port; a `containerPort` is
+    # documentation. The process listens on 9090 either way, from
+    # `METRICS_LISTEN` in `templates/deployment.yaml`.
+    - ports:
+        - protocol: TCP
+          port: 9090
+      from:
+        # A `namespaceSelector` on the label Kubernetes sets on every namespace
+        # itself, so nothing has to be labelled by hand. This admits EVERY pod
+        # in that namespace to 9090, which is the trade for not coupling this
+        # chart to the pod labels of whatever runs the scrape. Prometheus
+        # scrapes the POD IP cross-namespace, so a rule naming the Service
+        # would allow nothing.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.scrapeFrom.namespace }}
+    {{- end }}
+{{- end }}

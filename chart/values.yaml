@@ -914,3 +914,97 @@ topologySpread:
   maxSkew: 1
   topologyKey: kubernetes.io/hostname
   whenUnsatisfiable: ScheduleAnyway
+
+# THE INGRESS ALLOW-LIST FOR THIS MODULE, rendered by
+# `templates/networkpolicy.yaml`.
+networkPolicy:
+  # OFF, AND NOT FOR THE REASON `autoscaling.enabled` IS OFF. That default
+  # exists because KEDA's CRD may be absent and the chart would then not install
+  # at all. A NetworkPolicy is core API and installs everywhere, so that arm of
+  # D80 does not reach it — read alone, D80's fail-closed rule argues for
+  # defaulting this `true`.
+  #
+  # The reason is ASYMMETRIC COST. A wrong policy on an enforcing CNI is an
+  # outage, and an absent one is no worse than today. The allow-list below is an
+  # assertion about somebody else's topology on any other deployment. An adopter
+  # with an enforcing CNI turns it on with one value and gets the whole
+  # baseline; an adopter whose topology differs is not handed a silent partition
+  # on first install.
+  enabled: false
+  # THE PEERS ALLOWED TO REACH 8080 — EMPTY, AND THAT IS MEASURED RATHER THAN A
+  # PLACEHOLDER.
+  #
+  # THIS KEY HOLDS `from` PEERS HERE, NOT WORKLOAD NAMES, AND THAT IS THE ONE
+  # PLACE THIS CHART DEPARTS FROM ITS SIBLINGS. Every other module chart's
+  # `networkPolicy.clients` holds names and renders `podSelector: {app: <name>}`
+  # for each. The pods that dial `gateway:8080` are the ingress
+  # implementation's data plane: they carry `app.kubernetes.io/name` rather than
+  # `app`, and they run in their OWN namespace rather than beside this release,
+  # while a bare `podSelector` matches this namespace only. The sibling shape
+  # would therefore render a selector matching no pod — accepted, listed and
+  # describable, protecting nothing. `chart/values.schema.json` types these
+  # entries as objects, so a list of names pasted from a sibling chart is
+  # REFUSED by the render naming this key rather than accepted and applied.
+  #
+  # NO DEFAULT, BECAUSE A DEFAULT HERE WOULD NAME AN INGRESS IMPLEMENTATION IN
+  # A MODULE CHART. ADR-0685 placed this estate's own copy of this allow-list in
+  # the repository that also declares the `Gateway` object its selector is
+  # derived from, and that copy stays there FOR NOW — ADR-0774 owes an ordered
+  # train that retires it. What this chart adds is that decision's own recorded
+  # viable alternative — a `from` supplied by values, so the template carries no
+  # ingress-implementation literal — and what AUTHORISES the chart-local
+  # placement is ADR-0774, which supersedes ADR-0685's placement clause and
+  # accepts the coupling-locality cost with its price named rather than arguing
+  # it away.
+  #
+  # THE BLOCK THE REFERENCE DEPLOYMENT SUPPLIES, for an estate fronted by Envoy
+  # Gateway. BOTH SELECTORS SIT IN ONE ENTRY, WHICH MEANS **AND**; written as
+  # two entries they are an OR admitting "any pod in that namespace" OR "any pod
+  # anywhere with those labels", which reads as correct and is far broader.
+  # `owning-gateway-name` and `owning-gateway-namespace` are derived by the
+  # controller from the `Gateway` object's own `metadata.name` and
+  # `metadata.namespace`, so they must agree with whoever renders that Gateway —
+  # rename it and this allow-list matches no pod, with nothing refusing the
+  # mismatch:
+  #
+  #   networkPolicy:
+  #     clients:
+  #       - namespaceSelector:
+  #           matchLabels:
+  #             kubernetes.io/metadata.name: envoy-gateway-system
+  #         podSelector:
+  #           matchLabels:
+  #             app.kubernetes.io/name: envoy
+  #             gateway.envoyproxy.io/owning-gateway-name: edge
+  #             gateway.envoyproxy.io/owning-gateway-namespace: yadgar
+  #
+  # EMPTY IS REFUSED WHILE `enabled` IS TRUE, and the template fails the render
+  # naming this value. That is not pedantry about a no-op. An empty or missing
+  # `from` matches ALL sources per the Kubernetes API, so the policy would open
+  # 8080 to every pod in the cluster while still listing and describing as a
+  # control (ADR-0664). `fail` ABORTS THE ENTIRE CHART RENDER rather than this
+  # one template, so the day a shared values block sets `enabled: true` across
+  # every module uniformly, THIS CHART'S WHOLE APPLICATION REFUSES TO SYNC until
+  # this list names a peer. That is deliberate. Do not special-case the template
+  # to skip the policy quietly when this list is empty — that would install the
+  # chart with 8080 open to every pod while a reviewer reading
+  # `networkPolicy.enabled: true` believed the edge was covered.
+  clients: []
+  # WHERE THE METRICS SCRAPE COMES FROM. Empty renders NO rule for port 9090 at
+  # all, so a bare install exposes the metrics port to nobody rather than to a
+  # guessed namespace. Set `namespace:` and the template admits that namespace:
+  #
+  #   networkPolicy:
+  #     scrapeFrom:
+  #       namespace: observability
+  #
+  # DEPLOYMENT-SPECIFIC BY NATURE, which is why there is no default. The
+  # reference deployment sets it in `yadgarhq/argocd`'s ApplicationSet, in the
+  # shared `values:` block that already carries `autoscaling.enabled` and
+  # `tls.enabled` — the one place that reaches every module uniformly without
+  # naming any of them (D54).
+  #
+  # 9090 SERVES METRICS WITHOUT AUTHENTICATION, so ADR-0770 governs this rule:
+  # it is scoped to one named namespace, never left open to the cluster, and it
+  # is absent entirely until a namespace is named.
+  scrapeFrom: {}

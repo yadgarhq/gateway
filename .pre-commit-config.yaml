@@ -99,25 +99,75 @@ repos:
       # with a reason. This repository had never run it before this PR.
       - id: boot-reads-watched
       - id: no-test-skips
-      # LEDGER 511, and this repository adopts ONE of the two halves ADR-0685
-      # split that gate into. `chart-baseline` asserts the three fields that are
+      # LEDGER 511, and this repository now adopts BOTH halves ADR-0685 split
+      # that gate into. `chart-baseline` asserts the three fields that are
       # properties of the chart's own pod spec: the grace period against
       # ADR-0601's floor, a dedicated ServiceAccount with no API token, and a
       # hostname topology spread carrying `ScheduleAnyway` so it cannot hang a
-      # roll. ADR-0577 makes a published hook inert until a repository
-      # references it, so this line is what enforces those three here for the
-      # first time. Measured on this tree at v1.22.0: 1 chart, 1 judged, 29
-      # assertions evaluated, 0 findings.
+      # roll. `chart-network-policy` asserts the fourth, that a template declares
+      # `kind: NetworkPolicy`. ADR-0577 makes a published hook inert until a
+      # repository references it, so these two lines are what enforce those four
+      # here.
       #
-      # `chart-network-policy` IS DELIBERATELY ABSENT, AND THE ABSENCE IS THE
-      # WHOLE MECHANISM. This repository's ingress policy lives in
-      # `yadgarhq/deploy` as `infra/network-policies/gateway-ingress.yaml`,
-      # because its allow-list names the Envoy Gateway data plane and a policy
-      # validated against one ingress implementation does not belong in a module
-      # chart (D80). ADR-0685 split the gate on exactly that boundary rather
-      # than granting an exemption: an exemption keyed on `kind: HTTPRoute`
-      # encodes "ships an HTTPRoute" while the reason is "is edge-facing", so
-      # the next edge-facing module would inherit it with nothing red. There is
-      # therefore no skip, no exclude and no marker anywhere for it — not
-      # referencing the hook is the entire statement.
+      # `chart-network-policy` IS NOW REFERENCED, AND THIS BLOCK USED TO SAY THE
+      # OPPOSITE. It read that the hook was deliberately absent and that the
+      # absence was the whole mechanism, because this repository's ingress policy
+      # lived only in `yadgarhq/deploy` as
+      # `infra/network-policies/gateway-ingress.yaml`. THAT COPY IS UNCHANGED FOR
+      # NOW and stays where ADR-0685 placed it, but not as a resting state:
+      # ADR-0774 owes an ordered train that retires it once this chart's render
+      # is proved live.
+      #
+      # WHAT CHANGED IS THAT THIS CHART NOW RENDERS ONE TOO, for an adopter, and
+      # ADR-0774 is what authorises it. That decision supersedes ADR-0685's
+      # placement clause on the operator's ruling of 2026-09-22, which postdates
+      # ADR-0685 and names this object. It does NOT argue the coupling-locality
+      # objection away: a values-supplied `from` never defeated it, and the cost
+      # is accepted with its price named. `templates/networkpolicy.yaml` carries
+      # the argument in full. ADR-0685's gate split stands and is not an
+      # exemption mechanism — this repository simply now has a chart-local policy
+      # for the half to judge.
+      #
+      # Measured on this tree at v1.22.0: chart-baseline 1 chart, 1 judged, 29
+      # assertions evaluated, 0 findings; chart-network-policy 1 chart, 1 judged,
+      # 1 assertion evaluated, 0 findings. Both halves carry floors —
+      # `MINIMUM_CHARTS`, `MINIMUM_ASSERTIONS` and a `judged == charts` check — so
+      # a half that examined nothing is red rather than green.
       - id: chart-baseline
+      - id: chart-network-policy
+
+  # LOCAL, because it is this repository's own content assertion rather than a rule
+  # the estate shares. Until this hook the chart was covered by `helm lint --strict`
+  # and the two shared `chart-*` hooks alone — none of which asserts what the chart
+  # RENDERS — so `scripts/tests/` is this chart's first content assertion and this
+  # line is what makes it run. The Rust suites in `tests/` that read `chart/` read
+  # its VALUES as text; none of them renders the chart, and a policy's correctness
+  # is a property of the rendered object.
+  #
+  # INSIDE THE MERGE GATE. `ci-pr.yaml`'s `passed` job lists `precommit` in its
+  # `needs`, and the ruleset on `main` requires the check `ci / passed`, so a red
+  # case here blocks the merge rather than reporting beside it.
+  #
+  # `language: python` rather than `system`, so pre-commit provisions the
+  # interpreter, pytest and PyYAML. PYYAML IS FOR THE SUBJECT AS WELL AS THE SUITE:
+  # every case there parses a `helm template` render. Both pins match
+  # `yadgarhq/platform`'s and `yadgarhq/iam-db`'s copies of this block.
+  #
+  # HELM IS NOT PROVISIONED BY THIS HOOK and the suite does not skip without it — it
+  # fails, naming helm (ADR-0650). `ci-pr.yaml`'s `precommit` job installs helm
+  # v3.18.4 before it runs pre-commit, and the suite is measured on that version and
+  # on 4.3.0.
+  #
+  # `always_run` with `pass_filenames: false`, and `files:` is omitted rather than
+  # written as documentation: a hook filtered on `^scripts/` reports `Skipped`, exit
+  # 0, on a pull request that changes only `chart/values.yaml` — which is exactly the
+  # pull request whose rendered instance this suite exists to check.
+  - repo: local
+    hooks:
+      - id: pytest-scripts
+        name: pytest scripts/tests
+        language: python
+        additional_dependencies: ["pytest==9.1.1", "pyyaml==6.0.3"]
+        entry: pytest scripts/tests/ -q
+        pass_filenames: false
+        always_run: true
