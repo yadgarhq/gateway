@@ -579,6 +579,23 @@ autoscaling:
   # (autoscaling.enabled=true in its values for this chart) to get the scaling
   # behaviour described below.
   enabled: false
+
+  # THE GROUP-AND-VERSION STRING THE RENDER CHECK NAMES, recorded here beside the
+  # toggle so an operator upgrade that moved the version turns the check red rather
+  # than silently weakening it. Read off KEDA at the version the estate pins,
+  # `yadgarhq/deploy`'s `infra/keda.yaml` — chart `keda` from
+  # https://kedacore.github.io/charts.
+  # `chart/templates/render-checks.yaml` passes the same string as a literal, because
+  # the suite reads the invocation's arguments off the template;
+  # `test_autoscaling.py::test_the_render_check_names_the_group_the_values_file_records`
+  # is the gate that keeps the two one.
+  #
+  # NAMED `kedaOperator` RATHER THAN `keda`, so one concept has one spelling inside one
+  # file. The `-db` charts record theirs at `database.mariadbOperator.apiVersion`, and
+  # the chart that carries both keys carries them in a SINGLE values file an adopter
+  # reads top to bottom. `<operator>Operator.apiVersion` is that one spelling.
+  kedaOperator:
+    apiVersion: keda.sh/v1alpha1
   minReplicas: 2
   # At least two, always (D55) — the floor is a correctness property, not a
   # tuning knob: one replica makes a class of defect unreachable.
