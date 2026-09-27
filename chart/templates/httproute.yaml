@@ -36,7 +36,9 @@ spec:
       # hostname nobody expects.
       sectionName: {{ .Values.gateway.listener }}
   hostnames:
-    - {{ .Values.gateway.hostname | quote }}
+    {{- /* `gateway.hostname`, else `global.hostname` (ADR-0808); see
+    `_hostname.tpl` for the order. */}}
+    - {{ include "gateway.hostname" (dict "local" .Values.gateway.hostname "context" $) | quote }}
   rules:
     # MCP is ONE endpoint and every request is a POST to it, so a single prefix
     # rule at / is the whole routing table. There is no per-method or per-tool

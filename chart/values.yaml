@@ -650,7 +650,14 @@ gateway:
   enabled: true
   name: edge
   listener: https
-  hostname: gateway.yadgar.internal
+  # EMPTY HERE, AND THAT IS NOT "UNSET". It falls back to `global.hostname`, the
+  # one place an adopter states the estate's hostname (ADR-0808), and to
+  # `gateway.yadgar.internal` when that is empty too. A value set here still wins
+  # over `global.hostname`. `templates/_hostname.tpl` holds the order. It
+  # defaults to empty rather than to `gateway.yadgar.internal` because a
+  # non-empty default cannot be told apart from a value somebody set, so the
+  # global would never be read.
+  hostname: ""
 
 # WHERE A REQUEST CAME FROM, and whether this deployment can vouch for it
 # (ADR-0491, D80).
