@@ -1511,10 +1511,29 @@ async fn state_resolving_to(
     answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
     ttl: std::time::Duration,
 ) -> (Arc<AppState>, Arc<std::sync::atomic::AtomicUsize>) {
+    state_resolving_to_with_task(
+        answer,
+        ttl,
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+    )
+    .await
+}
+
+/// The same gateway, with `task` pointed at `task` rather than at nothing.
+///
+/// A SIBLING rather than a new parameter on [`state_resolving_to`], so every
+/// test written against an unreachable `task` keeps one. The tools that
+/// dispatch are asserted in `src/http/tests/task_tools.rs`, against a fake
+/// that records what arrived.
+async fn state_resolving_to_with_task(
+    answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
+    ttl: std::time::Duration,
+    task: Channel,
+) -> (Arc<AppState>, Arc<std::sync::atomic::AtomicUsize>) {
     let (iam, resolves) = stub_iam(answer).await;
     let state = Arc::new(AppState {
         attestation: Attestation::Iam,
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task,
         iam,
         credentials: crate::attest::Credentials::new(ttl),
         // GENEROUS, unlike the shared `state_with` above, and it is load-bearing.
@@ -2974,3 +2993,8 @@ fn with_no_registry_an_enforcing_gateway_answers_an_availability_failure() {
         "and the reason is distinct from every refusal reason: {body}"
     );
 }
+
+/// `edit_task` and `transition_task` through the real router, against a fake
+/// `task`. A child module so it reaches this file's harness without widening
+/// any of it.
+mod task_tools;

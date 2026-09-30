@@ -8,10 +8,13 @@ use serde_json::{json, Value};
 use tonic::transport::Channel;
 
 use crate::pb::yadgar::common::v1::{Idempotency, Scope};
+use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::{
     read_task_request::Key, task_service_client::TaskServiceClient, CreateTaskRequest,
     FindTasksRequest, FindTasksResponse, ReadTaskRequest,
 };
+
+mod change;
 
 /// A tool's name, as a bounded value.
 ///
@@ -22,6 +25,8 @@ use crate::pb::yadgar::taskapi::v1::{
 pub const CREATE_TASK: &str = "create_task";
 pub const READ_TASK: &str = "read_task";
 pub const FIND_TASKS: &str = "find_tasks";
+pub const EDIT_TASK: &str = "edit_task";
+pub const TRANSITION_TASK: &str = "transition_task";
 
 /// EVERY tool this gateway serves, stated ONCE.
 ///
@@ -39,13 +44,19 @@ pub const FIND_TASKS: &str = "find_tasks";
 /// names yields a module string, a JSON schema, or a dispatch — but each gates
 /// on membership here first, so a name outside this array reaches none of them.
 /// **Adding a tool anywhere is adding it HERE.**
-pub const SERVED: [&str; 3] = [CREATE_TASK, READ_TASK, FIND_TASKS];
+pub const SERVED: [&str; 5] = [
+    CREATE_TASK,
+    READ_TASK,
+    FIND_TASKS,
+    EDIT_TASK,
+    TRANSITION_TASK,
+];
 
 /// Whether `name` is a tool this gateway serves.
 ///
 /// **THE GUARD BEING THE ONLY ROUTE INTO EACH FUNCTION BELOW IS A REVIEW
 /// OBLIGATION, NOT AN ASSERTED ONE**, and it is stated here rather than left to
-/// be discovered. `the_served_set_is_exactly_the_three_task_tools` bounds the
+/// be discovered. `the_served_set_is_exactly_the_five_task_tools` bounds the
 /// ARRAY; nothing bounds the derivation. A `match` arm added AHEAD of one of
 /// these calls makes a verb reachable with the array untouched, and the tests
 /// catch it only if the verb happens to be one they probe by name. Read the
@@ -67,7 +78,7 @@ pub fn label_for(name: &str) -> Option<&'static str> {
 /// Whether a tool writes. Decides `CallRecord.kind`, and a wrong answer here
 /// makes read and write traffic indistinguishable in the roll-ups.
 pub fn is_write(name: &str) -> bool {
-    name == CREATE_TASK
+    matches!(name, CREATE_TASK | EDIT_TASK | TRANSITION_TASK)
 }
 
 /// The MODULE a tool belongs to, as a bounded value.
@@ -89,7 +100,7 @@ pub fn module_for(name: &str) -> Option<&'static str> {
         return None;
     }
     match name {
-        CREATE_TASK | READ_TASK | FIND_TASKS => Some("task"),
+        CREATE_TASK | READ_TASK | FIND_TASKS | EDIT_TASK | TRANSITION_TASK => Some("task"),
         _ => None,
     }
 }
@@ -151,6 +162,48 @@ fn definition(name: &str) -> Value {
                 },
             }),
         ),
+        EDIT_TASK => (
+            "Edit a task",
+            "Change a task's title, body, or both. Only the fields sent are \
+             written; send at least one. Status is changed with transition_task, \
+             never here. Refused if the task's version is not expect_version.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
+                    "expect_version": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "The version last read; the edit is refused if it moved",
+                    },
+                    "title": { "type": "string", "description": "New short summary" },
+                    "body": { "type": "string", "description": "New full description; empty clears it" },
+                },
+                "required": ["id", "expect_version"],
+            }),
+        ),
+        TRANSITION_TASK => (
+            "Transition a task",
+            "Move a task to another status. The module decides which moves are \
+             legal. Refused if the task's version is not expect_version.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
+                    "expect_version": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "The version last read; the move is refused if it moved",
+                    },
+                    "to": {
+                        "type": "string",
+                        "enum": change::TARGETS,
+                        "description": "The status to move to",
+                    },
+                },
+                "required": ["id", "expect_version", "to"],
+            }),
+        ),
         // Unreachable for a member of `SERVED`, and deliberately not a panic.
         _ => ("", "", Value::Null),
     };
@@ -204,6 +257,17 @@ fn find_tasks_output(resp: FindTasksResponse) -> Output {
         }),
         rows,
     }
+}
+
+/// A status as a client reads it: the enum's name, lowercased, prefix stripped.
+fn status_name(status: i32) -> String {
+    TaskStatus::try_from(status)
+        .map(|s| {
+            s.as_str_name()
+                .trim_start_matches("TASK_STATUS_")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_else(|_| "unspecified".to_string())
 }
 
 /// Call one tool.
@@ -320,6 +384,9 @@ pub async fn call(
             Ok(find_tasks_output(resp))
         }
 
+        EDIT_TASK => change::edit(&mut client, scope, args).await,
+        TRANSITION_TASK => change::transition(&mut client, scope, args).await,
+
         other => Err(ToolError::Unknown(other.to_string())),
     }
 }
@@ -352,13 +419,7 @@ impl From<Option<crate::pb::yadgar::task::v1::Task>> for TaskView {
             // The enum's own name, lowercased and stripped of its prefix — a
             // number would make the payload unreadable and would silently change
             // meaning if the enum were ever reordered.
-            status: crate::pb::yadgar::task::v1::TaskStatus::try_from(task.status)
-                .map(|s| {
-                    s.as_str_name()
-                        .trim_start_matches("TASK_STATUS_")
-                        .to_ascii_lowercase()
-                })
-                .unwrap_or_else(|_| "unspecified".to_string()),
+            status: status_name(task.status),
             version: meta.version,
         }
     }
