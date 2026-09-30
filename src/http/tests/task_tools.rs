@@ -36,6 +36,9 @@ use crate::pb::yadgar::taskapi::v1::{
 const RETURNED_ID: &str = "yadgar:task:returned-by-the-fake-c41d";
 const RETURNED_VERSION: u64 = 9_173;
 
+/// The version the fake refuses as stale, as `task-db`'s compare-and-set does.
+const STALE_VERSION: u64 = 13_131;
+
 /// The identity the forged header claims. It must never reach `task`.
 const FORGED_USER: &str = "mallory-forged-in-a-header";
 
@@ -64,7 +67,12 @@ impl TaskService for FakeTask {
         request: tonic::Request<EditTaskRequest>,
     ) -> Result<tonic::Response<EditTaskResponse>, tonic::Status> {
         self.0.hits.fetch_add(1, Ordering::SeqCst);
-        self.0.edits.lock().unwrap().push(request.into_inner());
+        let req = request.into_inner();
+        let stale = req.expect_version == STALE_VERSION;
+        self.0.edits.lock().unwrap().push(req);
+        if stale {
+            return Err(tonic::Status::failed_precondition("version moved"));
+        }
         Ok(tonic::Response::new(EditTaskResponse {
             meta: returned_meta(),
         }))
@@ -75,11 +83,12 @@ impl TaskService for FakeTask {
         request: tonic::Request<TransitionTaskRequest>,
     ) -> Result<tonic::Response<TransitionTaskResponse>, tonic::Status> {
         self.0.hits.fetch_add(1, Ordering::SeqCst);
-        self.0
-            .transitions
-            .lock()
-            .unwrap()
-            .push(request.into_inner());
+        let req = request.into_inner();
+        let stale = req.expect_version == STALE_VERSION;
+        self.0.transitions.lock().unwrap().push(req);
+        if stale {
+            return Err(tonic::Status::failed_precondition("version moved"));
+        }
         Ok(tonic::Response::new(TransitionTaskResponse {
             meta: returned_meta(),
             // Not the target, so a gateway echoing `to` back as `from` fails.
@@ -343,6 +352,84 @@ async fn a_call_missing_a_required_field_never_reaches_task() {
             seen.hits.load(Ordering::SeqCst),
             0,
             "{tool}: a refused call must not reach `task`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_title_only_edit_leaves_the_body_out_of_the_mask() {
+    // THE MIRROR OF THE BODY-ONLY CASE, and the one that loses data if wrong:
+    // a mask naming `body` here would write the empty body below over the
+    // task's real one.
+    let (state, seen) = gateway().await;
+
+    let (status, body) = call(
+        state,
+        "edit_task",
+        json!({ "id": "yadgar:task:sentinel-title-only", "expect_version": 8, "title": "sentinel only title k2" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let edits = seen.edits.lock().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(
+        edits[0].update_mask.as_ref().expect("a mask").paths,
+        ["title"]
+    );
+    assert_eq!(edits[0].title, "sentinel only title k2");
+    assert_eq!(edits[0].body, "", "no body was sent, so none is carried");
+}
+
+#[tokio::test]
+async fn a_null_body_is_absent_and_does_not_clear_the_body() {
+    // Null means "not sent", as on `create_task`. Clearing is `""`, and only
+    // `""` — a client that fills omitted arguments with null must not wipe a
+    // body it never meant to touch.
+    let (state, seen) = gateway().await;
+
+    let (status, body) = call(
+        state,
+        "edit_task",
+        json!({ "id": "yadgar:task:sentinel-null-body", "expect_version": 8, "title": "sentinel n7", "body": null }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let edits = seen.edits.lock().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(
+        edits[0].update_mask.as_ref().expect("a mask").paths,
+        ["title"]
+    );
+}
+
+#[tokio::test]
+async fn a_stale_version_is_a_tool_failure_not_a_protocol_error() {
+    // `task` answers a moved version with FAILED_PRECONDITION. Through the
+    // router that must be a 200 carrying `isError: true` — the request was
+    // well-formed MCP, and the caller's next step is to re-read, not to fix
+    // its envelope.
+    for (tool, args) in [
+        (
+            "edit_task",
+            json!({ "id": "yadgar:task:x", "expect_version": STALE_VERSION, "title": "t" }),
+        ),
+        (
+            "transition_task",
+            json!({ "id": "yadgar:task:x", "expect_version": STALE_VERSION, "to": "done" }),
+        ),
+    ] {
+        let (state, seen) = gateway().await;
+        let (status, body) = call(state, tool, args).await;
+        assert_eq!(seen.hits.load(Ordering::SeqCst), 1, "{tool} reached task");
+        assert_eq!(status, StatusCode::OK, "{tool}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{tool}: {body}");
+        assert!(
+            body["error"].is_null(),
+            "{tool}: not a JSON-RPC error: {body}"
         );
     }
 }

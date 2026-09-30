@@ -40,28 +40,50 @@ fn target(name: &str) -> Option<TaskStatus> {
 /// row holds rather than a wildcard, so a missing one would come back as an
 /// opaque FAILED_PRECONDITION instead of saying what the caller left out.
 fn target_task(args: &Value) -> Result<(String, u64), ToolError> {
-    let id = args
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::Invalid("`id` is required".into()))?;
-    let version = args
-        .get("expect_version")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| ToolError::Invalid("`expect_version` is required".into()))?;
+    let id = required_str(args, "id")?;
+    let version = present(args, "expect_version")
+        .ok_or_else(|| ToolError::Invalid("`expect_version` is required".into()))?
+        .as_u64()
+        .ok_or_else(|| {
+            ToolError::Invalid("`expect_version` must be a non-negative integer".into())
+        })?;
     Ok((id.to_string(), version))
 }
 
-/// An optional string argument: absent, or a string. Any other type is refused
-/// rather than read as absent, because for `edit_task` absent means "leave it".
-fn optional_str<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, ToolError> {
-    match args.get(field) {
-        None => Ok(None),
-        Some(v) => v
-            .as_str()
-            .map(Some)
-            .ok_or_else(|| ToolError::Invalid(format!("`{field}` must be a string"))),
-    }
+/// An argument that was SENT. JSON `null` counts as not sent, as it does for
+/// `create_task`: some clients fill every omitted optional argument with null.
+fn present<'a>(args: &'a Value, field: &str) -> Option<&'a Value> {
+    args.get(field).filter(|v| !v.is_null())
 }
+
+/// A required string argument. Missing and mistyped get different answers, so
+/// a caller is not sent hunting for a spelling mistake it did not make.
+fn required_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
+    present(args, field)
+        .ok_or_else(|| ToolError::Invalid(format!("`{field}` is required")))?
+        .as_str()
+        .ok_or_else(|| ToolError::Invalid(format!("`{field}` must be a string")))
+}
+
+/// An optional string argument: absent (or null), or a string. Any other type
+/// is refused rather than read as absent, because for `edit_task` absent means
+/// "leave it". **Null is absent, never "clear"** — `""` is how a field is
+/// cleared, so a null can never wipe a field the caller did not mean to touch.
+fn optional_str<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, ToolError> {
+    present(args, field)
+        .map(|v| {
+            v.as_str()
+                .ok_or_else(|| ToolError::Invalid(format!("`{field}` must be a string")))
+        })
+        .transpose()
+}
+
+/// Keys an edit REFUSES, because a caller sending one means to change status.
+///
+/// Every other unknown key is ignored, as `create_task` ignores them. These two
+/// are the exception because ignoring them turns a status change into a
+/// title-only SUCCESS, and the caller would believe the status moved.
+const STATUS_KEYS: [&str; 2] = ["status", "to"];
 
 /// Dispatch `edit_task`.
 pub(super) async fn edit(
@@ -69,6 +91,11 @@ pub(super) async fn edit(
     scope: Scope,
     args: &Value,
 ) -> Result<Output, ToolError> {
+    if let Some(key) = STATUS_KEYS.into_iter().find(|k| present(args, k).is_some()) {
+        return Err(ToolError::Invalid(format!(
+            "`{key}` cannot be edited; change a task's status with transition_task"
+        )));
+    }
     let (id, expect_version) = target_task(args)?;
     let title = optional_str(args, "title")?;
     let body = optional_str(args, "body")?;
@@ -117,11 +144,7 @@ pub(super) async fn transition(
     args: &Value,
 ) -> Result<Output, ToolError> {
     let (id, expect_version) = target_task(args)?;
-    let to = args
-        .get("to")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::Invalid("`to` is required".into()))?;
-    let to = target(to)
+    let to = target(required_str(args, "to")?)
         .ok_or_else(|| ToolError::Invalid(format!("`to` must be one of {}", TARGETS.join(", "))))?;
 
     let resp = client
@@ -140,8 +163,8 @@ pub(super) async fn transition(
     Ok(Output {
         // `from` as `task` reported it. On a replay of an applied
         // transition it equals the target — a known gap in `task`, not
-        // something this gateway can correct. It cannot arise from a
-        // gateway retry today: the key is minted per inbound call.
+        // something this gateway can correct. This gateway has no retry
+        // layer toward modules, so it never replays a key itself.
         content: json!({
             "id": meta.id,
             "version": meta.version,

@@ -313,3 +313,85 @@ fn the_edit_schema_requires_the_id_and_the_version_it_compares_against() {
         assert_eq!(edit["inputSchema"]["properties"][field]["type"], "string");
     }
 }
+
+/// The refusal's MESSAGE, for the tests that pin which one a caller gets.
+async fn refusal_message(name: &str, args: Value) -> String {
+    match refusal(name, args.clone()).await {
+        ToolError::Invalid(msg) => msg,
+        other => panic!("{args} must be refused as the caller's error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_missing_field_and_a_mistyped_one_are_told_apart() {
+    // "is required" for a field that is not there, a type complaint for one
+    // that is. A caller told `id` is required when it sent `id: 7` looks for
+    // a spelling mistake that is not there.
+    for (tool, args, expected) in [
+        (
+            "edit_task",
+            json!({ "expect_version": 3, "title": "t" }),
+            "`id` is required",
+        ),
+        (
+            "edit_task",
+            json!({ "id": 7, "expect_version": 3, "title": "t" }),
+            "`id` must be a string",
+        ),
+        (
+            "edit_task",
+            json!({ "id": "yadgar:task:x", "title": "t" }),
+            "`expect_version` is required",
+        ),
+        (
+            "edit_task",
+            json!({ "id": "yadgar:task:x", "expect_version": "3", "title": "t" }),
+            "`expect_version` must be a non-negative integer",
+        ),
+        (
+            "transition_task",
+            json!({ "id": "yadgar:task:x", "expect_version": -1, "to": "done" }),
+            "`expect_version` must be a non-negative integer",
+        ),
+        (
+            "transition_task",
+            json!({ "id": "yadgar:task:x", "expect_version": 3 }),
+            "`to` is required",
+        ),
+        (
+            "transition_task",
+            json!({ "id": "yadgar:task:x", "expect_version": 3, "to": 4 }),
+            "`to` must be a string",
+        ),
+    ] {
+        let msg = refusal_message(tool, args.clone()).await;
+        assert_eq!(msg, expected, "{tool} {args}");
+    }
+}
+
+#[tokio::test]
+async fn edit_task_refuses_a_status_change_and_names_the_tool_that_makes_one() {
+    // A caller who sends a status to `edit_task` must not get a title-only
+    // SUCCESS and believe the status moved too.
+    for key in ["status", "to"] {
+        let mut args = json!({ "id": "yadgar:task:x", "expect_version": 3, "title": "t" });
+        args[key] = json!("done");
+        let msg = refusal_message("edit_task", args).await;
+        assert!(
+            msg.contains("transition_task"),
+            "`{key}` must be refused with a pointer to transition_task, got {msg:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_edit_whose_fields_are_all_null_has_nothing_to_edit() {
+    // Null is ABSENT, as `create_task` reads it. So an all-null edit is an
+    // empty edit, and must hit the same refusal rather than clearing both.
+    let msg = refusal_message(
+        "edit_task",
+        json!({ "id": "yadgar:task:x", "expect_version": 3, "title": null, "body": null }),
+    )
+    .await;
+    assert!(msg.contains("nothing to edit"), "got {msg:?}");
+}
