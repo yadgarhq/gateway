@@ -8,9 +8,10 @@ use serde_json::{json, Value};
 use tonic::transport::Channel;
 
 use crate::pb::yadgar::common::v1::{Idempotency, Scope};
+use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::{
     read_task_request::Key, task_service_client::TaskServiceClient, CreateTaskRequest,
-    FindTasksRequest, FindTasksResponse, ReadTaskRequest,
+    EditTaskRequest, FindTasksRequest, FindTasksResponse, ReadTaskRequest, TransitionTaskRequest,
 };
 
 /// A tool's name, as a bounded value.
@@ -22,6 +23,8 @@ use crate::pb::yadgar::taskapi::v1::{
 pub const CREATE_TASK: &str = "create_task";
 pub const READ_TASK: &str = "read_task";
 pub const FIND_TASKS: &str = "find_tasks";
+pub const EDIT_TASK: &str = "edit_task";
+pub const TRANSITION_TASK: &str = "transition_task";
 
 /// EVERY tool this gateway serves, stated ONCE.
 ///
@@ -39,13 +42,19 @@ pub const FIND_TASKS: &str = "find_tasks";
 /// names yields a module string, a JSON schema, or a dispatch — but each gates
 /// on membership here first, so a name outside this array reaches none of them.
 /// **Adding a tool anywhere is adding it HERE.**
-pub const SERVED: [&str; 3] = [CREATE_TASK, READ_TASK, FIND_TASKS];
+pub const SERVED: [&str; 5] = [
+    CREATE_TASK,
+    READ_TASK,
+    FIND_TASKS,
+    EDIT_TASK,
+    TRANSITION_TASK,
+];
 
 /// Whether `name` is a tool this gateway serves.
 ///
 /// **THE GUARD BEING THE ONLY ROUTE INTO EACH FUNCTION BELOW IS A REVIEW
 /// OBLIGATION, NOT AN ASSERTED ONE**, and it is stated here rather than left to
-/// be discovered. `the_served_set_is_exactly_the_three_task_tools` bounds the
+/// be discovered. `the_served_set_is_exactly_the_five_task_tools` bounds the
 /// ARRAY; nothing bounds the derivation. A `match` arm added AHEAD of one of
 /// these calls makes a verb reachable with the array untouched, and the tests
 /// catch it only if the verb happens to be one they probe by name. Read the
@@ -67,7 +76,7 @@ pub fn label_for(name: &str) -> Option<&'static str> {
 /// Whether a tool writes. Decides `CallRecord.kind`, and a wrong answer here
 /// makes read and write traffic indistinguishable in the roll-ups.
 pub fn is_write(name: &str) -> bool {
-    name == CREATE_TASK
+    matches!(name, CREATE_TASK | EDIT_TASK | TRANSITION_TASK)
 }
 
 /// The MODULE a tool belongs to, as a bounded value.
@@ -89,7 +98,7 @@ pub fn module_for(name: &str) -> Option<&'static str> {
         return None;
     }
     match name {
-        CREATE_TASK | READ_TASK | FIND_TASKS => Some("task"),
+        CREATE_TASK | READ_TASK | FIND_TASKS | EDIT_TASK | TRANSITION_TASK => Some("task"),
         _ => None,
     }
 }
@@ -151,6 +160,48 @@ fn definition(name: &str) -> Value {
                 },
             }),
         ),
+        EDIT_TASK => (
+            "Edit a task",
+            "Change a task's title, body, or both. Only the fields sent are \
+             written; send at least one. Status is changed with transition_task, \
+             never here. Refused if the task's version is not expect_version.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
+                    "expect_version": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "The version last read; the edit is refused if it moved",
+                    },
+                    "title": { "type": "string", "description": "New short summary" },
+                    "body": { "type": "string", "description": "New full description; empty clears it" },
+                },
+                "required": ["id", "expect_version"],
+            }),
+        ),
+        TRANSITION_TASK => (
+            "Transition a task",
+            "Move a task to another status. The module decides which moves are \
+             legal. Refused if the task's version is not expect_version.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
+                    "expect_version": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "The version last read; the move is refused if it moved",
+                    },
+                    "to": {
+                        "type": "string",
+                        "enum": TARGETS,
+                        "description": "The status to move to",
+                    },
+                },
+                "required": ["id", "expect_version", "to"],
+            }),
+        ),
         // Unreachable for a member of `SERVED`, and deliberately not a panic.
         _ => ("", "", Value::Null),
     };
@@ -203,6 +254,64 @@ fn find_tasks_output(resp: FindTasksResponse) -> Output {
             "next_page_token": resp.next_page_token,
         }),
         rows,
+    }
+}
+
+/// The statuses a transition may name, in the spelling [`TaskView`] emits.
+///
+/// `unspecified` is absent: it is the proto's zero value and no task can be
+/// moved to it. Which of these is legal FROM a given status is `task`'s rule,
+/// not this gateway's, so the list is every target and nothing more.
+const TARGETS: [&str; 5] = ["open", "in_progress", "blocked", "done", "dropped"];
+
+/// The tool's spelling of a status, to the proto's.
+///
+/// Through [`TARGETS`] first, so the only spellings accepted are the ones the
+/// schema advertises — `from_str_name` alone would also take `unspecified`.
+fn target(name: &str) -> Option<TaskStatus> {
+    TARGETS
+        .contains(&name)
+        .then(|| TaskStatus::from_str_name(&format!("TASK_STATUS_{}", name.to_ascii_uppercase())))
+        .flatten()
+}
+
+/// A status as a client reads it: the enum's name, lowercased, prefix stripped.
+fn status_name(status: i32) -> String {
+    TaskStatus::try_from(status)
+        .map(|s| {
+            s.as_str_name()
+                .trim_start_matches("TASK_STATUS_")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_else(|_| "unspecified".to_string())
+}
+
+/// The `id` and `expect_version` every write to an existing task carries.
+///
+/// **`expect_version` IS REQUIRED, not defaulted.** Upstream, 0 is a version no
+/// row holds rather than a wildcard, so a missing one would come back as an
+/// opaque FAILED_PRECONDITION instead of saying what the caller left out.
+fn target_task(args: &Value) -> Result<(String, u64), ToolError> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::Invalid("`id` is required".into()))?;
+    let version = args
+        .get("expect_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ToolError::Invalid("`expect_version` is required".into()))?;
+    Ok((id.to_string(), version))
+}
+
+/// An optional string argument: absent, or a string. Any other type is refused
+/// rather than read as absent, because for `edit_task` absent means "leave it".
+fn optional_str<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, ToolError> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| ToolError::Invalid(format!("`{field}` must be a string"))),
     }
 }
 
@@ -320,6 +429,85 @@ pub async fn call(
             Ok(find_tasks_output(resp))
         }
 
+        EDIT_TASK => {
+            let (id, expect_version) = target_task(args)?;
+            let title = optional_str(args, "title")?;
+            let body = optional_str(args, "body")?;
+
+            // THE MASK IS WHAT THE CALLER SENT, by key presence. `task` reads an
+            // EMPTY mask as "every editable field", so omitting it would write the
+            // zero value of whatever the caller left out — blanking a body on a
+            // title-only edit. An empty string that WAS sent is still written:
+            // that is how a body is cleared.
+            let paths: Vec<String> = [("title", title), ("body", body)]
+                .into_iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(p, _)| p.to_string())
+                .collect();
+            if paths.is_empty() {
+                return Err(ToolError::Invalid(
+                    "send `title`, `body`, or both — there is nothing to edit".into(),
+                ));
+            }
+
+            let resp = client
+                .edit_task(EditTaskRequest {
+                    idempotency: Some(Idempotency {
+                        key: crate::idempotency_key(),
+                    }),
+                    scope: Some(scope),
+                    id,
+                    expect_version,
+                    title: title.unwrap_or_default().to_string(),
+                    body: body.unwrap_or_default().to_string(),
+                    update_mask: Some(prost_types::FieldMask { paths }),
+                })
+                .await?
+                .into_inner();
+            let meta = resp.meta.unwrap_or_default();
+            Ok(Output {
+                content: json!({ "id": meta.id, "version": meta.version }),
+                rows: 1,
+            })
+        }
+
+        TRANSITION_TASK => {
+            let (id, expect_version) = target_task(args)?;
+            let to = args
+                .get("to")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::Invalid("`to` is required".into()))?;
+            let to = target(to).ok_or_else(|| {
+                ToolError::Invalid(format!("`to` must be one of {}", TARGETS.join(", ")))
+            })?;
+
+            let resp = client
+                .transition_task(TransitionTaskRequest {
+                    idempotency: Some(Idempotency {
+                        key: crate::idempotency_key(),
+                    }),
+                    scope: Some(scope),
+                    id,
+                    expect_version,
+                    to: to as i32,
+                })
+                .await?
+                .into_inner();
+            let meta = resp.meta.unwrap_or_default();
+            Ok(Output {
+                // `from` as `task` reported it. On a replay of an applied
+                // transition it equals the target — a known gap in `task`, not
+                // something this gateway can correct. It cannot arise from a
+                // gateway retry today: the key is minted per inbound call.
+                content: json!({
+                    "id": meta.id,
+                    "version": meta.version,
+                    "from": status_name(resp.from),
+                }),
+                rows: 1,
+            })
+        }
+
         other => Err(ToolError::Unknown(other.to_string())),
     }
 }
@@ -352,13 +540,7 @@ impl From<Option<crate::pb::yadgar::task::v1::Task>> for TaskView {
             // The enum's own name, lowercased and stripped of its prefix — a
             // number would make the payload unreadable and would silently change
             // meaning if the enum were ever reordered.
-            status: crate::pb::yadgar::task::v1::TaskStatus::try_from(task.status)
-                .map(|s| {
-                    s.as_str_name()
-                        .trim_start_matches("TASK_STATUS_")
-                        .to_ascii_lowercase()
-                })
-                .unwrap_or_else(|_| "unspecified".to_string()),
+            status: status_name(task.status),
             version: meta.version,
         }
     }
