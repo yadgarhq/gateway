@@ -405,3 +405,93 @@ async fn each_admin_verb_hands_iam_one_id_for_attestation_and_verb() {
         assert_all_carry(&arrivals, &["resolve_credential", rpc], &id);
     }
 }
+
+// ---------------------------------------------------------------------------
+// `project`: the fallback `ResolveProject` an enforced refusal dials.
+// ---------------------------------------------------------------------------
+
+/// A recording `project`: `ResolveProject` answers, `ListProjects` is refused.
+struct RecordingProject(Arrivals);
+
+#[tonic::async_trait]
+impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for RecordingProject {
+    async fn resolve_project(
+        &self,
+        req: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse>,
+        tonic::Status,
+    > {
+        self.0.lock().unwrap().push(Arrival {
+            rpc: "resolve_project",
+            header: header_of(&req),
+            scope: None,
+        });
+        Ok(tonic::Response::new(Default::default()))
+    }
+
+    async fn list_projects(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceListProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceListProjectsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "the registry here is loaded_with",
+        ))
+    }
+}
+
+/// `tools/call` under ENFORCEMENT, claiming a workspace the registry refuses
+/// beneath a registered namespace anchor: `attest` hands the call's id to
+/// `projects.check`, and the fallback `ResolveProject` must carry the id on
+/// the call's own record — the same one `iam` was handed.
+///
+/// **THE MUTANT THIS EXISTS FOR** is `attest` passing a fresh
+/// `crate::request_id()` to `check` instead of `attested.scope.request_id`.
+/// Every other test in the suite survives it, because `project` reads no header
+/// today; the join breaks silently the day it does.
+#[tokio::test]
+async fn an_enforced_refusal_hands_project_the_id_on_the_calls_own_record() {
+    let (state, arrivals) = gateway().await;
+    let project = serve(tonic::service::Routes::new(
+        crate::pb::yadgar::project::v1::project_service_server::ProjectServiceServer::new(
+            RecordingProject(Arc::clone(&arrivals)),
+        ),
+    ))
+    .await;
+    let mut state = Arc::try_unwrap(state)
+        .ok()
+        .expect("the only handle on a fresh state");
+    // `yadgarhq` is a registered ANCHOR and `yadgarhq/gateway` is not
+    // registered beneath it: an anchored refusal, the one case that dials.
+    state.projects = Arc::new(crate::project::Validator::new(
+        crate::project::Registry::loaded_with(["yadgarhq".to_string()]),
+        crate::project::Mode::Enforcing,
+        project,
+    ));
+
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "_meta": {
+                meta_keys::PROTOCOL_VERSION: PROTOCOL_VERSION,
+                meta_keys::CLIENT_CAPABILITIES: {},
+            },
+            "name": "find_tasks",
+            "arguments": {},
+        }
+    });
+    let req = post()
+        .header(headers::METHOD, "tools/call")
+        .header(headers::NAME, "find_tasks")
+        .header("x-yadgar-project", "yadgarhq/gateway")
+        .header(axum::http::header::AUTHORIZATION, "Bearer a-token")
+        .body(Body::from(body.to_string()))
+        .expect("request");
+    let (status, record) = send_recorded(Arc::new(state), req).await;
+    assert_ne!(status, StatusCode::OK, "the claim is refused: {record}");
+    let id = minted(&record);
+    assert_all_carry(&arrivals, &["resolve_credential", "resolve_project"], &id);
+}
