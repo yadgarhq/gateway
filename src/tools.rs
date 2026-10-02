@@ -295,7 +295,10 @@ pub async fn call(
         return Err(ToolError::Unknown(name.to_string()));
     }
 
-    let mut client = TaskServiceClient::new(channel);
+    let mut client = TaskServiceClient::new(crate::upstream::request_id::carrying(
+        channel,
+        &scope.request_id,
+    ));
 
     match name {
         CREATE_TASK => {

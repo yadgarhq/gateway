@@ -7,7 +7,6 @@
 //! lives here; membership, labels and schemas stay with [`super::SERVED`].
 
 use serde_json::{json, Value};
-use tonic::transport::Channel;
 
 use super::{status_name, Output, ToolError};
 use crate::pb::yadgar::common::v1::{Idempotency, Scope};
@@ -87,7 +86,7 @@ const STATUS_KEYS: [&str; 2] = ["status", "to"];
 
 /// Dispatch `edit_task`.
 pub(super) async fn edit(
-    client: &mut TaskServiceClient<Channel>,
+    client: &mut TaskServiceClient<crate::upstream::request_id::Carrying>,
     scope: Scope,
     args: &Value,
 ) -> Result<Output, ToolError> {
@@ -139,7 +138,7 @@ pub(super) async fn edit(
 
 /// Dispatch `transition_task`.
 pub(super) async fn transition(
-    client: &mut TaskServiceClient<Channel>,
+    client: &mut TaskServiceClient<crate::upstream::request_id::Carrying>,
     scope: Scope,
     args: &Value,
 ) -> Result<Output, ToolError> {

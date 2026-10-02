@@ -55,7 +55,7 @@ const FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3)
 
 /// The answer for one classified refusal, dialling the fallback where the
 /// remediation needs data the loaded set does not hold.
-pub(super) async fn compose(project: &Channel, refusal: Refusal) -> Denied {
+pub(super) async fn compose(project: &Channel, refusal: Refusal, request_id: &str) -> Denied {
     let Some(anchor) = refusal.anchor.as_deref() else {
         // EVERY OTHER CLASS IS COMPOSED FROM THE REASON ALONE, so nothing is
         // dialled for it. A grammar failure, an unregistered private path and an
@@ -67,7 +67,7 @@ pub(super) async fn compose(project: &Channel, refusal: Refusal) -> Denied {
         };
     };
 
-    let resolved = resolve(project, anchor).await;
+    let resolved = resolve(project, anchor, request_id).await;
     Denied {
         reason: refusal.reason,
         prose: sentence(
@@ -136,8 +136,11 @@ fn present(value: String) -> Option<String> {
 /// collation — plus the repository the remediation names. [`Resolved::absent`]
 /// means the tier could not be reached, and the caller above falls back to the
 /// anchor this gateway walked to.
-async fn resolve(project: &Channel, anchor: &str) -> Resolved {
-    let mut client = ProjectServiceClient::new(project.clone());
+async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved {
+    let mut client = ProjectServiceClient::new(crate::upstream::request_id::carrying(
+        project.clone(),
+        request_id,
+    ));
     let rpc = client.resolve_project(ProjectServiceResolveProjectRequest {
         candidate_path: anchor.to_string(),
     });

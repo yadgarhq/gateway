@@ -470,5 +470,8 @@ pub async fn connect_project(
     }
 }
 
+/// D67's request id on every outbound request (ledger 1248).
+pub mod request_id;
+
 #[cfg(test)]
 mod tests;
