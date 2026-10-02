@@ -11,6 +11,7 @@
 //! checks asserts that the code agrees with itself.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
@@ -267,7 +268,7 @@ fn checked(registry: Registry, mode: Mode, claimed: &str) -> (Result<(), Denied>
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(claimed)
+                .check(claimed, "a-request-id")
                 .await
         })
     });
@@ -703,17 +704,24 @@ fn a_refusal_stands_when_the_fallback_rpc_cannot_be_reached() {
 /// the boot load would be asserting something this stub was never built to say.
 struct StubProject {
     answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
+    /// The `x-yadgar-request-id` each `ResolveProject` arrived carrying.
+    request_ids: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 #[tonic::async_trait]
 impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for StubProject {
     async fn resolve_project(
         &self,
-        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectRequest>,
+        req: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectRequest>,
     ) -> Result<
         tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse>,
         tonic::Status,
     > {
+        let header = req
+            .metadata()
+            .get(crate::upstream::request_id::HEADER)
+            .map(|v| v.to_str().expect("an ASCII header").to_string());
+        self.request_ids.lock().unwrap().push(header);
         Ok(tonic::Response::new(self.answer.clone()))
     }
 
@@ -734,6 +742,15 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
 async fn stub_project(
     answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
 ) -> tonic::transport::Channel {
+    stub_project_recording(answer).await.0
+}
+
+/// The same stub, and the request ids its `ResolveProject` calls arrived with.
+async fn stub_project_recording(
+    answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
+) -> (tonic::transport::Channel, Arc<Mutex<Vec<Option<String>>>>) {
+    let request_ids = Arc::new(Mutex::new(Vec::new()));
+    let served = Arc::clone(&request_ids);
     let incoming = tonic::transport::server::TcpIncoming::bind(
         "127.0.0.1:0".parse().expect("a loopback address"),
     )
@@ -743,15 +760,19 @@ async fn stub_project(
         tonic::transport::Server::builder()
             .add_service(
                 crate::pb::yadgar::project::v1::project_service_server::ProjectServiceServer::new(
-                    StubProject { answer },
+                    StubProject {
+                        answer,
+                        request_ids: served,
+                    },
                 ),
             )
             .serve_with_incoming(incoming)
             .await
     });
-    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("a URI")
-        .connect_lazy()
+        .connect_lazy();
+    (channel, request_ids)
 }
 
 /// One `ResolveProject` answer for the anchor these tests refuse beneath.
@@ -780,7 +801,8 @@ fn answered(
 #[tokio::test]
 async fn the_served_source_repo_reaches_the_composed_remediation() {
     let project = stub_project(answered("yadgarhq", "yadgarhq/estate")).await;
-    let denied = remediate::compose(&project, Refusal::under_anchor("yadgarhq")).await;
+    let denied =
+        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
 
     assert_eq!(
         denied.reason.token(),
@@ -816,7 +838,8 @@ async fn the_served_source_repo_reaches_the_composed_remediation() {
 #[tokio::test]
 async fn an_empty_served_source_repo_degrades_instead_of_interpolating_nothing() {
     let project = stub_project(answered("yadgarhq", "")).await;
-    let denied = remediate::compose(&project, Refusal::under_anchor("yadgarhq")).await;
+    let denied =
+        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
 
     assert!(
         denied
@@ -847,7 +870,8 @@ async fn an_empty_served_source_repo_degrades_instead_of_interpolating_nothing()
 #[tokio::test]
 async fn an_empty_served_resolved_path_falls_back_to_the_walked_anchor() {
     let project = stub_project(answered("", "")).await;
-    let denied = remediate::compose(&project, Refusal::under_anchor("yadgarhq")).await;
+    let denied =
+        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
 
     assert!(
         denied
@@ -855,5 +879,30 @@ async fn an_empty_served_resolved_path_falls_back_to_the_walked_anchor() {
             .contains("The namespace yadgarhq is registered"),
         "an empty resolved_path falls back to the anchor rather than being interpolated: {}",
         denied.prose
+    );
+}
+
+/// THE FALLBACK `ResolveProject` CARRIES THE CALL'S REQUEST ID (D67, ledger
+/// 1248), threaded from `Validator::check` through to the dial.
+///
+/// **`project` DOES NOT READ THE HEADER TODAY** — it reads `request_id` only out
+/// of a `Scope`, and `ResolveProject` carries none. The gateway sends it anyway,
+/// so the hop is joinable the day `project` reads it, with no change here.
+#[tokio::test]
+async fn an_enforced_refusal_dials_resolve_project_carrying_the_request_id() {
+    let (project, request_ids) =
+        stub_project_recording(answered("yadgarhq", "yadgarhq/estate")).await;
+    let answer = Validator::new(estate(), Mode::Enforcing, project)
+        .check("yadgarhq/gateway", "the-id-on-this-call")
+        .await;
+
+    assert!(
+        answer.is_err(),
+        "the anchored refusal is the one that dials"
+    );
+    assert_eq!(
+        *request_ids.lock().unwrap(),
+        vec![Some("the-id-on-this-call".to_string())],
+        "exactly one ResolveProject, carrying the id `check` was handed"
     );
 }

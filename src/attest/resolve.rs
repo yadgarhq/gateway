@@ -56,7 +56,7 @@ pub async fn attest(
     // terminal state it reached — see `crate::project`, whose whole subject is
     // why the counted stage exists before the enforcing one.
     projects
-        .check(&attested.scope.project_id)
+        .check(&attested.scope.project_id, &attested.scope.request_id)
         .await
         .map_err(AttestError::Project)?;
     Ok(attested)
@@ -116,7 +116,10 @@ async fn attested(
             // THROUGH THE CACHE, which is D72's "on a cache miss, never per
             // request". Everything below the closure runs on a MISS only.
             let resolved = resolve_through(cache, token, || async {
-                let mut client = IamServiceClient::new(iam.clone());
+                let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
+                    iam.clone(),
+                    &request_id,
+                ));
                 let rpc = client.resolve_credential(ResolveCredentialRequest {
                     // As PRESENTED, never hashed here. The contract is explicit
                     // that hashing is `iam`'s job: a caller that hashed first would

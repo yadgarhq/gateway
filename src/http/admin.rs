@@ -132,7 +132,10 @@ pub(super) async fn admin_create_user(
         }
     };
 
-    let mut client = IamServiceClient::new(state.iam.clone());
+    let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
+        state.iam.clone(),
+        &request_id,
+    ));
     let rpc = client.create_user(CreateUserRequest {
         // MINTED HERE, PER INBOUND REQUEST, and it buys what `enrol`'s buys and
         // no more: this gateway's own retry to `iam` is safe; a CLIENT's retry is
@@ -252,7 +255,10 @@ pub(super) async fn admin_issue_enrolment(
         }
     };
 
-    let mut client = IamServiceClient::new(state.iam.clone());
+    let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
+        state.iam.clone(),
+        &request_id,
+    ));
     let rpc = client.issue_enrolment(IssueEnrolmentRequest {
         // SENT, AND NOT SUPPRESSED. `iam-db` discards this key today (ledger 668)
         // and step 1's sensor exists to say so out loud on the day a caller
@@ -377,7 +383,10 @@ pub(super) async fn admin_set_user_admin(
         );
     }
 
-    let mut client = IamServiceClient::new(state.iam.clone());
+    let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
+        state.iam.clone(),
+        &request_id,
+    ));
     let rpc = client.set_user_admin(SetUserAdminRequest {
         idempotency: Some(Idempotency {
             key: crate::idempotency_key(),

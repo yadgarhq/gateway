@@ -1531,7 +1531,16 @@ async fn state_resolving_to_with_task(
     task: Channel,
 ) -> (Arc<AppState>, Arc<std::sync::atomic::AtomicUsize>) {
     let (iam, resolves) = stub_iam(answer).await;
-    let state = Arc::new(AppState {
+    (state_with_upstreams(iam, task, ttl), resolves)
+}
+
+/// The same gateway, with BOTH upstreams supplied by the caller.
+///
+/// For a test whose subject is what arrives at `iam` as well as at `task` — the
+/// request id each hop is handed (D67, ledger 1248) — so `iam` is a recording
+/// fake there rather than [`stub_iam`].
+fn state_with_upstreams(iam: Channel, task: Channel, ttl: std::time::Duration) -> Arc<AppState> {
+    Arc::new(AppState {
         attestation: Attestation::Iam,
         task,
         iam,
@@ -1566,8 +1575,7 @@ async fn state_resolving_to_with_task(
             crate::project::Mode::Counting,
             tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         )),
-    });
-    (state, resolves)
+    })
 }
 
 /// One `tools/call` carrying `token`, against `state`.
@@ -2998,3 +3006,6 @@ fn with_no_registry_an_enforcing_gateway_answers_an_availability_failure() {
 /// `task`. A child module so it reaches this file's harness without widening
 /// any of it.
 mod task_tools;
+
+/// What each upstream is handed as D67's join key (ledger 1248).
+mod request_id;

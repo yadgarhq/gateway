@@ -320,7 +320,10 @@ impl Validator {
     /// # Errors
     ///
     /// Only in [`Mode::Enforcing`], and then once per terminal state.
-    pub async fn check(&self, claimed: &str) -> Result<(), Denied> {
+    ///
+    /// `request_id` is the call's D67 id, carried to `project` if a refusal
+    /// dials it (ledger 1248).
+    pub async fn check(&self, claimed: &str, request_id: &str) -> Result<(), Denied> {
         let Some(loaded) = self.registry.loaded() else {
             // THE REGISTRY HAS NEVER LOADED (ADR-0674). Counted, because the
             // gate must not flip while this is happening; refused only under
@@ -329,7 +332,7 @@ impl Validator {
             // was unreachable — which is the enforcement this release exists
             // not to perform.
             return self
-                .decide(Refusal::bare(Reason::RegistryUnavailable))
+                .decide(Refusal::bare(Reason::RegistryUnavailable), request_id)
                 .await;
         };
 
@@ -342,12 +345,12 @@ impl Validator {
                 .increment(1);
                 Ok(())
             }
-            Outcome::Refused(refusal) => self.decide(refusal).await,
+            Outcome::Refused(refusal) => self.decide(refusal, request_id).await,
         }
     }
 
     /// Count one refusal, and answer it only under enforcement.
-    async fn decide(&self, refusal: Refusal) -> Result<(), Denied> {
+    async fn decide(&self, refusal: Refusal, request_id: &str) -> Result<(), Denied> {
         metrics::counter!(REFUSALS, "reason" => refusal.reason.token()).increment(1);
 
         if self.mode == Mode::Counting {
@@ -368,7 +371,7 @@ impl Validator {
             return Ok(());
         }
 
-        Err(remediate::compose(&self.project, refusal).await)
+        Err(remediate::compose(&self.project, refusal, request_id).await)
     }
 }
 

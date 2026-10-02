@@ -88,7 +88,8 @@ pub(super) async fn login(
     // request rather than a fact about it. Putting the submitted username in the
     // scope would write an unverified claim, and a wrong password's username, to
     // the telemetry store.
-    let call = Call::start(SERVICE, AUTH_LOGIN, Kind::Write, tel(crate::request_id()));
+    let request_id = crate::request_id();
+    let call = Call::start(SERVICE, AUTH_LOGIN, Kind::Write, tel(request_id.clone()));
 
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         call.fail("INVALID_ARGUMENT");
@@ -114,7 +115,10 @@ pub(super) async fn login(
         return refusal;
     }
 
-    let mut client = IamServiceClient::new(state.iam.clone());
+    let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
+        state.iam.clone(),
+        &request_id,
+    ));
     let rpc = client.login(LoginRequest {
         username: username.to_string(),
         password: password.to_string(),
@@ -295,7 +299,8 @@ pub(super) async fn enrol(
     }
     // NOT carrying an identity, for the same reason `login`'s does not: nothing
     // has been attested, and the person does not have a user id yet at all.
-    let call = Call::start(SERVICE, AUTH_ENROL, Kind::Write, tel(crate::request_id()));
+    let request_id = crate::request_id();
+    let call = Call::start(SERVICE, AUTH_ENROL, Kind::Write, tel(request_id.clone()));
 
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         call.fail("INVALID_ARGUMENT");
@@ -309,7 +314,10 @@ pub(super) async fn enrol(
         }
     };
 
-    let mut client = IamServiceClient::new(state.iam.clone());
+    let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
+        state.iam.clone(),
+        &request_id,
+    ));
     let rpc = client.redeem_enrolment(RedeemEnrolmentRequest {
         secret: secret.to_string(),
         password: password.to_string(),
