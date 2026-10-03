@@ -243,17 +243,17 @@ projectValidation:
 # WHO THIS GATEWAY SAYS IT IS WHEN IT DIALS ITS UPSTREAMS — mutual TLS
 # (ADR-0516).
 #
-# A THIRD DIRECTION, and it is not either of the two above. `task.tls.caSecret`
-# and `iam.tls.caSecret` are how this gateway VERIFIES the servers it reaches.
-# This is what it PRESENTS to them, so they can authenticate the caller rather
-# than accepting anything that reaches the port.
+# A THIRD DIRECTION, and it is not either of the two above. `task.tls.caSecret`,
+# `iam.tls.caSecret` and `project.tls.caSecret` are how this gateway VERIFIES the
+# servers it reaches. This is what it PRESENTS to them, so they can authenticate
+# the caller rather than accepting anything that reaches the port.
 #
-# ONE LEAF FOR BOTH UPSTREAMS, and that is why it lives here rather than inside
-# each `tls` block. `gateway-client-tls` is this process's identity, not a
-# property of the hop, so it is mounted once and both hops are pointed at the
+# ONE LEAF FOR ALL THREE UPSTREAMS, and that is why it lives here rather than
+# inside each `tls` block. `gateway-client-tls` is this process's identity, not a
+# property of the hop, so it is mounted once and every hop is pointed at the
 # same two files. The per-upstream flags still decide WHICH hops present it —
 # rendering is guarded on that upstream's `tls.enabled` — so a deployment can cut
-# one hop over before the other.
+# one hop over before the others.
 #
 # WHY A CERTIFICATE RATHER THAN A NetworkPolicy: ADR-0516. A NetworkPolicy is
 # enforced by the CNI, so the same manifest protects an EKS deployment and
