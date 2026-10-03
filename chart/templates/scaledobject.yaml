@@ -1,16 +1,13 @@
+{{- /*
+ADR-0850: THIS TEMPLATE RENDERS BEFORE `render-checks.yaml`'s OWN GUARD ON
+`autoscaling`'S SHAPE, measured — a values file setting `autoscaling` to a non-map
+crashes HERE, with a raw Go error naming no key at all, before that file's `fail`
+is ever reached. So this reader carries its own `kindIs "map"` arm rather than
+relying on render-checks.yaml running first; render-checks.yaml is still what
+refuses a non-bool `autoscaling.enabled` BY NAME, because this gate's only job is
+to keep `.enabled` from being read off a non-map.
+*/}}
 {{- if and (kindIs "map" .Values.autoscaling) .Values.autoscaling.enabled }}
-# THE `kindIs "map"` ARM IS THIS TEMPLATE'S OWN SHAPE GUARD (ADR-0850, ledger
-# 1135), NOT A STYLE CHOICE. helm renders this chart's templates in reverse
-# path order, so this file ("s") runs before `templates/render-checks.yaml`
-# ("r") — measured, helm 4.3.0. An `autoscaling` set to a non-map (for example
-# `autoscaling: "x"`) would otherwise reach `.Values.autoscaling.enabled`
-# first and die here with a raw field-access error, before render-checks.yaml
-# ever gets a chance to replace it with a named one. `and` short-circuits, so
-# a non-map `autoscaling` renders nothing here and `render-checks.yaml` is
-# what names it. This arm does not by itself catch a non-bool `enabled` on a
-# present map — `render-checks.yaml`'s `kindIs "bool"` arm is what refuses
-# that, and it runs next, before any later template reads the same toggle.
-#
 # KEDA, not a bare HPA (D68): it wraps a plain HPA for the concurrency cases,
 # handles queue depth natively for the write path, and gives scale-to-zero for a
 # disabled plugin (D1). One mechanism instead of prometheus-adapter plus special
