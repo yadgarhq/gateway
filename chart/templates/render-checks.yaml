@@ -1,4 +1,62 @@
 {{/*
+THE SHAPE OF `autoscaling`, GUARDED BEFORE ANY CHECK BELOW READS IT (ADR-0850,
+ledger 1135). `autoscaling.enabled` is a PLAIN TRUTHINESS READ, both here and in
+`templates/scaledobject.yaml`, and a Go template conditional does not know the
+toggle promises a boolean: `"false"` and `"no"` are non-empty strings and both
+read as true, so a quoted "false" turned autoscaling ON — measured, `helm
+template --set-string autoscaling.enabled=false` rendered a ScaledObject. The
+falsy-but-wrong-shape values (`0`, `{}`, `null`) are the same defect from the
+other side: they happen to read as off today, but a toggle that silently
+accepts any shape accepts the next wrong one too, so every shape but a real
+bool is refused by name rather than coerced.
+
+`hasKey` COMES FIRST (ADR-0794 idiom), because `kindOf` answers `invalid` both
+for an explicit `autoscaling: null` and for a key this chart's own default
+never left out — helm deletes a key written as `null` rather than putting the
+default back, and the two cases need different messages: one names a key that
+was taken away, the other names a value of the wrong type.
+
+ORDER IS LOAD-BEARING, and it is why this block sits ABOVE the capability
+check below rather than beside it in `scripts/tests/test_render_checks.py`'s
+`EXPECTED_CHECKS`. `fail` aborts at the first failing check, and a non-bool
+`autoscaling.enabled` must be named for ITS OWN reason, not for "KEDA is
+missing" — a message this chart would otherwise give for `autoscaling.enabled:
+"false"` against a target that has KEDA, which names the wrong thing entirely.
+
+`templates/scaledobject.yaml` ALSO GUARDS THE SAME SHAPE, and that is not
+duplication. helm renders this chart's templates in reverse path order, so
+`scaledobject.yaml` ("s") runs before this file ("r") — measured, helm 4.3.0.
+An `autoscaling` set to a non-map reaches `scaledobject.yaml`'s own
+`.Values.autoscaling.enabled` first and dies there with a raw field-access
+error unless that template carries its own `kindIs "map"` arm; this file's
+`fail` below would never get a chance to replace it with a named one. The
+two guards therefore cover different failure paths: this file is what an
+adopter reading `helm template`'s output meets for a shape `scaledobject.yaml`
+cannot raise on cleanly, and `scaledobject.yaml`'s own guard is what keeps its
+raise from pre-empting this one.
+*/}}
+{{- if not (hasKey .Values "autoscaling") }}
+{{- fail (join "" (list
+      "gateway: the autoscaling key has been deleted from this release's values, and this chart ships it. "
+      "Writing `autoscaling:` with nothing after it, or `autoscaling: null`, makes helm remove the key "
+      "rather than read it, so `templates/scaledobject.yaml` has no `enabled` to read off it. "
+      "Write `autoscaling.enabled: false` to leave autoscaling out, or omit the key entirely to accept "
+      "the chart's default.")) }}
+{{- else if not (kindIs "map" .Values.autoscaling) }}
+{{- fail (printf (join "" (list
+      "gateway: autoscaling is a %s rather than a mapping, so autoscaling.enabled cannot be read out of "
+      "it. Write autoscaling as a mapping with an enabled key, for example `autoscaling: {enabled: "
+      "false}`."))
+      (kindOf .Values.autoscaling)) }}
+{{- else if not (kindIs "bool" .Values.autoscaling.enabled) }}
+{{- fail (printf (join "" (list
+      "gateway: autoscaling.enabled is a %s rather than a boolean. `templates/scaledobject.yaml` renders "
+      "a KEDA ScaledObject when this reads true in a template conditional, and that includes the "
+      "strings \"false\" and \"no\" -- both non-empty, both true. Write true or false."))
+      (kindOf .Values.autoscaling.enabled)) }}
+{{- end }}
+
+{{/*
 EVERY RENDER CHECK THIS CHART DECLARES, IN ONE FILE, AND THE FILE RENDERS NOTHING.
 
 ONE CHECK PER OPERATOR, NOT ONE PER KIND. `autoscaling.enabled` renders one kind

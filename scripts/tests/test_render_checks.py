@@ -121,6 +121,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -739,4 +740,160 @@ def test_the_checks_are_unreachable_at_the_chart_defaults():
         f"the chart's DEFAULTS render objects from {sorted(rendered_groups & set(declared))}, "
         f"a group a render check asks for — so the check is reachable at the defaults "
         f"and every offline render in the estate refuses"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# THE SHAPE GUARD ON `autoscaling` (ADR-0850, ledger 1135).
+#
+# `autoscaling.enabled` is read by plain truthiness here and in
+# `templates/scaledobject.yaml`, and a Go template conditional does not know the
+# toggle promises a boolean — `"false"` and `"no"` are non-empty strings and both
+# read as true. Measured before this PR: `helm template --set-string
+# autoscaling.enabled=false` rendered a ScaledObject. `0`, `{}` and `null` are the
+# same defect read from the other side — they happen to render nothing today, but a
+# toggle that silently accepts any shape accepts the next wrong one too.
+#
+# THESE ROWS DISCRIMINATE ON STDERR, NEVER ON THE EXIT CODE ALONE (ADR-0794): a
+# named refusal and a raw Go-template raise both exit 1, so a case that asserted
+# only `returncode != 0` would pass unchanged if the `fail` arms in
+# `templates/render-checks.yaml` were deleted and `scaledobject.yaml`'s own raw
+# field-access error fired instead — which is exactly the regression ADR-0850's
+# "first reader carries its own guard" rule is about. `RAISE_MARKERS` is what tells
+# the two apart: none of them may appear in a message this suite asserts on, because
+# each one IS a raw raise, not a name.
+RAISE_MARKERS = ("error calling", "nil pointer", "can't evaluate field")
+
+
+def render_with_values(chart: Path, values_yaml: str, *arguments: str):
+    """`render`, but with an inline values file instead of `--set`.
+
+    `--set`/`--set-string`/`--set-json` each coerce the right-hand side through
+    helm's own CLI parser before it reaches the chart — measured, `--set-json
+    autoscaling.enabled={}` is reported by helm as "destination ... is a table.
+    Ignoring non-table value" and silently falls back to the chart's default rather
+    than setting a map. A values FILE is parsed as plain YAML and carries no such
+    coercion, which is what several of the rows below depend on.
+    """
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".yaml", delete=False, dir=chart.parent
+    ) as handle:
+        handle.write(values_yaml)
+        values_path = handle.name
+    try:
+        return render(chart, "-f", values_path, *arguments)
+    finally:
+        Path(values_path).unlink(missing_ok=True)
+
+
+def assert_named_refusal(result, name: str) -> None:
+    assert result.returncode != 0, (
+        f"expected a refusal naming {name!r}, the render succeeded: {result.stdout[:200]}"
+    )
+    assert name in result.stderr, result.stderr
+    assert not any(marker in result.stderr for marker in RAISE_MARKERS), (
+        f"the refusal for {name!r} contains a raw Go-template raise marker, so the "
+        f"named `fail` arm did not fire and this is the raise it exists to replace: "
+        f"{result.stderr}"
+    )
+
+
+def test_autoscaling_deleted_from_values_is_refused_by_name():
+    """`autoscaling: null` makes helm remove the key rather than read it (ADR-0794)."""
+    assert_named_refusal(render_with_values(CHART, "autoscaling: null\n"), "autoscaling")
+
+
+def test_autoscaling_as_a_non_map_is_refused_by_name():
+    """The whole block replaced by a scalar — `scaledobject.yaml`'s own case (ADR-0850)."""
+    assert_named_refusal(render_with_values(CHART, 'autoscaling: "x"\n'), "autoscaling")
+
+
+def test_autoscaling_enabled_quoted_false_is_refused_by_name():
+    """The exact shape ledger 1135 measured: a quoted "false" is truthy, not off.
+
+    CARRIES `--api-versions`, and not for `TOGGLE_ON`'s reason: a truthy string
+    reaches the SAME `if` the capability check sits behind, so without it a chart
+    whose shape guard was deleted would still refuse here — for the capability
+    check's reason, over a target with no KEDA — and this case would not be
+    evidence the shape guard did anything. With the group present, the capability
+    check would SUCCEED if reached, so only the shape guard can still refuse.
+    """
+    assert_named_refusal(
+        render_with_values(
+            CHART, 'autoscaling:\n  enabled: "false"\n', "--api-versions", "keda.sh/v1alpha1"
+        ),
+        "autoscaling.enabled",
+    )
+
+
+def test_autoscaling_enabled_quoted_no_is_refused_by_name():
+    assert_named_refusal(
+        render_with_values(
+            CHART, 'autoscaling:\n  enabled: "no"\n', "--api-versions", "keda.sh/v1alpha1"
+        ),
+        "autoscaling.enabled",
+    )
+
+
+def test_autoscaling_enabled_zero_is_refused_by_name():
+    assert_named_refusal(
+        render_with_values(CHART, "autoscaling:\n  enabled: 0\n"), "autoscaling.enabled"
+    )
+
+
+def test_autoscaling_enabled_empty_map_is_refused_by_name():
+    assert_named_refusal(
+        render_with_values(CHART, "autoscaling:\n  enabled: {}\n"), "autoscaling.enabled"
+    )
+
+
+def test_autoscaling_enabled_explicit_null_is_refused_by_name():
+    """`enabled: null` keeps the `autoscaling` map but deletes `enabled` from it,
+    which is a DIFFERENT shape than the whole-key deletion above and still not a
+    bool."""
+    assert_named_refusal(
+        render_with_values(CHART, "autoscaling:\n  enabled: null\n"), "autoscaling.enabled"
+    )
+
+
+def test_a_real_bool_is_not_refused_either_way():
+    """The green row both arms must let through, at both values the toggle takes.
+
+    `enabled: true` reaches the KEDA capability check beyond the shape guard, so it
+    carries `--api-versions` for the same reason `TOGGLE_ON` does elsewhere in this
+    file — without it this row would refuse for the renderer's reason, not the shape
+    guard's, and prove nothing about either.
+    """
+    off = render_with_values(CHART, "autoscaling:\n  enabled: false\n")
+    assert off.returncode == 0, off.stderr
+
+    on = render_with_values(
+        CHART, "autoscaling:\n  enabled: true\n", "--api-versions", "keda.sh/v1alpha1"
+    )
+    assert on.returncode == 0, on.stderr
+
+
+# A phrase unique to the capability check's own refusal (`templates/_require_api.tpl`),
+# never written by the shape guard above it. Used instead of searching for "KEDA" to
+# tell the two refusals apart, because the shape guard's OWN message names KEDA too
+# (it explains what `autoscaling.enabled` controls), so that word proves nothing about
+# which arm fired.
+CAPABILITY_CHECK_PHRASE = "needs the API"
+
+
+def test_the_shape_guard_runs_before_the_capability_check():
+    """ORDER, ASSERTED RATHER THAN ASSUMED. A non-bool `autoscaling.enabled` must be
+    named for its OWN reason, not reported as a missing KEDA — `fail` aborts at the
+    first failing check, so if the capability check in
+    `templates/render-checks.yaml` ran first, a quoted `"false"` against a target
+    that DOES have KEDA would render happily, since `.Capabilities.APIVersions.Has`
+    would answer true for a toggle this chart would still wrongly read as on.
+    """
+    result = render_with_values(
+        CHART, 'autoscaling:\n  enabled: "false"\n', "--api-versions", "keda.sh/v1alpha1"
+    )
+    assert result.returncode != 0
+    assert "autoscaling.enabled" in result.stderr, result.stderr
+    assert CAPABILITY_CHECK_PHRASE not in result.stderr, (
+        f"the capability check fired ahead of the shape guard: {result.stderr}"
     )
