@@ -9,22 +9,23 @@
   behind it, or a volume no mount names — either half missing is the mistake to
   watch for.
 
-  ONE LEAF, TWO UPSTREAMS, so the per-upstream environment blocks still guard on
-  their own `tls.enabled` beside this: a deployment can cut `task` over before
-  `iam`. What this value decides is whether the identity exists to be presented.
+  ONE LEAF, THREE UPSTREAMS, so the per-upstream environment blocks still guard
+  on their own `tls.enabled` beside this: a deployment can cut `task` over
+  before `iam`. What this value decides is whether the identity exists to be
+  presented.
 */}}
 {{- $clientCert := .Values.clientCertificate.secret -}}
 {{/*
   WHETHER THE MOUNT IS WORTH MAKING AT ALL.
 
   A client certificate is presented only INSIDE an encrypted transport, so a pod
-  with the Secret named and both upstreams cleartext has nothing to present it
+  with the Secret named and every upstream cleartext has nothing to present it
   on. Mounting it anyway would put a PRIVATE KEY in a pod that reads no part of
   it — and it would render a volume no environment variable names, which reads
   as a mistake to anyone diffing the manifest. Both halves are guarded, so the
   reverted state leaves nothing behind.
 */}}
-{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled) -}}
+{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.project.tls.enabled) -}}
 {{/*
   WHETHER D73'S BOOTSTRAP TOKEN IS MOUNTED AT ALL (ADR-0492, ledger 638).
 
@@ -277,9 +278,10 @@ spec:
             {{- if $clientCert }}
             # WHO THIS GATEWAY SAYS IT IS ON THAT HOP — mutual TLS (ADR-0516).
             #
-            # THE SAME TWO PATHS FOR BOTH UPSTREAMS, because there is ONE client
+            # THE SAME TWO PATHS FOR EVERY UPSTREAM, because there is ONE client
             # leaf: `gateway-client-tls` is this process's identity rather than a
-            # property of a hop. One volume below, two prefixes here.
+            # property of a hop. One volume below, three prefixes here (`task`,
+            # `iam`, `project`).
             #
             # RENDERED PER UPSTREAM, so a deployment can cut one hop over before
             # the other: this pair appears only when THAT upstream's TLS is on
@@ -328,7 +330,7 @@ spec:
             # WHO THIS GATEWAY SAYS IT IS ON THAT HOP — mutual TLS (ADR-0516).
             #
             # The same two paths the `task` block above names, and deliberately:
-            # one leaf, one mount, two upstreams.
+            # one leaf, one mount, three upstreams.
             #
             # RENDERED PER UPSTREAM, so a deployment can cut one hop over before
             # the other: this pair appears only when THAT upstream's TLS is on
@@ -819,11 +821,12 @@ spec:
             # expensive to break. A subPath mount is a one-time copy kubelet
             # never refreshes, so a renewed CLIENT certificate would never reach
             # this process; ADR-0516 makes that an expired leaf that STOPS the
-            # hop to `iam` or `task` rather than one that merely weakens it. The
-            # rotation watcher only works because this is a directory.
+            # hop to `task`, `iam` or `project` rather than one that merely
+            # weakens it. The rotation watcher only works because this is a
+            # directory.
             #
-            # ONE MOUNT FOR BOTH UPSTREAMS. Both prefixes' variables above name
-            # these same two files.
+            # ONE MOUNT FOR ALL THREE UPSTREAMS. Every prefix's variables above
+            # name these same two files.
             - name: client-cert
               mountPath: /var/run/secrets/client-cert
               readOnly: true
