@@ -422,10 +422,14 @@ def test_the_retained_typed_leaf_still_refuses_its_own_minimum(tmp_path):
     type belongs, because a wrong type here reaches
     `rotate::GatewayDocument::tools_poll_interval` at BOOT rather than at
     render. This schema's closure elsewhere must not have disturbed it.
+
+    ASSERTS THE KEY, NEVER HELM'S SENTENCE: helm 3.18.4 prints `Must be
+    greater than or equal to 1`; 3.20.2 and 4.3.0 print `minimum: got 0,
+    want 1`. Both name `intervalSeconds`; neither shares a word with the
+    other, so `intervalSeconds` is the only assertion stable across them.
     """
     result = render_with_overlay(CHART, {"toolsPoll": {"intervalSeconds": 0}}, tmp_path)
     assert result.returncode != 0, result.stdout
-    assert "minimum" in result.stderr, result.stderr
     assert "intervalSeconds" in result.stderr, result.stderr
 
 
