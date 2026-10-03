@@ -9,9 +9,10 @@
   behind it, or a volume no mount names — either half missing is the mistake to
   watch for.
 
-  ONE LEAF, TWO UPSTREAMS, so the per-upstream environment blocks still guard on
-  their own `tls.enabled` beside this: a deployment can cut `task` over before
-  `iam`. What this value decides is whether the identity exists to be presented.
+  ONE LEAF, THREE UPSTREAMS, so the per-upstream environment blocks still guard
+  on their own `tls.enabled` beside this: a deployment can cut `task` over
+  before `iam`. What this value decides is whether the identity exists to be
+  presented.
 */}}
 {{- $clientCert := .Values.clientCertificate.secret -}}
 {{/*
@@ -24,7 +25,7 @@
   as a mistake to anyone diffing the manifest. Both halves are guarded, so the
   reverted state leaves nothing behind.
 */}}
-{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled) -}}
+{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.project.tls.enabled) -}}
 {{/*
   WHETHER D73'S BOOTSTRAP TOKEN IS MOUNTED AT ALL (ADR-0492, ledger 638).
 
