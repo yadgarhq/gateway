@@ -1,26 +1,187 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "yadgar/gateway",
-  "description": "THE KNOBS OF gateway's OWN CONFIGURATION DOCUMENT, AND A REFUSAL FOR EVERY OTHER KEY UNDER THEM. ADR-0740 moved `gateway.yaml` out of `yadgarhq/config` and into this chart, and its schema and bounds moved with it: this file is what makes an adopter's typo a REFUSAL NAMING THE KEY rather than a value merged into a document nothing reads it from. Helm enforces it in both `helm lint` and `helm template`, which is the `helm lint and render` pre-commit hook and therefore `ci / passed`, and it is also what an Argo sync meets.",
-  "$comment": "THE ROOT IS OPEN AND `toolsPoll` IS CLOSED, and that asymmetry is deliberate rather than an oversight. `yadgarhq/config`'s schema sets `additionalProperties: false` AT EVERY LEVEL because it declares every knob its chart has. This chart does not: `chart/values.yaml` is 898 lines of module knobs that predate this file and are undeclared, and `argocd/applicationsets/modules.yaml` supplies a further inline values block to the reference deployment (measured 2026-09-19: `autoscaling`, `sourceAddress`, `adminBootstrap`, `tls`, `iam`, `task`, `iamDb`, `taskDb`, `project`, `projectDb`). Closing the root would refuse every one of those and break the live sync, so THE WEAKENING IS REAL AND WORTH STATING: `toolsPoll: {intervalSecond: 600}` is refused by name, and a misspelling of `toolsPoll` ITSELF at the root is accepted and silently reads as no override — where `config`'s closed root would have refused it. Closing this root is a separate change that has to declare all 898 lines first. THE TYPE IS PART OF THE REFUSAL: a values file reaches helm through sigs.k8s.io/yaml, so `intervalSeconds: \"600\"` would arrive as a string and reach serde_norway as one, which fails the reader at boot instead of the render. REQUIRED-NESS IS NOT EXPRESSED HERE, and nothing here is required: `chart/config/gateway.yaml` carries the value, and `.Values.toolsPoll` exists ONLY as an override. A knob with a default in the document AND a default in values.yaml would be two sources for one value (ADR-0569), which is why `chart/values.yaml` states no `toolsPoll` at all.",
+  "description": "EVERY KEY THIS CHART DECLARES, AND A REFUSAL FOR EVERYTHING ELSE UNDER THEM (ADR-0850). `chart/values.yaml`'s own blocks are declared one by one below, so an adopter's typo under any of them — `autoscalng`, `networkPolicy.scrapeFrom.namespac`, `toolsPoll.intervalSecond` — is a REFUSAL NAMING THE KEY rather than a value merged into a document nothing reads it from. Helm enforces it in both `helm lint` and `helm template`, which is the `helm lint and render` pre-commit hook and therefore `ci / passed`, and it is also what an Argo sync meets.",
+  "$comment": "CLOSURE IS PER CHART (ADR-0850): this file closes only the keys gateway's OWN `values.yaml` and templates read, and says nothing about any other chart's keys — the parent and the platform chart each own their own closure, and a sibling module chart's schema is a separate file entirely.\n\nTHREE PATHS STAY OPEN, deliberately. `global` is Helm's own reserved key, shared with every subchart (ADR-0722) — this chart reads it only through `_hostname.tpl`'s `.context.Values.global`, and what else lives under it belongs to the parent and the other subcharts, not to this file. `resources` is a raw `corev1.ResourceRequirements` this chart re-types nowhere (`templates/deployment.yaml`). `rollingUpdate` is a raw `appsv1.RollingUpdateDeployment`, read the same way (`with .Values.rollingUpdate` in `templates/deployment.yaml`).\n\nTWO EXTRAS ARE DECLARED AS LEAVES because `values.yaml` never states them. `image.digest` is read by `templates/deployment.yaml`; the CI release workflow rewrites it into a published chart at package time and no tag (D65, D61), so `values.yaml` ships no default for it. `networkPolicy.scrapeFrom.namespace` is read by `templates/networkpolicy.yaml`; declaring it here is why `scrapeFrom` itself is a CLOSED block rather than an open map.\n\nTYPES, TOGGLE SHAPES AND `required` LIVE IN `render-checks.yaml` (ADR-0847), NOT HERE: a block written as a scalar, or a toggle written as a non-bool, PASSES this schema and reaches the render check's own named refusal instead — measured, `autoscaling: \"x\"` passes this file and is `templates/render-checks.yaml`'s `must be a map` sentence. The one exception predates this file and stays: `toolsPoll.intervalSeconds` keeps its `integer, minimum 1` below, because nothing in `render-checks.yaml` reads `toolsPoll` and a wrong type there would reach `rotate::GatewayDocument::tools_poll_interval` at BOOT rather than at render — see that leaf's own description. `networkPolicy.clients`' items keep their typed-object shape for the same reason stated on that block: this chart's `from` peers are not another module's workload-name list, and a value nothing here re-types is a value the API server, not this schema, would refuse at apply.",
   "type": "object",
   "properties": {
-    "toolsPoll": {
-      "type": "object",
-      "description": "Overrides for chart/config/gateway.yaml's `toolsPoll` section — read only by `gateway`, which is the only service that builds the `tools/list` response.",
-      "additionalProperties": false,
+    "image": {
       "properties": {
-        "intervalSeconds": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "How often, in whole seconds, `gateway` tells an MCP client to re-poll `tools/list` for a changed tool catalogue. `0` is refused here rather than read as `off`: `rotate::GatewayDocument::tools_poll_interval` returns `ToolsPollError::Zero` for it, so a zero that passed the render would only fail later, at boot."
+        "repository": {},
+        "tag": {},
+        "digest": {}
+      },
+      "additionalProperties": false
+    },
+    "replicaCount": {},
+    "resources": {},
+    "task": {
+      "properties": {
+        "host": {},
+        "port": {},
+        "tls": {
+          "properties": {
+            "enabled": {},
+            "caSecret": {},
+            "caSecretKey": {},
+            "domain": {}
+          },
+          "additionalProperties": false
         }
-      }
+      },
+      "additionalProperties": false
+    },
+    "iam": {
+      "properties": {
+        "host": {},
+        "port": {},
+        "tls": {
+          "properties": {
+            "enabled": {},
+            "caSecret": {},
+            "caSecretKey": {},
+            "domain": {}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "project": {
+      "properties": {
+        "host": {},
+        "port": {},
+        "tls": {
+          "properties": {
+            "enabled": {},
+            "caSecret": {},
+            "caSecretKey": {},
+            "domain": {}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "projectValidation": {
+      "properties": {
+        "mode": {},
+        "registryPollSeconds": {}
+      },
+      "additionalProperties": false
+    },
+    "clientCertificate": {
+      "properties": {
+        "secret": {},
+        "certSecretKey": {},
+        "keySecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "credentialCache": {
+      "properties": {
+        "ttlSeconds": {}
+      },
+      "additionalProperties": false
+    },
+    "nats": {
+      "properties": {
+        "url": {},
+        "passwordSecret": {},
+        "passwordSecretKey": {},
+        "user": {}
+      },
+      "additionalProperties": false
+    },
+    "rateLimit": {
+      "properties": {
+        "addr": {},
+        "limits": {},
+        "default": {},
+        "timeoutMs": {},
+        "passwordSecret": {},
+        "passwordSecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "trustUnauthenticatedHeaders": {},
+    "autoscaling": {
+      "properties": {
+        "enabled": {},
+        "kedaOperator": {
+          "properties": {
+            "apiVersion": {}
+          },
+          "additionalProperties": false
+        },
+        "minReplicas": {},
+        "maxReplicas": {},
+        "threshold": {},
+        "prometheusAddress": {}
+      },
+      "additionalProperties": false
+    },
+    "service": {
+      "properties": {
+        "port": {}
+      },
+      "additionalProperties": false
+    },
+    "gateway": {
+      "properties": {
+        "enabled": {},
+        "name": {},
+        "listener": {},
+        "hostname": {}
+      },
+      "additionalProperties": false
+    },
+    "sourceAddress": {
+      "properties": {
+        "trustedProxyHops": {}
+      },
+      "additionalProperties": false
+    },
+    "cors": {
+      "properties": {
+        "allowedOrigins": {}
+      },
+      "additionalProperties": false
+    },
+    "credentialLimits": {
+      "properties": {
+        "attributed": {},
+        "unattributed": {}
+      },
+      "additionalProperties": false
+    },
+    "adminLimits": {
+      "properties": {
+        "attributed": {},
+        "unattributed": {}
+      },
+      "additionalProperties": false
+    },
+    "adminBootstrap": {
+      "properties": {
+        "tokenSecret": {},
+        "tokenSecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "preStopSleepSeconds": {},
+    "terminationGracePeriodSeconds": {},
+    "rollingUpdate": {},
+    "topologySpread": {
+      "properties": {
+        "enabled": {},
+        "maxSkew": {},
+        "topologyKey": {},
+        "whenUnsatisfiable": {}
+      },
+      "additionalProperties": false
     },
     "networkPolicy": {
-      "type": "object",
-      "description": "The ingress allow-list rendered by chart/templates/networkpolicy.yaml. DECLARED HERE BECAUSE THIS CHART'S `clients` IS TYPED DIFFERENTLY FROM ITS SIBLINGS': every other module chart takes a list of workload NAMES and renders `podSelector: {app: <name>}` for each, while this one takes `from` PEERS, because the pods that dial this module's serving port carry `app.kubernetes.io/name` rather than `app` and run in their own namespace. A list of names pasted from a sibling chart is valid YAML that helm renders happily and only the API server rejects — a silent failure until apply. Typing the items as objects converts it into a refusal naming this key, at render time.",
-      "additionalProperties": false,
       "properties": {
         "enabled": {
           "type": "boolean",
@@ -35,17 +196,34 @@
           }
         },
         "scrapeFrom": {
-          "type": "object",
-          "description": "Where the metrics scrape comes from. Absent renders no rule for the metrics port at all.",
-          "additionalProperties": false,
           "properties": {
             "namespace": {
               "type": "string",
               "description": "The one namespace admitted to the metrics port. The metrics port serves without authentication, so ADR-0770 scopes it by namespace rather than leaving it open to the cluster."
             }
-          }
+          },
+          "additionalProperties": false,
+          "type": "object",
+          "description": "Where the metrics scrape comes from. Absent renders no rule for the metrics port at all."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "The ingress allow-list rendered by chart/templates/networkpolicy.yaml. DECLARED HERE BECAUSE THIS CHART'S `clients` IS TYPED DIFFERENTLY FROM ITS SIBLINGS': every other module chart takes a list of workload NAMES and renders `podSelector: {app: <name>}` for each, while this one takes `from` PEERS, because the pods that dial this module's serving port carry `app.kubernetes.io/name` rather than `app` and run in their own namespace. A list of names pasted from a sibling chart is valid YAML that helm renders happily and only the API server rejects — a silent failure until apply. Typing the items as objects converts it into a refusal naming this key, at render time."
+    },
+    "global": {},
+    "toolsPoll": {
+      "type": "object",
+      "description": "Overrides for chart/config/gateway.yaml's `toolsPoll` section — read only by `gateway`, which is the only service that builds the `tools/list` response.",
+      "additionalProperties": false,
+      "properties": {
+        "intervalSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How often, in whole seconds, `gateway` tells an MCP client to re-poll `tools/list` for a changed tool catalogue. `0` is refused here rather than read as `off`: `rotate::GatewayDocument::tools_poll_interval` returns `ToolsPollError::Zero` for it, so a zero that passed the render would only fail later, at boot."
         }
       }
     }
-  }
+  },
+  "additionalProperties": false
 }
