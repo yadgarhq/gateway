@@ -1001,13 +1001,16 @@ fn the_cache_counter_reports_a_miss_and_then_a_hit() {
 }
 
 #[test]
-fn the_ttl_is_read_from_the_environment_and_a_bad_one_fails_boot() {
-    assert_eq!(
-        Credentials::from_lookup(env(&[]))
-            .expect("an unset environment takes the default")
-            .ttl(),
-        Duration::from_secs(DEFAULT_TTL_SECONDS)
+fn the_ttl_has_no_compiled_in_default_so_absent_or_bad_fails_boot() {
+    // ADR-0569: NO compiled-in default. Absent refuses, naming the variable
+    // and the chart key that sources it.
+    let err = Credentials::from_lookup(env(&[]))
+        .expect_err("an unset environment has no default to fall back to");
+    assert!(
+        err.contains(CREDENTIAL_TTL) && err.contains("credentialCache.ttlSeconds"),
+        "the refusal must name both the variable and its chart key: {err}"
     );
+
     assert_eq!(
         Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "7")]))
             .expect("seven seconds is usable")
@@ -1019,19 +1022,18 @@ fn the_ttl_is_read_from_the_environment_and_a_bad_one_fails_boot() {
         .ttl()
         .is_zero());
 
-    // AN EMPTY VALUE IS SET-BUT-USELESS, which a manifest reaches by
-    // `value: ""`. It reads as unset rather than as an error — the same rule
-    // `main.rs` applies to YADGAR_VALKEY_ADDR.
-    assert_eq!(
-        Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "")]))
-            .expect("an empty value is unset")
-            .ttl(),
-        Duration::from_secs(DEFAULT_TTL_SECONDS)
+    // AN EMPTY VALUE IS THE SAME AS ABSENT, which a manifest reaches by
+    // `value: ""` — refused for the same reason, naming the same two things.
+    let err = Credentials::from_lookup(env(&[(CREDENTIAL_TTL, "")]))
+        .expect_err("an empty value has no default to fall back to either");
+    assert!(
+        err.contains(CREDENTIAL_TTL) && err.contains("credentialCache.ttlSeconds"),
+        "the refusal must name both the variable and its chart key: {err}"
     );
 
-    // A NUMBER NOBODY CAN READ MUST NOT BECOME THE DEFAULT. Substituting one
-    // leaves an operator believing a bound that is not in force — `main.rs`
-    // already applies this rule to YADGAR_RATE_LIMIT_TIMEOUT_MS.
+    // A NUMBER NOBODY CAN READ MUST NOT BECOME A DEFAULT EITHER. Substituting
+    // one leaves an operator believing a bound that is not in force —
+    // `main.rs` already applies this rule to YADGAR_RATE_LIMIT_TIMEOUT_MS.
     for bad in ["30s", "thirty", "-1", "1.5"] {
         assert!(
             Credentials::from_lookup(env(&[(CREDENTIAL_TTL, bad)])).is_err(),

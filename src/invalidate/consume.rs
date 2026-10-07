@@ -30,10 +30,10 @@ use super::{subject, CONSUMING};
 ///
 /// [`forbidden_after_flush`] returns the instant the refusal lands, so a fast
 /// refusal costs nothing.
-pub(super) const PERMISSION_GRACE: Duration = Duration::from_millis(250);
+pub(super) const PERMISSION_GRACE: Duration = Duration::from_millis(250); // ADR-0569-EXCEPTION(CC): a bound this module derives BOOT_ANSWER_TIMEOUT from, not a tuning knob.
 
 /// How often the flag is read inside that window.
-const PERMISSION_POLL: Duration = Duration::from_millis(5);
+const PERMISSION_POLL: Duration = Duration::from_millis(5); // ADR-0569-EXCEPTION(CC): a poll interval sized against PERMISSION_GRACE, not a tuning knob.
 
 /// Whether the broker refused one of this module's subscriptions, given
 /// [`PERMISSION_GRACE`] to arrive.

@@ -127,6 +127,16 @@ arm, not only the first"); ADR-0797 is the rule the `enabled` guard in
 rule the `autoscaling` guard implements, one level up, because `autoscaling` is read
 as a BLOCK (`kindIs "map"`, `hasKey` first).
 
+LEDGER 965, 1278, ADR-0845, ADDED SEPARATELY BELOW (`render` onward). `task.tls.enabled`,
+`iam.tls.enabled` and `project.tls.enabled` became schema-`required` with NO chart
+default, the same shape `database.create` has in the `-db` repositories' own suites.
+`render` therefore passes `-f chart/ci/values.yaml` (C-A2's own override convention,
+`yadgarhq/actions` `scripts/chart_values_override.py`) ahead of any argument a caller
+supplies, so a caller's own `-f` or `--set` still wins and a bare `render(CHART)` keeps
+rendering rather than refusing on the three now-required keys. This is the one change
+this suite needed to keep working under the new schema; every other case in this file
+is untouched.
+
 Run: python3 -m pytest scripts/tests/ -q
 """
 
@@ -272,8 +282,25 @@ def red_api_versions(declared: Iterable[str], under_test: str) -> tuple[str, ...
     ) + FILLER_API_VERSIONS
 
 
+def ci_values_flags(chart: Path) -> tuple[str, ...]:
+    """`-f <chart>/ci/values.yaml`, or `()` when the chart declares none (C-A2).
+
+    The same file and the same reason the `helm-lint` pre-commit hook and
+    `d80_portability.py` read it for: `task.tls.enabled`, `iam.tls.enabled` and
+    `project.tls.enabled` are schema-`required` with no chart default
+    (ADR-0845), so a bare render against `CHART` needs this chart's own
+    declared values to supply them — exactly as a deployment's own values
+    file, or argocd's, must.
+    """
+    path = Path(chart) / "ci" / "values.yaml"
+    return ("-f", str(path)) if path.is_file() else ()
+
+
 def render(chart: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return helm("template", CHART_NAME, str(chart), *arguments)
+    # THE OVERRIDE COMES FIRST, so any `-f` or `--set` a caller passes is
+    # merged ON TOP of it and still wins — helm applies `-f` files left to
+    # right and `--set` last of all.
+    return helm("template", CHART_NAME, str(chart), *ci_values_flags(chart), *arguments)
 
 
 def objects(stdout: str) -> list[dict]:

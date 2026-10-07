@@ -1,4 +1,19 @@
 {{/*
+  ADR-0845, ADR-0797: EACH DIAL'S `tls.enabled` IS GUARDED HERE, before the
+  first read of any of them below. `required` in the schema catches an
+  ABSENT key, but helm deletes a null-valued key a chart declares and
+  restores no default, so `tls: {enabled: null}`, `tls: {enabled: "true"}`
+  and `tls: null` all survive to this template with `required` satisfied (a
+  key does exist — or, for `tls: null`, `hasKey` on the parent is still true
+  because the chart's own values.yaml declares `tls`). The bare truthiness
+  test every render below uses (`if .Values.task.tls.enabled`, and the
+  `ternary` beside it) is fail-open on exactly those shapes, so they are
+  refused here, before anything downstream reads them.
+*/}}
+{{- if not (and (kindIs "map" .Values.task.tls) (hasKey .Values.task.tls "enabled") (kindIs "bool" .Values.task.tls.enabled)) }}{{ fail "task.tls.enabled must be set to true or false; it renders TASK_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
+{{- if not (and (kindIs "map" .Values.iam.tls) (hasKey .Values.iam.tls "enabled") (kindIs "bool" .Values.iam.tls.enabled)) }}{{ fail "iam.tls.enabled must be set to true or false; it renders IAM_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
+{{- if not (and (kindIs "map" .Values.project.tls) (hasKey .Values.project.tls "enabled") (kindIs "bool" .Values.project.tls.enabled)) }}{{ fail "project.tls.enabled must be set to true or false; it renders PROJECT_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
+{{/*
   WHETHER THIS POD PRESENTS A CLIENT CERTIFICATE AT ALL (ADR-0516).
 
   Computed ONCE, here, because it is asked four times below — twice for the
@@ -261,14 +276,13 @@ spec:
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
               value: {{ .Values.task.port | quote }}
-            {{- if .Values.task.tls.enabled }}
-            # RENDERED ONLY WHEN TLS IS ASKED FOR, so a deployment that has not
-            # cut over sends the binary nothing at all and takes the cleartext
-            # path it always took. The same shape as
-            # YADGAR_TRUST_UNAUTHENTICATED_HEADERS below: absence is the
-            # default, and the flag is the whole of the lever.
+            # RENDERED UNCONDITIONALLY (ADR-0845): the binary requires this
+            # variable and refuses to boot without it, so the chart must never
+            # be the reason it is missing. `task.tls.enabled` is guarded above
+            # (`kindIs "bool"`), so this ternary never sees anything else.
             - name: TASK_TLS_ENABLED
-              value: "1"
+              value: {{ ternary "1" "0" .Values.task.tls.enabled | quote }}
+            {{- if .Values.task.tls.enabled }}
             # A PATH, never an issuer-specific resource (D80). cert-manager
             # writes this file in the reference deployment and a hand-assembled
             # Secret writes it anywhere else; neither the chart nor the binary
@@ -314,12 +328,12 @@ spec:
               value: {{ .Values.iam.host | quote }}
             - name: IAM_PORT
               value: {{ .Values.iam.port | quote }}
-            {{- if .Values.iam.tls.enabled }}
-            # The hop the BEARER TOKEN itself goes down. Rendered only when TLS
-            # is asked for, and configured independently of task's above so the
-            # two can be cut over one at a time.
+            # RENDERED UNCONDITIONALLY (ADR-0845), the same as TASK_TLS_ENABLED
+            # above: the hop the BEARER TOKEN itself goes down, configured
+            # independently of task's so the two can be cut over one at a time.
             - name: IAM_TLS_ENABLED
-              value: "1"
+              value: {{ ternary "1" "0" .Values.iam.tls.enabled | quote }}
+            {{- if .Values.iam.tls.enabled }}
             # A PATH, never an issuer-specific resource (D80). This channel
             # goes through yadgar-dial, exactly as task's does, so this bundle is
             # read once — by that crate, before it resolves anything — rather
@@ -365,11 +379,12 @@ spec:
               value: {{ .Values.project.host | quote }}
             - name: PROJECT_PORT
               value: {{ .Values.project.port | quote }}
-            {{- if .Values.project.tls.enabled }}
-            # The third hop, configured independently of the two above so the
-            # three can be cut over one at a time.
+            # RENDERED UNCONDITIONALLY (ADR-0845), the same as the two above:
+            # the third hop, configured independently of them so the three can
+            # be cut over one at a time.
             - name: PROJECT_TLS_ENABLED
-              value: "1"
+              value: {{ ternary "1" "0" .Values.project.tls.enabled | quote }}
+            {{- if .Values.project.tls.enabled }}
             # A PATH, never an issuer-specific resource (D80).
             - name: PROJECT_TLS_CA_FILE
               value: /var/run/config/project-ca/ca.pem

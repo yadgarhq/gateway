@@ -30,7 +30,23 @@ repos:
     # publish it — so no hook already in this block changes behaviour. A second
     # `repo:` entry pinning the same repository at a second rev was the
     # alternative, and it is the drift the shared manifest exists to prevent.
-    rev: v1.22.0
+    # THE REV MOVES FROM v1.22.0 TO v1.31.0 FOR TWO IDS THIS PR NEEDS TOGETHER
+    # (ledger 965, 1278, ADR-0845): `no-compiled-in-defaults` widens to the
+    # shapes C-A1 added (a `None` arm beside an env read, a bare `DEFAULT_*`
+    # name, a presence check against `Some("...")`, `EnvFilter::new`, a
+    # config-key lookup chained into `unwrap_or*`); `helm-lint` (C-A2) reads
+    # `chart/ci/values.yaml` when present and passes it to both `helm lint
+    # --strict` and `helm template`, which this PR's chart needs now that
+    # `task.tls.enabled`, `iam.tls.enabled`, `project.tls.enabled` and
+    # `credentialCache.ttlSeconds` are schema-`required` with no default.
+    #
+    # `git diff --stat v1.22.0 v1.31.0 -- hooks/ .pre-commit-hooks.yaml` also
+    # touches `boot_reads_watched.py`, `no_test_skips.py` and
+    # `observe_coverage.py` — all three IDs this block already runs — but
+    # every one of those commits (#89, #95, #96, #101) is a bugfix tightening
+    # an existing check, and this tree's full pre-commit run at the new rev is
+    # green, so none of the three changes this repository's verdict.
+    rev: v1.31.0
     hooks:
       - id: gitleaks
       - id: prettier

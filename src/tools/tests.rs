@@ -133,6 +133,30 @@ fn every_tool_declares_an_object_input_schema() {
     }
 }
 
+/// LEDGER 1281, ADR-0569: no second default. `task-db`'s `DEFAULT_PAGE` is the
+/// one place an unspecified page size is decided; this gateway forwards `0`
+/// rather than compiling in its own `20`.
+#[test]
+fn an_absent_page_size_forwards_zero_rather_than_a_compiled_in_default() {
+    // MUTATION THIS CATCHES: `unwrap_or(20)` (or any other nonzero literal)
+    // reappearing at the call site.
+    assert_eq!(requested_page_size(&json!({})), 0);
+    assert_eq!(requested_page_size(&json!({ "page_token": "next" })), 0);
+}
+
+/// An explicit `0` is indistinguishable from absence, which is the point: both
+/// forward as `0` and `task-db` decides what that means.
+#[test]
+fn an_explicit_zero_page_size_forwards_as_zero() {
+    assert_eq!(requested_page_size(&json!({ "page_size": 0 })), 0);
+}
+
+/// A caller-supplied page size still arrives unchanged.
+#[test]
+fn a_requested_page_size_forwards_unchanged() {
+    assert_eq!(requested_page_size(&json!({ "page_size": 7 })), 7);
+}
+
 #[test]
 fn find_tasks_reports_how_many_tasks_it_returned() {
     // MUTATION THIS CATCHES: `Outcome { ..Default::default() }` at the call

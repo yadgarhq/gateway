@@ -43,7 +43,7 @@ use rcgen::{
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::codegen::{http, Service};
-use tonic::transport::{Channel, Identity, Server, ServerTlsConfig};
+use tonic::transport::{Certificate, Channel, Identity, Server, ServerTlsConfig};
 
 use yadgar_dial::BalanceError;
 use yadgar_gateway::upstream::{self, UpstreamTls, IAM};
@@ -75,6 +75,32 @@ fn pki(san: &str) -> Pki {
     let mut params = CertificateParams::new(vec![san.to_string()]).unwrap();
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.distinguished_name.push(DnType::CommonName, san);
+    let cert = params.signed_by(&key, &ca).unwrap();
+
+    Pki {
+        ca_pem: ca.pem(),
+        cert_pem: cert.pem(),
+        key_pem: key.serialize_pem(),
+    }
+}
+
+/// The same as [`pki`], but the leaf carries `ClientAuth` rather than
+/// `ServerAuth` — what [`serve_requiring_client_auth`]'s verifier demands of
+/// whatever certificate a caller presents.
+fn client_pki(name: &str) -> Pki {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "yadgar-gateway test client authority");
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
+
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    params.distinguished_name.push(DnType::CommonName, name);
     let cert = params.signed_by(&key, &ca).unwrap();
 
     Pki {
@@ -267,6 +293,32 @@ async fn serve(p: &Pki) -> u16 {
     port
 }
 
+/// Serve gRPC over TLS, REQUIRING a client certificate signed by `client_ca`.
+///
+/// **THIS IS THE ONLY SERVER IN THIS FILE THAT CHECKS WHAT WAS PRESENTED,
+/// rather than merely that a handshake completed.** `iam` and `task` do not
+/// build `client_ca_root` yet (see `upstream.rs`'s module doc), so this rig
+/// stands in for the server half ADR-0516 still needs, to answer the one
+/// question neither of them can yet: did the CLIENT actually send the
+/// identity `UpstreamTls::options` attached, or only configure one that was
+/// never read off the struct.
+async fn serve_requiring_client_auth(p: &Pki, client_ca: &str) -> u16 {
+    let addrs = resolve().await;
+    let first = TcpListener::bind(addrs[0]).await.unwrap();
+    let port = first.local_addr().unwrap().port();
+    spawn_tls_server_requiring_client_auth(first, p, client_ca);
+
+    for addr in &addrs[1..] {
+        let listener = TcpListener::bind(SocketAddr::new(addr.ip(), port))
+            .await
+            .expect("the same free port on a second address of the same name");
+        spawn_tls_server_requiring_client_auth(listener, p, client_ca);
+    }
+
+    ready(port).await;
+    port
+}
+
 /// Serve gRPC in CLEARTEXT, for the case that has to keep working untouched —
 /// and for the case that must STOP working once TLS is on.
 async fn serve_cleartext() -> u16 {
@@ -297,6 +349,26 @@ fn spawn_tls_server(listener: TcpListener, p: &Pki) {
     let identity = Identity::from_pem(&p.cert_pem, &p.key_pem);
     let mut builder = Server::builder()
         .tls_config(ServerTlsConfig::new().identity(identity))
+        .unwrap();
+    let router = builder.add_routes(tonic::service::Routes::default());
+    tokio::spawn(async move {
+        let _ = router
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await;
+    });
+}
+
+/// The same as [`spawn_tls_server`], but the server REQUIRES a client
+/// certificate signed by `client_ca` and refuses the handshake without one.
+fn spawn_tls_server_requiring_client_auth(listener: TcpListener, p: &Pki, client_ca: &str) {
+    let identity = Identity::from_pem(&p.cert_pem, &p.key_pem);
+    let mut builder = Server::builder()
+        .tls_config(
+            ServerTlsConfig::new()
+                .identity(identity)
+                .client_ca_root(Certificate::from_pem(client_ca))
+                .client_auth_optional(false),
+        )
         .unwrap();
     let router = builder.add_routes(tonic::service::Routes::default());
     tokio::spawn(async move {
@@ -626,6 +698,56 @@ async fn a_client_identity_does_not_break_a_hop_whose_server_asks_for_none() {
         Ok(()),
         "a server that requests no client certificate must still be reachable by a client \
          configured to present one"
+    );
+}
+
+/// AUDIT B S-3: THE CALLER PRESENTATION WIRING TEST. `UpstreamTls::options`
+/// calls `TlsOptions::identity` exactly when `IAM_TLS_CLIENT_CERT_FILE` and
+/// `IAM_TLS_CLIENT_KEY_FILE` are both set — proved here by a REAL mutual-TLS
+/// handshake against a server that demands a client certificate and verifies
+/// it, rather than by inspecting `UpstreamTls`'s own fields (already done in
+/// `src/upstream/tests.rs`) or `dial`'s private `TlsOptions::identity` field,
+/// which this crate cannot read at all.
+///
+/// **BOTH HALVES OF THE PAIR MATTER.** [`settings_with_identity`] must
+/// SUCCEED against this server, and [`settings`] (no client cert configured)
+/// must be REFUSED by the same server — the second case is what makes the
+/// first one evidence rather than a server that accepts anything. Had
+/// `connect_iam` or `UpstreamTls::options` dropped the `.identity(..)` call on
+/// the floor, the first case would fail exactly like the second already does.
+#[tokio::test]
+async fn the_client_identity_is_actually_presented_to_a_server_that_requires_one() {
+    let p = pki(SERVED_NAME);
+    let ca = TempPem::with(&p.ca_pem);
+
+    let caller = client_pki("gateway-caller");
+    let certificate = TempPem::with(&caller.cert_pem);
+    let key = TempPem::with(&caller.key_pem);
+
+    let port = serve_requiring_client_auth(&p, &caller.ca_pem).await;
+
+    let with_identity = upstream::connect_iam(
+        SERVED_NAME,
+        port,
+        Some(&settings_with_identity(&ca, certificate.path(), key.path())),
+    )
+    .await
+    .expect("a complete identity is a usable configuration");
+    assert_eq!(
+        request(with_identity).await,
+        Ok(()),
+        "a client configured with an identity must be accepted by a server that \
+         requires and verifies one"
+    );
+
+    let without_identity = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+        .await
+        .expect("a flag and a bundle, with no identity, are a usable configuration");
+    let outcome = request(without_identity).await;
+    assert!(
+        outcome.is_err(),
+        "a client presenting no identity must be refused by a server that requires \
+         one, or this server is not proving anything: {outcome:?}"
     );
 }
 

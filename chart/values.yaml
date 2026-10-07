@@ -36,17 +36,21 @@ task:
   # time — a single flag would make that all-or-nothing, which is the opposite
   # of a change that can be reverted on its own.
   tls:
-    # OFF, and it stays off until the servers can answer. **task does not serve
-    # TLS yet**, so turning this on today breaks the hop rather than securing
-    # it. The code ships first and the cut-over is a separate, revertible change
-    # — the same discipline trustUnauthenticatedHeaders' cut-over used.
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). This key is deliberately
+    # ABSENT here: a defaulted security switch decides the transport's
+    # posture silently, so `values.schema.json` makes it `required` and
+    # `templates/deployment.yaml` refuses the render if it is absent, null or
+    # not a bare `true`/`false` — every consumer (argocd, `chart/ci/values.yaml`,
+    # an adopter's own values) must set `task.tls.enabled` explicitly.
+    # `task` serves TLS now (ledger 1294), so this is a real cut-over switch
+    # rather than a value with nowhere to land yet.
     #
     # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at
     # boot naming the file; it never falls back to cleartext, and it never falls
     # back to the platform trust store. `false` with a bundle still configured
     # is the reverted state, and gateway logs a warning saying the hop is in
     # cleartext so nobody has to infer it.
-    enabled: false
+    #
     # The Secret holding the authority that signed task's certificate.
     #
     # A SECRET, THOUGH A CA IS PUBLIC — because that is where an issuer actually
@@ -117,17 +121,18 @@ iam:
   # by real handshakes in tests/iam_tls.rs rather than by showing that a
   # configuration was attached.
   tls:
-    # OFF, and it stays off until the servers can answer. **iam does not serve
-    # TLS yet**, so turning this on today breaks the hop rather than securing
-    # it. The code ships first and the cut-over is a separate, revertible
-    # change.
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). This key is deliberately
+    # ABSENT here, the same as `task.tls.enabled` above: `values.schema.json`
+    # makes it `required` and `templates/deployment.yaml` refuses the render
+    # if it is absent, null or not a bare `true`/`false`. `iam` serves TLS now
+    # (ledger 1294), so every consumer must set `iam.tls.enabled` explicitly.
     #
     # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at
     # boot naming the file — and it fails EAGERLY, even though the iam channel
     # is otherwise lazy, because a bundle depends on the deployment that wrote
     # it rather than on iam existing. `false` with a bundle still configured is
     # the reverted state, and gateway logs a warning saying so.
-    enabled: false
+    #
     # The Secret holding the authority that signed iam's certificate. A Secret
     # though a CA is public, because that is where an issuer writes it; not a
     # PEM pasted into this file, because the authority rotates.
@@ -166,10 +171,11 @@ project:
   # The TRANSPORT to that service. Same shape as `task.tls` and `iam.tls`, and
   # configured independently of both so the three can be cut over one at a time.
   tls:
-    # OFF, and it stays off until the servers can answer — `project` does not
-    # serve TLS yet, so turning this on today breaks the hop rather than securing
-    # it.
-    enabled: false
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). This key is deliberately
+    # ABSENT here, the same as `task.tls.enabled` and `iam.tls.enabled` above.
+    # `project` serves TLS now (ledger 1294), so every consumer must set
+    # `project.tls.enabled` explicitly.
+    #
     # The Secret holding the authority that signed project's certificate.
     caSecret: project-tls
     # The key inside that Secret which holds the bundle, mounted as `ca.pem`.

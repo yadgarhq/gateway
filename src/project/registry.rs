@@ -58,7 +58,7 @@ pub const LOADED: &str = "yadgar_gateway_project_registry_loaded";
 /// credential lookup, sized for an upstream that is SLOW rather than one that is
 /// expensive, and nothing about a deployment changes what a stalled page should
 /// cost a background task.
-const PAGE_DEADLINE: Duration = Duration::from_secs(5);
+const PAGE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
 
 /// The environment variable naming the load cadence, in seconds.
 pub const POLL: &str = "YADGAR_PROJECT_REGISTRY_POLL_SECONDS";

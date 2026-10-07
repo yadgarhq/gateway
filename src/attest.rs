@@ -73,7 +73,9 @@
 //!
 //! Closing it needs a subject keyed on something other than a user, which is a
 //! contract change in `iam` rather than an edit here. Until then the bound is
-//! [`DEFAULT_TTL_SECONDS`], and the direction of the stale answer is whichever
+//! whatever [`Credentials`] is configured with (`YADGAR_CREDENTIAL_TTL_SECONDS`,
+//! sourced from the chart's `credentialCache.ttlSeconds`, ADR-0569 — no
+//! compiled-in default), and the direction of the stale answer is whichever
 //! way the policy moved — a tightened policy stays loose for up to that long.
 
 use std::fmt;
@@ -102,7 +104,7 @@ const TRUST_HEADERS: &str = "YADGAR_TRUST_UNAUTHENTICATED_HEADERS";
 /// latency-critical path. A stalled `iam` must cost one bounded wait rather than
 /// hold every request in the system open, so this is sized for a lookup that is
 /// slow rather than for one that is expensive.
-const RESOLVE_DEADLINE: Duration = Duration::from_secs(5);
+const RESOLVE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): sized against a lookup that is slow rather than expensive, not a tuning knob.
 
 /// Why a request has no attested identity.
 ///
@@ -216,7 +218,10 @@ impl Attestation {
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         // Exactly "1". A permissive parse here — "0", "false", "no" all enabling
         // it — is how a setting meant to be off ends up on.
-        if lookup(TRUST_HEADERS).as_deref() == Some("1") {
+        // Absence is the secure state (resolve via iam); there is no
+        // fallback to mark, only the state this flag opts OUT of.
+        let trusted_headers = lookup(TRUST_HEADERS).as_deref() == Some("1"); // ADR-0569-EXCEPTION(ABS)
+        if trusted_headers {
             return Self::TrustedHeaders;
         }
         Self::Iam

@@ -1,0 +1,31 @@
+# This chart's CI values override (C-A2, `yadgarhq/actions`
+# `scripts/chart_values_override.py`). Every shared gate that renders or
+# lints this chart OFFLINE — the `helm-lint` pre-commit hook,
+# `d80_portability.py` and `service_immutable.py` — deep-merges this file
+# over `chart/values.yaml` before it runs, with `-f chart/ci/values.yaml`.
+#
+# WHY THIS FILE EXISTS (ADR-0845, ledger 965, 1278). `task.tls.enabled`,
+# `iam.tls.enabled` and `project.tls.enabled` are each `required` in
+# `values.schema.json` with NO chart default: `chart/values.yaml` declares no
+# value for any of the three, by design, so a bare `helm lint --strict` or
+# `helm template` with no values file refuses on the missing key. An
+# adopter — argocd's `applications/yadgar.yaml`, or any other values file —
+# supplies the real value; this file is what lets the chart's OWN offline
+# checks exercise a render at all.
+#
+# `true` ON EVERY SWITCH, matching the explicit-values golden this PR's
+# `scripts/tests/test_render_checks.py` holds against `origin/main`'s chart:
+# with every dial's TLS on, this chart renders byte-identical to the
+# pre-ADR-0845 tree. `d80_portability.py`'s all-off pass flips each `enabled`
+# back to `false` on top of this file, so both states are exercised offline.
+task:
+  tls:
+    enabled: true
+
+iam:
+  tls:
+    enabled: true
+
+project:
+  tls:
+    enabled: true

@@ -188,7 +188,7 @@ pub const CONSUMING: &str = "yadgar_gateway_invalidation_consuming";
 ///
 /// Short, because the window it reopens is the one this module exists to close,
 /// and a redial costs one TCP connection.
-const RETRY: Duration = Duration::from_secs(5);
+const RETRY: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): sized against the window this module exists to close, not a tuning knob.
 
 /// How long the consumer waits before dialling again after the broker REFUSED its
 /// credential.
@@ -199,7 +199,7 @@ const RETRY: Duration = Duration::from_secs(5);
 /// Secret, so retrying it at the outage rate buys nothing, writes an error line
 /// every five seconds for as long as the mistake stands, and spends an
 /// authentication attempt on the broker each time.
-const REFUSED_RETRY: Duration = Duration::from_secs(60);
+const REFUSED_RETRY: Duration = Duration::from_secs(60); // ADR-0569-EXCEPTION(CC): deliberately far longer than RETRY — a refused credential retried at the outage rate buys nothing.
 
 /// How long [`start`] waits for [`run`]'s first answer.
 ///
@@ -215,6 +215,7 @@ const REFUSED_RETRY: Duration = Duration::from_secs(60);
 ///
 /// A second of slack on top, because this bounds a boot rather than a request and
 /// the cost of being slightly generous is nothing.
+// ADR-0569-EXCEPTION(CC): derived from CONNECT_TIMEOUT and PERMISSION_GRACE, never copied from one of their terms — not a tuning knob.
 const BOOT_ANSWER_TIMEOUT: Duration = CONNECT_TIMEOUT
     .saturating_add(PERMISSION_GRACE)
     .saturating_add(Duration::from_secs(1));

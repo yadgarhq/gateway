@@ -1,5 +1,40 @@
 # Migration notes
 
+## Every dial's TLS switch is now required, with no chart default (ADR-0845, ledger 965, 1278)
+
+**Breaking: `task.tls.enabled`, `iam.tls.enabled` and `project.tls.enabled` must
+each be set to `true` or `false` explicitly.** This chart shipped `false` as
+the default for all three; that default is gone. An install or upgrade that
+does not set one of them is refused at `helm template` / `helm lint --strict`
+/ an Argo sync, naming the chart key — never at apply, and never as a silent
+fallback to cleartext. `credentialCache.ttlSeconds` is unaffected (it still
+ships `30`), but the binary that reads it has carried no compiled-in default
+for a while; this release only adds the matching chart-level `required`.
+
+**Chart and image move together, the same rule ledger 881 states above.**
+`TASK_TLS_ENABLED`, `IAM_TLS_ENABLED` and `PROJECT_TLS_ENABLED` now render
+UNCONDITIONALLY as `"1"` or `"0"` — never omitted — and the binary refuses to
+boot if any of the three is absent or not exactly `"1"`/`"0"`. A pod that gets
+this image under the OLD chart (which renders the variable only when
+`tls.enabled` is `true`) exits at boot naming the missing variable on every
+dial left at its old implicit `false`. Land the chart with or before the
+image, never after.
+
+**What to set it to.** Set each dial's `enabled` to match what is already
+true of that hop: `true` if the upstream already serves TLS and this gateway
+already dials it over TLS, `false` if it does not. The kind reference
+deployment serves TLS on every dial today (ledger 1294), so its values set all
+three `true`; a deployment that has not cut a given hop over sets that one
+`false` — `false` is an explicit, supported, fully cleartext value, not a
+deprecated one.
+
+**Nothing about `UpstreamTls`'s decision logic changed except what counts as a
+valid value for the switch itself.** `"1"` still means TLS on, `"0"` still
+means TLS off with a warning if a CA bundle or client certificate is left
+configured; only "unset" and anything other than exactly `"1"` or `"0"` moved
+from "quietly off" to "refuses to boot", naming the variable and the chart
+key.
+
 ## Project validation — three new required variables, and the chart and the image must move together (ledger 881)
 
 **What this release does: it resolves every claimed workspace, counts what it

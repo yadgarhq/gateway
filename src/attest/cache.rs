@@ -32,17 +32,6 @@ use super::AttestError;
 /// be off by a thousand.
 pub(super) const CREDENTIAL_TTL: &str = "YADGAR_CREDENTIAL_TTL_SECONDS";
 
-/// The default lifetime of a cached resolution, in seconds.
-///
-/// **Short, because it is the revocation bound whenever the broker is not
-/// reachable.** The invalidation event ([`crate::invalidate`]) is the mechanism and
-/// this is its backstop, so the number is chosen against the cost of a missed event
-/// rather than against the hit rate. It buys almost all of the hit rate anyway: an
-/// agent making even one call a second serves thirty of them per lookup, and raising
-/// this to `iam`'s own 300 would multiply that window by ten to buy the last few
-/// percent.
-pub(super) const DEFAULT_TTL_SECONDS: u64 = 30;
-
 /// The largest lifetime this gateway will accept, in seconds.
 ///
 /// **A refusal rather than a clamp**, for the reason `limit::validate` gives about
@@ -52,6 +41,9 @@ pub(super) const DEFAULT_TTL_SECONDS: u64 = 30;
 /// caches — so nothing above it could be honoured for a live entry in any case,
 /// and for a REFUSED one it would be a revocation window measured in minutes with
 /// no event able to close it.
+// ADR-0569-EXCEPTION(CB): contract bound to iam's own credential lifetime
+// (300s, `iam/src/service/credential.rs` `MAX_EXPIRES_IN_SECONDS`), not a
+// tuning knob this chart could reasonably override independently.
 pub(super) const MAX_TTL_SECONDS: u64 = 300;
 
 /// How many resolutions one replica holds, per outcome.
@@ -67,7 +59,7 @@ pub(super) const MAX_TTL_SECONDS: u64 = 300;
 /// in the team count — it is sparse by construction and, unlike the entry COUNT
 /// above, it comes from `iam` rather than from the unauthenticated writer, so it
 /// widens the figure without widening who decides it.
-pub(super) const CAPACITY: usize = 4096;
+pub(super) const CAPACITY: usize = 4096; // ADR-0569-EXCEPTION(CC): sized against the chart's 128Mi limit, not a tuning knob.
 
 /// Whether the credential lookup was served from this replica's memory.
 ///
@@ -220,14 +212,27 @@ impl Credentials {
     /// [`Attestation::from_lookup`] gives: a test that sets a real environment
     /// variable steers every other test in the same binary.
     ///
-    /// **An unparseable value fails boot rather than falling back to the
-    /// default.** That is D69 and it is `main.rs`'s existing rule for
-    /// `YADGAR_RATE_LIMIT_TIMEOUT_MS`: a number nobody can read is a deployment
-    /// mistake, and quietly substituting one leaves an operator believing a bound
-    /// that is not in force.
+    /// **No compiled-in default (ADR-0569).** An absent or empty value refuses
+    /// boot naming the variable and the chart key that sources it, rather than
+    /// quietly reusing a number nobody chose: this value is the revocation
+    /// bound whenever the broker misses an invalidation event, so a silent
+    /// default would make that bound whatever happened to be compiled in. An
+    /// unparseable value fails boot the same way — that is D69 and it is
+    /// `main.rs`'s existing rule for `YADGAR_RATE_LIMIT_TIMEOUT_MS`: a number
+    /// nobody can read is a deployment mistake, and quietly substituting one
+    /// leaves an operator believing a bound that is not in force.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let seconds = match lookup(CREDENTIAL_TTL).filter(|v| !v.is_empty()) {
-            None => DEFAULT_TTL_SECONDS,
+            None => {
+                return Err(format!(
+                    "{CREDENTIAL_TTL} is not set. It has no compiled-in default (ADR-0569): \
+                     it is the bound on how long a revoked credential keeps working whenever \
+                     the broker misses an invalidation event, and a silent default would make \
+                     that bound whatever happened to be compiled in rather than whatever the \
+                     chart's credentialCache.ttlSeconds says. Set {CREDENTIAL_TTL}, sourced \
+                     from the chart's credentialCache.ttlSeconds."
+                ));
+            }
             Some(v) => v.parse::<u64>().map_err(|e| {
                 format!(
                     "{CREDENTIAL_TTL} is not a whole number of seconds: {e}. It is how long \

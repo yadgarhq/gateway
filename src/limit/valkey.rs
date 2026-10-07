@@ -291,11 +291,11 @@ impl Limiter {
         // Retrying inside one call is the wrong place for it besides: the next
         // call reconnects anyway, and a queue of callers all waiting on the same
         // doomed connect is latency at the one hop all traffic passes through.
-        let inner = self.timeout.mul_f32(0.66);
+        let inner = self.timeout.mul_f32(0.66); // ADR-0569-EXCEPTION(CC): two thirds of the caller's own budget, not a tuning knob — see the comment above.
         let config = ConnectionManagerConfig::new()
             .set_connection_timeout(Some(inner))
             .set_response_timeout(Some(inner))
-            .set_number_of_retries(0);
+            .set_number_of_retries(0); // ADR-0569-EXCEPTION(CC): zero because a retry inside one call is the wrong place for it — see the comment above.
 
         let mut conn = self
             .conn

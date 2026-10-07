@@ -31,7 +31,7 @@ pub(super) const PASSWORD_FILE: &str = "NATS_PASSWORD_FILE";
 /// seconds today, and a default in a dependency is not a bound this repository
 /// gets to rely on. Below [`RETRY`], so one dial cannot still be outstanding when
 /// the next is due.
-pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3); // ADR-0569-EXCEPTION(CC): a bound this module derives BOOT_ANSWER_TIMEOUT from, not a tuning knob.
 
 /// What this service presents to the broker.
 ///
@@ -117,12 +117,17 @@ impl Broker {
     /// with no password, must not fall back to connecting anonymously. That is
     /// the silent downgrade every other credential in this binary refuses.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
-        let url = lookup(URL).unwrap_or_default();
+        // The three reads below are marked ADR-0569-EXCEPTION(ABS) each: the
+        // chart renders every one of these variables unconditionally, so empty
+        // is this chart's own "broker is off" value rather than a fallback
+        // this code chose, and absence of the broker is a state the design
+        // needs (invalidation publishing is opt-in).
+        let url = lookup(URL).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): empty means the broker is off.
         if url.is_empty() {
             return Ok(None);
         }
-        let user = lookup(USER).unwrap_or_default();
-        let path = lookup(PASSWORD_FILE).unwrap_or_default();
+        let user = lookup(USER).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): no account to name while the broker is off.
+        let path = lookup(PASSWORD_FILE).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): no credential file to name while the broker is off.
 
         if path.is_empty() {
             if !user.is_empty() {
