@@ -117,6 +117,20 @@ def schema_node(schema: dict, path: str):
     return cursor
 
 
+def open_paths_failures(schema: dict) -> list[str]:
+    """Every `OPEN` path that is not the bare, unconstrained `{}` an open map
+    is — the real gate `test_the_open_paths_are_exactly_bare` asserts, reused
+    here so the mutation tests below call the actual check rather than a
+    weaker stand-in for it.
+    """
+    failures = []
+    for path in OPEN:
+        node = schema_node(schema, path)
+        if node != {}:
+            failures.append(f"{path} is declared as {node!r}, not the bare {{}} an open map is")
+    return failures
+
+
 def nodes_with_properties(schema: dict, prefix: str = ""):
     """Yield (path, node) for every node in the tree carrying `properties`.
 
@@ -182,10 +196,8 @@ def test_the_open_paths_are_exactly_bare():
     would pass a laxer check and still be a TYPED open map, which is not what
     this chart ships for any of the three.
     """
-    schema = load_schema()
-    for path in OPEN:
-        node = schema_node(schema, path)
-        assert node == {}, f"{path} is declared as {node!r}, not the bare {{}} an open map is"
+    failures = open_paths_failures(load_schema())
+    assert failures == [], "\n".join(failures)
 
 
 def test_every_values_yaml_leaf_is_declared():
@@ -231,7 +243,7 @@ def test_mutation_deleting_root_additional_properties_reddens_the_closure_check(
 def test_mutation_deleting_global_reddens_the_open_path_check():
     schema = load_schema()
     del schema["properties"]["global"]
-    assert schema_node(schema, "global") is None
+    assert open_paths_failures(schema) != []
 
 
 def test_mutation_deleting_an_extra_reddens_the_extras_check():
@@ -245,7 +257,7 @@ def test_mutation_deleting_an_extra_reddens_the_extras_check():
 def test_mutation_closing_an_open_map_reddens_the_open_path_check():
     schema = load_schema()
     schema["properties"]["resources"] = {"properties": {}, "additionalProperties": False}
-    assert schema_node(schema, "resources") != {}
+    assert open_paths_failures(schema) != []
 
 
 def test_mutation_reopening_autoscaling_lets_the_root_level_typo_through(tmp_path):
@@ -418,8 +430,8 @@ def test_an_untyped_leaf_takes_a_cli_override(tmp_path):
 
 def test_the_retained_typed_leaf_still_refuses_its_own_minimum(tmp_path):
     """`toolsPoll.intervalSeconds` PREDATES this closure and keeps its own
-    `integer, minimum 1` (§3.3) — the one leaf in this chart's schema where a
-    type belongs, because a wrong type here reaches
+    `integer, minimum 1` (§3.3) — one of the typed nodes that predate this
+    closure (see the schema's `$comment`), because a wrong type here reaches
     `rotate::GatewayDocument::tools_poll_interval` at BOOT rather than at
     render. This schema's closure elsewhere must not have disturbed it.
 
@@ -443,11 +455,9 @@ def test_the_default_render_is_unchanged():
 
 
 def test_the_argocd_gateway_section_still_renders(tmp_path):
-    """`global` + the `gateway` section of `argocd/applications/yadgar.yaml`'s
-    `valuesObject` (yadgarhq/argocd `origin/main`, read 2026-10-03, PR #61/
-    C-V0 already landed so no `gateway.tls` remains). A LITERAL count, for the
-    reason every expected count in this estate is one: a number derived from
-    the render under test agrees with whatever it happens to produce.
+    """A FROZEN COPY of that section as read on 2026-10-03; it does not track
+    the other repository. The live gate for argocd and parent inputs is the
+    parent chart's suite plus the K-9 valuesObject sweep before each pin bump.
     """
     body = {
         "adminBootstrap": {"tokenSecret": "admin-bootstrap-token"},
@@ -483,8 +493,9 @@ def test_the_argocd_gateway_section_still_renders(tmp_path):
 
 
 def test_the_parent_example_gateway_section_still_renders(tmp_path):
-    """`global` + the `gateway` section of `yadgarhq/chart`'s `example/
-    values.yaml` (`origin/main`, read 2026-10-03).
+    """A FROZEN COPY of that section as read on 2026-10-03; it does not track
+    the other repository. The live gate for argocd and parent inputs is the
+    parent chart's suite plus the K-9 valuesObject sweep before each pin bump.
     """
     body = {
         "global": {"hostname": ""},
