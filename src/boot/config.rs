@@ -87,10 +87,11 @@ pub fn rate_limiting() -> Result<(Limiter, Option<(String, PathBuf)>), Boxed> {
     // A misparsed limit must not become a default: a limit nobody notices is
     // gone is the failure this refusal exists to prevent.
     //
-    // `.to_string()` on the way out, and not decoration: `main` returns
-    // `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` here would
-    // put `UnknownKind("wrote")` on the operator's terminal instead of the
-    // sentence saying which kinds exist.
+    // `.to_string()` on the way out. It dates from when `main` returned
+    // `Result` and Rust printed a bare `?` here with Debug, as
+    // `UnknownKind("wrote")`. `main` prints Display now (ledger 1258), so the
+    // conversion no longer changes what the operator reads; it stays as the
+    // sentence it always produced.
     //
     // `YADGAR_RATE_LIMITS` MAY BE EMPTY and that is a real answer: it says no
     // kind carries its own bucket and every kind takes the default below. The

@@ -117,9 +117,9 @@ pub async fn wiring(
     // `shared.yaml` now restarts this pod exactly as editing a CA bundle would.
     //
     // ONE CALL, AND THE SAME ONE A TEST MAKES. This used to be two chained
-    // builder calls here, where nothing could reach them: no test spawns this
-    // binary, so deleting either compiled and passed everything. The list lives
-    // in `rotate::watch_set` now and `tests/assembly.rs` calls it.
+    // builder calls here, where nothing could reach them: no test spawned this
+    // binary then, so deleting either compiled and passed everything. The list
+    // lives in `rotate::watch_set` now and `tests/assembly.rs` calls it.
     // READ HERE, BEFORE THE WATCH SET, because that set is hashed as it is built
     // and every entry has to be a file this process ACTUALLY LOADED. Reading it
     // beside `admin_limits` further down would put the rest of boot inside a
@@ -173,10 +173,10 @@ pub async fn wiring(
 /// dial this gateway has always done — no module serves TLS yet, so the cut-over
 /// is a later change that can be reverted on its own, one hop at a time.
 ///
-/// `.to_string()` on the way out, for the reason `Limits::parse` gives: `main`
-/// returns `Box<dyn Error>`, which Rust prints with DEBUG, so a bare `?` would put
-/// `NoCaFile("TASK")` on the operator's terminal instead of the sentence naming
-/// the missing variable and saying why cleartext is not the answer.
+/// `.to_string()` on the way out. It dates from when `main` returned `Result`
+/// and Rust printed a bare `?` here with Debug, as `NoCaFile("TASK")`. `main`
+/// prints Display now (ledger 1258), so the conversion no longer changes what
+/// the operator reads; it stays as the sentence it always produced.
 ///
 /// Its own function since ledger 881 made it three reads rather than two, which
 /// took [`wiring`] past the function-length ceiling. The seam is the one the
@@ -295,8 +295,12 @@ pub async fn serve(
     watch_inputs: rotate::Inputs,
     schedule: rotate::Schedule,
 ) -> Result<(), Boxed> {
-    let addr: SocketAddr = env_required("LISTEN")?.parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr: SocketAddr = env_required("LISTEN")?
+        .parse()
+        .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("LISTEN={addr} could not be bound: {}", refusal(&e)))?;
     // ARMED BEFORE THE LISTENER IS SERVED, and that ordering is the fix rather
     // than an accident of where the line sits. `yadgar_lifecycle::shutdown`
     // installs both signal handlers when it is CALLED — a SIGTERM arriving between here and
@@ -357,7 +361,12 @@ pub async fn serve(
     };
 
     match drain_within(serving, ask_to_stop, stop, DRAIN_BUDGET).await {
-        Drain::Finished(result) => result?,
+        Drain::Finished(result) => result.map_err(|e| {
+            format!(
+                "the HTTP listener on LISTEN={addr} stopped with an error: {}",
+                refusal(&e)
+            )
+        })?,
         Drain::Overran => tracing::error!(
             budget_secs = DRAIN_BUDGET.as_secs(),
             "the drain did not finish within its budget; ending anyway with calls still in \
@@ -378,13 +387,14 @@ async fn upstreams(
     project_tls: Option<&upstream::UpstreamTls>,
 ) -> Result<(Channel, Channel, Channel), Boxed> {
     let task_host = env_required("TASK_HOST")?;
-    let task_port: u16 = env_required("TASK_PORT")?.parse()?;
+    let task_port: u16 = env_required("TASK_PORT")?
+        .parse()
+        .map_err(|e| format!("TASK_PORT is not a port number: {e}"))?;
     let task = upstream::connect_task(&task_host, task_port, task_tls)
         .await
         // Same reasoning: `BalanceError`'s messages are paragraphs explaining
         // that an empty bundle trusts nobody and that a missing one is not a
-        // reason to connect in cleartext. Debug prints the struct and throws all
-        // of that away.
+        // reason to connect in cleartext.
         //
         // `refusal` RATHER THAN `to_string()`, and see its own note for why this
         // site takes it and the other four do not: `BalanceError::Tls` is the one
@@ -434,7 +444,9 @@ async fn upstreams(
     // deferring the read would turn an operator's mistake into a per-request
     // failure found under traffic rather than a refusal to boot.
     let iam_host = env_required("IAM_HOST")?;
-    let iam_port: u16 = env_required("IAM_PORT")?.parse()?;
+    let iam_port: u16 = env_required("IAM_PORT")?
+        .parse()
+        .map_err(|e| format!("IAM_PORT is not a port number: {e}"))?;
     let iam = upstream::connect_iam(&iam_host, iam_port, iam_tls)
         .await
         // `refusal`, for the reason `connect_task` above gives.
@@ -451,7 +463,9 @@ async fn upstreams(
     // and ADR-0674 rules that its absence must cost a degraded window rather
     // than a front door that never opens.
     let project_host = env_required("PROJECT_HOST")?;
-    let project_port: u16 = env_required("PROJECT_PORT")?.parse()?;
+    let project_port: u16 = env_required("PROJECT_PORT")?
+        .parse()
+        .map_err(|e| format!("PROJECT_PORT is not a port number: {e}"))?;
     let project = upstream::connect_project(&project_host, project_port, project_tls)
         .await
         .map_err(|e| refusal(&e))?;

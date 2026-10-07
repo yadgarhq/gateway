@@ -20,19 +20,25 @@
 //! port-forward against a replica whose registry has never loaded, and it belongs
 //! to whoever deploys.
 //!
-//! **COMMENTS ARE STRIPPED BEFORE ANYTHING IS SEARCHED.** `main`'s own comments
+//! **COMMENTS ARE STRIPPED BEFORE ANYTHING IS SEARCHED.** `run`'s own comments
 //! name both `install_prometheus` and `boot::wiring` — they have to, ADR-0677
 //! requires the constraint stated where the boot sequence is written — so a search
 //! over the raw file would match prose and red or green on an edit to a sentence.
+//!
+//! **`main` ITSELF IS NOT SCANNED, AND THAT IS DELIBERATE (ledger 1258).**
+//! `main` now does nothing but call `run` and print its `Err` with Display
+//! (`tests/boot_message.rs` holds that print); every boot phase this file
+//! orders lives in `run`'s body, so that is the marker this file reads from.
 
 use std::path::PathBuf;
 
-/// The statements of `main`'s body, as `(line number, text)`, with every comment
+/// The statements of `run`'s body, as `(line number, text)`, with every comment
 /// line dropped.
 ///
-/// **FROM `async fn main(` RATHER THAN THE TOP OF THE FILE.** `use
-/// boot::env_required;` sits above it and contains `boot::`, so a rule of the
-/// shape "the recorder precedes every `boot::`" is poisoned before `main` begins.
+/// **FROM `async fn run(` RATHER THAN THE TOP OF THE FILE.** `use
+/// boot::{env_required, ...};` sits above it and contains `boot::`, so a rule
+/// of the shape "the recorder precedes every `boot::`" is poisoned before
+/// `run` begins.
 ///
 /// A missing marker PANICS rather than returning an empty body: a run that found
 /// nothing to check must not be a run that passed.
@@ -43,10 +49,10 @@ fn main_statements() -> Vec<(usize, String)> {
 
     let opens = source
         .lines()
-        .position(|line| line.starts_with("async fn main("))
+        .position(|line| line.starts_with("async fn run("))
         .unwrap_or_else(|| {
             panic!(
-                "{} must declare `async fn main(` at the start of a line — this file reads the \
+                "{} must declare `async fn run(` at the start of a line — this file reads the \
                  boot sequence from that marker and can check nothing without it",
                 path.display()
             )
@@ -62,7 +68,7 @@ fn main_statements() -> Vec<(usize, String)> {
 
     assert!(
         !statements.is_empty(),
-        "`main`'s body in {} is entirely comments, so this file checked nothing",
+        "`run`'s body in {} is entirely comments, so this file checked nothing",
         path.display()
     );
     statements
@@ -82,15 +88,15 @@ fn sole_line(statements: &[(usize, String)], needle: &str) -> usize {
     assert_eq!(
         found.len(),
         1,
-        "expected exactly one statement in `main` containing `{needle}`, found {}: {found:?}",
+        "expected exactly one statement in `run` containing `{needle}`, found {}: {found:?}",
         found.len()
     );
     found[0]
 }
 
-/// **THE RECORDER IS INSTALLED BEFORE EVERY BOOT PHASE `main` CALLS.**
+/// **THE RECORDER IS INSTALLED BEFORE EVERY BOOT PHASE `run` CALLS.**
 ///
-/// A RULE RATHER THAN A LIST: every `boot::` in `main`'s body is checked, so a
+/// A RULE RATHER THAN A LIST: every `boot::` in `run`'s body is checked, so a
 /// phase added later is covered without touching this file. `boot::wiring(` is
 /// named separately only as a vacuity guard — it is the phase whose gauge the
 /// incident was about, and a rename that made this search match nothing would
@@ -114,7 +120,7 @@ fn the_recorder_is_installed_before_every_boot_phase() {
         phases
             .iter()
             .any(|(_, line)| line.contains("boot::wiring(")),
-        "no statement in `main` calls `boot::wiring(` any more, so this test found no phase to \
+        "no statement in `run` calls `boot::wiring(` any more, so this test found no phase to \
          order the recorder against. Rename the needle rather than deleting the check \
          (ADR-0677)"
     );
