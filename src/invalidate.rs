@@ -215,10 +215,9 @@ const REFUSED_RETRY: Duration = Duration::from_secs(60); // ADR-0569-EXCEPTION(C
 ///
 /// A second of slack on top, because this bounds a boot rather than a request and
 /// the cost of being slightly generous is nothing.
-// ADR-0569-EXCEPTION(CC): derived from CONNECT_TIMEOUT and PERMISSION_GRACE, never copied from one of their terms — not a tuning knob.
 const BOOT_ANSWER_TIMEOUT: Duration = CONNECT_TIMEOUT
     .saturating_add(PERMISSION_GRACE)
-    .saturating_add(Duration::from_secs(1));
+    .saturating_add(Duration::from_secs(1)); // ADR-0569-EXCEPTION(CC): derived from CONNECT_TIMEOUT and PERMISSION_GRACE, not a tuning knob.
 
 /// Start consuming, and answer whether this replica actually is.
 ///

@@ -33,6 +33,50 @@ fn absent_tls_enabled_refuses_boot() {
     ));
 }
 
+/// THE DISPLAY TEXT ITSELF must name both the variable and the chart key, for
+/// every one of the three prefixes — a mutation that deletes `{1}` from
+/// `MissingEnabled`'s format string, or `{2}` from `InvalidEnabled`'s, passes
+/// every `matches!` check elsewhere in this file, because those destructure
+/// the FIELDS rather than read what `Display` renders from them.
+#[test]
+fn the_refusal_text_names_both_the_variable_and_the_chart_key() {
+    let missing = UpstreamTls::from_lookup(TASK, lookup(&[]))
+        .expect_err("absent TLS_ENABLED must refuse")
+        .to_string();
+    assert!(missing.contains("TASK_TLS_ENABLED"), "{missing}");
+    assert!(missing.contains("task.tls.enabled"), "{missing}");
+
+    let invalid = UpstreamTls::from_lookup(TASK, lookup(&[("TASK_TLS_ENABLED", "bogus")]))
+        .expect_err("an unrecognised value must refuse")
+        .to_string();
+    assert!(invalid.contains("TASK_TLS_ENABLED"), "{invalid}");
+    assert!(invalid.contains("task.tls.enabled"), "{invalid}");
+
+    let missing = UpstreamTls::from_lookup(IAM, lookup(&[]))
+        .expect_err("absent TLS_ENABLED must refuse")
+        .to_string();
+    assert!(missing.contains("IAM_TLS_ENABLED"), "{missing}");
+    assert!(missing.contains("iam.tls.enabled"), "{missing}");
+
+    let invalid = UpstreamTls::from_lookup(IAM, lookup(&[("IAM_TLS_ENABLED", "bogus")]))
+        .expect_err("an unrecognised value must refuse")
+        .to_string();
+    assert!(invalid.contains("IAM_TLS_ENABLED"), "{invalid}");
+    assert!(invalid.contains("iam.tls.enabled"), "{invalid}");
+
+    let missing = UpstreamTls::from_lookup(PROJECT, lookup(&[]))
+        .expect_err("absent TLS_ENABLED must refuse")
+        .to_string();
+    assert!(missing.contains("PROJECT_TLS_ENABLED"), "{missing}");
+    assert!(missing.contains("project.tls.enabled"), "{missing}");
+
+    let invalid = UpstreamTls::from_lookup(PROJECT, lookup(&[("PROJECT_TLS_ENABLED", "bogus")]))
+        .expect_err("an unrecognised value must refuse")
+        .to_string();
+    assert!(invalid.contains("PROJECT_TLS_ENABLED"), "{invalid}");
+    assert!(invalid.contains("project.tls.enabled"), "{invalid}");
+}
+
 /// A bundle without the flag is STILL refused: the flag has no default any
 /// more, so a CA path configured alone does not make its absence mean
 /// anything other than "not set".

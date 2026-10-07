@@ -7,9 +7,11 @@ each be set to `true` or `false` explicitly.** This chart shipped `false` as
 the default for all three; that default is gone. An install or upgrade that
 does not set one of them is refused at `helm template` / `helm lint --strict`
 / an Argo sync, naming the chart key — never at apply, and never as a silent
-fallback to cleartext. `credentialCache.ttlSeconds` is unaffected (it still
-ships `30`), but the binary that reads it has carried no compiled-in default
-for a while; this release only adds the matching chart-level `required`.
+fallback to cleartext. `credentialCache.ttlSeconds` still ships `30`. This
+release deletes the binary's compiled-in 30-second fallback for
+`YADGAR_CREDENTIAL_TTL_SECONDS` (ledger 1279), so an empty or absent value now
+refuses boot. The schema now makes the key `required` and `type: integer`, so
+a quoted `ttlSeconds: "30"` or a `null` is refused at render.
 
 **Chart and image move together, the same rule ledger 881 states above.**
 `TASK_TLS_ENABLED`, `IAM_TLS_ENABLED` and `PROJECT_TLS_ENABLED` now render

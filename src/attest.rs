@@ -220,7 +220,7 @@ impl Attestation {
         // it — is how a setting meant to be off ends up on.
         // Absence is the secure state (resolve via iam); there is no
         // fallback to mark, only the state this flag opts OUT of.
-        let trusted_headers = lookup(TRUST_HEADERS).as_deref() == Some("1"); // ADR-0569-EXCEPTION(ABS)
+        let trusted_headers = lookup(TRUST_HEADERS).as_deref() == Some("1"); // ADR-0569-EXCEPTION(ABS): absent fails safe (iam attestation).
         if trusted_headers {
             return Self::TrustedHeaders;
         }

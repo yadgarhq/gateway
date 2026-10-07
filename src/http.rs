@@ -161,9 +161,7 @@ const MAX_PASSWORD_BYTES: usize = 1024; // ADR-0569-EXCEPTION(CB): contract boun
 /// A contract on payload size rather than a tuning knob: every caller must get
 /// the same answer, and a value an operator could raise per-deployment would
 /// make "my request is too large" depend on which cluster answered it.
-// ADR-0569-EXCEPTION(CB): a contract bound on payload size, the same argument
-// MAX_LABEL_CHARS and MAX_PASSWORD_BYTES above carry.
-const MAX_BODY_BYTES: usize = 1024 * 1024;
+const MAX_BODY_BYTES: usize = 1024 * 1024; // ADR-0569-EXCEPTION(CB): a contract bound on payload size, not a tuning knob.
 
 pub struct AppState {
     pub attestation: Attestation,

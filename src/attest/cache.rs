@@ -41,10 +41,7 @@ pub(super) const CREDENTIAL_TTL: &str = "YADGAR_CREDENTIAL_TTL_SECONDS";
 /// caches — so nothing above it could be honoured for a live entry in any case,
 /// and for a REFUSED one it would be a revocation window measured in minutes with
 /// no event able to close it.
-// ADR-0569-EXCEPTION(CB): contract bound to iam's own credential lifetime
-// (300s, `iam/src/service/credential.rs` `MAX_EXPIRES_IN_SECONDS`), not a
-// tuning knob this chart could reasonably override independently.
-pub(super) const MAX_TTL_SECONDS: u64 = 300;
+pub(super) const MAX_TTL_SECONDS: u64 = 300; // ADR-0569-EXCEPTION(CB): contract bound to iam's own 300s credential lifetime (MAX_EXPIRES_IN_SECONDS), not a tuning knob.
 
 /// How many resolutions one replica holds, per outcome.
 ///
