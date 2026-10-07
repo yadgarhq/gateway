@@ -73,8 +73,9 @@
 //! # WHY THE SET IS A FUNCTION AND NOT A RUN OF STATEMENTS IN `main`
 //!
 //! It used to be two chained builder calls in `main.rs`. No test in this
-//! repository spawns the binary, so deleting either compiled, passed the whole
-//! suite, and shipped a process that would never notice that file rotating.
+//! repository spawned the binary then, so deleting either compiled, passed the
+//! whole suite, and shipped a process that would never notice that file
+//! rotating.
 //! `tests/tls_rotation.rs` could not catch it either: it rebuilt the same
 //! assembly by hand, so `main.rs` and the test could disagree while both stayed
 //! green.

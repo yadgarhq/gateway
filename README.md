@@ -551,8 +551,8 @@ implementations that say which files an upstream's configuration and a broker
 credential read.
 
 **That function is the point of the lift, not the de-duplication.** The set used
-to be two chained builder calls in `main.rs`, and no test here spawns the binary:
-either could be deleted and every test still passed. `main.rs` calls `watch_set`
+to be two chained builder calls in `main.rs`, and no test here spawned the binary
+then: either could be deleted and every test still passed. `main.rs` calls `watch_set`
 now and `tests/assembly.rs` calls the same function, so that edit turns a test
 red. Measured rather than asserted: each of the five members was deleted in turn
 and each deletion failed at least two cases in `tests/assembly.rs`.

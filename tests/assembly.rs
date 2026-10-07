@@ -10,8 +10,8 @@
 //! exactly these files are watched.**
 //!
 //! **THE MUTANT THIS FILE EXISTS TO KILL.** The watch set used to be two chained
-//! builder calls in `main.rs`, and no test in this repository spawns the binary
-//! — so deleting either compiled, passed the whole suite, and shipped a process
+//! builder calls in `main.rs`, and no test in this repository spawned the binary
+//! then — so deleting either compiled, passed the whole suite, and shipped a process
 //! that would never notice that file rotating. The old `tests/tls_rotation.rs`
 //! could not catch it: it rebuilt the same assembly by hand, so `main.rs` and
 //! the test could disagree while both stayed green. Every case below goes
