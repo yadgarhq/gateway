@@ -14,10 +14,12 @@ than assert it from the two files' names alone.
 THREE PATHS STAY OPEN (`OPEN` below) and are asserted bare `{}`, never typed:
 `global` (Helm's reserved key, ADR-0722), `resources`
 (`corev1.ResourceRequirements`, re-typed nowhere in this chart) and
-`rollingUpdate` (`appsv1.RollingUpdateDeployment`, same reason). TWO EXTRAS
+`rollingUpdate` (`appsv1.RollingUpdateDeployment`, same reason). FOUR EXTRAS
 (`EXTRAS` below) are declared though `values.yaml` never states them, because a
 template reads them anyway: `image.digest` (`templates/deployment.yaml`, D65/
-D61) and `networkPolicy.scrapeFrom.namespace` (`templates/networkpolicy.yaml`).
+D61), `networkPolicy.scrapeFrom.namespace` (`templates/networkpolicy.yaml`),
+`nats.tls.enabled` and `valkey.tls.enabled` (`templates/deployment.yaml`, the
+B-N3E / B-V3E expand; `valkey` and `valkey.tls` are their parent nodes).
 ONE PAIR PREDATES THIS CLOSURE (`RETAINED` below) and is excluded from the
 EXTRAS accounting rather than folded into it: `toolsPoll` /
 `toolsPoll.intervalSeconds`, which override `chart/config/gateway.yaml` and
@@ -70,7 +72,19 @@ OPEN = ("global", "resources", "rollingUpdate")
 # Leaves a template reads that `values.yaml` never states (§2 step 2's
 # "read-but-undeclared keys"), declared here as closed-block leaves rather
 # than left as open maps.
-EXTRAS = ("image.digest", "networkPolicy.scrapeFrom.namespace")
+# `nats.tls.enabled` and `valkey.tls.enabled` join them for the K-8 expand
+# (B-N3E, B-V3E): declared and read only when present, with no value in
+# `values.yaml`. B-N3 / B-V3 move them to `REQUIRED_NO_DEFAULT` when the
+# binary requires `NATS_TLS_ENABLED` / `VALKEY_TLS_ENABLED`.
+EXTRAS = (
+    "image.digest",
+    "networkPolicy.scrapeFrom.namespace",
+    "nats.tls",
+    "nats.tls.enabled",
+    "valkey",
+    "valkey.tls",
+    "valkey.tls.enabled",
+)
 
 # Declared leaves that predate this closure, excluded from the EXTRAS
 # accounting below because they were never derived from a template grep —

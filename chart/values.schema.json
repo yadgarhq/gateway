@@ -92,7 +92,16 @@
         "url": {},
         "passwordSecret": {},
         "passwordSecretKey": {},
-        "user": {}
+        "user": {},
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     },
@@ -104,6 +113,21 @@
         "timeoutMs": {},
         "passwordSecret": {},
         "passwordSecretKey": {}
+      },
+      "additionalProperties": false
+    },
+    "valkey": {
+      "type": "object",
+      "properties": {
+        "tls": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": false
     },
