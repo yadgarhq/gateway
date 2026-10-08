@@ -40,41 +40,85 @@ fn absent_tls_enabled_refuses_boot() {
 /// the FIELDS rather than read what `Display` renders from them.
 #[test]
 fn the_refusal_text_names_both_the_variable_and_the_chart_key() {
+    // NOTE: the failure messages below are STATIC strings rather than the
+    // interpolated error text — CodeQL reads any value a `TlsConfigError`
+    // variant carries (a certificate PATH, for `ClientCertificateWithoutKey`
+    // and its siblings) as sensitive, so printing it, even in a test
+    // assertion, is flagged as cleartext logging (the same fix task#73 and
+    // project#29 made). None of these values are secrets; the rule does not
+    // know that, and `.contains(..)` already proves what matters without
+    // ever printing the string.
     let missing = UpstreamTls::from_lookup(TASK, lookup(&[]))
         .expect_err("absent TLS_ENABLED must refuse")
         .to_string();
-    assert!(missing.contains("TASK_TLS_ENABLED"), "{missing}");
-    assert!(missing.contains("task.tls.enabled"), "{missing}");
+    assert!(
+        missing.contains("TASK_TLS_ENABLED"),
+        "the refusal must name TASK_TLS_ENABLED"
+    );
+    assert!(
+        missing.contains("task.tls.enabled"),
+        "the refusal must name task.tls.enabled"
+    );
 
     let invalid = UpstreamTls::from_lookup(TASK, lookup(&[("TASK_TLS_ENABLED", "bogus")]))
         .expect_err("an unrecognised value must refuse")
         .to_string();
-    assert!(invalid.contains("TASK_TLS_ENABLED"), "{invalid}");
-    assert!(invalid.contains("task.tls.enabled"), "{invalid}");
+    assert!(
+        invalid.contains("TASK_TLS_ENABLED"),
+        "the refusal must name TASK_TLS_ENABLED"
+    );
+    assert!(
+        invalid.contains("task.tls.enabled"),
+        "the refusal must name task.tls.enabled"
+    );
 
     let missing = UpstreamTls::from_lookup(IAM, lookup(&[]))
         .expect_err("absent TLS_ENABLED must refuse")
         .to_string();
-    assert!(missing.contains("IAM_TLS_ENABLED"), "{missing}");
-    assert!(missing.contains("iam.tls.enabled"), "{missing}");
+    assert!(
+        missing.contains("IAM_TLS_ENABLED"),
+        "the refusal must name IAM_TLS_ENABLED"
+    );
+    assert!(
+        missing.contains("iam.tls.enabled"),
+        "the refusal must name iam.tls.enabled"
+    );
 
     let invalid = UpstreamTls::from_lookup(IAM, lookup(&[("IAM_TLS_ENABLED", "bogus")]))
         .expect_err("an unrecognised value must refuse")
         .to_string();
-    assert!(invalid.contains("IAM_TLS_ENABLED"), "{invalid}");
-    assert!(invalid.contains("iam.tls.enabled"), "{invalid}");
+    assert!(
+        invalid.contains("IAM_TLS_ENABLED"),
+        "the refusal must name IAM_TLS_ENABLED"
+    );
+    assert!(
+        invalid.contains("iam.tls.enabled"),
+        "the refusal must name iam.tls.enabled"
+    );
 
     let missing = UpstreamTls::from_lookup(PROJECT, lookup(&[]))
         .expect_err("absent TLS_ENABLED must refuse")
         .to_string();
-    assert!(missing.contains("PROJECT_TLS_ENABLED"), "{missing}");
-    assert!(missing.contains("project.tls.enabled"), "{missing}");
+    assert!(
+        missing.contains("PROJECT_TLS_ENABLED"),
+        "the refusal must name PROJECT_TLS_ENABLED"
+    );
+    assert!(
+        missing.contains("project.tls.enabled"),
+        "the refusal must name project.tls.enabled"
+    );
 
     let invalid = UpstreamTls::from_lookup(PROJECT, lookup(&[("PROJECT_TLS_ENABLED", "bogus")]))
         .expect_err("an unrecognised value must refuse")
         .to_string();
-    assert!(invalid.contains("PROJECT_TLS_ENABLED"), "{invalid}");
-    assert!(invalid.contains("project.tls.enabled"), "{invalid}");
+    assert!(
+        invalid.contains("PROJECT_TLS_ENABLED"),
+        "the refusal must name PROJECT_TLS_ENABLED"
+    );
+    assert!(
+        invalid.contains("project.tls.enabled"),
+        "the refusal must name project.tls.enabled"
+    );
 }
 
 /// A bundle without the flag is STILL refused: the flag has no default any
