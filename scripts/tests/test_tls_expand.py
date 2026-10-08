@@ -199,8 +199,9 @@ def test_a_non_map_tls_is_a_schema_refusal(hop, tmp_path):
 @pytest.mark.parametrize("hop", HOPS)
 def test_a_null_enabled_past_the_schema_is_the_template_sentence(hop, tmp_path):
     """`--skip-schema-validation` is how a render reaches the template with a
-    null `enabled` (hasKey true, not a bool). The guard must refuse it rather
-    than let a fail-open `ternary` render "0"."""
+    null `enabled` (hasKey true, not a bool). The guard must refuse it with its
+    own sentence; without it the `ternary` below fails with Go's type error,
+    which names no key."""
     result = bare(
         write_overlay(with_tls(hop, {"enabled": None}), tmp_path), "--skip-schema-validation"
     )

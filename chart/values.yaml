@@ -454,6 +454,18 @@ nats:
   # the one leaf this pod already mounts for every dial (ADR-0852 design
   # item 7), so no second client-leaf key is added.
 
+# `valkey.tls.enabled`: TLS on the cache hop (ADR-0852, ADR-0845), B-V3E. THE
+# SAME K-8 EXPAND AS `nats.tls` above, and no `valkey` block is stated here,
+# deliberately:
+#
+#   - left out, nothing renders, and the manifest is what it was before;
+#   - `false` renders `VALKEY_TLS_ENABLED="0"`;
+#   - `true` is REFUSED at render. The binary reads `VALKEY_TLS_ENABLED` only
+#     from B-V3, and valkey serves no TLS until B-L1 and B-V2.
+#
+# B-V3 makes `enabled` required with no default and adds the CA keys and
+# mount. State `false` now. The cache address itself stays `rateLimit.addr`.
+
 # D74's token buckets: one per (user, module, kind), held in the shared cache
 # (D21) so every replica of this Deployment spends from the same one. A
 # per-replica bucket would silently multiply every limit below by replicaCount.
@@ -467,18 +479,6 @@ nats:
 # every user-attributed call at the one hop all traffic already funnels through.
 # The floor is what keeps failing open from meaning "no limit at all": six
 # replicas at rate/6 sum to the configured rate and never more.
-# `valkey.tls.enabled`: TLS on the cache hop (ADR-0852, ADR-0845), B-V3E. THE
-# SAME K-8 EXPAND AS `nats.tls` above, and no `valkey` block is stated here,
-# deliberately:
-#
-#   - left out, nothing renders, and the manifest is what it was before;
-#   - `false` renders `VALKEY_TLS_ENABLED="0"`;
-#   - `true` is REFUSED at render. The binary reads `VALKEY_TLS_ENABLED` only
-#     from B-V3, and valkey serves no TLS until B-L1 and B-V2.
-#
-# B-V3 makes `enabled` required with no default and adds the CA keys and
-# mount. State `false` now. The cache address itself stays `rateLimit.addr`.
-
 rateLimit:
   addr: valkey:6379
   # `<module>.<kind>=<rate>:<burst>`, comma separated. `rate` is the sustained
