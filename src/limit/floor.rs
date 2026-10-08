@@ -49,7 +49,7 @@ pub(super) struct Floor {
 }
 
 /// How many distinct callers one replica tracks while degraded.
-pub(super) const FLOOR_CAPACITY: usize = 4096;
+pub(super) const FLOOR_CAPACITY: usize = 4096; // ADR-0569-EXCEPTION(CC): sized against the chart's 128Mi limit, not a tuning knob.
 
 /// One caller's degraded-mode bucket.
 ///

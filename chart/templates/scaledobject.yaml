@@ -1,4 +1,13 @@
-{{- if .Values.autoscaling.enabled }}
+{{- /*
+ADR-0850: THIS TEMPLATE RENDERS BEFORE `render-checks.yaml`'s OWN GUARD ON
+`autoscaling`'S SHAPE, measured — a values file setting `autoscaling` to a non-map
+crashes HERE, with a raw Go error naming no key at all, before that file's `fail`
+is ever reached. So this reader carries its own `kindIs "map"` arm rather than
+relying on render-checks.yaml running first; render-checks.yaml is still what
+refuses a non-bool `autoscaling.enabled` BY NAME, because this gate's only job is
+to keep `.enabled` from being read off a non-map.
+*/}}
+{{- if and (kindIs "map" .Values.autoscaling) .Values.autoscaling.enabled }}
 # KEDA, not a bare HPA (D68): it wraps a plain HPA for the concurrency cases,
 # handles queue depth natively for the write path, and gives scale-to-zero for a
 # disabled plugin (D1). One mechanism instead of prometheus-adapter plus special

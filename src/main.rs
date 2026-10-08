@@ -59,26 +59,40 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use yadgar_gateway::http::AppState;
-use yadgar_gateway::source::TrustBoundary;
 
-/// The boot sequence, phase by phase, in the order `main` calls them.
+/// The boot sequence, phase by phase, in the order `run` calls them.
 mod boot;
 
-use boot::env_required;
+use boot::{env_required, install_logging, log_trust_boundary};
 
+/// The process entry point: run the service, and print a refusal as its SENTENCE.
+///
+/// **NOT `main() -> Result`** (ledger 1258). Rust prints a `main` that returns
+/// `Err` with DEBUG, so even a refusal already converted to its sentence
+/// arrived quoted and escaped — `Error: "LISTEN is not a host:port address: \
+/// invalid socket address syntax"` — and a bare `.parse()?` that skipped any
+/// conversion arrived as the parse error's Debug, e.g. `ParseIntError { kind:
+/// InvalidDigit }`. ADR-0569 asks a refusal to name the knob and where it is
+/// set; an operator reading a crash loop must get that as plain text.
+/// `tests/boot_message.rs` runs the binary and holds it. Shape and wording
+/// follow `iam-db`'s `main`.
+///
+/// The exit status is unchanged: an `Err` from `main` exits 1, and so does
+/// `ExitCode::FAILURE`. A drain — after SIGTERM or after a rotation — still
+/// returns `Ok(())` and exits 0, which `tests/exit_chain.rs` holds (ledger 748).
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .json()
-        // A DEFAULT, because from_default_env() with RUST_LOG unset enables
-        // NOTHING — the service runs silently and its boot sequence and its
-        // errors both vanish. Found by deploying: pods Running, `kubectl logs`
-        // empty, and the only evidence was the previous container's exit output.
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    install_logging();
 
     // PHASE 0: THE METRICS RECORDER, BEFORE EVERY OTHER PHASE (ADR-0677).
     //
@@ -112,7 +126,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // installs one picks the backend for every service linking it. A failure is
     // logged and ignored: telemetry must never fail a call (D25), and that rule
     // covers the metrics endpoint too.
-    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?.parse()?;
+    let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
+        .parse()
+        .map_err(|e| format!("METRICS_LISTEN is not a host:port address: {e}"))?;
     if let Err(e) = yadgar_telemetry::metrics::install_prometheus(metrics_addr) {
         tracing::warn!(error = %e, "metrics endpoint unavailable; continuing without it");
     }
@@ -138,24 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     watch_inputs.export_not_after();
 
     let (allowed_origins, trust, credential_limits, admin_limits) = boot::http_configuration()?;
-    match trust {
-        TrustBoundary::Undeclared => tracing::warn!(
-            "NO TRUST BOUNDARY IS DECLARED: YADGAR_TRUSTED_PROXY_HOPS is unset, so this \
-             gateway cannot tell which X-Forwarded-For entry is the client and which the \
-             caller wrote. Two consequences, both deliberate (ADR-0491, D80). Authentication \
-             events record NO source address, because a forged one is worse than none. And \
-             /auth/login and /auth/enrol are bounded per OBSERVED HOP rather than per client \
-             — behind an ingress that is one bucket for everybody, sized to bound Argon2id \
-             cost rather than to stop guessing. Set the variable to the number of proxies in \
-             front (0 if this gateway is exposed directly) to get per-client limits and an \
-             attributable audit record."
-        ),
-        TrustBoundary::Hops(hops) => tracing::info!(
-            hops,
-            "trust boundary declared; the source address is read from X-Forwarded-For counting \
-             from the right (ADR-0491)"
-        ),
-    }
+    log_trust_boundary(&trust);
 
     let state = Arc::new(AppState {
         attestation,

@@ -14,12 +14,58 @@ use std::path::PathBuf;
 
 use yadgar_gateway::admin::BootstrapToken;
 use yadgar_gateway::limit::Bucket;
+use yadgar_gateway::source::TrustBoundary;
 
 mod config;
 mod wiring;
 
 pub use config::{http_configuration, identity, rate_limiting};
 pub use wiring::{serve, start_invalidation, wiring, Wiring};
+
+/// The JSON subscriber, and the default that keeps this process observable.
+///
+/// Extracted from `main` for the file-and-function ceilings, and it is the one
+/// step of the boot that is not a decision about this service: every binary in
+/// the estate installs the same thing before it reads anything.
+pub(crate) fn install_logging() {
+    tracing_subscriber::fmt()
+        .json()
+        // A DEFAULT, because from_default_env() with RUST_LOG unset enables
+        // NOTHING — the service runs silently and its boot sequence and its
+        // errors both vanish. Found by deploying: pods Running, `kubectl logs`
+        // empty, and the only evidence was the previous container's exit output.
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")), // ADR-0569-EXCEPTION(LIB): the log level is observability, not behaviour.
+        )
+        .init();
+}
+
+/// The boot log's own account of D80/ADR-0491's trust boundary — pulled out of
+/// `run` for the file-and-function ceilings.
+///
+/// **UNDECLARED IS A WARNING, NOT A REFUSAL**, for [`trusted_proxy_hops`]'s own
+/// reason: it is a state the design needs, not a value nobody chose.
+pub(crate) fn log_trust_boundary(trust: &TrustBoundary) {
+    match trust {
+        TrustBoundary::Undeclared => tracing::warn!(
+            "NO TRUST BOUNDARY IS DECLARED: YADGAR_TRUSTED_PROXY_HOPS is unset, so this \
+             gateway cannot tell which X-Forwarded-For entry is the client and which the \
+             caller wrote. Two consequences, both deliberate (ADR-0491, D80). Authentication \
+             events record NO source address, because a forged one is worse than none. And \
+             /auth/login and /auth/enrol are bounded per OBSERVED HOP rather than per client \
+             — behind an ingress that is one bucket for everybody, sized to bound Argon2id \
+             cost rather than to stop guessing. Set the variable to the number of proxies in \
+             front (0 if this gateway is exposed directly) to get per-client limits and an \
+             attributable audit record."
+        ),
+        TrustBoundary::Hops(hops) => tracing::info!(
+            hops,
+            "trust boundary declared; the source address is read from X-Forwarded-For counting \
+             from the right (ADR-0491)"
+        ),
+    }
+}
 
 /// One configuration knob, read from its ONE source, with no compiled-in
 /// default behind it (ADR-0569).
@@ -68,15 +114,16 @@ pub(crate) fn env_required_allow_empty(key: &str) -> Result<String, String> {
     })
 }
 
-/// A boot refusal as the TEXT `main` returns, flattened through the estate's one
+/// A boot refusal as the TEXT `run` returns, flattened through the estate's one
 /// error-chain walker (ledger 733, ADR-0591).
 ///
 /// **NOT A SIXTH COPY.** The body is a call to `yadgar_telemetry::diagnose::chain`
 /// and nothing else; the source walk lives there and is written once. What this
-/// adds is a SEAM. Every `map_err` in `main` is a closure inside a binary target,
-/// so no test in this repository can reach one — routing the two sites that need
-/// the walk through a named function is what gives the property somewhere to be
-/// asserted, and reverting this body to `error.to_string()` turns
+/// adds is a SEAM. Every `map_err` in `run` is a closure inside a binary target,
+/// so no LIBRARY test can reach one (`tests/boot_message.rs` reaches them only
+/// through the compiled binary) — routing the two sites that need the walk
+/// through a named function is what gives the property somewhere a library test
+/// can assert, and reverting this body to `error.to_string()` turns
 /// `a_refusal_carries_the_layer_below_transport_error` red.
 ///
 /// **ONLY TWO OF THE SIX REFUSALS IN `main` TAKE IT, and the other four keep
@@ -87,7 +134,7 @@ pub(crate) fn env_required_allow_empty(key: &str) -> Result<String, String> {
 /// | site | error | measured |
 /// | --- | --- | --- |
 /// | `connect_task`, `connect_iam` | `yadgar_dial::BalanceError` | TAKES IT. `Tls` renders `TLS could not be configured: transport error` and keeps `invalid dns name` a layer below tonic's own error, where nothing else can reach it. |
-/// | `UpstreamTls::from_env` (twice) | `upstream::TlsConfigError` | no. Every variant carries a `&'static str` and no `#[source]`, so `chain` is byte-identical to `to_string()` — measured, both render the same sentence. |
+/// | `UpstreamTls::from_env` (three calls) | `upstream::TlsConfigError` | no. Every variant carries a `&'static str` and no `#[source]`, so `chain` is byte-identical to `to_string()` — measured, both render the same sentence. |
 /// | `Configuration::schedule` | `rotate::ScheduleError` | no. Its `#[error]` already interpolates `({source})`, so walking prints the inner text TWICE — and there is no further layer to gain: `serde_norway` 0.9.42's `Error::source()` forwards to `ErrorImpl::source()`, which answers `Some` only for `Io`/`FromUtf8`/`Shared`, and malformed YAML yields `Message` or `Libyaml`, both `None`. `Unreadable`'s `io::Error` has no source either. Settled, not deferred. |
 /// | `TrustBoundary::parse` | `source::TrustBoundaryError` | no. Two variants, neither with a source. |
 ///
@@ -121,10 +168,11 @@ pub(crate) fn refusal(error: &dyn std::error::Error) -> String {
 /// One `<rate>:<burst>` from the environment, naming the variable when it is
 /// wrong.
 ///
-/// The error is stringified for the reason `Limits::parse`'s is: `main` returns
-/// `Box<dyn Error>`, which Rust prints with DEBUG — so a bare `?` would put
-/// `NotPositive("0", "0:10")` on the operator's terminal instead of the sentence
-/// saying which variable is unusable and why.
+/// The error is stringified for the reason `Limits::parse`'s is. It dates from
+/// when `main` returned `Result` and Rust printed a bare `?` here with Debug,
+/// as `NotPositive("0", "0:10")`. `main` prints Display now (ledger 1258), so
+/// the conversion no longer changes what the operator reads; it stays as the
+/// sentence it always produced.
 ///
 /// NO `default` PARAMETER any more. This helper was the second place a
 /// compiled-in default lived in this binary, which is why the ADR-0569 gate

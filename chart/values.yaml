@@ -36,17 +36,21 @@ task:
   # time — a single flag would make that all-or-nothing, which is the opposite
   # of a change that can be reverted on its own.
   tls:
-    # OFF, and it stays off until the servers can answer. **task does not serve
-    # TLS yet**, so turning this on today breaks the hop rather than securing
-    # it. The code ships first and the cut-over is a separate, revertible change
-    # — the same discipline trustUnauthenticatedHeaders' cut-over used.
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). This key is deliberately
+    # ABSENT here: a defaulted security switch decides the transport's
+    # posture silently, so `values.schema.json` makes it `required` and
+    # `templates/deployment.yaml` refuses the render if it is absent, null or
+    # not a bare `true`/`false` — every consumer (argocd, `chart/ci/values.yaml`,
+    # an adopter's own values) must set `task.tls.enabled` explicitly.
+    # `task` serves TLS now (ledger 1294), so this is a real cut-over switch
+    # rather than a value with nowhere to land yet.
     #
     # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at
     # boot naming the file; it never falls back to cleartext, and it never falls
     # back to the platform trust store. `false` with a bundle still configured
     # is the reverted state, and gateway logs a warning saying the hop is in
     # cleartext so nobody has to infer it.
-    enabled: false
+    #
     # The Secret holding the authority that signed task's certificate.
     #
     # A SECRET, THOUGH A CA IS PUBLIC — because that is where an issuer actually
@@ -117,17 +121,18 @@ iam:
   # by real handshakes in tests/iam_tls.rs rather than by showing that a
   # configuration was attached.
   tls:
-    # OFF, and it stays off until the servers can answer. **iam does not serve
-    # TLS yet**, so turning this on today breaks the hop rather than securing
-    # it. The code ships first and the cut-over is a separate, revertible
-    # change.
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). This key is deliberately
+    # ABSENT here, the same as `task.tls.enabled` above: `values.schema.json`
+    # makes it `required` and `templates/deployment.yaml` refuses the render
+    # if it is absent, null or not a bare `true`/`false`. `iam` serves TLS now
+    # (ledger 1294), so every consumer must set `iam.tls.enabled` explicitly.
     #
     # THERE IS NO SILENT MIDDLE STATE. `true` with no usable bundle fails at
     # boot naming the file — and it fails EAGERLY, even though the iam channel
     # is otherwise lazy, because a bundle depends on the deployment that wrote
     # it rather than on iam existing. `false` with a bundle still configured is
     # the reverted state, and gateway logs a warning saying so.
-    enabled: false
+    #
     # The Secret holding the authority that signed iam's certificate. A Secret
     # though a CA is public, because that is where an issuer writes it; not a
     # PEM pasted into this file, because the authority rotates.
@@ -166,10 +171,11 @@ project:
   # The TRANSPORT to that service. Same shape as `task.tls` and `iam.tls`, and
   # configured independently of both so the three can be cut over one at a time.
   tls:
-    # OFF, and it stays off until the servers can answer — `project` does not
-    # serve TLS yet, so turning this on today breaks the hop rather than securing
-    # it.
-    enabled: false
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). This key is deliberately
+    # ABSENT here, the same as `task.tls.enabled` and `iam.tls.enabled` above.
+    # `project` serves TLS now (ledger 1294), so every consumer must set
+    # `project.tls.enabled` explicitly.
+    #
     # The Secret holding the authority that signed project's certificate.
     caSecret: project-tls
     # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
@@ -243,17 +249,17 @@ projectValidation:
 # WHO THIS GATEWAY SAYS IT IS WHEN IT DIALS ITS UPSTREAMS — mutual TLS
 # (ADR-0516).
 #
-# A THIRD DIRECTION, and it is not either of the two above. `task.tls.caSecret`
-# and `iam.tls.caSecret` are how this gateway VERIFIES the servers it reaches.
-# This is what it PRESENTS to them, so they can authenticate the caller rather
-# than accepting anything that reaches the port.
+# A THIRD DIRECTION, and it is not either of the two above. `task.tls.caSecret`,
+# `iam.tls.caSecret` and `project.tls.caSecret` are how this gateway VERIFIES the
+# servers it reaches. This is what it PRESENTS to them, so they can authenticate
+# the caller rather than accepting anything that reaches the port.
 #
-# ONE LEAF FOR BOTH UPSTREAMS, and that is why it lives here rather than inside
-# each `tls` block. `gateway-client-tls` is this process's identity, not a
-# property of the hop, so it is mounted once and both hops are pointed at the
+# ONE LEAF FOR ALL THREE UPSTREAMS, and that is why it lives here rather than
+# inside each `tls` block. `gateway-client-tls` is this process's identity, not a
+# property of the hop, so it is mounted once and every hop is pointed at the
 # same two files. The per-upstream flags still decide WHICH hops present it —
 # rendering is guarded on that upstream's `tls.enabled` — so a deployment can cut
-# one hop over before the other.
+# one hop over before the others.
 #
 # WHY A CERTIFICATE RATHER THAN A NetworkPolicy: ADR-0516. A NetworkPolicy is
 # enforced by the CNI, so the same manifest protects an EKS deployment and
@@ -431,6 +437,34 @@ nats:
   # block names an account and a password together, and gateway refuses to start
   # with one and not the other, in BOTH directions.
   user: gateway
+
+  # TLS on the broker hop (ADR-0852, ADR-0845): `nats.tls.enabled`. THIS CHART
+  # VERSION IS THE K-8 EXPAND. It declares the key in the schema and states no
+  # value for it here, deliberately, so nothing about the hop changes yet:
+  #
+  #   - left out, nothing renders, and the manifest is what it was before;
+  #   - `false` renders `NATS_TLS_ENABLED="0"`;
+  #   - `true` is REFUSED at render. The binary reads `NATS_TLS_ENABLED` only
+  #     from B-N3, and the broker serves no TLS until B-L1, so a `true` here
+  #     would look encrypted while the hop stays cleartext.
+  #
+  # B-N3 makes `enabled` required with no default (ADR-0845), lifts the `true`
+  # refusal, and adds the CA keys and mount. State `false` now, so that step
+  # needs no values change. The hop will present `clientCertificate.secret`,
+  # the one leaf this pod already mounts for every dial (ADR-0852 design
+  # item 7), so no second client-leaf key is added.
+
+# `valkey.tls.enabled`: TLS on the cache hop (ADR-0852, ADR-0845), B-V3E. THE
+# SAME K-8 EXPAND AS `nats.tls` above, and no `valkey` block is stated here,
+# deliberately:
+#
+#   - left out, nothing renders, and the manifest is what it was before;
+#   - `false` renders `VALKEY_TLS_ENABLED="0"`;
+#   - `true` is REFUSED at render. The binary reads `VALKEY_TLS_ENABLED` only
+#     from B-V3, and valkey serves no TLS until B-L1 and B-V2.
+#
+# B-V3 makes `enabled` required with no default and adds the CA keys and
+# mount. State `false` now. The cache address itself stays `rateLimit.addr`.
 
 # D74's token buckets: one per (user, module, kind), held in the shared cache
 # (D21) so every replica of this Deployment spends from the same one. A

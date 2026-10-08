@@ -51,7 +51,7 @@ use super::{Denied, Reason, Refusal};
 /// runs while a caller waits for a 400 it is going to get either way, so a
 /// stalled `project` must cost one bounded wait rather than hold the answer
 /// open.
-const FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+const FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
 
 /// The answer for one classified refusal, dialling the fallback where the
 /// remediation needs data the loaded set does not hold.
