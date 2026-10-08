@@ -29,3 +29,12 @@ iam:
 project:
   tls:
     enabled: true
+
+# B-N3E (K-8 expand, ADR-0852): the broker hop's switch, stated at its only
+# value this chart version accepts. `false` renders `NATS_TLS_ENABLED="0"`;
+# `true` is refused until B-N3, because platform's NATS serves no TLS until
+# B-L1. Stated here so B-N3, which makes the key required, needs no change to
+# this file.
+nats:
+  tls:
+    enabled: false
