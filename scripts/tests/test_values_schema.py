@@ -24,6 +24,19 @@ EXTRAS accounting rather than folded into it: `toolsPoll` /
 which `values.yaml` deliberately never states at all (ADR-0569, one source per
 knob) — the schema's own `$comment` carries the full reasoning.
 
+THREE MORE ARE EXCLUDED THE SAME WAY, FOR THE OPPOSITE REASON (`REQUIRED_NO_DEFAULT`
+below, ledger 965, 1278, ADR-0845): `task.tls.enabled`, `iam.tls.enabled` and
+`project.tls.enabled` are declared `type: boolean` and `required` in the schema
+and ABSENT from `values.yaml`, on purpose — a dial's TLS switch has no chart
+default and no binary default either (ADR-0569), so `values.yaml` ships no
+value for any of the three and every consumer must set one explicitly. These are
+not EXTRAS: EXTRAS is "a template reads this leaf though `values.yaml` never
+states it"; these three are "this leaf exists, is required, and `values.yaml`
+is the ONE place guaranteed never to supply it". Folding them into EXTRAS would
+make the EXTRAS test pass without saying why these three are schema-only, which
+is the exact blindness `test_every_schema_extra_is_exactly_the_declared_set`
+exists to refuse.
+
 THE STRUCTURAL TESTS BELOW ARE PURE — no helm, no subprocess — and are the ones
 the module's four required mutations are checked against: delete root
 `additionalProperties`, delete `global`, delete one extra, close one open map.
@@ -64,6 +77,11 @@ EXTRAS = ("image.digest", "networkPolicy.scrapeFrom.namespace")
 # `toolsPoll` overrides a document `values.yaml` deliberately never states a
 # key for (ADR-0569).
 RETAINED = ("toolsPoll", "toolsPoll.intervalSeconds")
+
+# Required, with no chart default (ADR-0845, ledger 965, 1278): each dial's
+# TLS switch. Excluded from the EXTRAS accounting for the opposite reason
+# RETAINED is — see the module docstring.
+REQUIRED_NO_DEFAULT = ("task.tls.enabled", "iam.tls.enabled", "project.tls.enabled")
 
 KEDA = ("--api-versions", "keda.sh/v1alpha1")
 
@@ -153,7 +171,13 @@ def closure_offenders(schema: dict) -> list[str]:
 
 
 def extras_found(schema: dict, values: dict) -> set[str]:
-    return schema_paths(schema) - values_paths(values) - {"global"} - set(RETAINED)
+    return (
+        schema_paths(schema)
+        - values_paths(values)
+        - {"global"}
+        - set(RETAINED)
+        - set(REQUIRED_NO_DEFAULT)
+    )
 
 
 def overlay(body, destination: Path) -> Path:

@@ -8,8 +8,14 @@ change that breaks the agreement — a dropped term, a `not`, a term moved out o
 the `or`, a later reassignment, or a narrowed guard on the mount itself.
 
 THE UPSTREAMS ARE DERIVED from `values.yaml` (every top-level key with a
-`tls.enabled`), so a fourth upstream is covered the day it is added, and
+`tls.caSecret`), so a fourth upstream is covered the day it is added, and
 pinned against a literal so the derivation cannot silently shrink.
+
+`tls.caSecret` RATHER THAN `tls.enabled` (ledger 965, 1278, ADR-0845):
+`enabled` is now schema-`required` with no chart default, so `values.yaml`
+states it for NONE of the three — deriving on it would make this function
+find no upstream at all. `caSecret` is a sibling key every dial's `tls` block
+still ships, so it names the same set `enabled` used to.
 """
 
 from __future__ import annotations
@@ -37,7 +43,7 @@ def upstreams() -> list[str]:
         for key, block in values.items()
         if isinstance(block, dict)
         and isinstance(block.get("tls"), dict)
-        and "enabled" in block["tls"]
+        and "caSecret" in block["tls"]
     )
 
 
@@ -82,9 +88,24 @@ def test_the_upstream_set_is_the_one_the_chart_declares() -> None:
     assert set(upstreams()) == EXPECTED_UPSTREAMS
 
 
+def tls_switches(on: str) -> tuple[str, ...]:
+    """`--set <u>.tls.enabled=<true|false>` for every upstream, `on` alone true.
+
+    EXPLICIT FOR ALL THREE, never relying on `chart/ci/values.yaml`'s own
+    `true` (C-A2, ADR-0845): that file exists to satisfy the schema's
+    `required` on a BARE render, and every case here tests which upstream is
+    on, which needs the other two pinned off regardless of what the override
+    file ships.
+    """
+    args: list[str] = []
+    for upstream in EXPECTED_UPSTREAMS:
+        args += ["--set", f"{upstream}.tls.enabled={'true' if upstream == on else 'false'}"]
+    return tuple(args)
+
+
 @pytest.mark.parametrize("upstream", upstreams())
 def test_one_upstream_alone_presents_a_mounted_identity(upstream: str) -> None:
-    spec = pod_spec(*IDENTITY, "--set", f"{upstream}.tls.enabled=true")
+    spec = pod_spec(*IDENTITY, *tls_switches(upstream))
     # NOT VACUOUS: the env pair this case is about must actually render.
     assert client_cert_env(spec) == [f"{upstream.upper()}_TLS_CLIENT_CERT_FILE"]
     assert unbacked_client_cert_paths(spec) == [], (
@@ -94,7 +115,17 @@ def test_one_upstream_alone_presents_a_mounted_identity(upstream: str) -> None:
 
 
 def test_no_upstream_on_mounts_no_private_key() -> None:
-    spec = pod_spec(*IDENTITY)
+    # EVERY DIAL EXPLICITLY OFF: `chart/ci/values.yaml` (C-A2, ADR-0845) sets
+    # all three `tls.enabled` to `true` so a bare render satisfies the
+    # schema's `required`; this case is about the all-cleartext state, so it
+    # overrides every one of them back to `false` rather than relying on a
+    # chart default that no longer exists.
+    all_off = (
+        "--set", "task.tls.enabled=false",
+        "--set", "iam.tls.enabled=false",
+        "--set", "project.tls.enabled=false",
+    )
+    spec = pod_spec(*IDENTITY, *all_off)
     assert client_cert_env(spec) == []
     assert not any(
         v.get("secret", {}).get("secretName") == SECRET for v in spec.get("volumes", [])

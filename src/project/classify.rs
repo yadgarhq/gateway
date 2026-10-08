@@ -36,7 +36,7 @@ use super::{Reason, Refusal};
 /// The same number `project-db/src/path.rs` declares as `MAX_LEN`, for the same
 /// reason: a longer value cannot be a registered path, so refusing it here
 /// answers the same question one hop earlier.
-const MAX_LEN: usize = 255;
+const MAX_LEN: usize = 255; // ADR-0569-EXCEPTION(CB): a contract bound, not a tuning knob.
 
 /// The one segment reserved from the organisation namespace (ADR-0605).
 ///

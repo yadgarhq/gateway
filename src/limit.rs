@@ -116,7 +116,7 @@ pub(super) const PREFIX: &str = "gw:rl";
 /// this narrows the window rather than closing it. Raise the constant itself, or
 /// configure a bucket whose refill window exceeds it, and the defect returns —
 /// which is why the second of those is refused at boot rather than documented.
-pub(super) const KEY_TTL_SECONDS: f64 = 3600.0;
+pub(super) const KEY_TTL_SECONDS: f64 = 3600.0; // ADR-0569-EXCEPTION(CC): boot refuses a bucket window above this; not a tuning knob.
 
 /// The user id, as a fixed-width component of a key in a SHARED cache.
 ///

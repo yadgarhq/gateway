@@ -243,6 +243,19 @@ pub struct Output {
     pub rows: u32,
 }
 
+/// `page_size` exactly as the MCP caller sent it, with no second default
+/// (ledger 1281, ADR-0569). Absence and an explicit `0` both forward as `0`
+/// rather than this gateway's own `20` — a page size has exactly one source,
+/// `task-db`'s `DEFAULT_PAGE`, and a gateway-side default was a second one
+/// nobody could see drift from the first.
+///
+/// Split out for the same reason [`find_tasks_output`] is: there is no task
+/// service stub to fake, so the request this gateway BUILDS is what a test
+/// can pin, not what it sends.
+fn requested_page_size(args: &Value) -> i32 {
+    args.get("page_size").and_then(Value::as_i64).unwrap_or(0) as i32
+}
+
 /// Shape a `find_tasks` response, and count what it returned.
 ///
 /// Split out so the count is testable without a task service behind it: `build.rs`
@@ -375,7 +388,7 @@ pub async fn call(
                 .find_tasks(FindTasksRequest {
                     scope: Some(scope),
                     statuses: Vec::new(),
-                    page_size: args.get("page_size").and_then(Value::as_i64).unwrap_or(20) as i32,
+                    page_size: requested_page_size(args),
                     page_token: args
                         .get("page_token")
                         .and_then(Value::as_str)

@@ -111,7 +111,7 @@ const BOOTSTRAP_HEADER: &str = "x-yadgar-bootstrap-token";
 /// the same reason, and two numbers would be two things to keep in agreement.
 /// `attest`'s lookup has its OWN, much shorter, because that one sits on the hot
 /// path of every call rather than on a person typing a password.
-const AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10); // ADR-0569-EXCEPTION(CC): coupled to iam's Argon2id cost, not a tuning knob.
 
 /// The longest `label` `iam` accepts, IN CHARACTERS. Its `MAX_LABEL_CHARS`.
 ///
@@ -135,7 +135,7 @@ const AUTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// and `VARCHAR(n)` there bounds characters, so 255 four-byte codepoints is 1020
 /// bytes and stores without complaint. A `.len()` check here would refuse it and
 /// invent a rule `iam` does not have.
-const MAX_LABEL_CHARS: usize = 255;
+const MAX_LABEL_CHARS: usize = 255; // ADR-0569-EXCEPTION(CB): contract bound to iam's own MAX_LABEL_CHARS; a second enforcement point, not a second authority.
 
 /// The longest password `iam.RedeemEnrolment` will hash, IN BYTES. Its
 /// `MAX_PASSWORD_BYTES`.
@@ -154,7 +154,14 @@ const MAX_LABEL_CHARS: usize = 255;
 ///
 /// BYTES, because that is the unit `iam` uses (`r.password.len()`) and a password
 /// is hashed as bytes.
-const MAX_PASSWORD_BYTES: usize = 1024;
+const MAX_PASSWORD_BYTES: usize = 1024; // ADR-0569-EXCEPTION(CB): contract bound to iam's own MAX_PASSWORD_BYTES; a second enforcement point, not a second authority.
+
+/// The largest request body this server accepts, over EVERY route, in bytes.
+///
+/// A contract on payload size rather than a tuning knob: every caller must get
+/// the same answer, and a value an operator could raise per-deployment would
+/// make "my request is too large" depend on which cluster answered it.
+const MAX_BODY_BYTES: usize = 1024 * 1024; // ADR-0569-EXCEPTION(CB): a contract bound on payload size, not a tuning knob.
 
 pub struct AppState {
     pub attestation: Attestation,
@@ -260,7 +267,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(dispatch::routes())
         .merge(auth::routes())
         .merge(admin::routes())
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(1024 * 1024))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            MAX_BODY_BYTES,
+        ))
         .with_state(state)
 }
 

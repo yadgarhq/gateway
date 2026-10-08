@@ -36,7 +36,7 @@ pub(crate) fn install_logging() {
         // empty, and the only evidence was the previous container's exit output.
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")), // ADR-0569-EXCEPTION(LIB): the log level is observability, not behaviour.
         )
         .init();
 }
@@ -134,7 +134,7 @@ pub(crate) fn env_required_allow_empty(key: &str) -> Result<String, String> {
 /// | site | error | measured |
 /// | --- | --- | --- |
 /// | `connect_task`, `connect_iam` | `yadgar_dial::BalanceError` | TAKES IT. `Tls` renders `TLS could not be configured: transport error` and keeps `invalid dns name` a layer below tonic's own error, where nothing else can reach it. |
-/// | `UpstreamTls::from_env` (twice) | `upstream::TlsConfigError` | no. Every variant carries a `&'static str` and no `#[source]`, so `chain` is byte-identical to `to_string()` — measured, both render the same sentence. |
+/// | `UpstreamTls::from_env` (three calls) | `upstream::TlsConfigError` | no. Every variant carries a `&'static str` and no `#[source]`, so `chain` is byte-identical to `to_string()` — measured, both render the same sentence. |
 /// | `Configuration::schedule` | `rotate::ScheduleError` | no. Its `#[error]` already interpolates `({source})`, so walking prints the inner text TWICE — and there is no further layer to gain: `serde_norway` 0.9.42's `Error::source()` forwards to `ErrorImpl::source()`, which answers `Some` only for `Io`/`FromUtf8`/`Shared`, and malformed YAML yields `Message` or `Libyaml`, both `None`. `Unreadable`'s `io::Error` has no source either. Settled, not deferred. |
 /// | `TrustBoundary::parse` | `source::TrustBoundaryError` | no. Two variants, neither with a source. |
 ///

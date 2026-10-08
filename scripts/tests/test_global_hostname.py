@@ -49,8 +49,18 @@ def helm(*arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run([binary, *arguments], capture_output=True, text=True)
 
 
+def ci_values_flags(chart: Path) -> tuple[str, ...]:
+    """`-f <chart>/ci/values.yaml`, or `()` when none (C-A2). Needed since
+    `task.tls.enabled`, `iam.tls.enabled` and `project.tls.enabled` became
+    schema-`required` with no chart default (ADR-0845); see
+    `test_render_checks.py`'s copy of this helper for the full reasoning.
+    """
+    path = Path(chart) / "ci" / "values.yaml"
+    return ("-f", str(path)) if path.is_file() else ()
+
+
 def template(chart: Path, *arguments: str) -> str:
-    result = helm("template", "gateway", str(chart), *arguments)
+    result = helm("template", "gateway", str(chart), *ci_values_flags(chart), *arguments)
     assert result.returncode == 0, result.stderr
     return result.stdout
 

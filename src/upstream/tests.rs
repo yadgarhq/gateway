@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::*;
 
 /// The values below are SENTINELS: nothing in `upstream.rs` could produce
@@ -16,34 +18,161 @@ fn lookup<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Opt
     }
 }
 
-/// THE DEFAULT, and the property the whole change is built around: nothing
-/// configured means the cleartext path, unchanged, for BOTH upstreams.
+/// REQUIRED, WITH NO COMPILED-IN DEFAULT (ADR-0845): absent `TLS_ENABLED`
+/// refuses the boot naming the variable and the chart key, for both
+/// upstreams, rather than falling back to the cleartext path.
 #[test]
-fn nothing_configured_means_no_tls() {
-    assert_eq!(UpstreamTls::from_lookup(TASK, lookup(&[])).unwrap(), None);
-    assert_eq!(UpstreamTls::from_lookup(IAM, lookup(&[])).unwrap(), None);
+fn absent_tls_enabled_refuses_boot() {
+    assert!(matches!(
+        UpstreamTls::from_lookup(TASK, lookup(&[])),
+        Err(TlsConfigError::MissingEnabled("TASK", chart_key)) if chart_key == "task.tls.enabled"
+    ));
+    assert!(matches!(
+        UpstreamTls::from_lookup(IAM, lookup(&[])),
+        Err(TlsConfigError::MissingEnabled("IAM", chart_key)) if chart_key == "iam.tls.enabled"
+    ));
 }
 
-/// A bundle without the flag is the REVERTED state, not an error. The flag
-/// is the lever; leaving the path in place is how it gets pulled back.
+/// THE DISPLAY TEXT ITSELF must name both the variable and the chart key, for
+/// every one of the three prefixes — a mutation that deletes `{1}` from
+/// `MissingEnabled`'s format string, or `{2}` from `InvalidEnabled`'s, passes
+/// every `matches!` check elsewhere in this file, because those destructure
+/// the FIELDS rather than read what `Display` renders from them.
 #[test]
-fn a_ca_bundle_alone_does_not_enable_tls() {
+fn the_refusal_text_names_both_the_variable_and_the_chart_key() {
+    // NOTE: the failure messages below are STATIC strings rather than the
+    // interpolated error text — CodeQL reads any value a `TlsConfigError`
+    // variant carries (a certificate PATH, for `ClientCertificateWithoutKey`
+    // and its siblings) as sensitive, so printing it, even in a test
+    // assertion, is flagged as cleartext logging (the same fix task#73 and
+    // project#29 made). None of these values are secrets; the rule does not
+    // know that, and `.contains(..)` already proves what matters without
+    // ever printing the string.
+    let missing = UpstreamTls::from_lookup(TASK, lookup(&[]))
+        .expect_err("absent TLS_ENABLED must refuse")
+        .to_string();
+    assert!(
+        missing.contains("TASK_TLS_ENABLED"),
+        "the refusal must name TASK_TLS_ENABLED"
+    );
+    assert!(
+        missing.contains("task.tls.enabled"),
+        "the refusal must name task.tls.enabled"
+    );
+
+    let invalid = UpstreamTls::from_lookup(TASK, lookup(&[("TASK_TLS_ENABLED", "bogus")]))
+        .expect_err("an unrecognised value must refuse")
+        .to_string();
+    assert!(
+        invalid.contains("TASK_TLS_ENABLED"),
+        "the refusal must name TASK_TLS_ENABLED"
+    );
+    assert!(
+        invalid.contains("task.tls.enabled"),
+        "the refusal must name task.tls.enabled"
+    );
+
+    let missing = UpstreamTls::from_lookup(IAM, lookup(&[]))
+        .expect_err("absent TLS_ENABLED must refuse")
+        .to_string();
+    assert!(
+        missing.contains("IAM_TLS_ENABLED"),
+        "the refusal must name IAM_TLS_ENABLED"
+    );
+    assert!(
+        missing.contains("iam.tls.enabled"),
+        "the refusal must name iam.tls.enabled"
+    );
+
+    let invalid = UpstreamTls::from_lookup(IAM, lookup(&[("IAM_TLS_ENABLED", "bogus")]))
+        .expect_err("an unrecognised value must refuse")
+        .to_string();
+    assert!(
+        invalid.contains("IAM_TLS_ENABLED"),
+        "the refusal must name IAM_TLS_ENABLED"
+    );
+    assert!(
+        invalid.contains("iam.tls.enabled"),
+        "the refusal must name iam.tls.enabled"
+    );
+
+    let missing = UpstreamTls::from_lookup(PROJECT, lookup(&[]))
+        .expect_err("absent TLS_ENABLED must refuse")
+        .to_string();
+    assert!(
+        missing.contains("PROJECT_TLS_ENABLED"),
+        "the refusal must name PROJECT_TLS_ENABLED"
+    );
+    assert!(
+        missing.contains("project.tls.enabled"),
+        "the refusal must name project.tls.enabled"
+    );
+
+    let invalid = UpstreamTls::from_lookup(PROJECT, lookup(&[("PROJECT_TLS_ENABLED", "bogus")]))
+        .expect_err("an unrecognised value must refuse")
+        .to_string();
+    assert!(
+        invalid.contains("PROJECT_TLS_ENABLED"),
+        "the refusal must name PROJECT_TLS_ENABLED"
+    );
+    assert!(
+        invalid.contains("project.tls.enabled"),
+        "the refusal must name project.tls.enabled"
+    );
+}
+
+/// A bundle without the flag is STILL refused: the flag has no default any
+/// more, so a CA path configured alone does not make its absence mean
+/// anything other than "not set".
+#[test]
+fn a_ca_bundle_alone_does_not_waive_the_flag() {
     let vars = [("IAM_TLS_CA_FILE", SENTINEL_CA)];
-    assert_eq!(UpstreamTls::from_lookup(IAM, lookup(&vars)).unwrap(), None);
+    assert!(matches!(
+        UpstreamTls::from_lookup(IAM, lookup(&vars)),
+        Err(TlsConfigError::MissingEnabled("IAM", _))
+    ));
 }
 
-/// Anything but "1" is off, the same rule
-/// `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` gets.
+/// "0" IS THE EXPLICIT, SUPPORTED OFF — the revert lever for the cut-over —
+/// and it is the only value besides "1" this flag accepts. Everything else,
+/// the same rule `YADGAR_TRUST_UNAUTHENTICATED_HEADERS` gets, is refused
+/// rather than treated as either value.
 #[test]
-fn only_exactly_one_enables_tls() {
-    for value in ["0", "false", "no", "true", "yes", "", " "] {
+fn only_exactly_one_enables_tls_and_only_exactly_zero_is_the_explicit_off() {
+    let vars = [("IAM_TLS_ENABLED", "0"), ("IAM_TLS_CA_FILE", SENTINEL_CA)];
+    assert_eq!(UpstreamTls::from_lookup(IAM, lookup(&vars)).unwrap(), None);
+
+    for value in ["false", "no", "true", "yes"] {
         let vars = [("IAM_TLS_ENABLED", value), ("IAM_TLS_CA_FILE", SENTINEL_CA)];
-        assert_eq!(
-            UpstreamTls::from_lookup(IAM, lookup(&vars)).unwrap(),
-            None,
-            "{value:?} must not enable TLS"
+        assert!(
+            matches!(
+                UpstreamTls::from_lookup(IAM, lookup(&vars)),
+                Err(TlsConfigError::InvalidEnabled("IAM", v, _)) if v == value
+            ),
+            "{value:?} must be refused, not treated as \"0\" or \"1\""
         );
     }
+
+    // An empty or blank value is the same as absent, the same rule the CA
+    // bundle path gets.
+    for value in ["", " "] {
+        let vars = [("IAM_TLS_ENABLED", value), ("IAM_TLS_CA_FILE", SENTINEL_CA)];
+        assert!(
+            matches!(
+                UpstreamTls::from_lookup(IAM, lookup(&vars)),
+                Err(TlsConfigError::MissingEnabled("IAM", _))
+            ),
+            "{value:?} must be refused the same as absent"
+        );
+    }
+}
+
+/// A CA bundle or a client certificate left in place while the flag is
+/// explicitly "0" is NOT an error — that is how the cut-over gets reverted.
+#[test]
+fn an_explicit_off_with_a_bundle_still_configured_is_not_an_error() {
+    let vars = [("IAM_TLS_ENABLED", "0"), ("IAM_TLS_CA_FILE", SENTINEL_CA)];
+    assert_eq!(UpstreamTls::from_lookup(IAM, lookup(&vars)).unwrap(), None);
 }
 
 /// THE FAILURE THAT MUST NOT DEGRADE. Asking for TLS and naming no bundle
@@ -87,7 +216,11 @@ fn the_bundle_and_the_domain_both_arrive() {
 /// through, so the prefixes have to keep the two apart.
 #[test]
 fn one_upstream_can_be_encrypted_while_the_other_is_not() {
-    let vars = [("TASK_TLS_ENABLED", "1"), ("TASK_TLS_CA_FILE", SENTINEL_CA)];
+    let vars = [
+        ("TASK_TLS_ENABLED", "1"),
+        ("TASK_TLS_CA_FILE", SENTINEL_CA),
+        ("IAM_TLS_ENABLED", "0"),
+    ];
     assert!(UpstreamTls::from_lookup(TASK, lookup(&vars))
         .unwrap()
         .is_some());
@@ -171,17 +304,32 @@ fn an_empty_client_path_is_the_same_as_an_unset_one() {
     assert_eq!(tls.client_certificate_file(), None);
 }
 
-/// A CLIENT CERTIFICATE WITHOUT THE FLAG IS THE REVERTED STATE, not an
-/// error. Mutual TLS runs inside the encrypted transport, so the one flag
-/// turns both off, and leaving the paths in place is how the cut-over gets
-/// pulled back.
+/// A CLIENT CERTIFICATE WITH THE FLAG EXPLICITLY OFF IS THE REVERTED STATE,
+/// not an error. Mutual TLS runs inside the encrypted transport, so the one
+/// flag turns both off, and leaving the paths in place is how the cut-over
+/// gets pulled back.
 #[test]
 fn a_client_certificate_alone_does_not_enable_tls() {
     let vars = [
+        ("IAM_TLS_ENABLED", "0"),
         ("IAM_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
         ("IAM_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
     ];
     assert_eq!(UpstreamTls::from_lookup(IAM, lookup(&vars)).unwrap(), None);
+}
+
+/// AND THE FLAG ITSELF IS STILL REQUIRED even when a client certificate is
+/// configured: a client identity does not waive ADR-0845's switch.
+#[test]
+fn a_client_certificate_alone_does_not_waive_the_flag() {
+    let vars = [
+        ("IAM_TLS_CLIENT_CERT_FILE", SENTINEL_CLIENT_CERT),
+        ("IAM_TLS_CLIENT_KEY_FILE", SENTINEL_CLIENT_KEY),
+    ];
+    assert!(matches!(
+        UpstreamTls::from_lookup(IAM, lookup(&vars)),
+        Err(TlsConfigError::MissingEnabled("IAM", _))
+    ));
 }
 
 /// ONE LEAF, TWO UPSTREAMS, and the prefixes still have to keep them apart.

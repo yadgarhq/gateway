@@ -85,7 +85,7 @@ where
 /// column is silently always empty. Refusing at boot is how that gets noticed.
 /// Sixteen is far past any real ingress chain and still small enough to be
 /// obviously wrong when exceeded.
-const MAX_HOPS: u32 = 16;
+const MAX_HOPS: u32 = 16; // ADR-0569-EXCEPTION(CB): a contract bound, not a tuning knob.
 
 /// How many proxies stand between a client and this gateway.
 ///

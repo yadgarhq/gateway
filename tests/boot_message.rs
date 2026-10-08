@@ -63,6 +63,36 @@ fn a_typed_refusal_is_printed_as_its_sentence() {
     );
 }
 
+/// ADR-0845: `TASK_TLS_ENABLED` has no compiled-in default, so leaving it
+/// out of the environment entirely refuses the boot naming both the
+/// variable and the chart key that sources it, rather than falling back to
+/// cleartext.
+#[test]
+fn an_absent_tls_enabled_refuses_boot_naming_the_chart_key() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "TASK_TLS_ENABLED");
+    let line = refusal_without_mounts(&vars);
+    assert!(
+        line.contains("TASK_TLS_ENABLED") && line.contains("task.tls.enabled"),
+        "the refusal must name both the variable and its chart key: {line}"
+    );
+}
+
+/// ADR-0569: `YADGAR_CREDENTIAL_TTL_SECONDS` has no compiled-in default
+/// either, so an absent value refuses the boot naming it and the chart key
+/// that sources it, rather than quietly reusing a compiled-in 30 seconds.
+#[test]
+fn an_absent_credential_ttl_refuses_boot_naming_the_chart_key() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "YADGAR_CREDENTIAL_TTL_SECONDS");
+    let line = refusal_without_mounts(&vars);
+    assert!(
+        line.contains("YADGAR_CREDENTIAL_TTL_SECONDS")
+            && line.contains("credentialCache.ttlSeconds"),
+        "the refusal must name both the variable and its chart key: {line}"
+    );
+}
+
 /// `METRICS_LISTEN` is parsed FIRST of all — PHASE 0 in `run`, ahead of
 /// `install_prometheus` (ADR-0677) and ahead of either mounted document — so
 /// this case needs no mount namespace, like the typed refusal above.
