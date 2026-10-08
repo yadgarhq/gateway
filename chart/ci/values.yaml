@@ -38,3 +38,10 @@ project:
 nats:
   tls:
     enabled: false
+
+# B-V3E (K-8 expand, ADR-0852): the cache hop's switch, stated at the only
+# value this chart version accepts. `true` is refused until B-V3, because
+# platform's valkey serves no TLS until B-L1 and B-V2.
+valkey:
+  tls:
+    enabled: false
