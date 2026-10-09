@@ -145,7 +145,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         task,
         iam,
         projects,
-    } = boot::wiring(&broker, &valkey_password).await?;
+    } = boot::wiring(&broker, &valkey_password, limiter.tls()).await?;
 
     // AFTER THE EXPORTER, NEVER BEFORE IT. A value recorded before there is a
     // recorder is a value nobody ever sees. This process serves no certificate,

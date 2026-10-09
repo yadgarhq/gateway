@@ -12,6 +12,7 @@ use yadgar_gateway::http::CredentialLimits;
 use yadgar_gateway::invalidate::Broker;
 use yadgar_gateway::limit::{Limiter, Limits};
 use yadgar_gateway::source::TrustBoundary;
+use yadgar_gateway::upstream::UpstreamTls;
 
 use super::{env_required, env_required_allow_empty, parse_bucket_env, trusted_proxy_hops};
 
@@ -76,14 +77,12 @@ pub fn rate_limiting() -> Result<(Limiter, Option<(String, PathBuf)>), Boxed> {
     // outage of one component, and the call proceeds (see `limit::Decision`).
     // Conflating the two would either hide the mistake or turn the outage into
     // one of our own.
-    let valkey_addr = std::env::var("YADGAR_VALKEY_ADDR")
-        .ok()
-        .filter(|a| !a.is_empty())
-        .ok_or(
-            "YADGAR_VALKEY_ADDR is unset. Every user-attributed call spends a token from a \
-             bucket held in the shared cache (D74), and a gateway with nowhere to keep them \
-             enforces no capacity limit at all. Set it to the Valkey service, e.g. valkey:6379.",
-        )?;
+    //
+    // THE SWITCH IS READ IN THE SAME BREATH (B-V3, ADR-0852): boot order is
+    // part of the contract (this module's own comment), and `valkey_transport`
+    // is what keeps the two together rather than letting a later edit put a
+    // knob between them.
+    let (valkey_addr, valkey_tls) = valkey_transport()?;
     // A misparsed limit must not become a default: a limit nobody notices is
     // gone is the failure this refusal exists to prevent.
     //
@@ -149,11 +148,13 @@ pub fn rate_limiting() -> Result<(Limiter, Option<(String, PathBuf)>), Boxed> {
         limits,
         limit_timeout,
         max_replicas,
+        valkey_tls,
     )?;
     tracing::info!(
         addr = %valkey_addr,
         timeout_ms = limit_timeout.as_millis(),
         max_replicas,
+        tls = limiter.tls().is_some(),
         // WHETHER, never WHAT. The value is a credential and this log is shipped.
         authenticated = valkey_password.is_some(),
         "rate limiting enabled (D74)"
@@ -180,6 +181,31 @@ pub fn rate_limiting() -> Result<(Limiter, Option<(String, PathBuf)>), Boxed> {
         );
     }
     Ok((limiter, valkey_password))
+}
+
+/// The cache's address, and its resolved, pre-validated transport (B-V3,
+/// ADR-0852).
+///
+/// Its own function so [`rate_limiting`] reads the two in the same breath it
+/// always read the address alone in — see the module comment on boot order —
+/// without `rate_limiting` itself carrying every line of either refusal.
+///
+/// `tls` is REQUIRED WITH NO CONDITION IN FRONT OF IT, unlike the broker
+/// hop's `NATS_TLS_ENABLED` (only required once `NATS_URL` is set): `addr`
+/// below refuses its own absence first, so this is never reached with no
+/// cache configured.
+fn valkey_transport() -> Result<(String, Option<UpstreamTls>), Boxed> {
+    let addr = std::env::var("YADGAR_VALKEY_ADDR")
+        .ok()
+        .filter(|a| !a.is_empty())
+        .ok_or(
+            "YADGAR_VALKEY_ADDR is unset. Every user-attributed call spends a token from a \
+             bucket held in the shared cache (D74), and a gateway with nowhere to keep them \
+             enforces no capacity limit at all. Set it to the Valkey service, e.g. valkey:6379.",
+        )?;
+    let tls =
+        yadgar_gateway::limit::valkey_tls(&|k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
+    Ok((addr, tls))
 }
 
 /// The cache's `requirepass`, resolved from the FILE the deployment named.

@@ -47,9 +47,11 @@ use sha2::{Digest, Sha256};
 
 mod config;
 mod floor;
+mod transport;
 mod valkey;
 
 pub use config::{kind_str, Bucket, ConfigError, Limits, Overrides};
+pub use transport::valkey_tls;
 pub use valkey::Limiter;
 
 /// The metric this module emits, over and above D67's three.

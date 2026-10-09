@@ -54,6 +54,7 @@ pub struct Wiring {
 pub async fn wiring(
     broker: &Option<Broker>,
     valkey_password: &Option<(String, PathBuf)>,
+    valkey_tls: Option<&upstream::UpstreamTls>,
 ) -> Result<Wiring, Boxed> {
     let (task_tls, iam_tls, project_tls) = transports()?;
 
@@ -136,6 +137,7 @@ pub async fn wiring(
         iam_tls.as_ref(),
         project_tls.as_ref(),
         broker.as_ref(),
+        valkey_tls,
         valkey_password.as_ref().map(|(_, file)| file.as_path()),
         bootstrap_file.as_deref(),
         &config,

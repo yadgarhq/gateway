@@ -114,6 +114,20 @@ fn generation() -> Generation {
     );
     let fourth = CertifiedIssuer::self_signed(fourth_params, fourth_key).unwrap();
 
+    // A FIFTH authority, for the cache hop (B-V3, ADR-0852), on the same
+    // argument: a `valkey-ca.pem` byte-identical to another bundle would make
+    // dropping the cache's TLS arm from the watch set an equivalent mutant.
+    let fifth_key = KeyPair::generate().unwrap();
+    let mut fifth_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    fifth_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    fifth_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    fifth_params.not_after = date_time_ymd(2037, 6, 15);
+    fifth_params.distinguished_name.push(
+        DnType::CommonName,
+        "yadgar-gateway assembly test authority 5",
+    );
+    let fifth = CertifiedIssuer::self_signed(fifth_params, fifth_key).unwrap();
+
     // THE CLIENT LEAF, issued for `client auth` rather than `server auth`
     // (ADR-0516): a peer verifying a client chain refuses a leaf naming the
     // wrong purpose even though it trusts the issuer perfectly well.
@@ -131,6 +145,7 @@ fn generation() -> Generation {
         ("iam-ca.pem".to_string(), other.pem()),
         ("project-ca.pem".to_string(), third.pem()),
         ("nats-ca.pem".to_string(), fourth.pem()),
+        ("valkey-ca.pem".to_string(), fifth.pem()),
         (
             "client.pem".to_string(),
             format!("{}{}", client_leaf.pem(), ca.pem()),
@@ -424,6 +439,7 @@ fn the_broker_hop_watches_its_bundle_and_the_identity_it_presents() {
         Some(&broker),
         None,
         None,
+        None,
         &config,
         &gw_config,
     );
@@ -452,6 +468,7 @@ fn the_broker_hop_watches_its_bundle_and_the_identity_it_presents() {
             Some(&broker),
             None,
             None,
+            None,
             &config,
             &gw_config
         )
@@ -467,6 +484,49 @@ fn the_broker_hop_watches_its_bundle_and_the_identity_it_presents() {
         ],
         "one client leaf, presented to a gRPC hop and to the broker, is one member"
     );
+}
+
+/// THE CACHE HOP WATCHES ITS BUNDLE AND THE IDENTITY IT PRESENTS (B-V3), with
+/// every other hop in cleartext — the B-V4.2 shape, where valkey is the first
+/// hop to turn TLS on.
+///
+/// Delete the `valkey` argument from `rotate::watch_set`'s call in
+/// `boot::wiring` (or from the array inside it) and this goes red: `redis`
+/// re-reads neither file after boot, so a rotation of either must end this
+/// process the way a rotated upstream bundle does, and only this set is what
+/// makes that happen. `valkey-ca.pem` is its own authority (the fifth), so
+/// dropping it from the set is not an equivalent mutant of dropping any other
+/// member.
+#[test]
+fn the_cache_hop_watches_its_bundle_and_the_identity_it_presents() {
+    let mount = Mount::new(&generation());
+    let valkey = upstream_tls(&mount, "VALKEY", "valkey-ca.pem");
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+    let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
+    let inputs = rotate::watch_set(
+        None,
+        None,
+        None,
+        None,
+        Some(&valkey),
+        None,
+        None,
+        &config,
+        &gw_config,
+    );
+
+    assert_eq!(
+        inputs.watched(),
+        vec![
+            mount.path("valkey-ca.pem").as_path(),
+            mount.path("client.pem").as_path(),
+            mount.path("client-key.pem").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
+        "the cache's CA bundle and the client pair it presents"
+    );
+    assert_eq!(inputs.not_after(Presented::Client), Some(CLIENT_NOT_AFTER));
 }
 
 /// EVERY FILE THE CONFIGURATION NAMED IS IN THE WATCH SET, IN ORDER, AND NOTHING
@@ -499,6 +559,7 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
     let iam = upstream_tls(&mount, upstream::IAM, "iam-ca.pem");
     let project = upstream_tls(&mount, upstream::PROJECT, "project-ca.pem");
     let broker = broker(&mount);
+    let valkey = upstream_tls(&mount, "VALKEY", "valkey-ca.pem");
     let cache_password = mount.path("valkey-password");
     let bootstrap_token = mount.path("admin-bootstrap-token");
     let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
@@ -510,10 +571,11 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             Some(&iam),
             Some(&project),
             Some(&broker),
+            Some(&valkey),
             Some(&cache_password),
             Some(&bootstrap_token),
             &config,
-            &gw_config,
+            &gw_config
         )
         .watched(),
         vec![
@@ -523,16 +585,21 @@ fn the_watch_set_holds_every_file_this_deployment_configured() {
             mount.path("iam-ca.pem").as_path(),
             mount.path("project-ca.pem").as_path(),
             mount.path("nats-password").as_path(),
+            // THE SHARED CLIENT PAIR DEDUPLICATES AGAIN HERE: `valkey`'s own
+            // pair is the same two paths `task` already contributed, so only
+            // its CA bundle is new.
+            mount.path("valkey-ca.pem").as_path(),
             mount.path("valkey-password").as_path(),
             mount.path("admin-bootstrap-token").as_path(),
             config.path(),
             gw_config.path(),
         ],
-        "a fully configured `gateway` reads ten files at boot: a bundle per upstream — three \
-         of them since ledger 881 added `project` — the one client identity it presents to \
-         all of them (ADR-0516), the broker password (D72), the cache password (D74), D73's \
-         administrative bootstrap token (ADR-0492), the shared configuration document every \
-         service watches (step 2a), and this service's OWN document"
+        "a fully configured `gateway` reads eleven files at boot: a bundle per upstream — three \
+         of them since ledger 881 added `project`, a fourth since B-V3 added the cache — the \
+         one client identity it presents to all of them (ADR-0516), the broker password (D72), \
+         the cache password (D74), D73's administrative bootstrap token (ADR-0492), the shared \
+         configuration document every service watches (step 2a), and this service's OWN \
+         document"
     );
 }
 
@@ -562,6 +629,7 @@ fn the_client_certificate_is_the_one_the_gauge_speaks_for() {
         Some(&iam),
         Some(&project),
         Some(&broker),
+        None,
         Some(&cache_password),
         Some(&bootstrap_token),
         &config,
@@ -600,7 +668,7 @@ fn each_configured_half_contributes_on_its_own() {
     let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
 
     assert_eq!(
-        rotate::watch_set(None, None, None, None, None, None, &config, &gw_config).watched(),
+        rotate::watch_set(None, None, None, None, None, None, None, &config, &gw_config).watched(),
         vec![config.path(), gw_config.path()],
         "with both upstreams cleartext and neither password configured, the two mounted \
          configuration documents are the only thing watched — both are unconditional, unlike \
@@ -611,6 +679,7 @@ fn each_configured_half_contributes_on_its_own() {
     assert_eq!(
         rotate::watch_set(
             Some(&task),
+            None,
             None,
             None,
             None,
@@ -635,6 +704,7 @@ fn each_configured_half_contributes_on_its_own() {
         rotate::watch_set(
             None,
             Some(&iam),
+            None,
             None,
             None,
             None,
@@ -676,6 +746,7 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             None,
+            None,
             &config,
             &gw_config
         )
@@ -702,6 +773,7 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             Some(&project_only),
+            None,
             None,
             None,
             None,
@@ -734,6 +806,7 @@ fn each_configured_half_contributes_on_its_own() {
             Some(&broker(&mount)),
             None,
             None,
+            None,
             &config,
             &gw_config
         )
@@ -753,6 +826,7 @@ fn each_configured_half_contributes_on_its_own() {
     // refused until somebody restarts the pod.
     assert_eq!(
         rotate::watch_set(
+            None,
             None,
             None,
             None,
@@ -784,6 +858,7 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             None,
+            None,
             Some(&mount.path("admin-bootstrap-token")),
             &config,
             &gw_config
@@ -809,7 +884,7 @@ fn each_configured_half_contributes_on_its_own() {
     // `yadgar_rotation_watched_files_unreadable`, which is a gauge an operator
     // reads as a fault.
     assert_eq!(
-        rotate::watch_set(None, None, None, None, None, None, &config, &gw_config).watched(),
+        rotate::watch_set(None, None, None, None, None, None, None, &config, &gw_config).watched(),
         vec![config.path(), gw_config.path()],
         "an unmounted bootstrap token names no file, so there is no file to watch"
     );
@@ -831,6 +906,7 @@ fn each_configured_half_contributes_on_its_own() {
             None,
             None,
             Some(&open_broker),
+            None,
             None,
             None,
             &config,
@@ -877,6 +953,7 @@ fn the_gauge_names_this_service_and_the_one_certificate_it_holds() {
             Some(&iam),
             Some(&project),
             Some(&broker),
+            None,
             Some(&cache_password),
             Some(&bootstrap_token),
             &config,
@@ -961,6 +1038,7 @@ fn the_unreadable_gauge_carries_this_service_and_is_published_at_zero_too() {
         Some(&iam),
         Some(&project),
         Some(&broker),
+        None,
         Some(&cache_password),
         Some(&bootstrap_token),
         &config,

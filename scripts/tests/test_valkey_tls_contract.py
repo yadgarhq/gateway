@@ -1,19 +1,25 @@
-"""B-N3: the CONTRACT step for the gateway's NATS client TLS switch (ADR-0852,
-ADR-0845, K-8 of the October ledger sweep).
+"""B-V3: the CONTRACT step for the gateway's valkey client TLS switch
+(ADR-0852, ADR-0845, K-8 of the October ledger sweep).
 
-The expand (B-N3E) declared `nats.tls.enabled` optional and refused `true`. The
-parent fixture (yadgarhq/chart B-P2) now states `false`. This step:
+The expand (B-V3E, folded with B-N3E) declared `valkey.tls.enabled` optional
+and refused `true`; B-N3 contracted the broker hop and moved its own cases to
+`test_nats_tls_contract.py`, leaving this file as `test_tls_expand.py`'s last
+tenant. This step retires that file (no hop is left in the EXPAND state) and:
 
   - makes `enabled` REQUIRED with no chart default — the schema's `required`
     plus the template's map / `hasKey` / `kindIs "bool"` guard, the same pair
-    the three dials carry (`test_adr_0845_tls_required.py`);
-  - renders `NATS_TLS_ENABLED` unconditionally, so `false` is the literal "0"
-    and NOTHING ELSE — the acceptance line: a parent that states `false`
-    renders exactly what it rendered against the expand;
-  - lifts the `true` refusal: `true` renders the CA path, an item-only mount of
-    `ca.crt` from `nats.tls.caSecret` (`nats-tls`), and the client pair from
-    the ONE `client-cert` mount (`test_client_cert_pairing.py` covers that the
-    pair always has a mount behind it, nats included).
+    every other dial carries (`test_adr_0845_tls_required.py`,
+    `test_nats_tls_contract.py`);
+  - renders `VALKEY_TLS_ENABLED` unconditionally, so `false` is the literal
+    "0" and NOTHING ELSE — the acceptance line: a parent that states `false`
+    renders exactly what it rendered against the expand. Unlike
+    `NATS_TLS_ENABLED`, this is never conditional on anything: `NATS_URL` may
+    be unset, but `YADGAR_VALKEY_ADDR` is always required, so the cache hop's
+    switch is unconditionally required too;
+  - lifts the `true` refusal: `true` renders the CA path, an item-only mount
+    of `ca.crt` from `valkey.tls.caSecret` (`valkey-tls`), and the client pair
+    from the ONE `client-cert` mount (`test_client_cert_pairing.py` covers
+    that the pair always has a mount behind it, valkey included).
 
 Run: python3 -m pytest scripts/tests/ -q
 """
@@ -29,23 +35,20 @@ from test_render_checks import CHART, CHART_NAME, helm, objects
 
 SCHEMA_WRAPPER = "values don't meet the specifications of the schema(s)"
 REQUIRED_SENTENCE = (
-    "nats.tls.enabled must be set to true or false; it renders NATS_TLS_ENABLED "
+    "valkey.tls.enabled must be set to true or false; it renders VALKEY_TLS_ENABLED "
     "(ADR-0845, ADR-0797)"
 )
-CA_PATH = "/var/run/config/nats-ca/ca.pem"
+CA_PATH = "/var/run/config/valkey-ca/ca.pem"
 SECRET = "gateway-client-tls"
 
-# The dials every render needs (ADR-0845), cleartext, so the broker hop is the
-# ONLY place a client identity could be presented. `valkey` joins them since
-# B-V3 made its switch required too (see `test_valkey_tls_contract.py`); it is
-# under test nowhere in this file, so it is always satisfied the same way the
-# three gRPC dials are.
-DIALS = {u: {"tls": {"enabled": False}} for u in ("task", "iam", "project", "valkey")}
-NATS_VARIABLES = (
-    "NATS_TLS_ENABLED",
-    "NATS_TLS_CA_FILE",
-    "NATS_TLS_CLIENT_CERT_FILE",
-    "NATS_TLS_CLIENT_KEY_FILE",
+# The dials every render needs (ADR-0845), cleartext, so the cache hop is the
+# ONLY place a client identity could be presented.
+DIALS = {u: {"tls": {"enabled": False}} for u in ("task", "iam", "project", "nats")}
+VALKEY_VARIABLES = (
+    "VALKEY_TLS_ENABLED",
+    "VALKEY_TLS_CA_FILE",
+    "VALKEY_TLS_CLIENT_CERT_FILE",
+    "VALKEY_TLS_CLIENT_KEY_FILE",
 )
 
 
@@ -56,9 +59,9 @@ def write_overlay(body: dict, destination: Path) -> Path:
     return path
 
 
-def overlay(nats_tls, identity: bool = True) -> dict:
+def overlay(valkey_tls, identity: bool = True) -> dict:
     body: dict = {k: {"tls": dict(v["tls"])} for k, v in DIALS.items()}
-    body["nats"] = {"tls": nats_tls}
+    body["valkey"] = {"tls": valkey_tls}
     if identity:
         body["clientCertificate"] = {"secret": SECRET}
     return body
@@ -74,12 +77,12 @@ def pod_spec(stdout: str) -> dict:
     return deployment["spec"]["template"]["spec"]
 
 
-def nats_env(spec: dict) -> dict[str, str]:
+def valkey_env(spec: dict) -> dict[str, str]:
     (container,) = spec["containers"]
     return {
         e["name"]: e.get("value")
         for e in container.get("env", [])
-        if e["name"] in NATS_VARIABLES
+        if e["name"] in VALKEY_VARIABLES
     }
 
 
@@ -92,8 +95,8 @@ def mount(spec: dict, name: str) -> dict | None:
     return next((m for m in container.get("volumeMounts", []) if m["name"] == name), None)
 
 
-def rendered(tmp_path: Path, nats_tls, identity: bool = True) -> dict:
-    result = bare(write_overlay(overlay(nats_tls, identity), tmp_path))
+def rendered(tmp_path: Path, valkey_tls, identity: bool = True) -> dict:
+    result = bare(write_overlay(overlay(valkey_tls, identity), tmp_path))
     assert result.returncode == 0, result.stderr
     return pod_spec(result.stdout)
 
@@ -110,9 +113,9 @@ def test_an_absent_switch_is_a_schema_refusal(tmp_path):
 
 
 def test_a_null_tls_block_is_the_template_sentence(tmp_path):
-    """`values.yaml` declares `nats.tls`, so a null coalesces it AWAY: there is
-    no `enabled` for the schema's `required` to judge, and only the template's
-    own guard is left to refuse."""
+    """`values.yaml` declares `valkey.tls`, so a null coalesces it AWAY: there
+    is no `enabled` for the schema's `required` to judge, and only the
+    template's own guard is left to refuse."""
     result = bare(write_overlay(overlay(None), tmp_path))
     assert result.returncode != 0, result.stdout
     assert REQUIRED_SENTENCE in result.stderr, result.stderr
@@ -147,10 +150,11 @@ def test_an_unknown_key_under_tls_is_a_schema_refusal(tmp_path):
 
 def test_false_renders_the_literal_zero_and_nothing_else(tmp_path):
     spec = rendered(tmp_path, {"enabled": False})
-    assert nats_env(spec) == {"NATS_TLS_ENABLED": "0"}
-    assert volume(spec, "nats-ca") is None
-    assert mount(spec, "nats-ca") is None
-    # Every dial is cleartext too, so no private key is mounted for nothing.
+    assert valkey_env(spec) == {"VALKEY_TLS_ENABLED": "0"}
+    assert volume(spec, "valkey-ca") is None
+    assert mount(spec, "valkey-ca") is None
+    # Every other hop is cleartext too, so no private key is mounted for
+    # nothing.
     assert volume(spec, "client-cert") is None
 
 
@@ -159,36 +163,36 @@ def test_false_renders_the_literal_zero_and_nothing_else(tmp_path):
 
 def test_true_renders_the_ca_and_the_identity(tmp_path):
     spec = rendered(tmp_path, {"enabled": True})
-    assert nats_env(spec) == {
-        "NATS_TLS_ENABLED": "1",
-        "NATS_TLS_CA_FILE": CA_PATH,
-        "NATS_TLS_CLIENT_CERT_FILE": "/var/run/secrets/client-cert/client.crt",
-        "NATS_TLS_CLIENT_KEY_FILE": "/var/run/secrets/client-cert/client.key",
+    assert valkey_env(spec) == {
+        "VALKEY_TLS_ENABLED": "1",
+        "VALKEY_TLS_CA_FILE": CA_PATH,
+        "VALKEY_TLS_CLIENT_CERT_FILE": "/var/run/secrets/client-cert/client.crt",
+        "VALKEY_TLS_CLIENT_KEY_FILE": "/var/run/secrets/client-cert/client.key",
     }
 
 
-def test_the_ca_is_one_key_of_nats_tls_mounted_where_the_variable_points(tmp_path):
+def test_the_ca_is_one_key_of_valkey_tls_mounted_where_the_variable_points(tmp_path):
     spec = rendered(tmp_path, {"enabled": True})
-    ca = volume(spec, "nats-ca")
+    ca = volume(spec, "valkey-ca")
     assert ca is not None
-    # ONE KEY, never the whole Secret: `nats-tls` also holds the broker's
+    # ONE KEY, never the whole Secret: `valkey-tls` also holds the cache's
     # private key.
     assert ca["secret"] == {
-        "secretName": "nats-tls",
+        "secretName": "valkey-tls",
         "optional": True,
         "items": [{"key": "ca.crt", "path": "ca.pem"}],
     }
-    ca_mount = mount(spec, "nats-ca")
+    ca_mount = mount(spec, "valkey-ca")
     assert ca_mount is not None
     assert ca_mount["readOnly"] is True
     assert "subPath" not in ca_mount
     assert f"{ca_mount['mountPath']}/ca.pem" == CA_PATH
 
 
-def test_the_broker_hop_alone_mounts_the_client_identity(tmp_path):
-    """THE B-N4.2 SHAPE: NATS over TLS while every gRPC hop is cleartext. The
-    client pair must have the `client-cert` volume behind it, or the pod exits
-    at boot naming a path nothing mounted."""
+def test_the_cache_hop_alone_mounts_the_client_identity(tmp_path):
+    """THE B-V4.2 SHAPE: valkey over TLS while every other hop is cleartext.
+    The client pair must have the `client-cert` volume behind it, or the pod
+    exits at boot naming a path nothing mounted."""
     spec = rendered(tmp_path, {"enabled": True})
     cert = volume(spec, "client-cert")
     assert cert is not None
@@ -198,11 +202,11 @@ def test_the_broker_hop_alone_mounts_the_client_identity(tmp_path):
 
 def test_true_with_no_client_secret_presents_no_identity(tmp_path):
     spec = rendered(tmp_path, {"enabled": True}, identity=False)
-    assert nats_env(spec) == {"NATS_TLS_ENABLED": "1", "NATS_TLS_CA_FILE": CA_PATH}
+    assert valkey_env(spec) == {"VALKEY_TLS_ENABLED": "1", "VALKEY_TLS_CA_FILE": CA_PATH}
     assert volume(spec, "client-cert") is None
 
 
 def test_true_with_no_ca_secret_is_refused_naming_the_key(tmp_path):
     result = bare(write_overlay(overlay({"enabled": True, "caSecret": ""}), tmp_path))
     assert result.returncode != 0, result.stdout
-    assert "nats.tls.caSecret" in result.stderr, result.stderr
+    assert "valkey.tls.caSecret" in result.stderr, result.stderr

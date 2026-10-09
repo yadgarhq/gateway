@@ -27,8 +27,9 @@ import yaml
 
 from test_render_checks import CHART, objects, render
 
-# `nats` since B-N3 (ADR-0852): the broker hop presents the same leaf.
-EXPECTED_UPSTREAMS = {"task", "iam", "project", "nats"}
+# `nats` since B-N3, `valkey` since B-V3 (ADR-0852): the broker and cache
+# hops present the same leaf.
+EXPECTED_UPSTREAMS = {"task", "iam", "project", "nats", "valkey"}
 SECRET = "gateway-client-tls-m-agahi"
 IDENTITY = (
     "--set", f"clientCertificate.secret={SECRET}",
@@ -126,6 +127,7 @@ def test_no_upstream_on_mounts_no_private_key() -> None:
         "--set", "iam.tls.enabled=false",
         "--set", "project.tls.enabled=false",
         "--set", "nats.tls.enabled=false",
+        "--set", "valkey.tls.enabled=false",
     )
     spec = pod_spec(*IDENTITY, *all_off)
     assert client_cert_env(spec) == []

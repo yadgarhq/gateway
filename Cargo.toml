@@ -94,10 +94,35 @@ yadgar-telemetry = { git = "https://github.com/yadgarhq/telemetry.git", tag = "v
 # the read-compute-write MUST be one atomic operation or the limit is silently
 # multiplied by the replica count. Default features are off — acl, streams,
 # geospatial and num-bigint are surface this service never touches.
+#
+# `tokio-rustls-comp` (B-V3, ADR-0852) is the cache hop's TLS, over the same
+# tokio runtime `tokio-comp` already asks for — it implies `tls-rustls`, so
+# that feature is not named twice. NOT a counter-example to the `tls-ring`
+# reasoning below `async-nats`: `redis`'s own `rustls` dependency is
+# `default-features = false` and chooses no crypto provider itself, so it
+# resolves to whichever this tree already carries. CHECKED rather than
+# assumed, the same way: `cargo tree -e normal -i aws-lc-rs` still matches no
+# package with this feature on.
 redis = { version = "1.6", default-features = false, features = [
   "script",
   "tokio-comp",
   "connection-manager",
+  "tokio-rustls-comp",
+] }
+
+# The PEM parsing the cache hop's boot-time checks use (B-V3, ADR-0852):
+# counting the certificates in `VALKEY_TLS_CA_FILE` and
+# `VALKEY_TLS_CLIENT_CERT_FILE` before `redis` ever dials, the same way
+# `async-nats`'s own re-export of `rustls` lets the broker hop do it without
+# a direct dependency of its own. `redis` depends on `rustls` too but
+# re-exports none of it (`redis::tls` exports only `ClientTlsConfig` and
+# `TlsCertificates`), so this crate names the smaller one directly rather
+# than pulling the whole of `rustls` for four lines of PEM counting.
+# `default-features = false`: this process parses PEM, nothing else — no
+# crypto provider, no `std`-only alloc shapes this chart's distroless image
+# would not already have through `async-nats`.
+rustls-pki-types = { version = "1", default-features = false, features = [
+  "alloc",
 ] }
 
 # The metrics facade, DIRECTLY rather than through yadgar-telemetry. The three

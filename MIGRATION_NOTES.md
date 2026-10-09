@@ -1,5 +1,37 @@
 # Migration notes
 
+## The cache hop's TLS switch is now required (B-V3, ADR-0852, ADR-0845)
+
+**Breaking: `valkey.tls.enabled` must be set to `true` or `false` explicitly.**
+The expand release (B-V3E) made it optional; this release makes it `required`
+in the schema with no chart default, guarded in `templates/deployment.yaml`
+like the other dials' switches. A values source without it is refused at
+`helm template` / `helm lint --strict` / an Argo sync, naming the key. Unlike
+`NATS_TLS_ENABLED` (required only once `NATS_URL` is set), the binary refuses
+to boot on an absent, empty or not-`1`/`0` `VALKEY_TLS_ENABLED` UNCONDITIONALLY
+— `YADGAR_VALKEY_ADDR` is itself always required, so there is no cleartext
+deployment with no cache to gate this on.
+
+- `yadgarhq/chart`'s `chart/ci/values.yaml` and `example/values.yaml` already
+  state `gateway.valkey.tls.enabled: false` (chart#39, B-P2). argocd's values
+  gain it in PB-3, before argocd moves past parent 0.19.1.
+- `false` renders exactly what the expand rendered: `VALKEY_TLS_ENABLED="0"`
+  and nothing else.
+- `true` dials the cache over TLS, with `redis`'s `tokio-rustls-comp` feature
+  and `rediss://`. It verifies the cache against `valkey.tls.caSecret` /
+  `caSecretKey` (default `valkey-tls` / `ca.crt`, one key mounted at
+  `/var/run/config/valkey-ca/ca.pem`) and nothing else. It presents
+  `clientCertificate.secret` when that is set. **It dials the cache's FIXED
+  TLS port, 6380 (B-V2), rather than whatever port `rateLimit.addr` names** —
+  the address's host half still names the cache, but the port half is only
+  ever the plaintext one; a TLS dial never reaches it. Set `enabled: true`
+  only after platform's valkey serves TLS (B-V4.1). The flip is B-V4.2.
+- `VALKEY_TLS_CA_FILE` holding no PEM certificate refuses the boot by name:
+  `redis` treats an empty bundle as zero trust anchors and no error, which
+  would otherwise surface as every handshake failing as an unknown issuer.
+
+Revert is a straight `git revert`.
+
 ## The broker hop's TLS switch is now required (B-N3, ADR-0852, ADR-0845)
 
 **Breaking: `nats.tls.enabled` must be set to `true` or `false` explicitly.**
