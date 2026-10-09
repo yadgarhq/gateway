@@ -14,28 +14,28 @@ than assert it from the two files' names alone.
 THREE PATHS STAY OPEN (`OPEN` below) and are asserted bare `{}`, never typed:
 `global` (Helm's reserved key, ADR-0722), `resources`
 (`corev1.ResourceRequirements`, re-typed nowhere in this chart) and
-`rollingUpdate` (`appsv1.RollingUpdateDeployment`, same reason). FOUR EXTRAS
+`rollingUpdate` (`appsv1.RollingUpdateDeployment`, same reason). THREE EXTRAS
 (`EXTRAS` below) are declared though `values.yaml` never states them, because a
 template reads them anyway: `image.digest` (`templates/deployment.yaml`, D65/
 D61), `networkPolicy.scrapeFrom.namespace` (`templates/networkpolicy.yaml`),
-`nats.tls.enabled` and `valkey.tls.enabled` (`templates/deployment.yaml`, the
-B-N3E / B-V3E expand; `valkey` and `valkey.tls` are their parent nodes).
+`valkey.tls.enabled` (`templates/deployment.yaml`, the B-V3E expand; `valkey`
+and `valkey.tls` are its parent nodes).
 ONE PAIR PREDATES THIS CLOSURE (`RETAINED` below) and is excluded from the
 EXTRAS accounting rather than folded into it: `toolsPoll` /
 `toolsPoll.intervalSeconds`, which override `chart/config/gateway.yaml` and
 which `values.yaml` deliberately never states at all (ADR-0569, one source per
 knob) — the schema's own `$comment` carries the full reasoning.
 
-THREE MORE ARE EXCLUDED THE SAME WAY, FOR THE OPPOSITE REASON (`REQUIRED_NO_DEFAULT`
-below, ledger 965, 1278, ADR-0845): `task.tls.enabled`, `iam.tls.enabled` and
-`project.tls.enabled` are declared `type: boolean` and `required` in the schema
+FOUR MORE ARE EXCLUDED THE SAME WAY, FOR THE OPPOSITE REASON (`REQUIRED_NO_DEFAULT`
+below, ledger 965, 1278, ADR-0845): `task.tls.enabled`, `iam.tls.enabled`,
+`project.tls.enabled` and, since B-N3, `nats.tls.enabled` are declared `type: boolean` and `required` in the schema
 and ABSENT from `values.yaml`, on purpose — a dial's TLS switch has no chart
 default and no binary default either (ADR-0569), so `values.yaml` ships no
-value for any of the three and every consumer must set one explicitly. These are
+value for any of the four and every consumer must set one explicitly. These are
 not EXTRAS: EXTRAS is "a template reads this leaf though `values.yaml` never
-states it"; these three are "this leaf exists, is required, and `values.yaml`
+states it"; these four are "this leaf exists, is required, and `values.yaml`
 is the ONE place guaranteed never to supply it". Folding them into EXTRAS would
-make the EXTRAS test pass without saying why these three are schema-only, which
+make the EXTRAS test pass without saying why these four are schema-only, which
 is the exact blindness `test_every_schema_extra_is_exactly_the_declared_set`
 exists to refuse.
 
@@ -72,15 +72,14 @@ OPEN = ("global", "resources", "rollingUpdate")
 # Leaves a template reads that `values.yaml` never states (§2 step 2's
 # "read-but-undeclared keys"), declared here as closed-block leaves rather
 # than left as open maps.
-# `nats.tls.enabled` and `valkey.tls.enabled` join them for the K-8 expand
-# (B-N3E, B-V3E): declared and read only when present, with no value in
-# `values.yaml`. B-N3 / B-V3 move them to `REQUIRED_NO_DEFAULT` when the
-# binary requires `NATS_TLS_ENABLED` / `VALKEY_TLS_ENABLED`.
+# `valkey.tls.enabled` joins them for the K-8 expand (B-V3E): declared and
+# read only when present, with no value in `values.yaml`. B-V3 moves it to
+# `REQUIRED_NO_DEFAULT` when the binary requires `VALKEY_TLS_ENABLED`, as B-N3
+# moved `nats.tls.enabled` (its `nats.tls` block is now stated in
+# `values.yaml`, carrying `caSecret` and `caSecretKey`).
 EXTRAS = (
     "image.digest",
     "networkPolicy.scrapeFrom.namespace",
-    "nats.tls",
-    "nats.tls.enabled",
     "valkey",
     "valkey.tls",
     "valkey.tls.enabled",
@@ -95,7 +94,12 @@ RETAINED = ("toolsPoll", "toolsPoll.intervalSeconds")
 # Required, with no chart default (ADR-0845, ledger 965, 1278): each dial's
 # TLS switch. Excluded from the EXTRAS accounting for the opposite reason
 # RETAINED is — see the module docstring.
-REQUIRED_NO_DEFAULT = ("task.tls.enabled", "iam.tls.enabled", "project.tls.enabled")
+REQUIRED_NO_DEFAULT = (
+    "task.tls.enabled",
+    "iam.tls.enabled",
+    "project.tls.enabled",
+    "nats.tls.enabled",
+)
 
 KEDA = ("--api-versions", "keda.sh/v1alpha1")
 

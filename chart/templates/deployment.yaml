@@ -14,18 +14,14 @@
 {{- if not (and (kindIs "map" .Values.iam.tls) (hasKey .Values.iam.tls "enabled") (kindIs "bool" .Values.iam.tls.enabled)) }}{{ fail "iam.tls.enabled must be set to true or false; it renders IAM_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
 {{- if not (and (kindIs "map" .Values.project.tls) (hasKey .Values.project.tls "enabled") (kindIs "bool" .Values.project.tls.enabled)) }}{{ fail "project.tls.enabled must be set to true or false; it renders PROJECT_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
 {{/*
-  B-N3E, THE K-8 EXPAND FOR THE BROKER HOP (ADR-0852). `nats.tls.enabled` is
-  OPTIONAL in this chart version: absent renders nothing, so every values file
-  written before this key existed renders as it did. PRESENCE IS `enabled`,
-  never the `tls` map, because B-N3 adds `caSecret` beside it.
-  Present, it is validated here (the same map / `hasKey` / `kindIs "bool"`
-  shape as the dials above), and `true` is refused: the binary reads
-  `NATS_TLS_ENABLED` only from B-N3 and the broker serves no TLS until B-L1.
-  B-N3 makes the key required and lifts the `true` refusal.
+  B-N3, THE K-8 CONTRACT FOR THE BROKER HOP (ADR-0852, ADR-0845). The expand
+  (B-N3E) declared `nats.tls.enabled` optional and refused `true`; the parent
+  fixture (B-P2) now states it. So it is REQUIRED here with the same map /
+  `hasKey` / `kindIs "bool"` guard as the three dials above — `required` in the
+  schema cannot see `tls: null`, which helm coalesces away — and `true` is a
+  real value: the binary dials the broker over TLS from this release.
 */}}
-{{- $natsTlsStated := and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") -}}
-{{- if and $natsTlsStated (not (kindIs "bool" .Values.nats.tls.enabled)) }}{{ fail "nats.tls.enabled must be true or false when it is set; it renders NATS_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
-{{- if and $natsTlsStated (kindIs "bool" .Values.nats.tls.enabled) .Values.nats.tls.enabled }}{{ fail "nats.tls.enabled: true is refused by this chart version: it declares the key, but the binary reads NATS_TLS_ENABLED only from B-N3 and the broker serves no TLS until B-L1. Set it to false (ADR-0845, ADR-0852)" }}{{ end }}
+{{- if not (and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") (kindIs "bool" .Values.nats.tls.enabled)) }}{{ fail "nats.tls.enabled must be set to true or false; it renders NATS_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
 {{/*
   B-V3E, THE SAME K-8 EXPAND FOR THE CACHE HOP (ADR-0852), folded into the
   same release as B-N3E. `valkey.tls.enabled` is OPTIONAL in this chart
@@ -65,7 +61,14 @@
   as a mistake to anyone diffing the manifest. Both halves are guarded, so the
   reverted state leaves nothing behind.
 */}}
-{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.project.tls.enabled) -}}
+{{/*
+  THE BROKER HOP IS A FOURTH PLACE THE LEAF IS PRESENTED (B-N3, ADR-0852), so
+  `nats.tls.enabled` joins the three dials here. Without it, the B-N4.2 shape —
+  NATS over TLS while every gRPC hop is still cleartext — renders
+  `NATS_TLS_CLIENT_*` naming a `client-cert` mount that does not exist, and
+  the pod exits at boot naming a path nothing mounted.
+*/}}
+{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.project.tls.enabled .Values.nats.tls.enabled) -}}
 {{/*
   WHETHER D73'S BOOTSTRAP TOKEN IS MOUNTED AT ALL (ADR-0492, ledger 638).
 
@@ -475,13 +478,29 @@ spec:
             # See values.yaml.
             - name: NATS_URL
               value: {{ .Values.nats.url | quote }}
-            {{- if $natsTlsStated }}
-            # B-N3E: RENDERED ONLY WHEN `nats.tls.enabled` IS STATED, and only
-            # ever as "0" — the guard at the top of this file refuses `true`
-            # until B-N3. This binary does not read the variable yet; it is on
-            # the wire so the stated value is visible in the manifest.
+            # RENDERED UNCONDITIONALLY (ADR-0845, B-N3), the same as the three
+            # dials' switches: the binary requires it whenever NATS_URL is set
+            # and refuses to boot without it. `nats.tls.enabled` is guarded at
+            # the top of this file, so this ternary never sees anything else.
             - name: NATS_TLS_ENABLED
               value: {{ ternary "1" "0" .Values.nats.tls.enabled | quote }}
+            {{- if .Values.nats.tls.enabled }}
+            # THE ONLY TRUST STORE FOR THE BROKER (ADR-0852). A PATH, never an
+            # issuer-specific resource (D80). The binary adds no platform or
+            # public root beside it, on the first dial or on any reconnect, and
+            # refuses to boot if the file is unreadable or holds no certificate.
+            - name: NATS_TLS_CA_FILE
+              value: /var/run/config/nats-ca/ca.pem
+            {{- if $clientCert }}
+            # WHO THIS GATEWAY SAYS IT IS TO THE BROKER — the same one leaf, the
+            # same mount and the same two paths as the gRPC hops above
+            # (ADR-0852 design item 7). The broker verifies it once platform's
+            # `nats.tls.clientAuth` is `required` (B-N5).
+            - name: NATS_TLS_CLIENT_CERT_FILE
+              value: /var/run/secrets/client-cert/client.crt
+            - name: NATS_TLS_CLIENT_KEY_FILE
+              value: /var/run/secrets/client-cert/client.key
+            {{- end }}
             {{- end }}
             {{- if .Values.nats.passwordSecret }}
             # RENDERED ONLY WHEN THE BROKER ASKS FOR A CREDENTIAL, so an adopter
@@ -872,6 +891,14 @@ spec:
               mountPath: /var/run/config/project-ca
               readOnly: true
             {{- end }}
+            {{- if .Values.nats.tls.enabled }}
+            # SEPARATE FROM EVERY UPSTREAM's, for the reason those are separate
+            # from each other: one bundle trusting several authorities would
+            # make each hop's trust depend on the others' rotation.
+            - name: nats-ca
+              mountPath: /var/run/config/nats-ca
+              readOnly: true
+            {{- end }}
             {{- if $presentsIdentity }}
             # A DIRECTORY MOUNT, never subPath — and here the rule is at its most
             # expensive to break. A subPath mount is a one-time copy kubelet
@@ -992,6 +1019,20 @@ spec:
             # `ca.pem` that TASK_TLS_CA_FILE names.
             items:
               - key: {{ required "task.tls.caSecretKey names the key inside task.tls.caSecret that holds the CA bundle and must be set whenever task.tls.enabled is; see the chart's values.yaml" .Values.task.tls.caSecretKey | quote }}
+                path: ca.pem
+        {{- end }}
+        {{- if .Values.nats.tls.enabled }}
+        - name: nats-ca
+          secret:
+            secretName: {{ required "nats.tls.caSecret holds the CA bundle the broker is verified against and must be set whenever nats.tls.enabled is; see the chart's values.yaml" .Values.nats.tls.caSecret }}
+            # OPTIONAL, for the reason `task-ca` gives: a missing Secret is an
+            # empty directory, and the binary exits naming NATS_TLS_CA_FILE
+            # rather than leaving the pod in ContainerCreating.
+            optional: true
+            # ONE KEY, not the whole Secret: `nats-tls` is the BROKER's serving
+            # leaf and holds its private key, which this pod must never read.
+            items:
+              - key: {{ required "nats.tls.caSecretKey names the key inside nats.tls.caSecret that holds the CA bundle and must be set whenever nats.tls.enabled is; see the chart's values.yaml" .Values.nats.tls.caSecretKey | quote }}
                 path: ca.pem
         {{- end }}
         {{- if $presentsIdentity }}

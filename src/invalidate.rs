@@ -134,6 +134,7 @@ use tokio::sync::oneshot;
 
 mod broker;
 mod consume;
+mod transport;
 
 use broker::{first_connection, redial, Connection, CONNECT_TIMEOUT, URL};
 pub use broker::{Broker, BrokerCredentials};

@@ -1,6 +1,7 @@
-"""B-N3E and B-V3E: the EXPAND step for the gateway's NATS and valkey client
-TLS switches, folded into one release (ADR-0852, ADR-0845, K-8 of the
-October ledger sweep).
+"""B-V3E: the EXPAND step for the gateway's valkey client TLS switch
+(ADR-0852, ADR-0845, K-8 of the October ledger sweep). It shipped folded with
+B-N3E (NATS); B-N3 has since CONTRACTED the NATS key, so its cases moved to
+`test_nats_tls_contract.py` and this file keeps the valkey hop only.
 
 WHAT AN EXPAND IS, AND WHY THIS ONE IS CHART-ONLY. Every gateway release is
 pinned into the parent chart with no PR CI, and this chart's schema closes
@@ -40,12 +41,6 @@ SCHEMA_WRAPPER = "values don't meet the specifications of the schema(s)"
 
 # hop -> (variable, the sentence that refuses `true`)
 HOPS = {
-    "nats": (
-        "NATS_TLS_ENABLED",
-        "nats.tls.enabled: true is refused by this chart version: it declares the key, "
-        "but the binary reads NATS_TLS_ENABLED only from B-N3 and the broker serves no "
-        "TLS until B-L1. Set it to false (ADR-0845, ADR-0852)",
-    ),
     "valkey": (
         "VALKEY_TLS_ENABLED",
         "valkey.tls.enabled: true is refused by this chart version: it declares the key, "
@@ -68,6 +63,9 @@ def not_bool(hop: str) -> str:
 # because that file states both hop switches too and the ABSENT case must not
 # see them.
 DIALS = {u: {"tls": {"enabled": True}} for u in ("task", "iam", "project")}
+# The broker hop is REQUIRED since B-N3 (see `test_nats_tls_contract.py`), so
+# every render here states it at the value the parent fixture states.
+DIALS["nats"] = {"tls": {"enabled": False}}
 
 
 def write_overlay(body: dict, destination: Path) -> Path:
@@ -134,11 +132,11 @@ def test_false_renders_the_literal_zero_and_nothing_else(hop, tmp_path):
     assert hop_env(result.stdout) == {HOPS[hop][0]: "0"}
 
 
-def test_the_ci_values_state_both_false():
+def test_the_ci_values_state_valkey_false():
     """`chart/ci/values.yaml` is the fixture every offline gate renders with."""
     result = render(CHART)
     assert result.returncode == 0, result.stderr
-    assert hop_env(result.stdout) == {"NATS_TLS_ENABLED": "0", "VALKEY_TLS_ENABLED": "0"}
+    assert hop_env(result.stdout) == {"VALKEY_TLS_ENABLED": "0"}
 
 
 # ── 3. PRESENT AND TRUE: refused until the contract ─────────────────────────

@@ -113,9 +113,20 @@ use crate::upstream::UpstreamTls;
 /// a path invented here would be reported unreadable for ever by
 /// [`WATCHED_FILES_UNREADABLE`] on a gateway with nothing wrong with it, and
 /// that gauge is one an operator is meant to be able to read as a fault.
+///
+/// **AND THE BROKER HOP'S TLS MATERIAL (B-N3, ADR-0852)** when
+/// `NATS_TLS_ENABLED` is `"1"`: its CA bundle and the client pair it presents,
+/// through [`UpstreamTls`]'s own impl below. `async-nats` re-reads these on
+/// every dial, inside the library, so the `boot-reads-watched` gate cannot see
+/// them; `tests/assembly.rs` is what holds them here. The pair is the same
+/// `client-cert` mount the gRPC hops name, so the fold hashes it once.
 impl Material for Broker {
     fn files(&self) -> Vec<File<'_>> {
-        self.password_file().map(File::read).into_iter().collect()
+        let mut files: Vec<File<'_>> = self.password_file().map(File::read).into_iter().collect();
+        if let Some(tls) = self.tls() {
+            files.extend(tls.files());
+        }
+        files
     }
 }
 
