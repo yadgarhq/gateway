@@ -14,7 +14,17 @@ use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use super::config::{kind_str, Bucket, Limits, Overrides};
 use super::floor::Floor;
+use super::transport;
 use super::{address_component, user_component, Decision, Degrade, PREFIX};
+use crate::upstream::UpstreamTls;
+
+/// The cache's fixed TLS listener (B-V2, ADR-0852). NOT `rateLimit.addr`'s
+/// port — that address stays the plaintext one so B-V3's contract needs no
+/// values change — and not a values key either: every valkey in this estate
+/// serves TLS on this one port beside its plaintext one, the same way
+/// `platform/chart/templates/ingress-policies.yaml` hardcodes it rather than
+/// reading it from a key.
+const TLS_PORT: u16 = 6380;
 
 /// The atomic read-compute-write.
 ///
@@ -132,6 +142,8 @@ pub struct Limiter {
     script: redis::Script,
     /// What applies while `conn` cannot answer. See [`Floor`].
     floor: Floor,
+    /// The cache hop's transport; `None` is the explicit `VALKEY_TLS_ENABLED="0"`.
+    tls: Option<UpstreamTls>,
 }
 
 impl Limiter {
@@ -148,16 +160,34 @@ impl Limiter {
     /// autoscaler may run, and it is the divisor of the degraded-mode floor —
     /// see [`Floor`]. It is a parameter rather than a constant because the
     /// authority for it is the chart.
+    ///
+    /// `tls` is the cache hop's resolved, pre-validated transport (B-V3,
+    /// ADR-0852) — `None` dials exactly as every deployment of this before
+    /// B-V3 did. `Some` dials `rediss://` at [`TLS_PORT`] rather than at
+    /// `addr`'s own port: the host half of `addr` still names the cache,
+    /// but a TLS dial always reaches it on the cache's TLS listener, never
+    /// on the plaintext one the address spells out.
     pub fn new(
         addr: &str,
         password: Option<&str>,
         limits: Limits,
         timeout: Duration,
         max_replicas: u32,
+        tls: Option<UpstreamTls>,
     ) -> Result<Self, redis::RedisError> {
         use redis::IntoConnectionInfo;
 
-        let info = format!("redis://{addr}").into_connection_info()?;
+        let info = match &tls {
+            None => format!("redis://{addr}").into_connection_info()?,
+            Some(_) => {
+                // THE HOST HALF ONLY. `addr` is `host:port` (`rateLimit.addr`),
+                // and the port half is never dialled under TLS: the cache's TLS
+                // listener is the fixed port above, not whatever plaintext port
+                // the address names.
+                let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+                format!("rediss://{host}:{TLS_PORT}").into_connection_info()?
+            }
+        };
         // NO CONNECTION IS MADE HERE, with or without a password. The credential
         // is only recorded on the handshake this process will perform later, on
         // first use — `conn` is still a `OnceCell`, for the reason on it.
@@ -168,18 +198,33 @@ impl Limiter {
             }
             None => info,
         };
+        let client = match &tls {
+            None => redis::Client::open(info)?,
+            Some(t) => {
+                let certificates = transport::certificates(t)?;
+                redis::Client::build_with_tls(info, certificates)?
+            }
+        };
         Ok(Self {
-            client: redis::Client::open(info)?,
+            client,
             conn: OnceCell::new(),
             limits,
             timeout,
             script: redis::Script::new(SCRIPT),
             floor: Floor::new(max_replicas),
+            tls,
         })
     }
 
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The cache hop's transport, or `None` for cleartext. `crate::rotate`
+    /// builds the watch set from this — the resolved configuration, never a
+    /// second read of the environment.
+    pub fn tls(&self) -> Option<&UpstreamTls> {
+        self.tls.as_ref()
     }
 
     /// Spend one token, or refuse.

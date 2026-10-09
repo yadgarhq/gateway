@@ -81,8 +81,11 @@ exec "$2""#;
 /// registry's own cadence. Port 0 on both listeners, because the cases in a
 /// target run in parallel. Every `*_HOST` is an address rather than a name, so
 /// no case depends on DNS: every dial is lazy (ADR-0532), so nothing needs to
-/// answer on it. All three `*_TLS_ENABLED` are stated as `"0"` rather than
-/// left absent.
+/// answer on it. The three gRPC `*_TLS_ENABLED` are stated as `"0"` rather
+/// than left absent. `VALKEY_TLS_ENABLED` joins them (B-V3, ADR-0852):
+/// unlike `NATS_TLS_ENABLED`, which is only required once `NATS_URL` is set
+/// (absent here, so it is never reached), `YADGAR_VALKEY_ADDR` above is
+/// always required, so `VALKEY_TLS_ENABLED` is unconditionally required too.
 pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
     vec![
         ("METRICS_LISTEN", "127.0.0.1:0"),
@@ -109,6 +112,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("TASK_TLS_ENABLED", "0"),
         ("IAM_TLS_ENABLED", "0"),
         ("PROJECT_TLS_ENABLED", "0"),
+        ("VALKEY_TLS_ENABLED", "0"),
     ]
 }
 

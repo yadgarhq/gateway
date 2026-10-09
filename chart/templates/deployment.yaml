@@ -23,17 +23,14 @@
 */}}
 {{- if not (and (kindIs "map" .Values.nats.tls) (hasKey .Values.nats.tls "enabled") (kindIs "bool" .Values.nats.tls.enabled)) }}{{ fail "nats.tls.enabled must be set to true or false; it renders NATS_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
 {{/*
-  B-V3E, THE SAME K-8 EXPAND FOR THE CACHE HOP (ADR-0852), folded into the
-  same release as B-N3E. `valkey.tls.enabled` is OPTIONAL in this chart
-  version and `values.yaml` declares no `valkey` block at all, so `default
-  dict` stands in for an absent one. `true` is refused: the binary reads
-  `VALKEY_TLS_ENABLED` only from B-V3, and valkey serves no TLS until B-L1 /
-  B-V2. B-V3 makes the key required and lifts the refusal.
+  B-V3, THE K-8 CONTRACT FOR THE CACHE HOP (ADR-0852, ADR-0845). The expand
+  (B-V3E) declared `valkey.tls.enabled` optional and refused `true`; the
+  parent fixture (B-P2) now states it. So it is REQUIRED here with the same
+  map / `hasKey` / `kindIs "bool"` guard as the other dials above — `required`
+  in the schema cannot see `tls: null`, which helm coalesces away — and `true`
+  is a real value: the binary dials the cache over TLS from this release.
 */}}
-{{- $valkey := .Values.valkey | default dict -}}
-{{- $valkeyTlsStated := and (kindIs "map" $valkey) (kindIs "map" $valkey.tls) (hasKey $valkey.tls "enabled") -}}
-{{- if and $valkeyTlsStated (not (kindIs "bool" $valkey.tls.enabled)) }}{{ fail "valkey.tls.enabled must be true or false when it is set; it renders VALKEY_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
-{{- if and $valkeyTlsStated (kindIs "bool" $valkey.tls.enabled) $valkey.tls.enabled }}{{ fail "valkey.tls.enabled: true is refused by this chart version: it declares the key, but the binary reads VALKEY_TLS_ENABLED only from B-V3 and valkey serves no TLS until B-L1 and B-V2. Set it to false (ADR-0845, ADR-0852)" }}{{ end }}
+{{- if not (and (kindIs "map" .Values.valkey.tls) (hasKey .Values.valkey.tls "enabled") (kindIs "bool" .Values.valkey.tls.enabled)) }}{{ fail "valkey.tls.enabled must be set to true or false; it renders VALKEY_TLS_ENABLED (ADR-0845, ADR-0797)" }}{{ end }}
 {{/*
   WHETHER THIS POD PRESENTS A CLIENT CERTIFICATE AT ALL (ADR-0516).
 
@@ -67,8 +64,13 @@
   NATS over TLS while every gRPC hop is still cleartext — renders
   `NATS_TLS_CLIENT_*` naming a `client-cert` mount that does not exist, and
   the pod exits at boot naming a path nothing mounted.
+
+  THE CACHE HOP IS A FIFTH (B-V3, ADR-0852), for the same reason:
+  `valkey.tls.enabled` joins the others here, or the B-V4.2 shape — valkey
+  over TLS while every other hop is cleartext — renders `VALKEY_TLS_CLIENT_*`
+  naming a mount that does not exist.
 */}}
-{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.project.tls.enabled .Values.nats.tls.enabled) -}}
+{{- $presentsIdentity := and $clientCert (or .Values.task.tls.enabled .Values.iam.tls.enabled .Values.project.tls.enabled .Values.nats.tls.enabled .Values.valkey.tls.enabled) -}}
 {{/*
   WHETHER D73'S BOOTSTRAP TOKEN IS MOUNTED AT ALL (ADR-0492, ledger 638).
 
@@ -552,13 +554,32 @@ spec:
             # at RUNTIME is the other case, and there the call proceeds.
             - name: YADGAR_VALKEY_ADDR
               value: {{ .Values.rateLimit.addr | quote }}
-            {{- if $valkeyTlsStated }}
-            # B-V3E: RENDERED ONLY WHEN `valkey.tls.enabled` IS STATED, and only
-            # ever as "0" — the guard at the top of this file refuses `true`
-            # until B-V3. This binary does not read the variable yet; it is on
-            # the wire so the stated value is visible in the manifest.
+            # RENDERED UNCONDITIONALLY (ADR-0845, B-V3), the same as the other
+            # dials' switches: the binary requires it, and `YADGAR_VALKEY_ADDR`
+            # is itself always required, so this is never conditional on
+            # anything the way `NATS_TLS_ENABLED` is on `NATS_URL` being set.
+            # `valkey.tls.enabled` is guarded at the top of this file, so this
+            # ternary never sees anything else.
             - name: VALKEY_TLS_ENABLED
-              value: {{ ternary "1" "0" $valkey.tls.enabled | quote }}
+              value: {{ ternary "1" "0" .Values.valkey.tls.enabled | quote }}
+            {{- if .Values.valkey.tls.enabled }}
+            # THE ONLY TRUST STORE FOR THE CACHE (ADR-0852). A PATH, never an
+            # issuer-specific resource (D80). The binary adds no platform or
+            # public root beside it, and refuses to boot if the file is
+            # unreadable or holds no certificate.
+            - name: VALKEY_TLS_CA_FILE
+              value: /var/run/config/valkey-ca/ca.pem
+            {{- if $clientCert }}
+            # WHO THIS GATEWAY SAYS IT IS TO THE CACHE — the same one leaf, the
+            # same mount and the same two paths as the gRPC hops and the
+            # broker above (ADR-0852 design item 7). The cache verifies it
+            # once platform's `valkey.tls.clientAuth` is `optional` or
+            # `required` (B-V5, B-V6).
+            - name: VALKEY_TLS_CLIENT_CERT_FILE
+              value: /var/run/secrets/client-cert/client.crt
+            - name: VALKEY_TLS_CLIENT_KEY_FILE
+              value: /var/run/secrets/client-cert/client.key
+            {{- end }}
             {{- end }}
             - name: YADGAR_RATE_LIMITS
               value: {{ .Values.rateLimit.limits | quote }}
@@ -899,6 +920,14 @@ spec:
               mountPath: /var/run/config/nats-ca
               readOnly: true
             {{- end }}
+            {{- if .Values.valkey.tls.enabled }}
+            # SEPARATE AGAIN, for the reason nats-ca is separate from the
+            # upstreams': one bundle trusting several authorities would make
+            # each hop's trust depend on the others' rotation.
+            - name: valkey-ca
+              mountPath: /var/run/config/valkey-ca
+              readOnly: true
+            {{- end }}
             {{- if $presentsIdentity }}
             # A DIRECTORY MOUNT, never subPath — and here the rule is at its most
             # expensive to break. A subPath mount is a one-time copy kubelet
@@ -1033,6 +1062,21 @@ spec:
             # leaf and holds its private key, which this pod must never read.
             items:
               - key: {{ required "nats.tls.caSecretKey names the key inside nats.tls.caSecret that holds the CA bundle and must be set whenever nats.tls.enabled is; see the chart's values.yaml" .Values.nats.tls.caSecretKey | quote }}
+                path: ca.pem
+        {{- end }}
+        {{- if .Values.valkey.tls.enabled }}
+        - name: valkey-ca
+          secret:
+            secretName: {{ required "valkey.tls.caSecret holds the CA bundle the cache is verified against and must be set whenever valkey.tls.enabled is; see the chart's values.yaml" .Values.valkey.tls.caSecret }}
+            # OPTIONAL, for the reason `nats-ca` gives: a missing Secret is an
+            # empty directory, and the binary exits naming VALKEY_TLS_CA_FILE
+            # rather than leaving the pod in ContainerCreating.
+            optional: true
+            # ONE KEY, not the whole Secret: `valkey-tls` is the CACHE's
+            # serving leaf and holds its private key, which this pod must
+            # never read.
+            items:
+              - key: {{ required "valkey.tls.caSecretKey names the key inside valkey.tls.caSecret that holds the CA bundle and must be set whenever valkey.tls.enabled is; see the chart's values.yaml" .Values.valkey.tls.caSecretKey | quote }}
                 path: ca.pem
         {{- end }}
         {{- if $presentsIdentity }}

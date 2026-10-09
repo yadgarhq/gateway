@@ -61,7 +61,8 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 /// would be a third outcome muddying both.
 fn limiter(addr: &str, password: Option<&str>) -> Limiter {
     let limits = Limits::parse("auth.write=1000:1000", "1000:1000").expect("the limits parse");
-    Limiter::new(addr, password, limits, Duration::from_millis(500), 6).expect("the limiter opens")
+    Limiter::new(addr, password, limits, Duration::from_millis(500), 6, None)
+        .expect("the limiter opens")
 }
 
 async fn spend(limiter: &Limiter) -> Decision {

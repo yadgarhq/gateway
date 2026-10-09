@@ -389,6 +389,23 @@ pub enum ToolsPollError {
 /// [`WATCHED_FILES_UNREADABLE`] off zero by watching a path that never
 /// existed.
 ///
+/// **THE CACHE HOP'S TRANSPORT IS A NEW MEMBER, RIGHT AFTER `broker` AND
+/// BEFORE THE TWO PASSWORDS (B-V3, ADR-0852).** `valkey` is `Option<&
+/// UpstreamTls>`, the same type [`task`], [`iam`] and [`project`] already
+/// are — unlike `broker`'s own TLS, which folds into `Broker`'s own
+/// [`Material`] impl because `async-nats` re-reads its paths on every
+/// reconnect. `redis::Client::build_with_tls` instead bakes the cache hop's
+/// bytes into the `Client` once, in `limit::Limiter::new`, so there is no
+/// analogous place to hang the transport beside a credential the way
+/// `Broker` does — `crate::limit::Limiter::tls` is the resolved value this
+/// set is built from, the same reason `cache_password` is taken as the path
+/// `main.rs` itself read rather than a second read of the environment. It is
+/// `None` on every deployment today, and `Option<M>: Material` folds an
+/// absent one to nothing. What it buys on the day the cut-over reaches the
+/// cache (B-V4.2): a rotated bundle for this hop ends this process exactly
+/// as a rotated `task` bundle does, rather than being the one hop whose
+/// rotation is silent.
+///
 /// **D73'S BOOTSTRAP TOKEN IS MEMBER FIVE, AND IT IS ABSENT ON THE DEPLOYMENT
 /// RUNNING TODAY.** The chart mounts no `admin-bootstrap-token` Secret yet
 /// (ledger 638's step 7), so this arm folds to nothing and the reference pod
@@ -424,7 +441,7 @@ pub enum ToolsPollError {
 /// Collecting paths and reading them when the watcher first polls would put the
 /// rest of boot inside a window where a kubelet swap quietly becomes the
 /// baseline, and the real rotation would never be noticed.
-/// **EIGHT ARGUMENTS, AND THE ALTERNATIVE IS WORSE THAN THE LINT.** Grouping
+/// **NINE ARGUMENTS, AND THE ALTERNATIVE IS WORSE THAN THE LINT.** Grouping
 /// them into a struct is what clippy is asking for, and a struct that satisfied
 /// the call sites would carry `Default` — at which point `tests/assembly.rs`'s
 /// per-half cases could omit a member with `..Default::default()`, and a NEW
@@ -439,6 +456,7 @@ pub fn watch_set(
     iam: Option<&UpstreamTls>,
     project: Option<&UpstreamTls>,
     broker: Option<&Broker>,
+    valkey: Option<&UpstreamTls>,
     cache_password: Option<&Path>,
     bootstrap_token: Option<&Path>,
     config: &Configuration,
@@ -459,6 +477,12 @@ pub fn watch_set(
             // whose rotation is silent.
             &project,
             &broker,
+            // THE CACHE HOP'S OWN TRANSPORT (B-V3, ADR-0852), SEPARATE FROM
+            // `broker` for the reason given above it: `redis` bakes its bytes
+            // into a `Client` once rather than re-reading paths, so there is
+            // no credential-carrying type to fold this into the way the
+            // broker's TLS folds into `Broker`.
+            &valkey,
             &cache_password,
             &bootstrap_token,
             config,

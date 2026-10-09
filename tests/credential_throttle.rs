@@ -107,6 +107,7 @@ fn state_with_admin(
             // would make what these tests assert depend on arithmetic they are
             // not about.
             1,
+            None,
         )
         .expect("the limiter opens"),
         allowed_origins: Vec::new(),

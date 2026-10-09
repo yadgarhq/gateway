@@ -59,7 +59,8 @@ fn limiter(addr: &str, module: &str, bucket: Bucket) -> Limiter {
     .expect("the limits parse");
     // Six, the chart's `autoscaling.maxReplicas`. It divides only the degraded
     // floor, which these tests do not take — every one of them has a real Valkey.
-    Limiter::new(addr, None, limits, Duration::from_millis(500), 6).expect("the limiter opens")
+    Limiter::new(addr, None, limits, Duration::from_millis(500), 6, None)
+        .expect("the limiter opens")
 }
 
 /// A module name nothing else will collide with, so a re-run starts empty and
@@ -344,7 +345,7 @@ async fn one_drained_bucket_does_not_throttle_another_user_module_or_kind() {
     )
     .expect("the limits parse");
     let limiter =
-        Limiter::new(&addr, None, limits, Duration::from_millis(500), 6).expect("limiter");
+        Limiter::new(&addr, None, limits, Duration::from_millis(500), 6, None).expect("limiter");
     let overrides = Overrides::default();
 
     assert_eq!(
@@ -418,8 +419,15 @@ async fn a_per_user_override_is_what_gets_enforced() {
 async fn an_unreachable_cache_degrades_rather_than_refusing_the_call() {
     let limits = Limits::parse("task.write=1:1", "1:1").expect("parse");
     // Port 1: nothing listens, and the refusal is immediate.
-    let limiter =
-        Limiter::new("127.0.0.1:1", None, limits, Duration::from_millis(500), 6).expect("limiter");
+    let limiter = Limiter::new(
+        "127.0.0.1:1",
+        None,
+        limits,
+        Duration::from_millis(500),
+        6,
+        None,
+    )
+    .expect("limiter");
 
     assert_eq!(
         limiter
@@ -458,6 +466,7 @@ async fn an_unreachable_cache_is_floored_rather_than_unlimited() {
             limits,
             Duration::from_millis(50),
             REPLICAS,
+            None,
         )
         .expect("limiter"),
     );

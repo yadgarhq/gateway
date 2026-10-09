@@ -42,6 +42,7 @@ fn state() -> Arc<AppState> {
             yadgar_gateway::limit::Limits::parse("task.write=1:1", "1:1").expect("limits"),
             std::time::Duration::from_millis(200),
             6,
+            None,
         )
         .expect("limiter"),
         allowed_origins: Vec::new(),

@@ -461,17 +461,33 @@ nats:
     # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
     caSecretKey: ca.crt
 
-# `valkey.tls.enabled`: TLS on the cache hop (ADR-0852, ADR-0845), B-V3E. THE
-# SAME K-8 EXPAND AS `nats.tls` above, and no `valkey` block is stated here,
-# deliberately:
-#
-#   - left out, nothing renders, and the manifest is what it was before;
-#   - `false` renders `VALKEY_TLS_ENABLED="0"`;
-#   - `true` is REFUSED at render. The binary reads `VALKEY_TLS_ENABLED` only
-#     from B-V3, and valkey serves no TLS until B-L1 and B-V2.
-#
-# B-V3 makes `enabled` required with no default and adds the CA keys and
-# mount. State `false` now. The cache address itself stays `rateLimit.addr`.
+# TLS on the cache hop (ADR-0852, ADR-0845, B-V3).
+valkey:
+  tls:
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). Deliberately ABSENT here, the
+    # same as `nats.tls.enabled` above: `values.schema.json` makes it
+    # `required` and `templates/deployment.yaml` refuses the render if it is
+    # absent, null or not a bare `true`/`false`. It renders `VALKEY_TLS_ENABLED`
+    # "1" or "0".
+    #
+    # `true` dials the cache over TLS, at the fixed port 6380 (B-V2's
+    # `--tls-port`) rather than `rateLimit.addr`'s port — `rateLimit.addr`
+    # still names the HOST, but a TLS dial always reaches the cache on 6380,
+    # never on the plaintext port the address spells out. It verifies the
+    # cache against the bundle below and nothing else, and refuses a cache
+    # that serves no TLS rather than falling back to cleartext. It presents
+    # `clientCertificate.secret`, the one leaf this pod already presents to
+    # every other hop (ADR-0852 design item 7), so no second client-leaf key
+    # exists. Turn it on only once platform's valkey serves TLS (B-V4.1); the
+    # hop step that flips it is B-V4.2.
+    #
+    # The Secret holding the authority that signed the cache's certificate.
+    # `valkey-tls` is the cache's own cert-manager leaf; its `ca.crt` is the
+    # issuing authority (ADR-0883's convention). ONE KEY is mounted from it,
+    # never the whole Secret, which also holds the cache's private key.
+    caSecret: valkey-tls
+    # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
+    caSecretKey: ca.crt
 
 # D74's token buckets: one per (user, module, kind), held in the shared cache
 # (D21) so every replica of this Deployment spends from the same one. A

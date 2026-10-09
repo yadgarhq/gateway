@@ -71,17 +71,26 @@ def write_overlay(body: dict, destination: Path) -> Path:
 # provokes.
 NATS_STATED = {"nats": {"tls": {"enabled": False}}}
 
+# The cache hop's switch, required since B-V3 and covered by
+# `test_valkey_tls_contract.py`, stated for the same reason.
+VALKEY_STATED = {"valkey": {"tls": {"enabled": False}}}
+
 
 def others_enabled(upstream: str) -> dict:
     """The other two upstreams satisfied, so only `upstream` is under test."""
     return {
         **{u: {"tls": {"enabled": True}} for u in UPSTREAMS if u != upstream},
         **NATS_STATED,
+        **VALKEY_STATED,
     }
 
 
 def all_enabled() -> dict:
-    return {**{u: {"tls": {"enabled": True}} for u in UPSTREAMS}, **NATS_STATED}
+    return {
+        **{u: {"tls": {"enabled": True}} for u in UPSTREAMS},
+        **NATS_STATED,
+        **VALKEY_STATED,
+    }
 
 
 def deployment_env(stdout: str) -> dict[str, str]:

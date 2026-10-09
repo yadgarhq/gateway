@@ -112,7 +112,8 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // there is nothing to cache. Present because AppState holds it, not because
         // this file exercises it.
         credentials: Credentials::new(Duration::from_secs(30)),
-        limiter: Limiter::new(&addr, None, limits, Duration::from_millis(500), 6).expect("limiter"),
+        limiter: Limiter::new(&addr, None, limits, Duration::from_millis(500), 6, None)
+            .expect("limiter"),
         allowed_origins: Vec::new(),
         trust: yadgar_gateway::source::TrustBoundary::Undeclared,
         credential_limits: CredentialLimits {
