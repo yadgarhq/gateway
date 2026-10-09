@@ -366,8 +366,14 @@ async fn a_cache_signed_by_another_authority_is_refused_by_this_gateway() {
 
 #[test]
 fn absent_valkey_tls_enabled_refuses_the_boot_naming_it() {
+    // NEITHER ASSERT FORMATS `err` INTO ITS OWN MESSAGE, deliberately: this
+    // function's `Err` type is shared with branches that do name a
+    // certificate path, and a CI security scan flags any value reachable
+    // from those branches once it is written out, even on a path — this one
+    // — that never touches one. `.contains` still exercises the real
+    // sentence; only the echo is gone.
     let err = yadgar_gateway::limit::valkey_tls(&|_: &str| None)
         .expect_err("VALKEY_TLS_ENABLED absent must refuse rather than default to cleartext");
-    assert!(err.contains("VALKEY_TLS_ENABLED"), "{err}");
-    assert!(err.contains("valkey.tls.enabled"), "{err}");
+    assert!(err.contains("VALKEY_TLS_ENABLED"));
+    assert!(err.contains("valkey.tls.enabled"));
 }
