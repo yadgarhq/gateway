@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::transport::broker_tls;
 use super::{subject, REFUSED_RETRY, RETRY};
+use crate::upstream::UpstreamTls;
 
 /// Where the broker is. The same name `iam` reads, because it is the same broker.
 pub(super) const URL: &str = "NATS_URL";
@@ -76,11 +78,18 @@ impl fmt::Debug for BrokerCredentials {
 pub struct Broker {
     pub(super) url: String,
     pub(super) credentials: Option<BrokerCredentials>,
+    /// The broker hop's transport; `None` is the explicit `NATS_TLS_ENABLED="0"`.
+    pub(super) tls: Option<UpstreamTls>,
 }
 
 impl Broker {
+    /// A cleartext broker; TLS is resolved and checked only in [`Self::from_lookup`].
     pub fn new(url: String, credentials: Option<BrokerCredentials>) -> Self {
-        Self { url, credentials }
+        Self {
+            url,
+            credentials,
+            tls: None,
+        }
     }
 
     /// The file this broker's password was read from, or `None` when this broker
@@ -126,6 +135,8 @@ impl Broker {
         if url.is_empty() {
             return Ok(None);
         }
+        // REQUIRED ONCE A BROKER IS CONFIGURED (ADR-0845); see `broker_tls`.
+        let tls = broker_tls(&lookup)?;
         let user = lookup(USER).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): no account to name while the broker is off.
         let path = lookup(PASSWORD_FILE).unwrap_or_default(); // ADR-0569-EXCEPTION(ABS): no credential file to name while the broker is off.
 
@@ -139,7 +150,10 @@ impl Broker {
                      cause. Either mount the Secret or unset {USER}."
                 ));
             }
-            return Ok(Some(Self::new(url, None)));
+            return Ok(Some(Self {
+                tls,
+                ..Self::new(url, None)
+            }));
         }
 
         // ADR-0523-WATCHED: Broker
@@ -170,28 +184,19 @@ impl Broker {
                  to present it as cannot authenticate."
             ));
         }
-        Ok(Some(Self::new(
+        Ok(Some(Self {
             url,
-            Some(BrokerCredentials {
+            credentials: Some(BrokerCredentials {
                 user,
                 password,
                 password_file: PathBuf::from(path),
             }),
-        )))
+            tls,
+        }))
     }
 
     pub(super) async fn connect(&self) -> Result<Connection, async_nats::ConnectError> {
-        // BUILT FROM THE PAIR, never spliced into the URL. `nats://user:pass@host`
-        // carries a password only URL-encoded, so one containing `@`, `/` or `#`
-        // would be silently truncated and a DIFFERENT password sent than the one
-        // in the Secret — a failure with no visible cause at any layer.
-        let options = match &self.credentials {
-            Some(c) => async_nats::ConnectOptions::with_user_and_password(
-                c.user.clone(),
-                c.password.clone(),
-            ),
-            None => async_nats::ConnectOptions::new(),
-        };
+        let options = self.connect_options();
         // THE CHANNEL THE CALLBACK WRITES. Per connection, because a redial gets a
         // fresh answer from the broker and a stale `true` would keep a recovered
         // consumer reporting itself forbidden.
@@ -413,9 +418,10 @@ pub(super) async fn first_connection(broker: &Broker) -> Option<Connection> {
         Err(e) => {
             tracing::error!(
                 url = %broker.url, error = %e,
-                "cannot reach the broker, so NO invalidation is consumed and a revoked \
-                 credential is honoured until its cache entry expires. Retrying every {} \
-                 seconds.",
+                tls = broker.tls.is_some(),
+                "cannot reach the broker, or the TLS handshake with it failed (see `error`), so \
+                 NO invalidation is consumed and a revoked credential is honoured until its \
+                 cache entry expires. Retrying every {} seconds.",
                 RETRY.as_secs()
             );
             None
@@ -456,7 +462,9 @@ async fn wait_after(broker: &Broker, e: async_nats::ConnectError) {
     } else {
         tracing::error!(
             url = %broker.url, error = %e,
-            "still cannot reach the broker; no invalidation is being consumed. \
+            tls = broker.tls.is_some(),
+            "still cannot reach the broker, or the TLS handshake with it failed (see `error`); \
+             no invalidation is being consumed. \
              Retrying every {} seconds.",
             RETRY.as_secs()
         );

@@ -100,6 +100,20 @@ fn generation() -> Generation {
     );
     let third = CertifiedIssuer::self_signed(third_params, third_key).unwrap();
 
+    // A FOURTH authority, for the broker hop (B-N3, ADR-0852), on the same
+    // argument: a `nats-ca.pem` byte-identical to another bundle would make
+    // dropping the broker's TLS arm from the watch set an equivalent mutant.
+    let fourth_key = KeyPair::generate().unwrap();
+    let mut fourth_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    fourth_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    fourth_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    fourth_params.not_after = date_time_ymd(2037, 6, 15);
+    fourth_params.distinguished_name.push(
+        DnType::CommonName,
+        "yadgar-gateway assembly test authority 4",
+    );
+    let fourth = CertifiedIssuer::self_signed(fourth_params, fourth_key).unwrap();
+
     // THE CLIENT LEAF, issued for `client auth` rather than `server auth`
     // (ADR-0516): a peer verifying a client chain refuses a leaf naming the
     // wrong purpose even though it trusts the issuer perfectly well.
@@ -116,6 +130,7 @@ fn generation() -> Generation {
         ("task-ca.pem".to_string(), ca.pem()),
         ("iam-ca.pem".to_string(), other.pem()),
         ("project-ca.pem".to_string(), third.pem()),
+        ("nats-ca.pem".to_string(), fourth.pem()),
         (
             "client.pem".to_string(),
             format!("{}{}", client_leaf.pem(), ca.pem()),
@@ -341,6 +356,7 @@ fn upstream_tls(mount: &Mount, prefix: &'static str, ca: &str) -> UpstreamTls {
 fn broker(mount: &Mount) -> Broker {
     let vars = [
         ("NATS_URL".to_string(), "nats://nats:4222".to_string()),
+        ("NATS_TLS_ENABLED".to_string(), "0".to_string()),
         ("NATS_USER".to_string(), "gateway".to_string()),
         (
             "NATS_PASSWORD_FILE".to_string(),
@@ -350,6 +366,107 @@ fn broker(mount: &Mount) -> Broker {
     Broker::from_lookup(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
         .expect("a complete configuration")
         .expect("the broker is configured")
+}
+
+/// The same broker with TLS on (B-N3, ADR-0852): its own CA bundle, and the
+/// SAME client leaf the gRPC hops present — the chart points
+/// `NATS_TLS_CLIENT_*` at the one `client-cert` mount.
+///
+/// **THESE FILES ARE READ INSIDE `async-nats`, on every dial**, so the
+/// `boot-reads-watched` gate, which scans `src/` for reads, cannot see them. This
+/// helper and the case that uses it are what hold them in the watch set.
+fn tls_broker(mount: &Mount) -> Broker {
+    let vars = [
+        ("NATS_URL".to_string(), "nats://nats:4222".to_string()),
+        ("NATS_TLS_ENABLED".to_string(), "1".to_string()),
+        (
+            "NATS_TLS_CA_FILE".to_string(),
+            mount.path("nats-ca.pem").display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_CERT_FILE".to_string(),
+            mount.path("client.pem").display().to_string(),
+        ),
+        (
+            "NATS_TLS_CLIENT_KEY_FILE".to_string(),
+            mount.path("client-key.pem").display().to_string(),
+        ),
+        ("NATS_USER".to_string(), "gateway".to_string()),
+        (
+            "NATS_PASSWORD_FILE".to_string(),
+            mount.path("nats-password").display().to_string(),
+        ),
+    ];
+    Broker::from_lookup(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+        .expect("a complete TLS configuration")
+        .expect("the broker is configured")
+}
+
+/// THE BROKER HOP WATCHES ITS BUNDLE AND THE IDENTITY IT PRESENTS (B-N3), with
+/// every gRPC hop in cleartext — the B-N4.2 shape, where NATS is the first hop
+/// to turn TLS on.
+///
+/// Delete the TLS arm from `impl Material for Broker` and this goes red: the
+/// bundle and the pair are read by `async-nats` on every dial, and a rotation
+/// of any of them must end this process the way a rotated upstream bundle does.
+/// The client certificate is recorded as `Presented::Client`, so the expiry
+/// gauge speaks for it even when no gRPC hop presents it.
+#[test]
+fn the_broker_hop_watches_its_bundle_and_the_identity_it_presents() {
+    let mount = Mount::new(&generation());
+    let broker = tls_broker(&mount);
+    let config = configuration("tlsRotation:\n  pollSeconds: 17\n  splayMaxSeconds: 941\n");
+    let gw_config = gateway_config(GATEWAY_CONFIG_BODY);
+    let inputs = rotate::watch_set(
+        None,
+        None,
+        None,
+        Some(&broker),
+        None,
+        None,
+        &config,
+        &gw_config,
+    );
+
+    assert_eq!(
+        inputs.watched(),
+        vec![
+            mount.path("nats-password").as_path(),
+            mount.path("nats-ca.pem").as_path(),
+            mount.path("client.pem").as_path(),
+            mount.path("client-key.pem").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
+        "the broker's password, its CA bundle and the client pair it presents"
+    );
+    assert_eq!(inputs.not_after(Presented::Client), Some(CLIENT_NOT_AFTER));
+
+    // AND THE SHARED LEAF IS STILL HASHED ONCE when a gRPC hop presents it too.
+    let task = upstream_tls(&mount, upstream::TASK, "task-ca.pem");
+    assert_eq!(
+        rotate::watch_set(
+            Some(&task),
+            None,
+            None,
+            Some(&broker),
+            None,
+            None,
+            &config,
+            &gw_config
+        )
+        .watched(),
+        vec![
+            mount.path("task-ca.pem").as_path(),
+            mount.path("client.pem").as_path(),
+            mount.path("client-key.pem").as_path(),
+            mount.path("nats-password").as_path(),
+            mount.path("nats-ca.pem").as_path(),
+            config.path(),
+            gw_config.path(),
+        ],
+        "one client leaf, presented to a gRPC hop and to the broker, is one member"
+    );
 }
 
 /// EVERY FILE THE CONFIGURATION NAMED IS IN THE WATCH SET, IN ORDER, AND NOTHING
@@ -701,10 +818,13 @@ fn each_configured_half_contributes_on_its_own() {
     // than this chart's, and the state that must contribute NOTHING. `NATS_URL`
     // is set, the account is not, and there is no file to watch: a path invented
     // here would be unreadable for ever on a gateway with nothing wrong with it.
-    let open_broker =
-        Broker::from_lookup(|k| (k == "NATS_URL").then(|| "nats://nats:4222".to_string()))
-            .expect("a broker that asks for no credential is a complete configuration")
-            .expect("the url is set");
+    let open_broker = Broker::from_lookup(|k| match k {
+        "NATS_URL" => Some("nats://nats:4222".to_string()),
+        "NATS_TLS_ENABLED" => Some("0".to_string()),
+        _ => None,
+    })
+    .expect("a broker that asks for no credential is a complete configuration")
+    .expect("the url is set");
     assert_eq!(
         rotate::watch_set(
             None,

@@ -66,13 +66,22 @@ def write_overlay(body: dict, destination: Path) -> Path:
     return path
 
 
+# The broker hop's switch, required since B-N3 and covered by
+# `test_nats_tls_contract.py`, stated so it is never the refusal a case here
+# provokes.
+NATS_STATED = {"nats": {"tls": {"enabled": False}}}
+
+
 def others_enabled(upstream: str) -> dict:
     """The other two upstreams satisfied, so only `upstream` is under test."""
-    return {u: {"tls": {"enabled": True}} for u in UPSTREAMS if u != upstream}
+    return {
+        **{u: {"tls": {"enabled": True}} for u in UPSTREAMS if u != upstream},
+        **NATS_STATED,
+    }
 
 
 def all_enabled() -> dict:
-    return {u: {"tls": {"enabled": True}} for u in UPSTREAMS}
+    return {**{u: {"tls": {"enabled": True}} for u in UPSTREAMS}, **NATS_STATED}
 
 
 def deployment_env(stdout: str) -> dict[str, str]:

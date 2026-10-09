@@ -438,21 +438,28 @@ nats:
   # with one and not the other, in BOTH directions.
   user: gateway
 
-  # TLS on the broker hop (ADR-0852, ADR-0845): `nats.tls.enabled`. THIS CHART
-  # VERSION IS THE K-8 EXPAND. It declares the key in the schema and states no
-  # value for it here, deliberately, so nothing about the hop changes yet:
-  #
-  #   - left out, nothing renders, and the manifest is what it was before;
-  #   - `false` renders `NATS_TLS_ENABLED="0"`;
-  #   - `true` is REFUSED at render. The binary reads `NATS_TLS_ENABLED` only
-  #     from B-N3, and the broker serves no TLS until B-L1, so a `true` here
-  #     would look encrypted while the hop stays cleartext.
-  #
-  # B-N3 makes `enabled` required with no default (ADR-0845), lifts the `true`
-  # refusal, and adds the CA keys and mount. State `false` now, so that step
-  # needs no values change. The hop will present `clientCertificate.secret`,
-  # the one leaf this pod already mounts for every dial (ADR-0852 design
-  # item 7), so no second client-leaf key is added.
+  # TLS on the broker hop (ADR-0852, ADR-0845, B-N3).
+  tls:
+    # REQUIRED, WITH NO CHART DEFAULT (ADR-0845). Deliberately ABSENT here, the
+    # same as `task.tls.enabled`: `values.schema.json` makes it `required` and
+    # `templates/deployment.yaml` refuses the render if it is absent, null or
+    # not a bare `true`/`false`. It renders `NATS_TLS_ENABLED` "1" or "0".
+    #
+    # `true` dials `nats.url` over TLS, verifies the broker against the bundle
+    # below and NOTHING ELSE (no platform or public root, on any reconnect),
+    # and refuses a broker that serves no TLS rather than falling back to
+    # cleartext. It presents `clientCertificate.secret` — the one leaf this pod
+    # already presents to every gRPC hop (ADR-0852 design item 7) — so no
+    # second client-leaf key exists. Turn it on only once platform's NATS
+    # serves TLS (B-N4.1); the hop step that flips it is B-N4.2.
+    #
+    # The Secret holding the authority that signed the broker's certificate.
+    # `nats-tls` is the broker's own cert-manager leaf; its `ca.crt` is the
+    # issuing authority (ADR-0883's convention). ONE KEY is mounted from it,
+    # never the whole Secret, which also holds the broker's private key.
+    caSecret: nats-tls
+    # The key inside that Secret which holds the bundle, mounted as `ca.pem`.
+    caSecretKey: ca.crt
 
 # `valkey.tls.enabled`: TLS on the cache hop (ADR-0852, ADR-0845), B-V3E. THE
 # SAME K-8 EXPAND AS `nats.tls` above, and no `valkey` block is stated here,
