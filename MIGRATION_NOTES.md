@@ -1,5 +1,29 @@
 # Migration notes
 
+## The broker hop's TLS switch is now required (B-N3, ADR-0852, ADR-0845)
+
+**Breaking: `nats.tls.enabled` must be set to `true` or `false` explicitly.**
+The expand release (B-N3E) made it optional; this release makes it `required`
+in the schema with no chart default, guarded in `templates/deployment.yaml`
+like the three dials' switches. A values source without it is refused at
+`helm template` / `helm lint --strict` / an Argo sync, naming the key. The
+binary refuses to boot when `NATS_URL` is set and `NATS_TLS_ENABLED` is
+absent, empty, or not `1`/`0`.
+
+- `yadgarhq/chart`'s `chart/ci/values.yaml` and `example/values.yaml` already
+  state `gateway.nats.tls.enabled: false` (chart#39, B-P2). argocd's values
+  gain it in PB-3, before argocd moves past parent 0.19.1.
+- `false` renders exactly what the expand rendered: `NATS_TLS_ENABLED="0"`
+  and nothing else.
+- `true` dials the broker over TLS. It verifies the broker against
+  `nats.tls.caSecret` / `caSecretKey` (default `nats-tls` / `ca.crt`, one key
+  mounted at `/var/run/config/nats-ca/ca.pem`) and nothing else. It refuses a
+  broker that serves no TLS. It presents `clientCertificate.secret` when that
+  is set. Set it only after platform's NATS serves TLS (B-N4.1). The flip is
+  B-N4.2.
+
+Revert is a straight `git revert`.
+
 ## Every dial's TLS switch is now required, with no chart default (ADR-0845, ledger 965, 1278)
 
 **Breaking: `task.tls.enabled`, `iam.tls.enabled` and `project.tls.enabled` must
