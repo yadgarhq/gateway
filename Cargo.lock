@@ -2731,7 +2731,7 @@ checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 [[package]]
 name = "yadgar-dial"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/dial.git?tag=v0.2.14#7ba58d836e020ab6c0b63eb4680d78727a191a88"
+source = "git+https://github.com/yadgarhq/dial.git?tag=v0.2.17#f005c9d1b3c287e6e149187e6e822a8c22f90142"
 dependencies = [
  "metrics",
  "rustls",
