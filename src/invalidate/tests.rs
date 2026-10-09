@@ -253,6 +253,21 @@ fn tls_off_dials_with_no_tls_configuration() {
 }
 
 #[test]
+fn tls_off_reads_no_tls_file_even_when_one_is_named() {
+    // THE REVERT LEVER. "0" with the bundle still configured is how the
+    // cut-over is undone, so a CA path that does not exist must not be read,
+    // let alone refuse the boot.
+    let broker = Broker::from_lookup(env_of(&[
+        ("NATS_URL", "nats://nats:4222"),
+        ("NATS_TLS_ENABLED", "0"),
+        ("NATS_TLS_CA_FILE", "/nowhere/nats-ca.pem"),
+    ]))
+    .expect("\"0\" never reads a TLS file")
+    .expect("a broker");
+    assert!(broker.tls().is_none());
+}
+
+#[test]
 fn tls_on_without_a_ca_bundle_refuses_the_boot() {
     let err = Broker::from_lookup(env_of(&[
         ("NATS_URL", "nats://nats:4222"),
@@ -377,10 +392,24 @@ fn the_options_production_dials_with_require_tls_the_ca_and_the_identity() {
     .expect("a complete TLS configuration")
     .expect("a broker");
     let printed = format!("{:?}", broker.connect_options());
-    assert!(printed.contains("\"tls_required\": true"), "{printed}");
-    assert!(printed.contains(ca.as_str()), "{printed}");
-    assert!(printed.contains(cert.as_str()), "{printed}");
-    assert!(printed.contains(key.as_str()), "{printed}");
+    // STATIC MESSAGES, never the Debug text: `ConnectOptions` carries the
+    // broker credential, and an assert message is a log line.
+    assert!(
+        printed.contains("\"tls_required\": true"),
+        "TLS on must set require_tls"
+    );
+    assert!(
+        printed.contains(ca.as_str()),
+        "NATS_TLS_CA_FILE must be the root file"
+    );
+    assert!(
+        printed.contains(cert.as_str()),
+        "NATS_TLS_CLIENT_CERT_FILE must be presented"
+    );
+    assert!(
+        printed.contains(key.as_str()),
+        "NATS_TLS_CLIENT_KEY_FILE must be presented"
+    );
 
     let plain = Broker::from_lookup(env_of(&[
         ("NATS_URL", "nats://nats:4222"),
