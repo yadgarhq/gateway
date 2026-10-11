@@ -29,24 +29,38 @@ use crate::upstream::UpstreamTls;
 /// reading it from a key.
 const TLS_PORT: u16 = 6380;
 
-/// How long [`Limiter::warm`]'s background connect, started at boot, may run
-/// before giving up (ledger 1430).
+/// How long ANY connection ATTEMPT this type makes — the first one, whichever
+/// of [`Limiter::warm`] or [`Limiter::spend`] wins the race to make it, and
+/// every reconnect `redis`'s own `ConnectionManager` makes after — may take
+/// before it is abandoned (ledger 1430).
 ///
-/// **A CONSTANT, NOT A NEW KNOB.** `warm` is fire-and-forget (`main` spawns it
-/// and never awaits the handle, D69/ADR-0555), so nothing is WAITING on this
-/// number the way every caller of [`Limiter::check`] waits on `self.timeout` —
-/// there is no operator-visible latency to tune here, only "how long does one
-/// background task linger before it gives up and lets the first real call try
-/// again exactly as it would have anyway." A chart value would be a second knob
-/// for a question nobody who deploys this needs to answer (ADR-0569's own test:
-/// who would ever change it, and why).
+/// **DECOUPLED FROM `self.timeout` ON PURPOSE, where it used to share the same
+/// `inner` fraction `response_timeout` still uses.** `rateLimit.timeoutMs` is
+/// 20ms in production (`chart/values.yaml`) — two thirds of that is ~13ms, far
+/// too short for a real TCP-plus-TLS-plus-AUTH handshake to a cache one or two
+/// hops away, and that number was never meant to bound one: it exists to keep
+/// a HUNG COMMAND off the hot path (the comment on `response_timeout` below),
+/// not to bound how long standing up a NEW connection may take. Before this
+/// split, both shared it anyway, which is why the retry `Limiter::spend` now
+/// performs (ledger 1430) would have had almost no real window to land in —
+/// the manager's own reconnect would have been racing a ~13ms clock in
+/// production regardless of how long the restarted cache actually took to
+/// come back.
 ///
-/// **DELIBERATELY NOT DERIVED FROM `self.timeout`.** [`Limiter::connect_config`]
-/// bounds the connect ATTEMPT itself at `self.timeout`'s own `inner` fraction —
-/// the same budget every call through this type already uses — so a connection
-/// `warm` establishes behaves identically to one a real request established.
-/// This constant only bounds how long `warm`'s OWN task keeps the attempt's
-/// future alive; a generous number costs nothing since nothing blocks on it.
+/// **A CONSTANT, NOT A NEW KNOB.** A connect attempt that outlives this is
+/// abandoned by `redis`'s own `connection_timeout` machinery
+/// (`client.rs`'s `get_multiplexed_async_connection_inner_with_timeout` wraps
+/// the whole TCP/TLS/AUTH sequence in exactly this timeout, and nothing
+/// per-command); the CALLER waiting on it is bounded separately, by its own
+/// `self.timeout` through `decide`'s outer `tokio::time::timeout` — a slow
+/// connect is cut short for the caller long before this budget would ever
+/// matter to it. What this number actually buys is letting a reconnect
+/// RUNNING IN THE BACKGROUND (the manager detaches it; see `Limiter::spend`'s
+/// retry) get far enough to be useful to the NEXT caller even when THIS one
+/// gave up. A chart value would make that a second knob for a question
+/// nobody who deploys this needs to answer (ADR-0569's own test: who would
+/// ever change it, and why) — see `Limiter`'s own `connected` field for what
+/// keeps a connect this slow from ever being mislabelled `Timeout`.
 const CONNECT_BUDGET: Duration = Duration::from_secs(15);
 
 /// `decide`'s choice between `Unreachable` and `Timeout` once ITS OWN outer
@@ -187,13 +201,23 @@ impl Limiter {
     /// life (`aio/connection_manager.rs`'s `reconnect`), so a caller that built
     /// a DIFFERENT config for its own connect would leave every later call —
     /// including ones [`Self::spend`] makes through the SAME manager — running
-    /// under that caller's budget instead of `self.timeout`'s. [`Self::warm`]
-    /// gets a generous OUTER deadline of its own ([`CONNECT_BUDGET`]) for
-    /// exactly this reason: bounding how long ITS task waits, never changing
-    /// what the manager itself is configured with.
+    /// under that caller's budget instead of `self.timeout`'s.
+    ///
+    /// **TWO BUDGETS, NOT ONE, AND THEY NOW DIFFER (ledger 1430).**
+    /// `connection_timeout` and `response_timeout` used to share `inner`.
+    /// `client.rs`'s `get_multiplexed_async_connection_inner_with_timeout`
+    /// spends `connection_timeout` on the WHOLE TCP-plus-TLS-plus-AUTH
+    /// sequence of standing a connection up; nothing per-command is bounded
+    /// by it. `response_timeout` bounds each command ONCE connected — the
+    /// hot-path latency the comment below guards. Sharing one number meant
+    /// the connect itself inherited a budget sized for a round trip, which in
+    /// production (`rateLimit.timeoutMs: 20` in `chart/values.yaml`) is ~13ms
+    /// — far too short for a real handshake, and far too short for the
+    /// reconnect [`Self::spend`]'s retry waits on to have any real chance.
+    /// See [`CONNECT_BUDGET`] for what replaces it there.
     fn connect_config(&self) -> ConnectionManagerConfig {
-        // NO RETRIES, AND AN INNER BUDGET SMALLER THAN THE OUTER ONE. Both
-        // numbers exist so the REASON survives.
+        // NO RETRIES, AND A RESPONSE BUDGET SMALLER THAN THE CALLER'S OWN
+        // OUTER ONE. Both numbers exist so the REASON survives.
         //
         // The manager's default is a long exponential backoff. Under it every
         // failure outlived `self.timeout`, so the outer timeout was always what
@@ -203,14 +227,18 @@ impl Limiter {
         // is the exact misdirection the label was added to prevent. Two thirds of
         // the budget leaves room for the real error to come back and be named.
         //
-        // Retrying inside one call is the wrong place for it besides: the next
-        // call reconnects anyway, and a queue of callers all waiting on the same
-        // doomed connect is latency at the one hop all traffic passes through.
+        // The manager's OWN exponential backoff stays off (`number_of_retries:
+        // 0`) for the same reason it always was: a queue of callers all
+        // waiting on the SAME doomed connect, retried internally with a
+        // growing delay, is latency at the one hop all traffic passes
+        // through. `Self::spend`'s retry is a single bounded re-await of a
+        // reconnect `redis` already started on its own, not a second
+        // connection attempt this type asks for.
         let inner = self.timeout.mul_f32(0.66); // ADR-0569-EXCEPTION(CC): two thirds of the caller's own budget, not a tuning knob — see the comment above.
         ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(inner))
+            .set_connection_timeout(Some(CONNECT_BUDGET))
             .set_response_timeout(Some(inner))
-            .set_number_of_retries(0) // ADR-0569-EXCEPTION(CC): zero because a retry inside one call is the wrong place for it — see the comment above.
+            .set_number_of_retries(0) // ADR-0569-EXCEPTION(CC): zero — see the comment above.
     }
 
     /// Give the first connect a head start, in the background, without
@@ -220,7 +248,10 @@ impl Limiter {
     /// of what makes it safe to call here: a gateway whose Valkey is down, or
     /// simply slow to answer, still binds its listener on schedule, exactly as
     /// it always has — `conn` is still a [`OnceCell`], [`Self::new`] still does
-    /// no I/O, and this function changes nothing about either.
+    /// no I/O, and this function changes nothing about either. No timeout of
+    /// its own wraps the call: [`Self::connect_config`]'s `connection_timeout`
+    /// already bounds the attempt itself ([`CONNECT_BUDGET`]), and nothing
+    /// here is waiting on the result besides.
     ///
     /// **WHAT IT FIXES, AND WHAT IT DOES NOT.** This closes the COLD-START gap:
     /// without it, the very first `tools/call` on a freshly-rolled replica pays
@@ -230,18 +261,17 @@ impl Limiter {
     /// before degrading, not this.
     pub async fn warm(&self) {
         let config = self.connect_config();
-        let result = tokio::time::timeout(
-            CONNECT_BUDGET,
-            self.conn
-                .get_or_try_init(|| self.client.get_connection_manager_with_config(config)),
-        )
-        .await;
         // THE FAILURE CASE DOES NOTHING — NOT PANIC, NOT LOG AT ERROR, NOT
         // RETRY: a Valkey that is down at boot and comes back before the
         // first real call is picked up by that call exactly as it always
         // was, which is `conn`'s own `get_or_try_init` not caching the
         // error. This task's only job was to get there first when it could.
-        if let Ok(Ok(_)) = result {
+        if self
+            .conn
+            .get_or_try_init(|| self.client.get_connection_manager_with_config(config))
+            .await
+            .is_ok()
+        {
             self.connected.store(true, Ordering::Relaxed);
         }
     }

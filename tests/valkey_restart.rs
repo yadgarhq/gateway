@@ -38,11 +38,20 @@ const IMAGE: &str = "docker.io/valkey/valkey:9.1.1";
 /// How long a container may take to print its ready line.
 const READY: Duration = Duration::from_secs(60);
 
-/// This case's own outer rate-limit timeout: generous, so the retry's own
-/// `inner` fraction (two thirds, see `limit::valkey::Limiter::connect_config`)
-/// comfortably covers however long `docker run` takes to get a fresh
-/// container accepting connections — typically under a second, bounded here
-/// at several.
+/// This case's own outer rate-limit timeout: generous, so the retry's
+/// `response_timeout` fraction (two thirds, see
+/// `limit::valkey::Limiter::connect_config`) comfortably covers however long
+/// `docker run` takes to get a fresh container accepting connections —
+/// typically under a second, bounded here at several.
+///
+/// **DELIBERATELY NOT PRODUCTION'S OWN NUMBER.** `chart/values.yaml`'s
+/// `rateLimit.timeoutMs` is 20 — two thirds of that is ~13ms, which no real
+/// container restart finishes inside. This case proves the MECHANISM: a
+/// reconnect that lands within the budget it is given is not reported as
+/// degraded. It does not claim that today's 20ms production value gives a
+/// real restart that chance; under that number this retry mostly cannot
+/// help, because the outer timeout `decide` already enforces (unchanged by
+/// this PR) cuts the whole call off first regardless. See the PR body.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
