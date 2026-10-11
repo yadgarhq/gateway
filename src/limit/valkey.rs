@@ -1,11 +1,13 @@
-//! The token bucket over the shared cache: the Lua that makes it atomic, and the
-//! connection that runs it.
+//! The token bucket over the shared cache: the connection that runs it, and
+//! the policy around establishing and retrying that connection.
 //!
-//! Split out of [`super`] for the file-size ceiling. What a caller does with the
-//! answer, and what the answer MEANS, is [`super::Decision`]'s; this is the
-//! implementation behind it.
+//! Split out of [`super`] for the file-size ceiling. The Lua itself, and what
+//! a client error from running it actually means, is [`super::script`]'s; what
+//! a caller does with the answer, and what the answer MEANS, is
+//! [`super::Decision`]'s; this is the implementation behind both.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -14,6 +16,7 @@ use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use super::config::{kind_str, Bucket, Limits, Overrides};
 use super::floor::Floor;
+use super::script::{classify, SCRIPT};
 use super::transport;
 use super::{address_component, user_component, Decision, Degrade, PREFIX};
 use crate::upstream::UpstreamTls;
@@ -26,116 +29,57 @@ use crate::upstream::UpstreamTls;
 /// reading it from a key.
 const TLS_PORT: u16 = 6380;
 
-/// The atomic read-compute-write.
+/// How long [`Limiter::warm`]'s background connect, started at boot, may run
+/// before giving up (ledger 1430).
 ///
-/// KEYS[1] the bucket. ARGV: rate, burst, cost, ttl seconds.
-/// Returns `{allowed, tokens, retry_after_seconds}`.
+/// **A CONSTANT, NOT A NEW KNOB.** `warm` is fire-and-forget (`main` spawns it
+/// and never awaits the handle, D69/ADR-0555), so nothing is WAITING on this
+/// number the way every caller of [`Limiter::check`] waits on `self.timeout` —
+/// there is no operator-visible latency to tune here, only "how long does one
+/// background task linger before it gives up and lets the first real call try
+/// again exactly as it would have anyway." A chart value would be a second knob
+/// for a question nobody who deploys this needs to answer (ADR-0569's own test:
+/// who would ever change it, and why).
 ///
-/// **`tokens` and `retry_after` come back as STRINGS.** Lua-to-Redis conversion
-/// truncates a number to an integer, so returning them as numbers would report
-/// every fractional wait as `0` and make `retry-after` a lie in the common case.
-const SCRIPT: &str = r#"
-local key   = KEYS[1]
-local rate  = tonumber(ARGV[1])
-local burst = tonumber(ARGV[2])
-local cost  = tonumber(ARGV[3])
-local ttl   = tonumber(ARGV[4])
+/// **DELIBERATELY NOT DERIVED FROM `self.timeout`.** [`Limiter::connect_config`]
+/// bounds the connect ATTEMPT itself at `self.timeout`'s own `inner` fraction —
+/// the same budget every call through this type already uses — so a connection
+/// `warm` establishes behaves identically to one a real request established.
+/// This constant only bounds how long `warm`'s OWN task keeps the attempt's
+/// future alive; a generous number costs nothing since nothing blocks on it.
+const CONNECT_BUDGET: Duration = Duration::from_secs(15);
 
--- Valkey's clock, not the caller's: one clock for every replica.
-local t   = redis.call('TIME')
-local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
-
-local state  = redis.call('HMGET', key, 'tokens', 'ts')
-local tokens = tonumber(state[1])
-local ts     = tonumber(state[2])
-if tokens == nil or ts == nil then
-  -- An absent bucket is a FULL one. That is sound only while the key outlives
-  -- the refill window of the bucket READING it, which is what a TTL fixed for
-  -- the whole deployment buys -- see KEY_TTL_SECONDS in this file.
-  tokens = burst
-  ts     = now
-end
-
--- Clamped at zero. Valkey's clock is one clock, but it is not guaranteed
--- monotonic across a restart, and a negative elapsed would DRAIN the bucket.
-local elapsed = now - ts
-if elapsed < 0 then elapsed = 0 end
-tokens = math.min(burst, tokens + elapsed * rate)
-
-local allowed = 0
-local retry   = 0
-if tokens >= cost then
-  tokens  = tokens - cost
-  allowed = 1
-else
-  retry = (cost - tokens) / rate
-end
-
-redis.call('HSET', key, 'tokens', tokens, 'ts', now)
--- EXTEND ONLY, NEVER SHORTEN. Two processes may hold different configurations
--- during a rolling deploy, and the shorter TTL must not win: a key whose life
--- is cut expires while its bucket is still empty, and the next read treats
--- absent as full. TTL returns -2 for an absent key and -1 for one with no
--- expiry, and both compare below any real ttl, so both set it.
---
--- Not `EXPIRE key ttl GT`: GT treats a key with no TTL as having an infinite
--- one and refuses to set the first expiry at all, which is exactly the call
--- that must not be skipped.
-local current = redis.call('TTL', key)
-if current < ttl then
-  redis.call('EXPIRE', key, ttl)
-end
-
-return {allowed, tostring(tokens), tostring(retry)}
-"#;
-
-/// Which degradation a client error actually is.
-///
-/// **The distinction the counter is for.** A connection this process HAD and then
-/// lost reaches here as a command error, not as a failed init — so without this
-/// the reconnect case would be filed under `error` and an operator would look for
-/// a broken script rather than an absent server.
-fn classify(e: redis::RedisError) -> Degrade {
-    // FIRST, and before the connection arms, because the two overlap. A wrong
-    // password is refused during the handshake, and `redis` reports that as a
-    // failed connection attempt — so an auth arm placed after those would never
-    // be reached for the case an operator is most likely to create.
-    //
-    // TWO SHAPES, because `redis` 1.6 produces two. A password this process sent
-    // and the server rejected fails inside the handshake and arrives as
-    // `ErrorKind::AuthenticationFailed` with no code (`connection.rs`, the AUTH
-    // reply check). A password this process never sent, against a server that
-    // wanted one, is not a handshake failure at all — the connection is
-    // established and the FIRST COMMAND comes back `-NOAUTH`, which `redis` has
-    // no known kind for and surfaces as an extension code. Matching only the kind
-    // would leave the missing-credential case, which is the whole point of this
-    // arm, filed as an ordinary error and failed open.
-    if e.kind() == redis::ErrorKind::AuthenticationFailed
-        || matches!(e.code(), Some("NOAUTH" | "WRONGPASS" | "NOPERM"))
-    {
-        Degrade::Unauthenticated
-    } else if e.is_connection_refusal() || e.is_connection_dropped() {
-        Degrade::Unreachable
-    } else if e.is_timeout() {
-        // A server that ANSWERS SLOWLY, which is a different thing to look at
-        // from one that is not there. This arm is reachable only because the
-        // inner response budget is smaller than the outer one.
+/// `decide`'s choice between `Unreachable` and `Timeout` once ITS OWN outer
+/// timeout elapses, pulled out as a pure function so the choice is testable
+/// without a network (ledger 1430). `connected` is `self.connected`'s value at
+/// that moment: true if the cache answered the last time anything asked it,
+/// false otherwise.
+fn elapsed_label(connected: bool) -> Degrade {
+    if connected {
         Degrade::Timeout
     } else {
-        Degrade::Error
+        Degrade::Unreachable
     }
 }
 
 /// The token bucket, over the shared cache.
 pub struct Limiter {
     client: redis::Client,
-    /// Built on FIRST USE, not at boot.
+    /// Populated on FIRST USE if nothing populates it sooner.
     ///
     /// The gateway must not wait on a downstream to bind its listener — the same
     /// rule `main.rs` states for `task`, and under D68 a pod stuck in startup is
     /// one the autoscaler cannot help. `get_or_try_init` does not cache the
     /// error, so a Valkey that comes back is picked up by the next call rather
     /// than needing a restart.
+    ///
+    /// **`main` also gives this a head start (ledger 1430).** It spawns
+    /// [`Limiter::warm`] in the background right after this type is
+    /// constructed, WITHOUT awaiting it — so boot still never waits on this
+    /// field, exactly as it never did. All `warm` changes is which call ends
+    /// up winning the race to populate it: the gateway's own spawned task, if
+    /// Valkey answers before the first real request arrives, or that first
+    /// request, exactly as before, if it does not.
     conn: OnceCell<ConnectionManager>,
     limits: Limits,
     timeout: Duration,
@@ -144,6 +88,18 @@ pub struct Limiter {
     floor: Floor,
     /// The cache hop's transport; `None` is the explicit `VALKEY_TLS_ENABLED="0"`.
     tls: Option<UpstreamTls>,
+    /// Whether the LAST attempt through `conn` — the initial connect or a
+    /// script invocation — actually reached the cache (ledger 1430).
+    ///
+    /// **NOT THE SAME QUESTION AS `conn.get().is_some()`**, and the difference
+    /// is the point. `conn` never clears once populated, so "has a manager ever
+    /// existed" stays true forever after the first success — including through
+    /// an outage that outlives every connection that manager will ever hold.
+    /// `decide` reads THIS flag, not `conn`, to choose between `Unreachable` and
+    /// `Timeout` on its own outer timeout elapsing, because that choice is about
+    /// whether the cache is live RIGHT NOW, which `conn`'s mere existence cannot
+    /// answer once it is more than a few seconds old.
+    connected: AtomicBool,
 }
 
 impl Limiter {
@@ -213,11 +169,81 @@ impl Limiter {
             script: redis::Script::new(SCRIPT),
             floor: Floor::new(max_replicas),
             tls,
+            connected: AtomicBool::new(false),
         })
     }
 
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The config every connect THIS TYPE ever makes uses — the first one,
+    /// whichever of [`Self::warm`] or [`Self::spend`] wins the race to make
+    /// it, and every reconnect `redis`'s own `ConnectionManager` makes after.
+    ///
+    /// **ONE DEFINITION, because it is baked into the manager at construction
+    /// and never re-read.** `redis::aio::ConnectionManager` clones this
+    /// config into every future reconnect attempt for the manager's whole
+    /// life (`aio/connection_manager.rs`'s `reconnect`), so a caller that built
+    /// a DIFFERENT config for its own connect would leave every later call —
+    /// including ones [`Self::spend`] makes through the SAME manager — running
+    /// under that caller's budget instead of `self.timeout`'s. [`Self::warm`]
+    /// gets a generous OUTER deadline of its own ([`CONNECT_BUDGET`]) for
+    /// exactly this reason: bounding how long ITS task waits, never changing
+    /// what the manager itself is configured with.
+    fn connect_config(&self) -> ConnectionManagerConfig {
+        // NO RETRIES, AND AN INNER BUDGET SMALLER THAN THE OUTER ONE. Both
+        // numbers exist so the REASON survives.
+        //
+        // The manager's default is a long exponential backoff. Under it every
+        // failure outlived `self.timeout`, so the outer timeout was always what
+        // fired and every degradation — refused connection, dropped socket, bad
+        // reply — arrived labelled `timeout`. An operator reading that counter
+        // would go looking for a slow cache while the real one was absent, which
+        // is the exact misdirection the label was added to prevent. Two thirds of
+        // the budget leaves room for the real error to come back and be named.
+        //
+        // Retrying inside one call is the wrong place for it besides: the next
+        // call reconnects anyway, and a queue of callers all waiting on the same
+        // doomed connect is latency at the one hop all traffic passes through.
+        let inner = self.timeout.mul_f32(0.66); // ADR-0569-EXCEPTION(CC): two thirds of the caller's own budget, not a tuning knob — see the comment above.
+        ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(inner))
+            .set_response_timeout(Some(inner))
+            .set_number_of_retries(0) // ADR-0569-EXCEPTION(CC): zero because a retry inside one call is the wrong place for it — see the comment above.
+    }
+
+    /// Give the first connect a head start, in the background, without
+    /// making boot wait on it (D69/ADR-0555, ledger 1430).
+    ///
+    /// **`main` SPAWNS THIS AND NEVER AWAITS THE HANDLE.** That is the whole
+    /// of what makes it safe to call here: a gateway whose Valkey is down, or
+    /// simply slow to answer, still binds its listener on schedule, exactly as
+    /// it always has — `conn` is still a [`OnceCell`], [`Self::new`] still does
+    /// no I/O, and this function changes nothing about either.
+    ///
+    /// **WHAT IT FIXES, AND WHAT IT DOES NOT.** This closes the COLD-START gap:
+    /// without it, the very first `tools/call` on a freshly-rolled replica pays
+    /// the connect itself. It does nothing for a Valkey that restarts once this
+    /// replica is already warm — `conn` is already populated by then, and
+    /// [`Self::spend`]'s own retry is what gives THAT case a chance to land
+    /// before degrading, not this.
+    pub async fn warm(&self) {
+        let config = self.connect_config();
+        let result = tokio::time::timeout(
+            CONNECT_BUDGET,
+            self.conn
+                .get_or_try_init(|| self.client.get_connection_manager_with_config(config)),
+        )
+        .await;
+        // THE FAILURE CASE DOES NOTHING — NOT PANIC, NOT LOG AT ERROR, NOT
+        // RETRY: a Valkey that is down at boot and comes back before the
+        // first real call is picked up by that call exactly as it always
+        // was, which is `conn`'s own `get_or_try_init` not caching the
+        // error. This task's only job was to get there first when it could.
+        if let Ok(Ok(_)) = result {
+            self.connected.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The cache hop's transport, or `None` for cleartext. `crate::rotate`
@@ -298,11 +324,12 @@ impl Limiter {
             // that is simply DOWN would otherwise be reported as "timeout",
             // because the connect attempt outlives this budget and the outer
             // timeout is what fires — so an operator reading the counter would go
-            // looking for a slow cache rather than an absent one. If no
-            // connection has ever been established, "unreachable" is the true
-            // answer; once one has, a later stall really is a stall.
-            Err(_elapsed) if self.conn.get().is_none() => Degrade::Unreachable,
-            Err(_elapsed) => Degrade::Timeout,
+            // looking for a slow cache rather than an absent one. `self.connected`,
+            // not `self.conn.get().is_some()`, answers whether the LAST attempt
+            // actually reached the cache — see the field's own comment for why
+            // those are different questions once `conn` is more than a few
+            // seconds old.
+            Err(_elapsed) => elapsed_label(self.connected.load(Ordering::Relaxed)),
         };
         // BEFORE THE FLOOR, and that ordering is the whole of the change. The
         // floor is what makes failing open acceptable, and it is acceptable only
@@ -322,29 +349,12 @@ impl Limiter {
     }
 
     async fn spend(&self, key: &str, bucket: Bucket) -> Result<Decision, Degrade> {
-        // NO RETRIES, AND AN INNER BUDGET SMALLER THAN THE OUTER ONE. Both
-        // numbers exist so the REASON survives.
-        //
-        // The manager's default is a long exponential backoff. Under it every
-        // failure outlived `self.timeout`, so the outer timeout was always what
-        // fired and every degradation — refused connection, dropped socket, bad
-        // reply — arrived labelled `timeout`. An operator reading that counter
-        // would go looking for a slow cache while the real one was absent, which
-        // is the exact misdirection the label was added to prevent. Two thirds of
-        // the budget leaves room for the real error to come back and be named.
-        //
-        // Retrying inside one call is the wrong place for it besides: the next
-        // call reconnects anyway, and a queue of callers all waiting on the same
-        // doomed connect is latency at the one hop all traffic passes through.
-        let inner = self.timeout.mul_f32(0.66); // ADR-0569-EXCEPTION(CC): two thirds of the caller's own budget, not a tuning knob — see the comment above.
-        let config = ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(inner))
-            .set_response_timeout(Some(inner))
-            .set_number_of_retries(0); // ADR-0569-EXCEPTION(CC): zero because a retry inside one call is the wrong place for it — see the comment above.
-
         let mut conn = self
             .conn
-            .get_or_try_init(|| self.client.get_connection_manager_with_config(config))
+            .get_or_try_init(|| {
+                self.client
+                    .get_connection_manager_with_config(self.connect_config())
+            })
             .await
             // `classify` RATHER THAN a flat `Unreachable`, and this line is where
             // the wrong-password case is actually decided. `redis` performs the
@@ -365,6 +375,49 @@ impl Limiter {
         // `Bucket::key_ttl_seconds` and `KEY_TTL_SECONDS`.
         let ttl = bucket.key_ttl_seconds();
 
+        match self.invoke(&mut conn, key, bucket, ttl).await {
+            Ok(decision) => {
+                self.connected.store(true, Ordering::Relaxed);
+                Ok(decision)
+            }
+            // RETRY EXACTLY ONCE, and ONLY on a connection-class failure
+            // (ledger 1430). `invoke_async`'s OWN call above, inside
+            // `ConnectionManager::send_packed_command`, already noticed the
+            // dropped socket and kicked off a reconnect in the background
+            // (`redis`'s `reconnect_if_dropped!` / `reconnect_if_io_error!`,
+            // `aio/connection_manager.rs`) BEFORE returning this error — that
+            // reconnect is already racing by the time control reaches here.
+            // Calling `invoke` again on the SAME `conn` re-reads the manager's
+            // (by now possibly already-swapped) current connection future and
+            // AWAITS it, which is what actually gives that reconnect a chance
+            // to land before this call reports degraded. Bounded by the
+            // caller's own `tokio::time::timeout(self.timeout, ..)` in
+            // `decide` — this retry carries no budget of its own.
+            //
+            // NOT RETRIED for `Unauthenticated`, `Timeout` or `Error`: a
+            // rejected credential will not be accepted on a second try, and a
+            // server that is merely slow or returning bad data is not the
+            // "connection was dropped and is already being replaced" case this
+            // retry exists for.
+            Err(Degrade::Unreachable) => {
+                self.connected.store(false, Ordering::Relaxed);
+                let decision = self.invoke(&mut conn, key, bucket, ttl).await?;
+                self.connected.store(true, Ordering::Relaxed);
+                Ok(decision)
+            }
+            Err(degrade) => Err(degrade),
+        }
+    }
+
+    /// The one read-compute-write against an already-connected `conn`, with no
+    /// retry of its own — [`Self::spend`] decides whether to call this twice.
+    async fn invoke(
+        &self,
+        conn: &mut ConnectionManager,
+        key: &str,
+        bucket: Bucket,
+        ttl: u64,
+    ) -> Result<Decision, Degrade> {
         let (allowed, _tokens, retry): (i64, String, String) = self
             .script
             .key(key)
@@ -372,7 +425,7 @@ impl Limiter {
             .arg(bucket.burst)
             .arg(1.0)
             .arg(ttl)
-            .invoke_async(&mut conn)
+            .invoke_async(conn)
             .await
             .map_err(classify)?;
 
@@ -383,5 +436,20 @@ impl Limiter {
         Ok(Decision::Throttled {
             retry_after: Duration::from_secs_f64(seconds.clamp(0.0, 86_400.0)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{elapsed_label, Degrade};
+
+    /// The mapping [`super::Limiter::decide`] applies to its OWN outer
+    /// timeout elapsing, pulled out as a pure function so this is provable
+    /// without a network (ledger 1430). MUTATION: inlining `true` or `false`
+    /// for `connected` turns one arm or the other red.
+    #[test]
+    fn a_connection_that_has_answered_is_timed_out_an_absent_one_is_unreachable() {
+        assert_eq!(elapsed_label(true), Degrade::Timeout);
+        assert_eq!(elapsed_label(false), Degrade::Unreachable);
     }
 }

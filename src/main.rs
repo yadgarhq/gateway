@@ -171,6 +171,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         projects,
     });
 
+    // SPAWNED, NEVER AWAITED (D69/ADR-0555, ledger 1430): `Limiter::warm` gives
+    // the cache connection a head start in the background, but this boot must
+    // not wait on a downstream any more than it ever did — `tokio::spawn`
+    // returns at once, and a Valkey that is down or slow is picked up by the
+    // first real call exactly as it was before this existed.
+    // SPAWNED, NEVER AWAITED (D69/ADR-0555, ledger 1430): `Limiter::warm` gives
+    // the cache connection a head start in the background, but this boot must
+    // not wait on a downstream any more than it ever did — `tokio::spawn`
+    // returns at once, and a Valkey that is down or slow is picked up by the
+    // first real call exactly as it was before this existed.
+    tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { state.limiter.warm().await }
+    });
+
     boot::start_invalidation(broker, ttl, Arc::clone(&state)).await;
 
     boot::serve(state, watch_inputs, schedule).await?;
