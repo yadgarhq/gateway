@@ -23,11 +23,18 @@
 //! starts and restarts its own, on its own dynamically-published port, the
 //! same shape `tests/valkey_tls.rs` already uses for the same reason.
 //!
+//! **ALSO THE ABSENT-AT-BOOT CASE (ledger 1438).** A Valkey that is not up
+//! when `Limiter::warm` first runs, and comes up later, needs the same
+//! controllable real server on a port chosen in advance, so that case lives
+//! here too: see `warm_retries_until_a_valkey_absent_at_boot_comes_up`.
+//!
 //! **IT FAILS RATHER THAN SKIPS WITHOUT DOCKER.** A suite that turns green on
 //! a machine that cannot run it is coverage that is not there.
 
+use std::net::TcpListener;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use yadgar_gateway::limit::{Decision, Degrade, Limiter, Limits, Overrides};
@@ -79,21 +86,39 @@ struct Server {
 impl Server {
     /// Starts a fresh container and waits for it to accept connections.
     fn start() -> Self {
+        Self::start_on("127.0.0.1::6379", &[])
+    }
+
+    /// Starts a fresh container on a host port the CALLER already chose, for
+    /// a limiter that was built against that address before anything was
+    /// listening on it (ledger 1438).
+    fn start_at(port: u16) -> Self {
+        Self::start_on(&format!("127.0.0.1:{port}:6379"), &[])
+    }
+
+    /// Starts a fresh container that demands `password` (`requirepass`).
+    fn start_requiring(password: &str) -> Self {
+        Self::start_on("127.0.0.1::6379", &["--requirepass", password])
+    }
+
+    fn start_on(publish: &str, extra: &[&str]) -> Self {
         let name = unique("server");
+        let mut args = vec![
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "-p",
+            publish,
+            IMAGE,
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+        ];
+        args.extend_from_slice(extra);
         let out = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &name,
-                "-p",
-                "127.0.0.1::6379",
-                IMAGE,
-                "--save",
-                "",
-                "--appendonly",
-                "no",
-            ])
+            .args(&args)
             .output()
             .unwrap_or_else(|e| {
                 panic!(
@@ -138,6 +163,25 @@ impl Server {
 
     fn addr(&self) -> String {
         format!("127.0.0.1:{}", self.port)
+    }
+
+    /// How many clients the server holds OTHER than the `valkey-cli` this
+    /// asks with — read from the server, so it counts a connection the
+    /// gateway really made rather than a flag the gateway sets about itself.
+    fn foreign_clients(&self) -> usize {
+        let out = Command::new("docker")
+            .args(["exec", &self.name, "valkey-cli", "CLIENT", "LIST"])
+            .output()
+            .expect("docker exec valkey-cli");
+        assert!(
+            out.status.success(),
+            "CLIENT LIST failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty() && !l.contains("cmd=client|list"))
+            .count()
     }
 
     /// Kills THIS container outright (no graceful stop — the measured
@@ -215,10 +259,14 @@ fn published_port(name: &str) -> u16 {
 }
 
 fn limiter(addr: &str) -> Limiter {
+    limiter_with(addr, None)
+}
+
+fn limiter_with(addr: &str, password: Option<&str>) -> Limiter {
     let limits = Limits::parse("auth.write=1000:1000", "1000:1000").expect("the limits parse");
     // Six, an arbitrary `max_replicas`: this case never takes the degraded
     // floor path, so the divisor is unexercised.
-    Limiter::new(addr, None, limits, CALL_TIMEOUT, 6, None).expect("the limiter opens")
+    Limiter::new(addr, password, limits, CALL_TIMEOUT, 6, None).expect("the limiter opens")
 }
 
 async fn spend(limiter: &Limiter) -> Decision {
@@ -279,4 +327,159 @@ async fn a_dropped_connection_that_never_comes_back_degrades_as_unreachable() {
         "a connection that drops and stays down must still degrade — the retry gives a \
          live reconnect a chance, not an unconditional pass"
     );
+}
+
+/// A port nothing is listening on, so a connect to it is REFUSED at once —
+/// the shape of a Valkey that is simply not up yet when the gateway boots.
+fn closed_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    listener.local_addr().expect("the bound address").port()
+}
+
+/// How long the warm-up may take to notice a Valkey that came up after it
+/// first failed: one outage retry interval (5 s, `limit::valkey::warm`'s
+/// `RETRY`) plus generous slack for a loaded runner.
+const RECOVERY: Duration = Duration::from_secs(20);
+
+/// Ledger 1438: a Valkey that is ABSENT when `warm` first runs and comes up
+/// afterwards is connected by `warm` itself, in the background, with no
+/// request ever having to pay for that connect.
+///
+/// **NO `check` IS EVER CALLED.** `spend` connects lazily on its own, so a
+/// call here would make the connection appear whether or not `warm` retried —
+/// the assertion would pass for the defect. The evidence is read from the
+/// SERVER instead: a client connection that only `warm` could have opened.
+///
+/// Red before ledger 1438: `warm` made ONE attempt, which a closed port
+/// refuses at once, and returned — so the task is already finished at the
+/// first assertion, and no client ever appears at the second.
+#[tokio::test]
+async fn warm_retries_until_a_valkey_absent_at_boot_comes_up() {
+    let port = closed_port();
+    let limiter = Arc::new(limiter(&format!("127.0.0.1:{port}")));
+    let warming = tokio::spawn({
+        let limiter = Arc::clone(&limiter);
+        async move { limiter.warm().await }
+    });
+
+    // Long enough for the first attempt against the closed port to be refused.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !warming.is_finished(),
+        "`warm` gave up after a refused first attempt; a Valkey that comes up later would \
+         then be connected only by a request paying for it on the hot path (ledger 1438)"
+    );
+
+    let server = Server::start_at(port);
+
+    let deadline = Instant::now() + RECOVERY;
+    while server.foreign_clients() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "`warm` never connected to a Valkey that came up {RECOVERY:?} ago"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // AND IT STOPS once it has. A loop that kept dialling after success would
+    // leak a connection per interval for the life of the pod.
+    tokio::time::timeout(Duration::from_secs(5), warming)
+        .await
+        .expect("`warm` must end once it has connected")
+        .expect("the warm task must not panic");
+    assert_eq!(
+        server.foreign_clients(),
+        1,
+        "exactly the one manager `warm` populated, and no second connection"
+    );
+}
+
+/// A per-run credential with no string constant in its derivation: the
+/// standard library's per-instance random hasher keys, hashed over nothing.
+fn random_secret() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos(),
+    );
+    hasher.finish().to_string()
+}
+
+/// The server's own count of rejected AUTH attempts (`INFO stats`'
+/// `acl_access_denied_auth`), asked with the RIGHT password so the asking is
+/// not itself counted.
+fn auth_denials(server: &Server, password: &str) -> u64 {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            &server.name,
+            "valkey-cli",
+            "-a",
+            password,
+            "--no-auth-warning",
+            "INFO",
+            "stats",
+        ])
+        .output()
+        .expect("docker exec valkey-cli");
+    assert!(
+        out.status.success(),
+        "INFO stats failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("acl_access_denied_auth:"))
+        .unwrap_or_else(|| panic!("no acl_access_denied_auth in INFO stats:\n{text}"))
+        .parse()
+        .expect("acl_access_denied_auth is a number")
+}
+
+/// How long the refused-credential case watches `warm`: past two OUTAGE
+/// intervals (5 s each, so attempts at 0, 5 and 10 s) with two seconds of
+/// slack, and far inside one REFUSED interval (60 s).
+const REFUSAL_WINDOW: Duration = Duration::from_secs(12);
+
+/// Ledger 1438: a credential the cache REJECTED is retried at the refused
+/// rate, not the outage rate (ADR-0893).
+///
+/// **A WRONG password, not a missing one.** Only a password that was sent and
+/// rejected (`WRONGPASS`, which `redis` reports as `AuthenticationFailed`)
+/// fails the connect. With no password `redis` sends no AUTH, the connect
+/// succeeds, and `warm` ends — that case surfaces on calls as `NOAUTH`.
+///
+/// The evidence is the SERVER's count of denied AUTH attempts. At the refused
+/// rate the window holds exactly the first attempt; misread as an outage it
+/// would hold three.
+#[tokio::test]
+async fn warm_retries_a_rejected_credential_at_the_refused_rate() {
+    // MINTED PER RUN, never from a literal: a throwaway credential for a
+    // throwaway container. Code scanning traces a literal through `format!`,
+    // so these carry no string constant at all.
+    let password = random_secret();
+    let wrong = random_secret();
+    assert_ne!(password, wrong);
+    let server = Server::start_requiring(&password);
+    let limiter = Arc::new(limiter_with(&server.addr(), Some(&wrong)));
+    let warming = tokio::spawn({
+        let limiter = Arc::clone(&limiter);
+        async move { limiter.warm().await }
+    });
+
+    tokio::time::sleep(REFUSAL_WINDOW).await;
+
+    assert!(
+        !warming.is_finished(),
+        "a rejected credential must be retried, never treated as terminal (ADR-0893)"
+    );
+    assert_eq!(
+        auth_denials(&server, &password),
+        1,
+        "a rejected credential must wait the refused interval (60 s), not the outage \
+         interval (5 s), before it is tried again"
+    );
+    warming.abort();
 }
