@@ -174,16 +174,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // SPAWNED, NEVER AWAITED (D69/ADR-0555, ledger 1430): `Limiter::warm` gives
     // the cache connection a head start in the background, but this boot must
     // not wait on a downstream any more than it ever did — `tokio::spawn`
-    // returns at once, and a Valkey that is down or slow is picked up by the
-    // first real call exactly as it was before this existed.
-    tokio::spawn({
+    // returns at once. A Valkey that is down at boot is retried by that task
+    // until it answers (ledger 1438), so no request has to pay for the connect.
+    let warming = tokio::spawn({
         let state = Arc::clone(&state);
         async move { state.limiter.warm().await }
     });
 
     boot::start_invalidation(broker, ttl, Arc::clone(&state)).await;
 
-    boot::serve(state, watch_inputs, schedule).await?;
+    let served = boot::serve(state, watch_inputs, schedule).await;
+    // ABORTED WHEN SERVING ENDS, on every path out of `serve`: a warm-up still
+    // retrying against an absent cache has nothing left to warm for, and must
+    // not hold a connect open through the rest of shutdown (ledger 1438).
+    warming.abort();
+    served?;
 
     Ok(())
 }

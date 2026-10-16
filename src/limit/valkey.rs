@@ -21,6 +21,8 @@ use super::transport;
 use super::{address_component, user_component, Decision, Degrade, PREFIX};
 use crate::upstream::UpstreamTls;
 
+mod warm;
+
 /// The cache's fixed TLS listener (B-V2, ADR-0852). NOT `rateLimit.addr`'s
 /// port — that address stays the plaintext one so B-V3's contract needs no
 /// values change — and not a values key either: every valkey in this estate
@@ -93,7 +95,9 @@ pub struct Limiter {
     /// field, exactly as it never did. All `warm` changes is which call ends
     /// up winning the race to populate it: the gateway's own spawned task, if
     /// Valkey answers before the first real request arrives, or that first
-    /// request, exactly as before, if it does not.
+    /// request, exactly as before, if it does not. Since ledger 1438 `warm`
+    /// keeps retrying until it wins or something else populates this field,
+    /// so a Valkey absent at boot no longer waits for a request to connect it.
     conn: OnceCell<ConnectionManager>,
     limits: Limits,
     timeout: Duration,
@@ -239,41 +243,6 @@ impl Limiter {
             .set_connection_timeout(Some(CONNECT_BUDGET))
             .set_response_timeout(Some(inner))
             .set_number_of_retries(0) // ADR-0569-EXCEPTION(CC): zero — see the comment above.
-    }
-
-    /// Give the first connect a head start, in the background, without
-    /// making boot wait on it (D69/ADR-0555, ledger 1430).
-    ///
-    /// **`main` SPAWNS THIS AND NEVER AWAITS THE HANDLE.** That is the whole
-    /// of what makes it safe to call here: a gateway whose Valkey is down, or
-    /// simply slow to answer, still binds its listener on schedule, exactly as
-    /// it always has — `conn` is still a [`OnceCell`], [`Self::new`] still does
-    /// no I/O, and this function changes nothing about either. No timeout of
-    /// its own wraps the call: [`Self::connect_config`]'s `connection_timeout`
-    /// already bounds the attempt itself ([`CONNECT_BUDGET`]), and nothing
-    /// here is waiting on the result besides.
-    ///
-    /// **WHAT IT FIXES, AND WHAT IT DOES NOT.** This closes the COLD-START gap:
-    /// without it, the very first `tools/call` on a freshly-rolled replica pays
-    /// the connect itself. It does nothing for a Valkey that restarts once this
-    /// replica is already warm — `conn` is already populated by then, and
-    /// [`Self::spend`]'s own retry is what gives THAT case a chance to land
-    /// before degrading, not this.
-    pub async fn warm(&self) {
-        let config = self.connect_config();
-        // THE FAILURE CASE DOES NOTHING — NOT PANIC, NOT LOG AT ERROR, NOT
-        // RETRY: a Valkey that is down at boot and comes back before the
-        // first real call is picked up by that call exactly as it always
-        // was, which is `conn`'s own `get_or_try_init` not caching the
-        // error. This task's only job was to get there first when it could.
-        if self
-            .conn
-            .get_or_try_init(|| self.client.get_connection_manager_with_config(config))
-            .await
-            .is_ok()
-        {
-            self.connected.store(true, Ordering::Relaxed);
-        }
     }
 
     /// The cache hop's transport, or `None` for cleartext. `crate::rotate`
