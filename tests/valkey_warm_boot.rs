@@ -9,19 +9,20 @@
 //! it is silently dropped rather than answered either way, and the connect
 //! attempt hangs until something ELSE bounds it.
 //!
-//! **WHY `YADGAR_RATE_LIMIT_TIMEOUT_MS` IS RAISED FROM [`support::cleartext_env`]'s
-//! "50".** `Limiter::connect_config`'s `inner` budget — what actually bounds
-//! the hung connect attempt, both for `warm` and for a real call — is two
-//! thirds of this value. At "50" that bound is ~33ms, far too short to tell
-//! "awaited directly" apart from "spawned": either shape reaches the
-//! "gateway listening" line long before a 3-second deadline could ever catch
-//! the bug. Raised to eight seconds, an accidentally-`.await`ed `warm` would
-//! hold `run` on that hung connect for ~5.3 seconds (two thirds of it) before
-//! the listener ever binds — comfortably past the 3-second deadline this file
-//! asserts against.
+//! **WHAT THE TEST DISCRIMINATES ON: AN UNBOUNDED RETRY LOOP AGAINST A BLACKHOLE.**
+//! Since ledger 1438, `Limiter::warm` loops: a failed attempt is logged,
+//! `RETRY` (5 seconds) is slept, and it dials again, until `conn` is populated.
+//! `CONNECT_BUDGET` (15 seconds) bounds each single attempt and nothing more.
+//! Against `192.0.2.1` no attempt ever succeeds, so an awaited `warm` NEVER
+//! returns and `run` would never bind its listener. A `main` that spawns `warm`
+//! reaches "gateway listening" within `DEADLINE`; a `main` that awaits it does
+//! not reach it at all.
 //!
-//! `[limit::valkey::CONNECT_BUDGET]` is 15 seconds and plays no part here: it
-//! bounds `warm`'s own task, which this file never waits on either.
+//! **THE `YADGAR_RATE_LIMIT_TIMEOUT_MS` OVERRIDE BELOW IS VESTIGIAL.** It was
+//! raised from [`support::cleartext_env`]'s "50" when `inner`, two thirds of
+//! that value, also bounded the connect. Since ledger 1430 `inner` bounds only
+//! each command's response, so the override plays no part in what this test
+//! proves. It stays so this change touches no behaviour.
 
 mod support;
 
@@ -29,9 +30,9 @@ use std::time::Duration;
 
 use support::{cleartext_env, Booted};
 
-/// Comfortably under the ~5.3-second hang a blocking `warm` would cause
-/// (see the module comment), comfortably over how long a boot that never
-/// waits on Valkey actually takes.
+/// A boot that spawns `warm` binds its listener in well under this. A boot that
+/// awaits `warm` against the blackhole address never does, so any finite value
+/// separates them; 3 seconds leaves room for a slow runner.
 const DEADLINE: Duration = Duration::from_secs(3);
 
 #[test]

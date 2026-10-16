@@ -26,9 +26,14 @@
 //! `requirepass` on one server would otherwise each see the other's state.
 //!
 //! [`Locked`] restores the server on the way out, including on a panic, which is
-//! when it matters. It also clears first, so a run killed between the set and the
-//! restore cannot leave the shared Valkey locked and every later job failing on a
-//! `NOAUTH` that has nothing to do with the change under test.
+//! when it matters. It also clears first, which recovers from a run killed
+//! between the set and the restore ONLY while the password is one the next
+//! process can present. It is not, any more: the password is random per process
+//! (`random_secret`), so a local run killed there (a SIGINT, say) leaves the
+//! persistent Valkey locked behind a value nobody knows, and the next run's
+//! `CONFIG SET` fails with `NOAUTH`. **The recovery is to restart the
+//! container.** CI is unaffected: its Valkey is a service container that lives
+//! for one job.
 //!
 //! Run locally with:
 //!
@@ -38,8 +43,8 @@
 //! YADGAR_TEST_VALKEY=127.0.0.1:16379 cargo test --test valkey_auth -- --nocapture
 //! ```
 
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod common;
 use common::addr;
@@ -47,10 +52,29 @@ use common::addr;
 use yadgar_gateway::limit::{Decision, Degrade, Limiter, Limits, Overrides};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
-/// Deliberately unlike anything the implementation could contain. A fixture that
-/// happened to equal a constant in the code under test would pass for a build
-/// that ignored the configured password and used one of its own.
-const PASSWORD: &str = "sentinel-of-the-requirepass-9d41";
+/// A per-run password with no string constant in its derivation: the standard
+/// library's per-instance random hasher keys, hashed over the clock. A literal
+/// here is what CodeQL's `rust/hard-coded-cryptographic-value` flags (gateway#110
+/// hit it); this also keeps the old property that the fixture equals nothing the
+/// implementation could contain, so a build that ignored the configured password
+/// and used one of its own would fail. Mirrors `random_secret` in
+/// `tests/valkey_restart.rs`: sharing it through `tests/common/` would compile
+/// the `addr` gate and its tests into `valkey_restart`, which uses Docker rather
+/// than `YADGAR_TEST_VALKEY`, and leave unused items in the binaries that do
+/// not need it.
+fn random_secret() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos(),
+    );
+    hasher.finish().to_string()
+}
+
+static PASSWORD: LazyLock<String> = LazyLock::new(random_secret);
 
 /// Held for the whole of each test that touches the shared server. See the module
 /// comment: the binaries are serialised by cargo, the tests inside one are not.
@@ -82,7 +106,7 @@ fn admin(addr: &str) -> Option<redis::Connection> {
     // no password `AUTH` answers `ERR Client sent AUTH, but no password is set`,
     // which is not a problem — the connection is usable either way, and this is
     // the one call site that has to work in BOTH states.
-    let _: Result<(), _> = redis::cmd("AUTH").arg(PASSWORD).exec(&mut conn);
+    let _: Result<(), _> = redis::cmd("AUTH").arg(PASSWORD.as_str()).exec(&mut conn);
     Some(conn)
 }
 
@@ -108,7 +132,7 @@ struct Locked {
 
 impl Locked {
     fn requiring_a_password(addr: &str) -> Self {
-        Self::new(addr, PASSWORD)
+        Self::new(addr, PASSWORD.as_str())
     }
 
     fn requiring_none(addr: &str) -> Self {
@@ -124,7 +148,11 @@ impl Locked {
         // otherwise leave the shared server locked, and `admin` above is written
         // to get in from either state.
         let _: Result<(), _> = set_requirepass(&mut conn, "");
-        set_requirepass(&mut conn, password).expect("the test Valkey takes CONFIG SET requirepass");
+        set_requirepass(&mut conn, password).expect(
+            "the test Valkey refused CONFIG SET requirepass. If an earlier local run was killed \
+between the set and the restore, the server is still locked behind that run's random \
+password: restart the container",
+        );
         Self {
             addr: addr.to_string(),
             _held: held,
@@ -167,7 +195,7 @@ async fn the_same_cache_serves_a_client_that_carries_the_password() {
     // credential rather than about the server being broken for some unrelated
     // reason.
     assert_eq!(
-        spend(&limiter(&addr, Some(PASSWORD))).await,
+        spend(&limiter(&addr, Some(PASSWORD.as_str()))).await,
         Decision::Allowed,
         "the password this gateway was configured with was not accepted by the cache that \
          demands it, so it never reached the handshake"
@@ -215,7 +243,7 @@ async fn a_password_offered_to_a_cache_that_wants_none_is_also_refused() {
     // message, so a sentence about deployment order that nothing checks becomes
     // permanent folklore the day the behaviour drifts.
     assert_eq!(
-        spend(&limiter(&addr, Some(PASSWORD))).await,
+        spend(&limiter(&addr, Some(PASSWORD.as_str()))).await,
         Decision::Unauthenticated,
         "a gateway carrying a password reached a cache that wants none and was NOT refused. \
          That is a better outcome than the one documented, but the merge order in \
@@ -231,7 +259,7 @@ async fn an_unreachable_cache_still_fails_open_onto_the_floor() {
     // this change: the argument on `Decision::Degraded` is unchanged, and only
     // the credential case is carved out of it.
     assert_eq!(
-        spend(&limiter("127.0.0.1:1", Some(PASSWORD))).await,
+        spend(&limiter("127.0.0.1:1", Some(PASSWORD.as_str()))).await,
         Decision::Degraded(Degrade::Unreachable),
         "a cache that is simply absent must still let the call through under this replica's \
          own floor; only a REFUSED credential is fatal"
