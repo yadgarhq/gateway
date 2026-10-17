@@ -627,13 +627,21 @@ message ListCredentialsResponse {
 // credential they can use. D73 puts rotation POLICY outside the first cut; it
 // does not leave the deployment without a way back in, and this is the way.
 //
+// A RESET REPLACES THE PASSWORD; IT DOES NOT, BY DEFAULT, WITHDRAW A CREDENTIAL.
+// The redemption upserts the password, so the old password stops working. Every
+// credential the person already held keeps resolving unless the enrolment was
+// issued with `revoke_existing_credentials` (ADR-0943) — the reset to use when a
+// device or a token may have leaked. That field is decided HERE, at issue time,
+// by the attested administrator; the redeemer cannot set or clear it.
+//
 // THE RESIDUAL, STATED RATHER THAN LEFT TO BE NOTICED: an admin can mint an
 // enrolment for any existing user at any time and redeem it themselves. D73's
 // literal guarantee survives — the admin still never learns the password
 // anyone chose — but its RATIONALE, that an audit trail cannot otherwise tell
 // the person from the administrator who onboarded them, is MITIGATED RATHER
 // THAN ELIMINATED. The issuance is recorded and the victim's old password stops
-// working, so the act is LOUD rather than silent. That is a real improvement on
+// working (and, with `revoke_existing_credentials`, every credential they held),
+// so the act is LOUD rather than silent. That is a real improvement on
 // admin-sets-initial-password and it is why this shape stands; it is not the
 // same thing as the property being gone.
 message IssueEnrolmentRequest {
@@ -673,6 +681,19 @@ message IssueEnrolmentRequest {
   // succeed against, never grants anything, so it is safe to enforce
   // identically regardless of who set it.
   bool require_zero_credential_admin = 4;
+
+  // REVOKE EVERY CREDENTIAL THE TARGET HOLDS WHEN THIS ENROLMENT IS REDEEMED
+  // (ADR-0943), RELAYED VERBATIM to
+  // yadgar.iamdb.v1.CreateEnrolmentRequest.revoke_existing_credentials, which
+  // carries the semantics. Absent (the default) is the reset path exactly as it
+  // was: the password is replaced and existing credentials keep working.
+  //
+  // THE ATTESTED-ADMINISTRATOR PATH ONLY. The gateway refuses a request that
+  // asks for it on the bootstrap path, before calling this service, and
+  // `iam-db` refuses it together with `require_zero_credential_admin` — a
+  // target with zero credentials has nothing to revoke, so the pair is a
+  // malformed request. This service never populates it itself.
+  bool revoke_existing_credentials = 5;
 }
 message IssueEnrolmentResponse {
   // base64(EnrolmentToken) — the whole of what the admin hands over. `iam`

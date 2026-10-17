@@ -736,6 +736,20 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
             "this stub answers ResolveProject and nothing else",
         ))
     }
+
+    // proto v1.17.0's seeder-only verb (ADR-0936). This gateway never calls it;
+    // `build_server(true)` makes every stub of the trait implement it.
+    async fn sync_projects(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "this stub answers ResolveProject and nothing else",
+        ))
+    }
 }
 
 /// Serve one `ResolveProject` answer, and return a channel pointed at it.

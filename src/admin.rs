@@ -423,6 +423,24 @@ impl Authority {
             Authority::Administrator(_) => false,
         }
     }
+
+    /// Whether this caller may ask a re-enrolment to revoke every credential
+    /// its target holds (ADR-0943): an ATTESTED administrator may, the
+    /// bootstrap token may not.
+    ///
+    /// The bootstrap token reaches `IssueEnrolment` only for an administrator
+    /// who has never held a credential (ADR-0655 as amended by ADR-0656), so
+    /// there is nothing for it to revoke, and `iam-db` refuses the demand and
+    /// the instruction together. Refusing here as well keeps that grant exactly
+    /// as narrow as those ADRs drew it without depending on the tier below.
+    /// Beside [`Authority::demands_zero_credential_admin`] for the reason that
+    /// method gives: a downstream difference follows from the variant.
+    pub fn may_revoke_existing_credentials(&self) -> bool {
+        match self {
+            Authority::Bootstrap => false,
+            Authority::Administrator(_) => true,
+        }
+    }
 }
 
 /// D73's excluded case: an administrator removing their own flag.

@@ -224,11 +224,11 @@ ADR-0492's administrative surface (D73, ledger 638). **These are never MCP
 tools**: no name of theirs is in `tools::SERVED`, so `tools/call` cannot dispatch
 to one and `tools/list` cannot advertise one.
 
-| path                     | body                                               | answers                               |
-| ------------------------ | -------------------------------------------------- | ------------------------------------- |
-| `/admin/create-user`     | `external_id`, `display_name`, optional `is_admin` | `{"user_id": ...}`                    |
-| `/admin/issue-enrolment` | `user_id`                                          | `{"token": ..., "enrolment_id": ...}` |
-| `/admin/set-user-admin`  | `user_id`, `is_admin` (a required boolean)         | `{"user_id": ..., "is_admin": ...}`   |
+| path                     | body                                                          | answers                               |
+| ------------------------ | ------------------------------------------------------------- | ------------------------------------- |
+| `/admin/create-user`     | `external_id`, `display_name`, optional `is_admin`            | `{"user_id": ...}`                    |
+| `/admin/issue-enrolment` | `user_id`, optional `revoke_existing_credentials` (a boolean) | `{"token": ..., "enrolment_id": ...}` |
+| `/admin/set-user-admin`  | `user_id`, `is_admin` (a required boolean)                    | `{"user_id": ..., "is_admin": ...}`   |
 
 The `user_id` `/admin/create-user` returns is the one the other two take.
 
@@ -246,6 +246,16 @@ The `user_id` `/admin/create-user` returns is the one the other two take.
   (ADR-0655, as amended by ADR-0656). That last predicate is enforced inside
   `iam-db`'s write, never at this gateway. A request carrying the header is
   judged by these rules alone and never falls back to the attested path.
+
+**`revoke_existing_credentials: true` makes a re-enrolment a containing reset**
+(ADR-0943): when the enrolment is redeemed, every credential the user held is
+revoked in the same `iam-db` transaction that replaces the password. Absent, a
+reset replaces the password and existing credentials keep working. Only an
+attested administrator may set it; the bootstrap path answers
+`403 {"error":"the bootstrap token may not revoke existing credentials"}` before
+`iam` is called. `iam` publishes the cache eviction on redemption, so a revoked
+token stops resolving at once; a missed publish leaves it resolving from a
+replica's cache for at most `YADGAR_CREDENTIAL_TTL_SECONDS`.
 
 **An absent or empty bootstrap Secret DISABLES the bootstrap path**, answering
 `503 {"error":"the bootstrap token is not configured"}` — never a comparison
