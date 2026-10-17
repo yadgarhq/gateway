@@ -11,6 +11,18 @@ import "yadgar/common/v1/common.proto";
 enum ProjectStatus {
   PROJECT_STATUS_UNSPECIFIED = 0;
   PROJECT_STATUS_ACTIVE = 1;
+
+  // A row the declaration no longer names (ADR-0934: archived on the next
+  // sync, never deleted). ARCHIVING IS A STATUS FLIP AND NOTHING ELSE: the row
+  // keeps its path and aliases, and resolution still answers it, with this
+  // status — see `RegisteredPath.status`, which must stay unfiltered.
+  //
+  // AN ARCHIVED PROJECT REFUSES WRITES (ADR-0941, open). A caller that
+  // resolves a candidate for a WRITE and gets this status refuses the write; a READ still answers. The
+  // refusal belongs to whoever composes the write's refusal — the gateway —
+  // and NOT to this contract, which carries the status and no reason code.
+  // Stated here because no code enforces it yet: today neither resolver
+  // refuses on status, so a write to an archived project still lands.
   PROJECT_STATUS_ARCHIVED = 2;
 }
 
@@ -71,14 +83,13 @@ message RegisterProjectRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   yadgar.common.v1.Scope scope = 2;
   string path = 3;
-  // Refused past 255, enforced in BYTES today
-  // (`project-db/src/write.rs:58,116`, `MAX_DISPLAY_NAME`) against a column
-  // that is `display_name VARCHAR(255)` on utf8mb4 and so bounds CHARACTERS
-  // (`project-db/src/schema.rs:78`) — the same byte/character gap `iam` found
-  // and fixed on its own VARCHAR(255)-on-utf8mb4 columns, see
-  // `yadgar.iam.v1.LoginRequest.label` and
-  // `yadgar.iam.v1.CreateUserRequest.external_id` in `iam.proto`. Stated here
-  // as what the code does, not as a character bound, because it is not one.
+  // Refused past 255 CHARACTERS (`project-db/src/write/register.rs`,
+  // `MAX_DISPLAY_NAME_CHARS`), counted as Unicode scalars, because the column
+  // is `display_name VARCHAR(255)` on utf8mb4 and so bounds CHARACTERS, not
+  // bytes (`project-db/src/schema.rs`, `create_project`). This closes the
+  // byte/character gap the check once had, the same gap `iam` fixed on its own
+  // VARCHAR(255)-on-utf8mb4 columns: see `yadgar.iam.v1.LoginRequest.label`
+  // and `yadgar.iam.v1.CreateUserRequest.external_id` in `iam.proto`.
   string display_name = 4;
 
   // The repository whose PR flow governs an ORG namespace — NOT `path`,
@@ -197,21 +208,137 @@ message ArchiveProjectResponse {
   yadgar.common.v1.Meta meta = 1;
 }
 
+// One declared namespace root or project, as the organisation's GitOps
+// repository states it (ADR-0705 as amended by ADR-0713: the repository is
+// authoritative, and a sync overwrites).
+//
+// SHARED BY BOTH TIERS' SYNC REQUESTS, on purpose: `project` relays the
+// declaration to the store unchanged, so the element is one type and the relay
+// copies it rather than translating it. buf's `RPC_REQUEST_RESPONSE_UNIQUE`
+// binds request and response types only, and this is neither.
+message DeclaredProject {
+  // The canonical path, in the same grammar `RegisterProjectRequest.path`
+  // takes. ORG CLASS ONLY: a path under the reserved `local` segment is a
+  // personal project, outside every sync (ledger 641 owns that class), and is
+  // refused as `INVALID_ARGUMENT`. Compared case-folded, because the store's
+  // walk folds ASCII case (see `ProjectServiceListProjectsResponse.paths`).
+  string path = 1;
+
+  // Refused past 255 CHARACTERS, the width of the column `RegisterProject`
+  // writes too (`project-db/src/write/register.rs`, `MAX_DISPLAY_NAME_CHARS`).
+  // Empty is legal and is stored as given: a project whose name is its path is
+  // an ordinary declaration.
+  string display_name = 2;
+
+  // The repository whose PR flow governs the namespace. REQUIRED, for a root
+  // and for a project alike, because every declared row is org class and
+  // `ck_project_class` gives an org row a `source_repo` and never an owner.
+  // Same canonical form as `RegisterProjectRequest.source_repo`.
+  string source_repo = 3;
+}
+
+// THE WHOLE DECLARATION, in one request (ADR-0936). Not a per-row write: the
+// set of active org-class rows after the call is exactly what this request
+// names, and every org-class row it omits is archived.
+//
+// THE STORE HALF. Its only caller is `project`, relaying
+// `ProjectServiceSyncProjectsRequest` field for field — see the rpc's comment
+// on `ProjectDbService` for the caller rule.
+//
+// NO `Idempotency`, AND THAT IS A DECISION AGAINST D9 FOR THIS VERB ONLY. The
+// verb is idempotent by CONVERGENCE: the same declaration applied twice changes
+// nothing the second time, and every row comes back `unchanged`. A D9 key would
+// be WRONG here rather than redundant. After a database restore, a replayed key
+// returns the stored response and skips the very convergence the restore needs.
+//
+// NO `expect_version` EITHER (D8). The caller holds the declaration, not a row
+// it read, so there is no version it could have observed. The store serialises
+// concurrent syncs instead: each one locks a sentinel row that always exists,
+// so two first syncs into an empty store cannot both proceed.
+message SyncProjectsRequest {
+  // THE SEEDER'S SCOPE (ADR-0942, open), not a gateway-attested one.
+  // `user_id` is the seeder's fixed system principal, `yadgar:system:seeder`,
+  // stamped as `created_by` and `updated_by` on every row the sync writes.
+  // `project` has checked it against the caller's certificate before relaying
+  // (see `ProjectServiceSyncProjectsRequest.scope`). `request_id` is the one
+  // the seeder minted for this sync, relayed unchanged. project_id, team_ids
+  // and instance_id are empty and ignored.
+  yadgar.common.v1.Scope scope = 1;
+
+  // The namespace anchors: single-segment paths, resolvable through and never
+  // a landing site (ADR-0673). AT LEAST ONE: a declaration with no root is
+  // `INVALID_ARGUMENT`. More than one is legal — an organisation root beside a
+  // GitLab top-group, say — so a changed root is an archive plus an insert,
+  // never a rename. A root the declaration stops naming is archived like any
+  // other row.
+  repeated DeclaredProject roots = 2;
+
+  // Every declared project. Each must sit under one of `roots`. EMPTY IS LEGAL:
+  // it states that the organisation has only its anchors.
+  repeated DeclaredProject projects = 3;
+
+  // THE MASS-ARCHIVE GUARD (ADR-0939, open). False by default, and false is
+  // the guard ON.
+  //
+  // With this false, a sync that would archive STRICTLY MORE THAN HALF of the
+  // org-class rows that are ACTIVE when the sync takes its lock is refused
+  // `FAILED_PRECONDITION`, naming both counts and this field, and writes
+  // nothing. Roots count in both the numerator and the denominator: they are
+  // org-class rows like any other. Private-class rows count in neither.
+  // Exactly half is admitted.
+  //
+  // A COLD INSTALL NEVER TRIPS IT: with no active org row there is nothing to
+  // archive. The guard exists for the other case — a declaration emptied or
+  // truncated by mistake, which would otherwise archive most of a live
+  // registry in one commit. An archive is undone by re-declaring, so the guard
+  // buys a refusal in place of a recovery, not a recovery that was impossible.
+  //
+  // `FAILED_PRECONDITION` AND NOT `INVALID_ARGUMENT`, because the request is
+  // well-formed: whether it trips depends on what the store holds.
+  bool allow_mass_archive = 4;
+}
+
+// What the sync did, counted per row. Every declared row lands in exactly one
+// of `inserted`, `updated`, `reactivated` or `unchanged`; `archived` counts the
+// active org-class rows the declaration omitted. A no-op sync is all
+// `unchanged`, which is what makes one visible in the seeder's log.
+message SyncProjectsResponse {
+  // Declared with no row: written `ACTIVE`, version 1.
+  uint32 inserted = 1;
+  // Active, and `display_name` or `source_repo` differed: both overwritten,
+  // version + 1.
+  uint32 updated = 2;
+  // Active, org class, and not declared: set `ARCHIVED`, version + 1. Never
+  // deleted (ADR-0934).
+  uint32 archived = 3;
+  // Declared and `ARCHIVED`: set `ACTIVE`, and overwritten if it also differed,
+  // version + 1.
+  uint32 reactivated = 4;
+  // Declared, `ACTIVE`, and identical: no write, no version change.
+  uint32 unchanged = 5;
+}
+
 // Registration is administrative — GitOps or CLI, like configuration (D43).
 // Agents resolve and read; they never mint a partition key.
 //
-// THE SURFACE THAT SENTENCE NAMES DOES NOT EXIST, recorded here because a
-// contract naming an unreachable surface reads as though the surface is there.
-// ADR-0492 puts the administrative API on a gateway path of its own. The
-// gateway serves three routes — MCP, `/auth/login` and `/auth/enrol`
-// (`gateway/src/http.rs`) — and none of them is administrative, so
-// `RegisterProject` is reached by port-forwarding the service, exactly as
-// `CreateUser` and `IssueEnrolment` are. That is ledger 638, inherited here
-// rather than solved. The other half of the pointer does not resolve either:
-// `yadgarhq/config` writes ConfigMaps a process reads at boot and never rows,
-// so "GitOps" names no mechanism that can hold a registry row. `RegisterProject`
-// is implemented in `project-db` and has no caller, and that is the accurate
-// description of it today.
+// THE GITOPS HALF OF THAT SENTENCE IS `SyncProjects` (ADR-0705 as amended by
+// ADR-0936). Organisation-class rows are declared in the organisation's GitOps
+// repository, and the D35 seeder (ADR-0934) sends the whole declaration to
+// `ProjectService.SyncProjects`, which `project` relays here. That makes
+// `SyncProjects` the ONE writer of org-class rows.
+//
+// `RegisterProject` IS THE PERSONAL-CLASS PATH (`local/...`, ledger 641), and
+// is narrowing to it: the `project-db` release that serves `SyncProjects`
+// refuses an org-class path here with `FAILED_PRECONDITION`, so the two
+// writers are disjoint by `ck_project_class`, the engine's own constraint.
+// Until that release it accepts both classes, and no module calls it. An
+// operator port-forward to it is break-glass: exempt under ADR-0938 only while
+// a human starts it, no code path runs it, and no standing route makes it
+// reachable. It is not a registration path for any module.
+//
+// `RenameProject` and `ArchiveProject` answer `UNIMPLEMENTED`, and ADR-0705
+// gives them no caller. A sync's archive is a status flip inside
+// `SyncProjects`, not a call to `ArchiveProject`.
 service ProjectDbService {
   rpc RegisterProject(RegisterProjectRequest) returns (RegisterProjectResponse);
   rpc ResolveProject(ResolveProjectRequest) returns (ResolveProjectResponse);
@@ -220,6 +347,33 @@ service ProjectDbService {
   rpc TouchProjects(TouchProjectsRequest) returns (TouchProjectsResponse);
   rpc RenameProject(RenameProjectRequest) returns (RenameProjectResponse);
   rpc ArchiveProject(ArchiveProjectRequest) returns (ArchiveProjectResponse);
+
+  // Applies the whole declaration in ONE transaction (D5): validate, take the
+  // sentinel lock, insert, overwrite, reactivate, archive. The declared list
+  // applies, or none of it does.
+  //
+  // CALLABLE BY `project` ONLY (ADR-0936, ADR-0938). The store admits a call
+  // only when the client certificate verifies against the internal CA AND its
+  // identity is `project`'s own leaf (`project-caller`). Any other caller is
+  // `PERMISSION_DENIED` before a transaction opens, even one whose certificate
+  // verifies, because every module's leaf verifies against the same CA. This
+  // check is the second wall behind the NetworkPolicy: a mis-wired policy
+  // still cannot let another module write the registry.
+  //
+  // REFUSALS, each writing nothing:
+  // - `INVALID_ARGUMENT`, naming the path: bad grammar, a `local/` path, a
+  //   duplicate (case-folded), no root, a root of more than one segment, a
+  //   project under no declared root, an empty `source_repo`, a `display_name`
+  //   wider than the column.
+  // - `ALREADY_EXISTS`: a declared path is a former path (an alias) of another
+  //   project — the rule `RegisterProject` applies.
+  // - `FAILED_PRECONDITION`: the mass-archive guard tripped (see
+  //   `SyncProjectsRequest.allow_mass_archive`).
+  // - `PERMISSION_DENIED`: the caller is not `project`.
+  //
+  // PRIVATE-CLASS ROWS ARE NEVER TOUCHED. A row with an owner is outside every
+  // sync by class, whatever the declaration says.
+  rpc SyncProjects(SyncProjectsRequest) returns (SyncProjectsResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,9 +390,10 @@ service ProjectDbService {
 // refuses. That leaves a second `*api` package or a second service in this
 // file, and `plans/project-registry-callers.md` §1 rules the second.
 //
-// THE TWO TIERS SHARE NO MESSAGE, and buf enforces that rather than the
-// convention asking for it: `RPC_REQUEST_RESPONSE_UNIQUE` refuses to let two
-// rpcs share a request or response type. Every type below therefore carries
+// THE TWO TIERS SHARE NO REQUEST OR RESPONSE TYPE, and buf enforces that
+// rather than the convention asking for it: `RPC_REQUEST_RESPONSE_UNIQUE`
+// refuses to let two rpcs share one. An element type inside a request may be
+// shared, and `DeclaredProject` is, because the sync relays it unchanged. Every type below therefore carries
 // the service name as a prefix — `<ServiceName><RpcName>Request`, the second
 // form `RPC_REQUEST_STANDARD_NAME` accepts — which is also what stops a reader
 // of a package holding two `ResolveProject` rpcs having to guess which tier a
@@ -246,9 +401,11 @@ service ProjectDbService {
 //
 // WHAT THE TIER ADDS, because a pass-through would earn nothing over the store
 // it wraps: it answers in a shape a caller that is NOT A REQUEST can satisfy,
-// it publishes the registry-change events a loaded set is invalidated by, and
-// it owns the `last_seen_at` flush timer that calls `TouchProjects` above.
-// Only the first of the three is in this release.
+// it decides WHO MAY WRITE the registry (the caller check on `SyncProjects`,
+// ADR-0936), it publishes the registry-change events a loaded set is
+// invalidated by, and it owns the `last_seen_at` flush timer that calls
+// `TouchProjects` above. The first two are in this contract; the last two are
+// not.
 // ---------------------------------------------------------------------------
 
 // One registered path, and the three fields a resolution walk reads.
@@ -422,22 +579,66 @@ message ProjectServiceResolveProjectResponse {
   string source_repo = 5;
 }
 
+// The seeder's half of the sync. Field for field the same as
+// `SyncProjectsRequest`, which `project` builds from it unchanged: same
+// numbers, same meanings, and the same decisions against D9's `Idempotency`
+// and D8's `expect_version` (see that message). A separate type only because
+// `RPC_REQUEST_RESPONSE_UNIQUE` requires one per rpc.
+message ProjectServiceSyncProjectsRequest {
+  // A Scope ON THIS TIER, which `ListProjects` and `ResolveProject` above do
+  // not carry, and the difference is the caller (ADR-0942, open). ADR-0488 as
+  // superseded by ADR-0511 mints a Scope once, at the gateway, out of a
+  // request; those two rpcs are called by the gateway while it has none to
+  // pass. This rpc is never called by the gateway (see the caller rule on the
+  // rpc). Its caller is the seeder, which holds no user and no request, so this
+  // Scope carries no attested user: `user_id` is the seeder's FIXED SYSTEM
+  // PRINCIPAL, `yadgar:system:seeder`, and `project` refuses it
+  // `PERMISSION_DENIED` when it is anything else. The certificate and the
+  // principal are checked together, and neither one is trusted alone. The
+  // store needs the Scope because it stamps `created_by` and `updated_by`
+  // from it.
+  //
+  // `request_id` IS THE SECOND EXCEPTION, for the same reason. `Scope` says
+  // the gateway mints it, once, and there is no gateway on this path. So the
+  // seeder mints its own `request_id`, one per sync, and sends it here;
+  // `project` relays it unchanged to the store, so D67's records for one sync
+  // still join across both hops.
+  //
+  // project_id, team_ids and instance_id are empty and ignored.
+  yadgar.common.v1.Scope scope = 1;
+  repeated DeclaredProject roots = 2;
+  repeated DeclaredProject projects = 3;
+  // The mass-archive guard; see `SyncProjectsRequest.allow_mass_archive`.
+  // Relayed unchanged: the STORE applies the guard, because only the store
+  // knows how many org-class rows are active under the sync's lock.
+  bool allow_mass_archive = 4;
+}
+// The store's counts, relayed unchanged; see `SyncProjectsResponse`.
+message ProjectServiceSyncProjectsResponse {
+  uint32 inserted = 1;
+  uint32 updated = 2;
+  uint32 archived = 3;
+  uint32 reactivated = 4;
+  uint32 unchanged = 5;
+}
+
 // The registry's PUBLIC API — what the gateway calls (D4). Holds no store, and
 // reaches its data ONLY over `ProjectDbService`.
 //
-// TWO RPCS, AND THE OTHER FIVE ARE ABSENT FOR STATED REASONS rather than
-// pending. A logic tier implements what has a caller; mirroring seven verbs
-// one-for-one would be a proxy, and a proxy earns nothing over the store it
-// wraps.
+// THREE RPCS, AND THE OTHER FIVE STORE VERBS ARE ABSENT FOR STATED REASONS
+// rather than pending. A logic tier implements what has a caller; mirroring
+// eight verbs one-for-one would be a proxy, and a proxy earns nothing over the
+// store it wraps.
 //
-// - `RegisterProject`, `RenameProject` and `ArchiveProject` are ADMINISTRATIVE.
-//   The surface meant to reach them is ADR-0492's administrative path on the
-//   gateway, which does not exist — see the note above `ProjectDbService` — so
-//   they are reached by port-forwarding `project-db` today. The last two answer
-//   `UNIMPLEMENTED` there in any case, and for a reason that is not the missing
-//   admin path: an alias keeps a stored `Meta.project_id` VALID but not
-//   CURRENT, and the job that retags records already carrying an old path does
-//   not exist. They return together with that job.
+// - `RegisterProject`, `RenameProject` and `ArchiveProject` are ABSENT BY
+//   DECISION: ADR-0705 gives this tier no per-row Register, Rename or Archive
+//   verb, and ADR-0936, which adds `SyncProjects`, keeps that refusal. A
+//   per-row verb invites a runtime caller writing the rows a sync overwrites,
+//   the two-writer failure ADR-0713 forbids for entities. Organisation rows
+//   arrive through `SyncProjects`; personal rows are ledger 641's path. Rename
+//   and per-row archive also answer `UNIMPLEMENTED` at the store, because an
+//   alias keeps a stored `Meta.project_id` VALID but not CURRENT, and the job
+//   that retags records already carrying an old path does not exist.
 // - `GetProject` has no caller. Inventing one to justify a verb is the shape
 //   this contract refuses.
 // - `TouchProjects` is storage maintenance, and its caller is this tier's OWN
@@ -470,4 +671,29 @@ service ProjectService {
   // one-arm change in an existing match and belongs to that repository rather
   // than to this contract.
   rpc ResolveProject(ProjectServiceResolveProjectRequest) returns (ProjectServiceResolveProjectResponse);
+
+  // THE ONE WRITE VERB ON THIS TIER (ADR-0936): the organisation's whole
+  // declaration, relayed to `ProjectDbService.SyncProjects` in one call and
+  // applied there in one transaction. Not a per-row register, rename or
+  // archive.
+  //
+  // CALLABLE BY THE SEEDER ONLY. `project` admits a call only when the client
+  // certificate verifies against the internal CA, AND its identity is the
+  // seeder's own leaf (`seeder-caller`), AND `scope.user_id` is the seeder's
+  // system principal. That authorisation step runs in `project` BEFORE the
+  // relay, so a refused call never reaches the store. Every other caller is
+  // `PERMISSION_DENIED`, whether or not its certificate verifies — the
+  // gateway's, `iam`'s and `task`'s leaves included. mTLS alone cannot tell
+  // the seeder apart, because every module's leaf verifies against the same
+  // CA. The identity check is the policy, and the policy is what makes this
+  // tier more than a relay.
+  //
+  // THE GATEWAY NEVER EXPOSES THIS VERB ON ANY ROUTE. A route to it would be a
+  // runtime caller of an entity write, which ADR-0713 forbids, and the check
+  // above refuses `gateway-caller` regardless.
+  //
+  // The store's refusals (`INVALID_ARGUMENT`, `ALREADY_EXISTS`,
+  // `FAILED_PRECONDITION`; see the rpc on `ProjectDbService`) are relayed with
+  // their code and message unchanged.
+  rpc SyncProjects(ProjectServiceSyncProjectsRequest) returns (ProjectServiceSyncProjectsResponse);
 }
