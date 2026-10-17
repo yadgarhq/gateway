@@ -313,7 +313,8 @@ path that has no actor to relay — and a log line is not an audit trail. ADR-04
 
 ## The workspace a caller claims, and why nothing is refused yet
 
-Every `tools/call` and every `/admin/*` request carries `x-yadgar-project`. Until
+Every `tools/call` carries `x-yadgar-project`. `/admin/*` is not project-scoped
+(ledger 1545): it neither requires nor checks the header. Until
 ledger 881 the gateway checked that the header was PRESENT and nothing else: the
 value went into the `Scope` unexamined, and `task-db` bound it straight into the
 row. A caller could name any string on a write, and the named project's
