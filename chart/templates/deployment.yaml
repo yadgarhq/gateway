@@ -306,6 +306,10 @@ spec:
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
               value: {{ .Values.task.port | quote }}
+            # The per-request bound on this hop (ADR-0925 Q-C1). Required by the
+            # binary with no default; the schema holds the range. See values.yaml.
+            - name: TASK_REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.task.requestTimeoutSeconds | quote }}
             # RENDERED UNCONDITIONALLY (ADR-0845): the binary requires this
             # variable and refuses to boot without it, so the chart must never
             # be the reason it is missing. `task.tls.enabled` is guarded above
@@ -358,6 +362,10 @@ spec:
               value: {{ .Values.iam.host | quote }}
             - name: IAM_PORT
               value: {{ .Values.iam.port | quote }}
+            # The per-request bound on this hop (ADR-0925 Q-C1). Required by the
+            # binary with no default; the schema holds the range. See values.yaml.
+            - name: IAM_REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.iam.requestTimeoutSeconds | quote }}
             # RENDERED UNCONDITIONALLY (ADR-0845), the same as TASK_TLS_ENABLED
             # above: the hop the BEARER TOKEN itself goes down, configured
             # independently of task's so the two can be cut over one at a time.
@@ -409,6 +417,10 @@ spec:
               value: {{ .Values.project.host | quote }}
             - name: PROJECT_PORT
               value: {{ .Values.project.port | quote }}
+            # The per-request bound on this hop (ADR-0925 Q-C1). Required by the
+            # binary with no default; the schema holds the range. See values.yaml.
+            - name: PROJECT_REQUEST_TIMEOUT_SECONDS
+              value: {{ .Values.project.requestTimeoutSeconds | quote }}
             # RENDERED UNCONDITIONALLY (ADR-0845), the same as the two above:
             # the third hop, configured independently of them so the three can
             # be cut over one at a time.

@@ -459,7 +459,7 @@ fn dial_under_a_recorder(host: &str) -> (Vec<Emitted>, Channel) {
         .build()
         .expect("a runtime");
     let channel = metrics::with_local_recorder(&recorder, || {
-        rt.block_on(async { connect_task(host, 50051, None).await })
+        rt.block_on(async { connect_task(host, 50051, None, Duration::from_secs(30)).await })
     })
     .expect("a cleartext dial is lazy and hands back a channel");
 
@@ -488,4 +488,78 @@ fn gauge_for(emitted: &[Emitted], upstream: &str, want: f64) -> bool {
                 .any(|l| l.key() == "upstream" && l.value() == upstream)
             && matches!(value, metrics_util::debugging::DebugValue::Gauge(g) if g.0 == want)
     })
+}
+
+/// ADR-0925 Q-C1: the per-request bound has NO compiled-in default (ADR-0569).
+/// An unset variable refuses the boot, and the refusal names BOTH the variable
+/// and the chart key that renders it, for each of the three upstreams.
+#[test]
+fn an_unset_request_timeout_refuses_naming_the_variable_and_chart_key() {
+    for (prefix, var, key) in [
+        (
+            TASK,
+            "TASK_REQUEST_TIMEOUT_SECONDS",
+            "task.requestTimeoutSeconds",
+        ),
+        (
+            IAM,
+            "IAM_REQUEST_TIMEOUT_SECONDS",
+            "iam.requestTimeoutSeconds",
+        ),
+        (
+            PROJECT,
+            "PROJECT_REQUEST_TIMEOUT_SECONDS",
+            "project.requestTimeoutSeconds",
+        ),
+    ] {
+        let refusal = request_timeout(prefix, lookup(&[])).expect_err("unset must refuse");
+        assert!(
+            refusal.contains(var) && refusal.contains(key),
+            "the refusal must name {var} and {key}: {refusal}"
+        );
+    }
+}
+
+/// Zero, 13 (at keepalive detection) and 60 (the ingress idle timeout) are
+/// each outside `yadgar_dial`'s accepted range. Each refusal names the
+/// variable, so an operator reading a crash-looping pod knows what to fix.
+#[test]
+fn an_out_of_range_request_timeout_refuses_naming_the_variable() {
+    for value in ["0", "13", "60"] {
+        let pairs = [("TASK_REQUEST_TIMEOUT_SECONDS", value)];
+        let refusal =
+            request_timeout(TASK, lookup(&pairs)).expect_err("a value outside 14..=59 must refuse");
+        assert!(
+            refusal.contains("TASK_REQUEST_TIMEOUT_SECONDS")
+                && refusal.contains("task.requestTimeoutSeconds"),
+            "{value}: the refusal must name the variable and the chart key: {refusal}"
+        );
+    }
+}
+
+/// A value that is not a whole number keeps its parse reason, which sits one
+/// layer below the head as `source()`. `refusal` walks to it; `to_string` would
+/// drop it.
+#[test]
+fn a_non_numeric_request_timeout_keeps_the_parse_reason() {
+    let pairs = [("IAM_REQUEST_TIMEOUT_SECONDS", "15s")];
+    let refusal = request_timeout(IAM, lookup(&pairs)).expect_err("15s must refuse");
+    assert!(
+        refusal.contains("IAM_REQUEST_TIMEOUT_SECONDS") && refusal.contains("invalid digit"),
+        "the refusal must name the variable and carry the parse reason: {refusal}"
+    );
+}
+
+/// The two edges of the accepted range come back as the duration set, and the
+/// lookup is asked for this upstream's variable and no other.
+#[test]
+fn an_in_range_request_timeout_is_the_value_set() {
+    for (value, secs) in [("14", 14), ("59", 59)] {
+        let pairs = [("PROJECT_REQUEST_TIMEOUT_SECONDS", value)];
+        assert_eq!(
+            request_timeout(PROJECT, lookup(&pairs)),
+            Ok(std::time::Duration::from_secs(secs))
+        );
+        assert!(request_timeout(TASK, lookup(&pairs)).is_err());
+    }
 }
