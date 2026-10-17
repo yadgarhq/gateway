@@ -23,8 +23,14 @@
 //! per process and `tests/telemetry.rs` already installs one.
 
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+use std::time::Duration;
+
 use tonic::transport::Channel;
 use yadgar_gateway::upstream;
+
+/// The per-request bound handed to every dial here (ADR-0925 Q-C1). Any value
+/// `yadgar_dial` accepts serves: nothing in this file waits that long.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What `deploy`'s alert rule queries, spelled out rather than imported.
 const GAUGE: &str = "yadgar_dial_upstream_never_resolved";
@@ -103,13 +109,13 @@ async fn every_upstream_publishes_the_absence_gauge() {
     let snapshotter = recorder.snapshotter();
     recorder.install().expect("install the test recorder");
 
-    let absent_task: Channel = upstream::connect_task(ABSENT_TASK, 50051, None)
+    let absent_task: Channel = upstream::connect_task(ABSENT_TASK, 50051, None, TIMEOUT)
         .await
         .expect("an absent task must not fail the dial (ADR-0532)");
-    let absent_iam: Channel = upstream::connect_iam(ABSENT_IAM, 50052, None)
+    let absent_iam: Channel = upstream::connect_iam(ABSENT_IAM, 50052, None, TIMEOUT)
         .await
         .expect("an absent iam must not fail the dial");
-    let present_iam: Channel = upstream::connect_iam(PRESENT_IAM, 50052, None)
+    let present_iam: Channel = upstream::connect_iam(PRESENT_IAM, 50052, None, TIMEOUT)
         .await
         .expect("localhost resolves");
 

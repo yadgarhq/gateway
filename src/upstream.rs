@@ -12,6 +12,8 @@
 //! itself, and the absence gauge that dialling through `yadgar_dial`
 //! publishes.
 
+use std::time::Duration;
+
 use tonic::transport::Channel;
 
 pub use tls::{TlsConfigError, UpstreamTls, IAM, PROJECT, TASK};
@@ -58,11 +60,9 @@ pub async fn connect_task(
     host: &str,
     port: u16,
     tls: Option<&UpstreamTls>,
+    timeout: Duration,
 ) -> Result<Channel, yadgar_dial::BalanceError> {
-    match tls {
-        None => yadgar_dial::connect(host, port).await,
-        Some(tls) => yadgar_dial::connect_tls(host, port, &tls.options()).await,
-    }
+    dial(host, port, tls, timeout).await
 }
 
 /// Connect to the `iam` logic service.
@@ -133,11 +133,9 @@ pub async fn connect_iam(
     host: &str,
     port: u16,
     tls: Option<&UpstreamTls>,
+    timeout: Duration,
 ) -> Result<Channel, yadgar_dial::BalanceError> {
-    match tls {
-        None => yadgar_dial::connect(host, port).await,
-        Some(tls) => yadgar_dial::connect_tls(host, port, &tls.options()).await,
-    }
+    dial(host, port, tls, timeout).await
 }
 
 /// Connect to `project`, the registry's logic tier (ledger 881).
@@ -165,11 +163,47 @@ pub async fn connect_project(
     host: &str,
     port: u16,
     tls: Option<&UpstreamTls>,
+    timeout: Duration,
+) -> Result<Channel, yadgar_dial::BalanceError> {
+    dial(host, port, tls, timeout).await
+}
+
+/// The one dial all three `connect_*` share: `tls` picks the transport and
+/// `timeout` is the per-request bound [`request_timeout`] read.
+async fn dial(
+    host: &str,
+    port: u16,
+    tls: Option<&UpstreamTls>,
+    timeout: Duration,
 ) -> Result<Channel, yadgar_dial::BalanceError> {
     match tls {
-        None => yadgar_dial::connect(host, port).await,
-        Some(tls) => yadgar_dial::connect_tls(host, port, &tls.options()).await,
+        None => yadgar_dial::connect_with_request_timeout(host, port, timeout).await,
+        Some(tls) => {
+            yadgar_dial::connect_tls_with_request_timeout(host, port, &tls.options(), timeout).await
+        }
     }
+}
+
+/// The per-request bound for one upstream, read from
+/// `<PREFIX>_REQUEST_TIMEOUT_SECONDS` (ADR-0925 Q-C1, ledger 1490).
+///
+/// **NO FALLBACK** (ADR-0569): unset is a refusal, and so is a value outside
+/// `yadgar_dial`'s accepted range. The range is the crate's, not this
+/// repository's: below it the bound fires before keepalive can notice a
+/// vanished peer, and at 60 or above the ingress has already given up.
+///
+/// The variable and the chart key are both built from `prefix`, the same way
+/// [`UpstreamTls::from_lookup`] builds its names, so the three hops cannot
+/// drift apart. The error is rendered with its whole `source()` chain: the
+/// parse reason of a non-numeric value sits one layer below the head.
+pub fn request_timeout(
+    prefix: &'static str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Duration, String> {
+    let var = format!("{prefix}_REQUEST_TIMEOUT_SECONDS");
+    let chart_key = format!("{}.requestTimeoutSeconds", prefix.to_lowercase());
+    yadgar_dial::request_timeout_from_lookup(lookup, &var, &chart_key)
+        .map_err(|e| yadgar_telemetry::diagnose::chain(&e))
 }
 
 /// D67's request id on every outbound request (ledger 1248).

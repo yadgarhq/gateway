@@ -48,6 +48,10 @@ use tonic::transport::{Certificate, Channel, Identity, Server, ServerTlsConfig};
 use yadgar_dial::BalanceError;
 use yadgar_gateway::upstream::{self, UpstreamTls, IAM};
 
+/// The per-request bound handed to every dial here (ADR-0925 Q-C1). Any value
+/// `yadgar_dial` accepts serves: nothing in this file waits that long.
+const TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The name the test certificates are issued for, and the name the test rig
 /// listens on.
 const SERVED_NAME: &str = "localhost";
@@ -448,7 +452,7 @@ async fn a_configured_channel_reaches_a_tls_server() {
     let port = serve(&p).await;
     let ca = TempPem::with(&p.ca_pem);
 
-    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)), TIMEOUT)
         .await
         .expect("a valid CA bundle and a host that forms a URI");
 
@@ -471,7 +475,7 @@ async fn a_configured_channel_refuses_to_talk_to_a_cleartext_server() {
     let p = pki(SERVED_NAME);
     let ca = TempPem::with(&p.ca_pem);
 
-    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)), TIMEOUT)
         .await
         .expect("a valid CA bundle and a host that forms a URI");
 
@@ -497,14 +501,19 @@ async fn the_verification_domain_can_be_overridden() {
     let port = serve(&p).await;
     let ca = TempPem::with(&p.ca_pem);
 
-    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, Some(SENTINEL))))
-        .await
-        .unwrap();
+    let channel = upstream::connect_iam(
+        SERVED_NAME,
+        port,
+        Some(&settings(&ca, Some(SENTINEL))),
+        TIMEOUT,
+    )
+    .await
+    .unwrap();
     assert_eq!(request(channel).await, Ok(()));
 
     // And without the override the same server is correctly refused: the
     // certificate does not name the host.
-    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)), TIMEOUT)
         .await
         .unwrap();
     assert!(
@@ -526,7 +535,7 @@ async fn a_certificate_from_an_untrusted_authority_is_refused() {
     let stranger = pki(SERVED_NAME);
     let ca = TempPem::with(&stranger.ca_pem);
 
-    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
+    let channel = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)), TIMEOUT)
         .await
         .unwrap();
     assert!(
@@ -546,7 +555,8 @@ async fn a_certificate_from_an_untrusted_authority_is_refused() {
 async fn a_ca_bundle_with_no_certificate_in_it_is_an_error() {
     for contents in ["", "   ", "\n", "there is no certificate in this file\n"] {
         let ca = TempPem::with(contents);
-        let outcome = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None))).await;
+        let outcome =
+            upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)), TIMEOUT).await;
         assert!(
             matches!(outcome, Err(BalanceError::CaEmpty { .. })),
             "a bundle containing {contents:?} must be rejected, not connected"
@@ -592,7 +602,8 @@ fn one_section_that_is_not_a_certificate() -> TempPem {
 #[tokio::test]
 async fn a_ca_bundle_whose_sections_are_not_trust_anchors_is_an_error() {
     let ca = one_section_that_is_not_a_certificate();
-    let outcome = upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None))).await;
+    let outcome =
+        upstream::connect_iam(SERVED_NAME, 50052, Some(&settings(&ca, None)), TIMEOUT).await;
     assert!(
         matches!(
             outcome,
@@ -637,6 +648,7 @@ async fn a_client_identity_that_cannot_be_read_is_an_error_before_any_channel_ex
         SERVED_NAME,
         50052,
         Some(&settings_with_identity(&ca, &missing_cert, key.path())),
+        TIMEOUT,
     )
     .await;
     assert!(
@@ -658,6 +670,7 @@ async fn a_client_identity_that_cannot_be_read_is_an_error_before_any_channel_ex
             certificate.path(),
             &missing_key,
         )),
+        TIMEOUT,
     )
     .await;
     assert!(
@@ -690,6 +703,7 @@ async fn a_client_identity_does_not_break_a_hop_whose_server_asks_for_none() {
         SERVED_NAME,
         port,
         Some(&settings_with_identity(&ca, certificate.path(), key.path())),
+        TIMEOUT,
     )
     .await
     .expect("a complete identity is a usable configuration");
@@ -730,6 +744,7 @@ async fn the_client_identity_is_actually_presented_to_a_server_that_requires_one
         SERVED_NAME,
         port,
         Some(&settings_with_identity(&ca, certificate.path(), key.path())),
+        TIMEOUT,
     )
     .await
     .expect("a complete identity is a usable configuration");
@@ -740,9 +755,10 @@ async fn the_client_identity_is_actually_presented_to_a_server_that_requires_one
          requires and verifies one"
     );
 
-    let without_identity = upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)))
-        .await
-        .expect("a flag and a bundle, with no identity, are a usable configuration");
+    let without_identity =
+        upstream::connect_iam(SERVED_NAME, port, Some(&settings(&ca, None)), TIMEOUT)
+            .await
+            .expect("a flag and a bundle, with no identity, are a usable configuration");
     let outcome = request(without_identity).await;
     assert!(
         outcome.is_err(),
@@ -775,7 +791,7 @@ async fn a_ca_bundle_that_cannot_be_read_is_an_error_before_any_channel_exists()
 
     assert!(
         matches!(
-            upstream::connect_iam(SERVED_NAME, 50052, Some(&tls)).await,
+            upstream::connect_iam(SERVED_NAME, 50052, Some(&tls), TIMEOUT).await,
             Err(BalanceError::CaUnreadable { .. })
         ),
         "a CA path that does not exist must be rejected"
@@ -788,7 +804,7 @@ async fn a_ca_bundle_that_cannot_be_read_is_an_error_before_any_channel_exists()
 #[tokio::test]
 async fn the_cleartext_path_still_reaches_a_cleartext_server() {
     let port = serve_cleartext().await;
-    let channel = upstream::connect_iam(SERVED_NAME, port, None)
+    let channel = upstream::connect_iam(SERVED_NAME, port, None, TIMEOUT)
         .await
         .unwrap();
     assert_eq!(request(channel).await, Ok(()));
@@ -802,7 +818,7 @@ async fn the_cleartext_path_still_reaches_a_cleartext_server() {
 async fn the_cleartext_path_cannot_reach_a_tls_server() {
     let p = pki(SERVED_NAME);
     let port = serve(&p).await;
-    let channel = upstream::connect_iam(SERVED_NAME, port, None)
+    let channel = upstream::connect_iam(SERVED_NAME, port, None, TIMEOUT)
         .await
         .unwrap();
     assert!(
@@ -854,10 +870,10 @@ async fn the_cleartext_path_cannot_reach_a_tls_server() {
 async fn an_absent_upstream_never_fails_the_dial_and_never_hangs_a_request() {
     const ABSENT: &str = "gateway-no-such-upstream-6d1a04.invalid";
 
-    let task = upstream::connect_task(ABSENT, 50052, None)
+    let task = upstream::connect_task(ABSENT, 50052, None, TIMEOUT)
         .await
         .expect("an absent task must not fail the dial (ADR-0532)");
-    let iam = upstream::connect_iam(ABSENT, 50052, None)
+    let iam = upstream::connect_iam(ABSENT, 50052, None, TIMEOUT)
         .await
         .expect("an absent iam must not fail the dial");
 

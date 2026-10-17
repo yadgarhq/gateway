@@ -3009,5 +3009,9 @@ fn with_no_registry_an_enforcing_gateway_answers_an_availability_failure() {
 /// any of it.
 mod task_tools;
 
+/// The ledger 1284 ordering between the client's bound and the gateway's
+/// own waits, pinned against the chart's `task` maximum.
+mod request_deadlines;
+
 /// What each upstream is handed as D67's join key (ledger 1248).
 mod request_id;

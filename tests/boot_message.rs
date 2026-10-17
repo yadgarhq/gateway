@@ -155,6 +155,31 @@ fn an_unparsable_iam_or_project_port_names_the_variable() {
     );
 }
 
+/// ADR-0925 Q-C1: each upstream's request timeout has no compiled-in default
+/// (ADR-0569). Read inside `upstreams()`, after both mounted documents, so
+/// this needs the mount namespace. Each case drops ONE variable and leaves
+/// the other two valid, so the refusal is known to name THAT variable.
+#[test]
+fn an_absent_request_timeout_refuses_boot_naming_the_chart_key() {
+    for (var, key) in [
+        ("TASK_REQUEST_TIMEOUT_SECONDS", "task.requestTimeoutSeconds"),
+        ("IAM_REQUEST_TIMEOUT_SECONDS", "iam.requestTimeoutSeconds"),
+        (
+            "PROJECT_REQUEST_TIMEOUT_SECONDS",
+            "project.requestTimeoutSeconds",
+        ),
+    ] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != var);
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(var) && line.contains(key),
+            "the refusal must name both the variable and its chart key: {line}"
+        );
+    }
+}
+
 /// `LISTEN` is parsed last, inside `boot::serve`, after the two dials and the
 /// project registry's own knobs resolve — so this also needs the mount
 /// namespace.

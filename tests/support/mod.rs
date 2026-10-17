@@ -86,6 +86,8 @@ exec "$2""#;
 /// unlike `NATS_TLS_ENABLED`, which is only required once `NATS_URL` is set
 /// (absent here, so it is never reached), `YADGAR_VALKEY_ADDR` above is
 /// always required, so `VALKEY_TLS_ENABLED` is unconditionally required too.
+/// The three `*_REQUEST_TIMEOUT_SECONDS` carry the chart defaults (ADR-0925
+/// Q-C1): each is required with no binary default.
 pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
     vec![
         ("METRICS_LISTEN", "127.0.0.1:0"),
@@ -113,6 +115,9 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("IAM_TLS_ENABLED", "0"),
         ("PROJECT_TLS_ENABLED", "0"),
         ("VALKEY_TLS_ENABLED", "0"),
+        ("TASK_REQUEST_TIMEOUT_SECONDS", "16"),
+        ("IAM_REQUEST_TIMEOUT_SECONDS", "30"),
+        ("PROJECT_REQUEST_TIMEOUT_SECONDS", "30"),
     ]
 }
 

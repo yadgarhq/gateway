@@ -392,7 +392,11 @@ async fn upstreams(
     let task_port: u16 = env_required("TASK_PORT")?
         .parse()
         .map_err(|e| format!("TASK_PORT is not a port number: {e}"))?;
-    let task = upstream::connect_task(&task_host, task_port, task_tls)
+    // THE PER-REQUEST BOUND, read beside the host it bounds (ADR-0925 Q-C1).
+    // No fallback: unset or outside 14..=59 refuses the boot naming the
+    // variable and the chart key (ADR-0569), the class D69 says fails boot.
+    let task_timeout = upstream::request_timeout(upstream::TASK, |n| std::env::var(n).ok())?;
+    let task = upstream::connect_task(&task_host, task_port, task_tls, task_timeout)
         .await
         // Same reasoning: `BalanceError`'s messages are paragraphs explaining
         // that an empty bundle trusts nobody and that a missing one is not a
@@ -402,7 +406,13 @@ async fn upstreams(
         // site takes it and the other four do not: `BalanceError::Tls` is the one
         // error reaching `main` that hides its reason a layer down.
         .map_err(|e| refusal(&e))?;
-    tracing::info!(host = %task_host, port = task_port, tls = task_tls.is_some(), "connected to task");
+    tracing::info!(
+        host = %task_host,
+        port = task_port,
+        tls = task_tls.is_some(),
+        request_timeout_secs = task_timeout.as_secs(),
+        "connected to task"
+    );
 
     // The upstream for BOTH halves of the credential lifecycle: POST /auth/login
     // and POST /auth/enrol issue a token through this channel (D75, D73), and
@@ -449,7 +459,8 @@ async fn upstreams(
     let iam_port: u16 = env_required("IAM_PORT")?
         .parse()
         .map_err(|e| format!("IAM_PORT is not a port number: {e}"))?;
-    let iam = upstream::connect_iam(&iam_host, iam_port, iam_tls)
+    let iam_timeout = upstream::request_timeout(upstream::IAM, |n| std::env::var(n).ok())?;
+    let iam = upstream::connect_iam(&iam_host, iam_port, iam_tls, iam_timeout)
         .await
         // `refusal`, for the reason `connect_task` above gives.
         .map_err(|e| refusal(&e))?;
@@ -457,6 +468,7 @@ async fn upstreams(
         host = %iam_host,
         port = iam_port,
         tls = iam_tls.is_some(),
+        request_timeout_secs = iam_timeout.as_secs(),
         "iam channel ready (connects on first use)"
     );
     // THE REGISTRY'S LOGIC TIER (ledger 881), lazy for the reason the two above
@@ -468,13 +480,16 @@ async fn upstreams(
     let project_port: u16 = env_required("PROJECT_PORT")?
         .parse()
         .map_err(|e| format!("PROJECT_PORT is not a port number: {e}"))?;
-    let project = upstream::connect_project(&project_host, project_port, project_tls)
-        .await
-        .map_err(|e| refusal(&e))?;
+    let project_timeout = upstream::request_timeout(upstream::PROJECT, |n| std::env::var(n).ok())?;
+    let project =
+        upstream::connect_project(&project_host, project_port, project_tls, project_timeout)
+            .await
+            .map_err(|e| refusal(&e))?;
     tracing::info!(
         host = %project_host,
         port = project_port,
         tls = project_tls.is_some(),
+        request_timeout_secs = project_timeout.as_secs(),
         "project channel ready (connects on first use)"
     );
     Ok((task, iam, project))

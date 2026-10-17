@@ -1,5 +1,37 @@
 # Migration notes
 
+## Each upstream's request timeout is a chart value (ADR-0925 Q-C1, ledger 1490)
+
+**The binary now requires `TASK_REQUEST_TIMEOUT_SECONDS`,
+`IAM_REQUEST_TIMEOUT_SECONDS` and `PROJECT_REQUEST_TIMEOUT_SECONDS`.** Each is
+the per-request bound `yadgar-dial` v0.2.20 applies on that hop. There is no
+compiled-in default (ADR-0569): an absent, non-numeric or out-of-range value
+(outside `14..=59`) refuses boot, naming the variable and the chart key.
+
+- The chart renders all three from `task.requestTimeoutSeconds` (default
+  `16`, schema `14..=18`), `iam.requestTimeoutSeconds` and
+  `project.requestTimeoutSeconds` (default `30`, schema `14..=59`). A values
+  source that sets nothing gets the defaults. No adopter values change is
+  needed.
+- **Behaviour change on `task`:** the bound drops from dial's compiled-in 30 s
+  to 16 s. A `task` call that has not started its answer after 16 s now fails
+  where it used to wait up to 30 s.
+- **Chart and image move together.** This image under the OLD chart exits at
+  boot on the missing `TASK_REQUEST_TIMEOUT_SECONDS`. Land the chart with or
+  before the image.
+- **Deadline inversion one hop down (ledger 1522).** Gateway → task is now
+  16 s (max 18). Task → task-db stays at 30 s, and task-db's
+  `acquireTimeoutSeconds` defaults to 25 (max 29). A call that waits 16–25 s
+  for a task-db pool connection now fails at the gateway with a generic
+  deadline error, not task-db's pool error. A Create, Edit or Transition that
+  is mid-flight when the gateway gives up can still commit. Each inbound
+  request gets a new idempotency key, so a client retry can create a
+  duplicate. The task call has no gateway-side tokio deadline either (ledger
+  1534).
+- `yadgar_call_duration_seconds` now exports as a histogram, not a summary
+  (`yadgar-telemetry` v0.2.0, ADR-0925 Q-C2). Its `quantile` series are
+  replaced by `_bucket{le}`; no rule or dashboard read them.
+
 ## The cache hop's TLS switch is now required (B-V3, ADR-0852, ADR-0845)
 
 **Breaking: `valkey.tls.enabled` must be set to `true` or `false` explicitly.**

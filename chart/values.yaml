@@ -22,6 +22,27 @@ task:
   host: task
   port: 50052
 
+  # THE PER-REQUEST BOUND ON THIS HOP, in seconds (ADR-0925 Q-C1), rendered as
+  # TASK_REQUEST_TIMEOUT_SECONDS. It caps how long one call may wait for a
+  # `task` that is connected and never replies. The binary has no default
+  # (ADR-0569) and refuses a value outside yadgar-dial's 14..=59.
+  #
+  # 16, CAPPED AT 18 IN THE SCHEMA — BELOW THE CRATE'S 59, deliberately. A
+  # `task` call (src/tools.rs) has NO tokio timeout around it, so this bound is
+  # the gateway's only limit on the wait. The yadgar client gives up on a round
+  # trip at 30 s (yadgarhq/yadgar src/proxy.rs:68, ADR-0925 Q-C4). A
+  # tools/call first attests on a cache miss (RESOLVE_DEADLINE 5 s), then dials
+  # task: connect 2 s + TLS handshake 2 s (dial CONNECT_TIMEOUT), which run
+  # BEFORE this bound starts. Ledger 1284 / ADR-0928 keep the sum strictly
+  # below the client's: 5 + 4 + 18 + 2 s margin = 29 < 30. AUTH_DEADLINE is not
+  # on this path; login and admin never call task.
+  # src/http/tests/request_deadlines.rs pins that sum against the schema max.
+  #
+  # WHY 16 AND NOT 15 (ledger 1522 plan): dial's floor is 14 s, so a chain that
+  # shrinks inward under the gateway needs gateway->task 16 > task->task-db 14
+  # > task-db pool acquire 12. 15 would leave the inner hops no room.
+  requestTimeoutSeconds: 16
+
   # The TRANSPORT to that service. Everything behind the TLS edge is cleartext
   # today, so every task body and every tool argument crosses the pod network in
   # the open; this is the seam that closes it, one hop at a time.
@@ -106,6 +127,16 @@ iam:
   host: iam
   port: 50052
 
+  # THE PER-REQUEST BOUND ON THIS HOP, in seconds (ADR-0925 Q-C1), rendered as
+  # IAM_REQUEST_TIMEOUT_SECONDS. No binary default (ADR-0569); 14..=59.
+  #
+  # 30, THE CRATE'S WHOLE RANGE. Every call on this channel already sits inside
+  # a shorter tokio timeout: AUTH_DEADLINE 10 s on /auth/login, /auth/enrol and
+  # the admin paths (src/http/auth.rs, src/http/admin.rs), RESOLVE_DEADLINE 5 s
+  # on attestation (src/attest/resolve.rs). This bound is never the limiting
+  # wait on a client request, so it does not enter the ledger 1284 ordering.
+  requestTimeoutSeconds: 30
+
   # The TRANSPORT to that service, and the hop with the most to lose: the bearer
   # token itself goes down it, on `/auth/login`, on `/auth/enrol` and on every
   # attested `tools/call`. On a flat pod network anyone on the network reads it.
@@ -167,6 +198,17 @@ project:
   # `iam.port` above are the same 50052, and both of those hops work;
   # `tests/chart_upstream_ports.rs` asserts the rule over all three.
   port: 50052
+
+  # THE PER-REQUEST BOUND ON THIS HOP, in seconds (ADR-0925 Q-C1), rendered as
+  # PROJECT_REQUEST_TIMEOUT_SECONDS. No binary default (ADR-0569); 14..=59.
+  #
+  # 30, THE CRATE'S WHOLE RANGE, for iam's reason. Both calls on this channel
+  # sit inside a shorter tokio timeout: the registry load (PAGE_DEADLINE 5 s,
+  # src/project/registry.rs) and the refusal path's ResolveProject
+  # (FALLBACK_DEADLINE 3 s, src/project/remediate.rs) — the one project call on
+  # a client's path. This bound is never the limiting wait, so it does not
+  # enter the ledger 1284 ordering.
+  requestTimeoutSeconds: 30
 
   # The TRANSPORT to that service. Same shape as `task.tls` and `iam.tls`, and
   # configured independently of both so the three can be cut over one at a time.
