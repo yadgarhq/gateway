@@ -62,6 +62,39 @@ pub async fn attest(
     Ok(attested)
 }
 
+/// Attest a caller to an ADMINISTRATIVE route, which is not project-scoped
+/// (ledger 1545, Max's ruling).
+///
+/// **NO WORKSPACE IS REQUIRED, NO WORKSPACE IS CHECKED, AND NONE IS CARRIED.**
+/// `/admin` acts on users and credentials, which belong to no project, and the
+/// bootstrap path has never named one. The scope this returns has an EMPTY
+/// `project_id`, whatever the request carried: a header sent anyway is ignored
+/// rather than believed, so a claimed workspace cannot reach an administrative
+/// scope. [`crate::project::Validator::check`] is NOT called, so an
+/// administrative request leaves no entry in
+/// `yadgar_gateway_project_refusal_total` — that counter measures what
+/// enforcement would break for project-scoped calls, and an admin call that
+/// named no project is not one of them.
+///
+/// **EVERYTHING ELSE [`attest`] DOES STILL RUNS**: the credential is resolved
+/// through `iam`, a dead one is refused, and `is_admin` is returned for the
+/// caller to enforce. Only the workspace half is dropped. Task and MCP routes
+/// keep calling [`attest`].
+pub async fn attest_admin(
+    how: &Attestation,
+    iam: &Channel,
+    cache: &Credentials,
+    credential: Option<&str>,
+    claimed: Claimed<'_>,
+    request_id: String,
+) -> Result<Attested, AttestError> {
+    let claimed = Claimed {
+        project_id: Some(""),
+        ..claimed
+    };
+    attested(how, iam, cache, credential, claimed, request_id).await
+}
+
 /// The identity half, unchanged: everything [`attest`] did before the workspace
 /// was checked against anything.
 ///

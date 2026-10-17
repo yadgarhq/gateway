@@ -44,6 +44,12 @@ pub const TRANSITION_TASK: &str = "transition_task";
 /// names yields a module string, a JSON schema, or a dispatch — but each gates
 /// on membership here first, so a name outside this array reaches none of them.
 /// **Adding a tool anywhere is adding it HERE.**
+///
+/// **CO-CHANGE (ledger 1550): the client's rules ship in the binary and name
+/// these tools.** `yadgarhq/yadgar` `src/install/rules.rs` and
+/// `assets/rules.md` list the served tool names. Adding, removing or renaming a
+/// member here changes what those rules must say — change them in the same
+/// release, or a rename recreates ledger 1543.
 pub const SERVED: [&str; 5] = [
     CREATE_TASK,
     READ_TASK,

@@ -385,9 +385,8 @@ async fn post(
 fn as_admin() -> Vec<(&'static str, &'static str)> {
     vec![
         ("authorization", "Bearer a-real-token"),
-        // REQUIRED, exactly as on `tools/call`: `Attested` carries a `Scope` and
-        // a `Scope` names a workspace, which the gateway does not have to supply
-        // and must not invent.
+        // SENT BY MANY CLIENTS AND NOT REQUIRED: `/admin` is not project-scoped
+        // (ledger 1545), so the header is ignored here. Tests below send none.
         ("x-yadgar-project", "acme/demo"),
     ]
 }
@@ -455,6 +454,53 @@ async fn a_resolved_non_administrator_is_refused_every_administrative_verb() {
              is not a refusal"
         );
     }
+}
+
+/// Headers of an administrator who names NO workspace (ledger 1545).
+fn as_admin_without_project() -> Vec<(&'static str, &'static str)> {
+    vec![("authorization", "Bearer a-real-token")]
+}
+
+/// **`/admin` IS NOT PROJECT-SCOPED (ledger 1545).** A bearer administrator
+/// with no `x-yadgar-project` is admitted, as the bootstrap path always was.
+/// The credential is still resolved through `iam`, so attestation is not skipped.
+#[tokio::test]
+async fn an_administrator_with_no_project_header_reaches_every_administrative_verb() {
+    for (path, body) in admin_verbs() {
+        let (state, _log) = gateway(resolved(true)).await;
+        let (status, answer) = post(state, path, &body, &as_admin_without_project()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path} must not demand a workspace; got {answer}"
+        );
+    }
+}
+
+/// Dropping the header must not drop the admin check: a resolved
+/// non-administrator with no project header is 403, before `iam` is written to.
+#[tokio::test]
+async fn a_non_administrator_with_no_project_header_is_still_403() {
+    for (path, body) in admin_verbs() {
+        let (state, log) = gateway(resolved(false)).await;
+        let (status, answer) = post(state, path, &body, &as_admin_without_project()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {answer}");
+        assert!(log.drain().is_empty(), "{path} must refuse before iam");
+    }
+}
+
+/// Dropping the header must not drop attestation: no credential is still 401.
+#[tokio::test]
+async fn no_credential_and_no_project_header_is_still_401() {
+    let (state, _log) = gateway(resolved(true)).await;
+    let (status, _) = post(
+        state,
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":false}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// A caller presenting no credential at all is 401, not 403.
