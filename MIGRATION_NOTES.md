@@ -19,6 +19,15 @@ compiled-in default (ADR-0569): an absent, non-numeric or out-of-range value
 - **Chart and image move together.** This image under the OLD chart exits at
   boot on the missing `TASK_REQUEST_TIMEOUT_SECONDS`. Land the chart with or
   before the image.
+- **Deadline inversion one hop down (ledger 1522).** Gateway → task is now
+  15 s (max 18). Task → task-db stays at 30 s, and task-db's
+  `acquireTimeoutSeconds` defaults to 25 (max 29). A call that waits 15–25 s
+  for a task-db pool connection now fails at the gateway with a generic
+  deadline error, not task-db's pool error. A Create, Edit or Transition that
+  is mid-flight when the gateway gives up can still commit. Each inbound
+  request gets a new idempotency key, so a client retry can create a
+  duplicate. The task call has no gateway-side tokio deadline either (ledger
+  1534).
 - `yadgar_call_duration_seconds` now exports as a histogram, not a summary
   (`yadgar-telemetry` v0.2.0, ADR-0925 Q-C2). Its `quantile` series are
   replaced by `_bucket{le}`; no rule or dashboard read them.

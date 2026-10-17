@@ -2,28 +2,42 @@
 //!
 //! The yadgar client bounds one gateway round trip at 30 s
 //! (`yadgarhq/yadgar` `src/proxy.rs:68`, `REQUEST_TIMEOUT`, ADR-0925 Q-C4).
-//! On a `tools/call` the gateway can wait on `iam` (attestation, bounded by a
-//! `tokio::time::timeout` no longer than [`AUTH_DEADLINE`]) and then on `task`,
-//! whose call has NO `tokio::time::timeout` — the dial's per-request bound is
-//! the only limit there. If the sum reached the client's bound, the client
-//! would give up on an answer the gateway was still about to send, and see a
-//! transport error instead of the gateway's status.
 //!
-//! So the HIGHEST value the chart lets an operator set for
-//! `task.requestTimeoutSeconds` — the schema maximum, not the default — plus
-//! [`AUTH_DEADLINE`] plus a margin must fit inside the client's bound.
+//! THE PATH SUMMED IS A `tools/call`, the one route that reaches `task`:
+//!
+//! 1. attestation on a credential-cache miss, bounded by [`RESOLVE_DEADLINE`];
+//! 2. the task dial's connect bound and TLS handshake bound;
+//! 3. the task request bound — the chart's `task.requestTimeoutSeconds`. The
+//!    `task` call in `src/tools.rs` has NO `tokio::time::timeout`, so this is
+//!    the only limit on that wait.
+//!
+//! Steps 2 and 3 ADD rather than overlap: tonic 0.14.6's `GrpcTimeout` starts
+//! its timer in `call()`, after `Reconnect` has connected (and handshaken) in
+//! `poll_ready`. `AUTH_DEADLINE` is NOT on this path: login and admin never
+//! call `task`.
+//!
+//! If the sum reached the client's bound, the client would give up on an answer
+//! the gateway was still about to send. So the HIGHEST value the chart lets an
+//! operator set — the schema maximum, not the default — must keep the sum plus
+//! a margin STRICTLY below the client's bound (ADR-0928 states `<`).
 
 use std::time::Duration;
 
-use super::super::AUTH_DEADLINE;
+use crate::attest::RESOLVE_DEADLINE;
 
 /// The yadgar client's per-round-trip bound. Restated, not imported: it lives
 /// in another repository (`yadgarhq/yadgar` `src/proxy.rs:68`). A change there
 /// must be mirrored here, and this test then says whether the chart still fits.
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30); // ADR-0569-EXCEPTION(CC): mirrors yadgarhq/yadgar src/proxy.rs:68, a test oracle, not a knob.
 
-/// Headroom for the hops the sum does not count: TLS, the ingress, the
-/// client's own scheduling.
+/// `yadgar-dial`'s connect bound plus its TLS handshake bound: 2 s each, one
+/// constant (`CONNECT_TIMEOUT`, dial v0.2.20 `src/lib.rs:304`, shared with the
+/// handshake bound in `TlsOptions::prepare`). Restated because v0.2.20 does
+/// not export it.
+const DIAL_CONNECT_AND_HANDSHAKE: Duration = Duration::from_secs(2 + 2); // ADR-0569-EXCEPTION(CC): mirrors dial v0.2.20 src/lib.rs:304 CONNECT_TIMEOUT x2, a test oracle, not a knob.
+
+/// Headroom for what the sum does not count: the ingress hop, the gateway's
+/// own work around the calls, the client's scheduling.
 const MARGIN: Duration = Duration::from_secs(2); // ADR-0569-EXCEPTION(CC): ledger 1284 ordering margin, a test oracle, not a knob.
 
 fn schema_value(pointer: &str) -> u64 {
@@ -37,13 +51,16 @@ fn schema_value(pointer: &str) -> u64 {
 }
 
 #[test]
-fn the_client_outlasts_the_longest_task_bound_plus_auth_deadline() {
+fn the_client_outlasts_the_longest_tools_call_path() {
     let task_max = Duration::from_secs(schema_value(
         "/properties/task/properties/requestTimeoutSeconds/maximum",
     ));
+    let path = RESOLVE_DEADLINE + DIAL_CONNECT_AND_HANDSHAKE + task_max + MARGIN;
     assert!(
-        task_max + AUTH_DEADLINE + MARGIN <= CLIENT_REQUEST_TIMEOUT,
-        "task.requestTimeoutSeconds maximum {task_max:?} + AUTH_DEADLINE {AUTH_DEADLINE:?} + \
-         margin {MARGIN:?} must fit inside the client's {CLIENT_REQUEST_TIMEOUT:?} (ledger 1284)"
+        path < CLIENT_REQUEST_TIMEOUT,
+        "RESOLVE_DEADLINE {RESOLVE_DEADLINE:?} + dial connect+handshake \
+         {DIAL_CONNECT_AND_HANDSHAKE:?} + task.requestTimeoutSeconds maximum {task_max:?} + \
+         margin {MARGIN:?} = {path:?} must stay below the client's {CLIENT_REQUEST_TIMEOUT:?} \
+         (ledger 1284, ADR-0928)"
     );
 }

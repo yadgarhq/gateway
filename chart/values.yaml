@@ -30,10 +30,12 @@ task:
   # 15, CAPPED AT 18 IN THE SCHEMA — BELOW THE CRATE'S 59, deliberately. A
   # `task` call (src/tools.rs) has NO tokio timeout around it, so this bound is
   # the gateway's only limit on the wait. The yadgar client gives up on a round
-  # trip at 30 s (yadgarhq/yadgar src/proxy.rs:68, ADR-0925 Q-C4), and before
-  # the task call a tools/call can wait on iam (RESOLVE_DEADLINE 5 s; any iam
-  # call is at most AUTH_DEADLINE 10 s). Ledger 1284 keeps the client's bound
-  # above the gateway's: 18 + 10 + 2 s margin = 30. The default 15 leaves 5 s.
+  # trip at 30 s (yadgarhq/yadgar src/proxy.rs:68, ADR-0925 Q-C4). A
+  # tools/call first attests on a cache miss (RESOLVE_DEADLINE 5 s), then dials
+  # task: connect 2 s + TLS handshake 2 s (dial CONNECT_TIMEOUT), which run
+  # BEFORE this bound starts. Ledger 1284 / ADR-0928 keep the sum strictly
+  # below the client's: 5 + 4 + 18 + 2 s margin = 29 < 30. AUTH_DEADLINE is not
+  # on this path; login and admin never call task.
   # src/http/tests/request_deadlines.rs pins that sum against the schema max.
   requestTimeoutSeconds: 15
 

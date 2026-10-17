@@ -104,7 +104,7 @@ const TRUST_HEADERS: &str = "YADGAR_TRUST_UNAUTHENTICATED_HEADERS";
 /// latency-critical path. A stalled `iam` must cost one bounded wait rather than
 /// hold every request in the system open, so this is sized for a lookup that is
 /// slow rather than for one that is expensive.
-const RESOLVE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): sized against a lookup that is slow rather than expensive, not a tuning knob.
+pub(crate) const RESOLVE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): sized against a lookup that is slow rather than expensive, not a tuning knob.
 
 /// Why a request has no attested identity.
 ///

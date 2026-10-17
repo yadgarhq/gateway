@@ -6,8 +6,9 @@ carries an explicit default (ADR-0705) and a schema range, so a bad value is
 refused at render rather than as a crash-looping pod.
 
 `task` is capped at 18, not at `yadgar_dial`'s 59: the 1284 ordering keeps the
-client's 30 s above the gateway's own waits (task dial bound + AUTH_DEADLINE
-10 s + 2 s margin). `iam` and `project` use the crate's whole range, because
+client's 30 s strictly above the gateway's longest tools/call path
+(RESOLVE_DEADLINE 5 s + dial connect and handshake 4 s + task bound + 2 s
+margin; pinned in `src/http/tests/request_deadlines.rs`). `iam` and `project` use the crate's whole range, because
 every call on those channels is already bounded by a shorter
 `tokio::time::timeout`. See `chart/values.yaml`.
 
