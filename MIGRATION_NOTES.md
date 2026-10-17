@@ -9,19 +9,19 @@ compiled-in default (ADR-0569): an absent, non-numeric or out-of-range value
 (outside `14..=59`) refuses boot, naming the variable and the chart key.
 
 - The chart renders all three from `task.requestTimeoutSeconds` (default
-  `15`, schema `14..=18`), `iam.requestTimeoutSeconds` and
+  `16`, schema `14..=18`), `iam.requestTimeoutSeconds` and
   `project.requestTimeoutSeconds` (default `30`, schema `14..=59`). A values
   source that sets nothing gets the defaults. No adopter values change is
   needed.
 - **Behaviour change on `task`:** the bound drops from dial's compiled-in 30 s
-  to 15 s. A `task` call that has not started its answer after 15 s now fails
+  to 16 s. A `task` call that has not started its answer after 16 s now fails
   where it used to wait up to 30 s.
 - **Chart and image move together.** This image under the OLD chart exits at
   boot on the missing `TASK_REQUEST_TIMEOUT_SECONDS`. Land the chart with or
   before the image.
 - **Deadline inversion one hop down (ledger 1522).** Gateway → task is now
-  15 s (max 18). Task → task-db stays at 30 s, and task-db's
-  `acquireTimeoutSeconds` defaults to 25 (max 29). A call that waits 15–25 s
+  16 s (max 18). Task → task-db stays at 30 s, and task-db's
+  `acquireTimeoutSeconds` defaults to 25 (max 29). A call that waits 16–25 s
   for a task-db pool connection now fails at the gateway with a generic
   deadline error, not task-db's pool error. A Create, Edit or Transition that
   is mid-flight when the gateway gives up can still commit. Each inbound

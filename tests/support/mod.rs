@@ -115,7 +115,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("IAM_TLS_ENABLED", "0"),
         ("PROJECT_TLS_ENABLED", "0"),
         ("VALKEY_TLS_ENABLED", "0"),
-        ("TASK_REQUEST_TIMEOUT_SECONDS", "15"),
+        ("TASK_REQUEST_TIMEOUT_SECONDS", "16"),
         ("IAM_REQUEST_TIMEOUT_SECONDS", "30"),
         ("PROJECT_REQUEST_TIMEOUT_SECONDS", "30"),
     ]

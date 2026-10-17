@@ -27,7 +27,7 @@ task:
   # `task` that is connected and never replies. The binary has no default
   # (ADR-0569) and refuses a value outside yadgar-dial's 14..=59.
   #
-  # 15, CAPPED AT 18 IN THE SCHEMA — BELOW THE CRATE'S 59, deliberately. A
+  # 16, CAPPED AT 18 IN THE SCHEMA — BELOW THE CRATE'S 59, deliberately. A
   # `task` call (src/tools.rs) has NO tokio timeout around it, so this bound is
   # the gateway's only limit on the wait. The yadgar client gives up on a round
   # trip at 30 s (yadgarhq/yadgar src/proxy.rs:68, ADR-0925 Q-C4). A
@@ -37,7 +37,11 @@ task:
   # below the client's: 5 + 4 + 18 + 2 s margin = 29 < 30. AUTH_DEADLINE is not
   # on this path; login and admin never call task.
   # src/http/tests/request_deadlines.rs pins that sum against the schema max.
-  requestTimeoutSeconds: 15
+  #
+  # WHY 16 AND NOT 15 (ledger 1522 plan): dial's floor is 14 s, so a chain that
+  # shrinks inward under the gateway needs gateway->task 16 > task->task-db 14
+  # > task-db pool acquire 12. 15 would leave the inner hops no room.
+  requestTimeoutSeconds: 16
 
   # The TRANSPORT to that service. Everything behind the TLS edge is cleartext
   # today, so every task body and every tool argument crosses the pod network in

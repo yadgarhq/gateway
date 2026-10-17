@@ -31,7 +31,7 @@ from test_adr_0845_tls_required import (
 from test_render_checks import CHART, CHART_NAME, helm
 
 # (upstream, chart default, schema maximum)
-UPSTREAMS = (("task", 15, 18), ("iam", 30, 59), ("project", 30, 59))
+UPSTREAMS = (("task", 16, 18), ("iam", 30, 59), ("project", 30, 59))
 
 # `yadgar_dial::min_request_timeout()`; `tests/chart_request_timeout.rs` pins
 # the schema to the crate's own value.
