@@ -299,6 +299,8 @@ pub(super) async fn admin_issue_enrolment(
     let rendered = json!({
         "token": resp.token,
         "enrolment_id": resp.enrolment_id,
+        // AS APPLIED — see `revoke_instruction` for why it is echoed.
+        "revoke_existing_credentials": revoke,
     })
     .to_string();
     call.finish(Outcome {
@@ -439,6 +441,11 @@ pub(super) async fn admin_set_user_admin(
 /// This instruction only ever withdraws credentials, only an attested
 /// administrator may set it ([`bootstrap_revoke_refusal`]), and its absence is
 /// the reset path exactly as it was.
+///
+/// THE 200 ECHOES THE VALUE AS APPLIED (ledger 1579). An unknown JSON key is
+/// ignored, so a misspelt field is a 200 and a plain reset with every old token
+/// still working; the echo is how a client that asked for a revoke learns it
+/// did not get one.
 fn revoke_instruction(req: &Value) -> Option<bool> {
     match req.get("revoke_existing_credentials") {
         None => Some(false),
