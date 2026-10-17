@@ -88,11 +88,10 @@ pub(super) async fn authorise(
         Ok(None) => {}
     }
 
-    let attested = match attest::attest(
+    let attested = match attest::attest_admin(
         &state.attestation,
         &state.iam,
         &state.credentials,
-        &state.projects,
         header(headers, axum::http::header::AUTHORIZATION.as_str()),
         Claimed {
             // NOT PASSED, exactly as on `tools_call`: a self-asserted username is
@@ -101,14 +100,10 @@ pub(super) async fn authorise(
             // `TrustedHeaders` `is_admin` is false — so the header buys no
             // authority there either.
             user_id: header(headers, "x-yadgar-user"),
-            // REQUIRED HERE FOR THE SAME REASON IT IS ON `tools/call`, and NOT
-            // invented. `Attested` carries a `Scope`, `Scope` carries a
-            // workspace, and the gateway does not have one to supply — a
-            // placeholder would write a workspace nobody named into the type
-            // ADR-0511 keeps to what this gateway mints. An absent header is
-            // `MissingWorkspace`, which `attest_answer` renders as a 400 naming
-            // the header rather than as a credential failure.
-            project_id: header(headers, "x-yadgar-project"),
+            // NOT PASSED, and NOT REQUIRED (ledger 1545): `/admin` is not
+            // project-scoped, so `attest_admin` ignores any workspace header and
+            // mints a scope with none. The bootstrap path never needed one.
+            project_id: None,
             instance_id: header(headers, "x-yadgar-instance"),
         },
         request_id,
