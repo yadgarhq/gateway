@@ -807,6 +807,10 @@ async fn an_attested_administrator_demands_nothing_on_the_wire() {
         "an absent `revoke_existing_credentials` must arrive false, or every recovery signs the \
          person out everywhere (ADR-0943)"
     );
+    assert_eq!(
+        answer["revoke_existing_credentials"], false,
+        "the 200 echoes the instruction AS APPLIED, so an absent one reads back false"
+    );
 }
 
 /// ADR-0943: an ATTESTED administrator may ask a re-enrolment to revoke every
@@ -837,6 +841,33 @@ async fn an_attested_administrator_can_ask_to_revoke_existing_credentials() {
         Some(false),
         "the instruction changes nothing about the demand"
     );
+    assert_eq!(
+        answer["revoke_existing_credentials"], true,
+        "the 200 echoes the instruction AS APPLIED (ledger 1579)"
+    );
+}
+
+/// LEDGER 1579: THE TYPO FALSE GREEN, and the echo is what exposes it. Unknown
+/// JSON keys are ignored, so a client that misspells the field gets a 200 and a
+/// plain reset — the old tokens keep working and nothing said so. The 200 now
+/// states what was applied, so a client that asked for a revoke can see it did
+/// not get one.
+#[tokio::test]
+async fn a_misspelt_revoke_instruction_reads_back_as_not_applied() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, answer) = post(
+        state,
+        "/admin/issue-enrolment",
+        &format!(r#"{{"user_id":"{OTHER_ID}","revoke_existing_credential":true}}"#),
+        &as_admin(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {answer}");
+    assert_eq!(log.drain()[0].revokes_existing_credentials, Some(false));
+    assert_eq!(
+        answer["revoke_existing_credentials"], false,
+        "a misspelt key is not the instruction, and the answer must say none was applied"
+    );
 }
 
 /// ADR-0943: THE BOOTSTRAP PATH NEVER CARRIES THE REVOKE INSTRUCTION. Refused
@@ -866,21 +897,32 @@ async fn the_bootstrap_path_refuses_the_revoke_instruction() {
 /// A `revoke_existing_credentials` that is not a JSON boolean is a 400, before
 /// any authorisation and before `iam`: `"true"` or `1` is not an instruction to
 /// sign somebody out everywhere, and guessing what was meant is not a kindness.
+///
+/// THREE SHAPES, ONE RULE (ledger 1579): a string, a number and `null`. `1` is
+/// the truthy reading a lenient parser would take, and `null` the one a client
+/// serialising an unset optional would send; neither is a boolean, so neither
+/// is guessed at.
 #[tokio::test]
 async fn a_non_boolean_revoke_instruction_is_refused() {
-    let (state, log) = gateway(resolved(true)).await;
-    let (status, answer) = post(
-        state,
-        "/admin/issue-enrolment",
-        &format!(r#"{{"user_id":"{OTHER_ID}","revoke_existing_credentials":"true"}}"#),
-        &as_admin(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "got {answer}");
-    assert!(
-        log.drain().is_empty(),
-        "a malformed request must not reach iam"
-    );
+    for value in [r#""true""#, "1", "null"] {
+        let (state, log) = gateway(resolved(true)).await;
+        let (status, answer) = post(
+            state,
+            "/admin/issue-enrolment",
+            &format!(r#"{{"user_id":"{OTHER_ID}","revoke_existing_credentials":{value}}}"#),
+            &as_admin(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{value} must be refused; got {answer}"
+        );
+        assert!(
+            log.drain().is_empty(),
+            "a malformed request ({value}) must not reach iam"
+        );
+    }
 }
 
 /// An upstream `PERMISSION_DENIED` on enrolment renders as ONE 403 with ONE

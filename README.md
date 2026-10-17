@@ -224,11 +224,11 @@ ADR-0492's administrative surface (D73, ledger 638). **These are never MCP
 tools**: no name of theirs is in `tools::SERVED`, so `tools/call` cannot dispatch
 to one and `tools/list` cannot advertise one.
 
-| path                     | body                                                          | answers                               |
-| ------------------------ | ------------------------------------------------------------- | ------------------------------------- |
-| `/admin/create-user`     | `external_id`, `display_name`, optional `is_admin`            | `{"user_id": ...}`                    |
-| `/admin/issue-enrolment` | `user_id`, optional `revoke_existing_credentials` (a boolean) | `{"token": ..., "enrolment_id": ...}` |
-| `/admin/set-user-admin`  | `user_id`, `is_admin` (a required boolean)                    | `{"user_id": ..., "is_admin": ...}`   |
+| path                     | body                                                          | answers                                                                                  |
+| ------------------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `/admin/create-user`     | `external_id`, `display_name`, optional `is_admin`            | `{"user_id": ...}`                                                                       |
+| `/admin/issue-enrolment` | `user_id`, optional `revoke_existing_credentials` (a boolean) | `{"token": ..., "enrolment_id": ..., "revoke_existing_credentials": <bool, as applied>}` |
+| `/admin/set-user-admin`  | `user_id`, `is_admin` (a required boolean)                    | `{"user_id": ..., "is_admin": ...}`                                                      |
 
 The `user_id` `/admin/create-user` returns is the one the other two take.
 
@@ -256,6 +256,9 @@ attested administrator may set it; the bootstrap path answers
 `iam` is called. `iam` publishes the cache eviction on redemption, so a revoked
 token stops resolving at once; a missed publish leaves it resolving from a
 replica's cache for at most `YADGAR_CREDENTIAL_TTL_SECONDS`.
+The `200` echoes `revoke_existing_credentials` as applied. Unknown JSON keys are
+ignored, so a misspelt field is a plain reset; a client that asked for a revoke
+must check the echo.
 
 **An absent or empty bootstrap Secret DISABLES the bootstrap path**, answering
 `503 {"error":"the bootstrap token is not configured"}` — never a comparison
