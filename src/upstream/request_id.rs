@@ -30,9 +30,15 @@ pub type Carrying = InterceptedService<Channel, Stamp>;
 
 /// Build a client over `channel` with `request_id` on every request it sends.
 ///
-/// `request_id` is the id ALREADY ON this call's `CallRecord` — never a fresh
-/// mint. A second id here would be a well-formed UUIDv7 that joins to nothing,
-/// which breaks D67 exactly as badly as sending none and looks fine doing it.
+/// A call that has an inbound `CallRecord` passes the id ALREADY ON that record —
+/// never a fresh mint. A second id here would be a well-formed UUIDv7 that joins
+/// to nothing, which breaks D67 exactly as badly as sending none and looks fine
+/// doing it.
+///
+/// A background call with no inbound request, such as the registry poll, has no
+/// record to inherit from. It mints its own id with [`crate::request_id`], once
+/// per logical operation: every page of one load shares that id, and the next
+/// load mints another.
 pub fn carrying(channel: Channel, request_id: &str) -> Carrying {
     InterceptedService::new(channel, Stamp::new(request_id))
 }
