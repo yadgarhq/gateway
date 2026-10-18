@@ -34,7 +34,7 @@
 //! empty and every attested user is admitted, unless a private row's alias is
 //! spelled beneath it — and then the org claim would reach that private row.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use super::classify::{is_private_class, Registered};
 use super::{Access, Reason};
@@ -103,9 +103,12 @@ fn is_member(registered: &impl Registered, landed: &Landed<'_>, user_id: &str) -
 /// **SORTED SO "BENEATH" IS ONE RANGE.** Every path strictly beneath `p` starts
 /// with `p/`, and in a sorted map those keys are contiguous — so a lookup is a
 /// range scan, not a walk of the whole set on every call.
+///
+/// **A SET OF `(path, owner)` PAIRS, NOT A MAP FROM PATH.** Two spellings may
+/// fold to one path, and each keeps its owner here.
 #[derive(Debug, Default)]
 pub struct PrivateIndex {
-    by_path: BTreeMap<String, String>,
+    by_path: BTreeSet<(String, String)>,
 }
 
 impl PrivateIndex {
@@ -128,10 +131,13 @@ impl PrivateIndex {
     /// **THE RANGE STARTS AT `path/`, WITH THE SLASH.** `-` and `.` sort before
     /// `/`, so a range on the bare prefix would admit `local/a/notes-x` as
     /// beneath `local/a/notes` — a sibling, which no call into `notes` reaches.
+    ///
+    /// A trailing slash on `path` is dropped first: ranging on `p//` would
+    /// find nothing, and "nothing beneath" is a pass.
     pub fn beneath(&self, path: &str) -> Vec<&str> {
-        let prefix = format!("{}/", path.to_ascii_lowercase());
+        let prefix = format!("{}/", path.trim_end_matches('/').to_ascii_lowercase());
         self.by_path
-            .range(prefix.clone()..)
+            .range((prefix.clone(), String::new())..)
             .take_while(|(key, _)| key.starts_with(&prefix))
             .map(|(_, owner)| owner.as_str())
             .collect()

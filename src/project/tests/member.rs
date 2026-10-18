@@ -666,3 +666,169 @@ fn malformed_folded_and_prefix_claims_never_admit_a_non_owner() {
         answer.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Security review 2: the loaded set and the private-owner index stay one state.
+// ---------------------------------------------------------------------------
+
+/// HOLE 3: two spellings that FOLD TO ONE KEY kept only the last row's owner,
+/// in the path map and in the index alike. A foreign owner beneath a caller's
+/// row could be dropped by an alias collision, and the subtree rule then
+/// passed. Every owner of every spelling must stay in the index, whatever
+/// order the rows arrive in.
+#[test]
+fn a_folded_collision_beneath_a_row_keeps_every_owner_in_the_index() {
+    let rows = vec![
+        wire_aliased("local/alice/notes", "alice", &[]),
+        wire_aliased("local/alice/notes/deep", "mallory", &[]),
+        wire_aliased("local/alice/other", "alice", &["LOCAL/alice/notes/deep"]),
+    ];
+    for order in [rows.clone(), rows.into_iter().rev().collect()] {
+        let (answer, _) = as_user(
+            Registry::loaded_from(order),
+            Mode::Enforcing,
+            Access::Read,
+            "alice",
+            "local/alice/notes",
+        );
+        assert_eq!(
+            answer.expect_err("mallory's row is beneath").reason.token(),
+            "PROJECT_NOT_MEMBER"
+        );
+    }
+}
+
+/// HOLE 4: when two rows of DIFFERENT owners fold to the claimed key, the
+/// last one loaded won, so whoever owned it was admitted to the other's row.
+/// An ambiguous owner is nobody's.
+#[test]
+fn a_claim_whose_spelling_two_owners_share_admits_nobody() {
+    let rows = vec![
+        wire_aliased("local/alice/p", "alice", &[]),
+        wire_aliased("local/bob/q", "bob", &["Local/Alice/P"]),
+    ];
+    for order in [rows.clone(), rows.into_iter().rev().collect::<Vec<_>>()] {
+        for user in ["alice", "bob"] {
+            let (answer, _) = as_user(
+                Registry::loaded_from(order.clone()),
+                Mode::Enforcing,
+                Access::Write,
+                user,
+                "local/alice/p",
+            );
+            assert_eq!(
+                answer.expect_err(user).reason.token(),
+                "PROJECT_NOT_MEMBER",
+                "{user}"
+            );
+        }
+    }
+}
+
+/// HOLE 5: `private_owners_beneath` with a trailing slash ranged on `p//`
+/// and found nothing, which reads as "nobody beneath" — a pass. Not reachable
+/// through `classify` today (the grammar refuses a trailing slash), closed so
+/// no later caller can open it.
+#[test]
+fn the_index_ignores_a_trailing_slash_on_the_queried_path() {
+    let registry = members();
+    let loaded = registry.loaded().expect("loaded");
+    assert_eq!(
+        loaded.private_owners_beneath("local/alice/notes/"),
+        vec!["mallory"]
+    );
+}
+
+/// CHECKED: an ARCHIVED foreign row beneath still blocks — status is not
+/// filtered out of the index, so archiving a row never opens its subtree.
+#[test]
+fn an_archived_foreign_row_beneath_still_blocks() {
+    let registry = owned(&[
+        ("local/alice/notes", "alice", ACTIVE),
+        ("local/alice/notes/deep", "mallory", ARCHIVED),
+    ]);
+    let (answer, _) = as_user(
+        registry,
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert_eq!(
+        answer.expect_err("blocked").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
+}
+
+/// CHECKED: an EMPTY load refuses a private claim under enforcement, and
+/// counts it under counting. It never admits.
+#[test]
+fn an_empty_load_fails_closed_for_private_claims() {
+    let (answer, _) = as_user(
+        Registry::loaded_from(Vec::new()),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert_eq!(
+        answer.expect_err("nothing loaded").reason.token(),
+        "PROJECT_UNREGISTERED_PERSONAL"
+    );
+}
+
+/// CHECKED: a reload swaps the path map AND the index together. After a
+/// second load adds a foreign row beneath, the owner of the parent is refused
+/// and the new row resolves — neither half lags the other.
+#[test]
+fn a_reload_swaps_the_paths_and_the_index_as_one_state() {
+    let registry = Registry::never_loaded();
+    let recorder = DebuggingRecorder::new();
+    metrics::with_local_recorder(&recorder, || {
+        install(
+            &registry,
+            vec![wire_aliased("local/alice/notes", "alice", &[])],
+        );
+    });
+    let (answer, _) = as_user(
+        registry.clone(),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert!(answer.is_ok(), "{:?}", answer.err());
+
+    metrics::with_local_recorder(&recorder, || {
+        install(
+            &registry,
+            vec![
+                wire_aliased("local/alice/notes", "alice", &[]),
+                wire_aliased("local/alice/notes/deep", "mallory", &[]),
+            ],
+        );
+    });
+    let (answer, _) = as_user(
+        registry.clone(),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert_eq!(
+        answer.expect_err("refused").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
+    let (answer, snapshotter) = as_user(
+        registry,
+        Mode::Counting,
+        Access::Read,
+        "mallory",
+        "local/alice/notes/deep",
+    );
+    assert!(answer.is_ok());
+    assert_eq!(
+        the_one_series(&snapshotter),
+        (RESOLVED.to_string(), "exact".to_string())
+    );
+}

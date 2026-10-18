@@ -122,6 +122,29 @@ fn owner_of(row: &RegisteredPath) -> String {
     row.owner_user_id.clone()
 }
 
+/// Insert one spelling, resolving a folded collision toward REFUSAL.
+///
+/// The spelling and status keep the last row's, as before. The OWNER does
+/// not: two rows of different owners under one key make the key ambiguous,
+/// and an ambiguous owner is nobody's — admitting whichever row loaded last
+/// would hand one account the other's project. The class is private if
+/// either row is.
+fn merge(folded: &mut BTreeMap<String, Match>, key: String, m: Match) {
+    let merged = match folded.remove(&key) {
+        Some(prev) if prev.owner != m.owner => Match {
+            owner: String::new(),
+            private: prev.private || m.private,
+            ..m
+        },
+        Some(prev) => Match {
+            private: prev.private || m.private,
+            ..m
+        },
+        None => m,
+    };
+    folded.insert(key, merged);
+}
+
 /// Whether a wire status is ARCHIVED.
 ///
 /// **ONLY `PROJECT_STATUS_ARCHIVED` IS.** `UNSPECIFIED` is what a tier that
@@ -183,7 +206,18 @@ impl Loaded {
     }
 
     fn from_matches(matches: Vec<Match>) -> Self {
-        let folded: BTreeMap<String, Match> = matches
+        // THE INDEX IS BUILT FROM EVERY SPELLING, BEFORE THE FOLD BELOW
+        // DEDUPLICATES THEM. Two spellings that fold to one key are two owners,
+        // and the subtree rule must see both: a map that kept the last would
+        // drop a foreign owner beneath a caller's row by an accident of order.
+        let private = PrivateIndex::build(
+            matches
+                .iter()
+                .filter(|m| !m.path.eq_ignore_ascii_case("local"))
+                .map(|m| (m.path.as_str(), m.owner.as_str(), m.private)),
+        );
+        let mut folded: BTreeMap<String, Match> = BTreeMap::new();
+        for (key, m) in matches
             .into_iter()
             // THE BARE RESERVED SEGMENT IS DROPPED HERE TOO. The tier
             // already refuses to emit it, so this is the second half of a
@@ -194,12 +228,9 @@ impl Loaded {
             // redundant check is nothing beside what it prevents.
             .filter(|m| !m.path.eq_ignore_ascii_case("local"))
             .map(|m| (m.path.to_ascii_lowercase(), m))
-            .collect();
-        let private = PrivateIndex::build(
-            folded
-                .values()
-                .map(|m| (m.path.as_str(), m.owner.as_str(), m.private)),
-        );
+        {
+            merge(&mut folded, key, m);
+        }
         Self {
             folded,
             private,
