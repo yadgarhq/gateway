@@ -832,3 +832,133 @@ fn a_reload_swaps_the_paths_and_the_index_as_one_state() {
         (RESOLVED.to_string(), "exact".to_string())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review of #121 at 68d8f30: F1, F2, F4, F5.
+// ---------------------------------------------------------------------------
+
+/// Both load orders of `rows`.
+fn both_orders(rows: Vec<RegisteredPath>) -> [Vec<RegisteredPath>; 2] {
+    let reversed = rows.iter().cloned().rev().collect();
+    [rows, reversed]
+}
+
+/// F1, DIFFERENT-OWNER ARM: an org row and a private row's alias fold to one
+/// non-`local/` key. Whichever loads last, the merged key stays PRIVATE and
+/// ownerless, so nobody — the org's users or the private owner — is admitted.
+///
+/// MUTATION THIS CATCHES: drop `private: prev.private || m.private` from the
+/// different-owner arm of `merge` — with the org row last the key reads as an
+/// org row and admits everyone.
+#[test]
+fn an_org_row_colliding_with_an_owned_private_alias_admits_nobody_in_either_order() {
+    for order in both_orders(vec![
+        wire_aliased("acme/team", "", &[]),
+        wire_aliased("local/alice/p", "alice", &["acme/team"]),
+    ]) {
+        for user in ["bob", "alice"] {
+            let (answer, _) = as_user(
+                Registry::loaded_from(order.clone()),
+                Mode::Enforcing,
+                Access::Read,
+                user,
+                "acme/team",
+            );
+            assert_eq!(answer.expect_err(user).reason.token(), "PROJECT_NOT_MEMBER");
+        }
+    }
+}
+
+/// F1, SAME-OWNER ARM, and the LIVE shape: project v0.3.7 sends `""` for every
+/// owner, so an org row and a private row's alias collide with EQUAL owners.
+///
+/// MUTATION THIS CATCHES: drop `private: prev.private || m.private` from the
+/// same-owner arm — with the org row last the key reads as org and admits
+/// everyone.
+#[test]
+fn an_org_row_colliding_with_an_ownerless_private_alias_admits_nobody_in_either_order() {
+    for order in both_orders(vec![
+        wire_aliased("acme/team", "", &[]),
+        wire_aliased("local/alice/p", "", &["acme/team"]),
+    ]) {
+        let (answer, _) = as_user(
+            Registry::loaded_from(order),
+            Mode::Enforcing,
+            Access::Write,
+            "bob",
+            "acme/team",
+        );
+        assert_eq!(
+            answer.expect_err("bob").reason.token(),
+            "PROJECT_NOT_MEMBER"
+        );
+    }
+}
+
+/// F2: a collision of an ARCHIVED and an ACTIVE row resolves toward refusal in
+/// either order — a write is `PROJECT_ARCHIVED`, never served.
+#[test]
+fn a_collision_with_an_archived_row_refuses_writes_in_either_order() {
+    for order in both_orders(vec![
+        RegisteredPath {
+            owner_user_id: String::new(),
+            ..row("acme/x", ARCHIVED, &[])
+        },
+        wire_aliased("acme/y", "", &["acme/x"]),
+    ]) {
+        let (answer, _) = as_user(
+            Registry::loaded_from(order),
+            Mode::Enforcing,
+            Access::Write,
+            "bob",
+            "acme/x",
+        );
+        assert_eq!(
+            answer.expect_err("archived").reason.token(),
+            "PROJECT_ARCHIVED"
+        );
+    }
+}
+
+/// F4: the gauge counts EVERY spelling nobody can reach, not only private rows
+/// by path: an org row carrying a `local/` alias, and a key `merge` made
+/// ownerless.
+#[test]
+fn the_gauge_counts_org_rows_with_local_aliases_and_keys_made_ownerless() {
+    for order in both_orders(vec![
+        wire_aliased("acme/docs", "", &["local/carol/docs"]),
+        wire_aliased("local/alice/p", "alice", &[]),
+        wire_aliased("local/bob/q", "bob", &["Local/Alice/P"]),
+    ]) {
+        let loaded = Loaded::from_registered(order);
+        assert_eq!(
+            loaded.private_rows_without_owner(),
+            2,
+            "one org row with a local/ alias, one key two owners share"
+        );
+    }
+}
+
+/// F5: an ORG claim refused under the subtree rule is not told that its own
+/// project is personal; the sentence fits both cases and still leaks nothing.
+#[test]
+fn the_not_member_prose_fits_an_org_claim_too() {
+    let (answer, _) = as_user(
+        Registry::loaded_from(vec![
+            wire_aliased("acme/team", "", &[]),
+            wire_aliased("local/alice/q", "alice", &["acme/team/q"]),
+        ]),
+        Mode::Enforcing,
+        Access::Read,
+        "bob",
+        "acme/team",
+    );
+    let prose = answer.expect_err("refused").prose;
+    assert!(
+        !prose.contains("this personal project"),
+        "an org claim is not a personal project: {prose}"
+    );
+    for leaked in ["acme", "team", "alice", "bob"] {
+        assert!(!prose.contains(leaked), "{leaked} leaked into: {prose}");
+    }
+}

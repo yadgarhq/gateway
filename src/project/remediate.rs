@@ -237,14 +237,18 @@ pub(super) fn sentence(reason: Reason, anchor: Option<&str>, source_repo: Option
                              different project, or the archived one reactivated."
             .to_string(),
 
+        // ONE SENTENCE FOR BOTH SHAPES: a personal project the caller does not
+        // own, and a project with another account's personal project beneath
+        // it. It names neither the claim, the owner nor which shape it was.
+        Reason::NotMember => "this call would reach a personal project that belongs to another \
+                              account. A personal project, and everything beneath it, is \
+                              reachable only by the account that registered it; use your own \
+                              local/<account>/... project."
+            .to_string(),
+
         // NOT ABOUT THE CALLER AT ALL (ADR-0674), and the sentence says so
         // plainly: an operator reading this next to the four above must not have
         // to guess which of the two conditions they are in.
-        Reason::NotMember => "this personal project belongs to another account. Use your own \
-                              local/<account>/... project; a personal project is reachable only \
-                              by the account that registered it."
-            .to_string(),
-
         Reason::RegistryUnavailable => "this gateway has not loaded the project registry yet, so \
                                         it cannot check which project this call names. Nothing \
                                         is wrong with the workspace or the credential. Retry; if \

@@ -103,8 +103,10 @@ pub struct Loaded {
     /// Every private spelling with its row's owner, sorted, for the subtree
     /// rule — built once per load, never per call.
     private: PrivateIndex,
-    /// Private ROWS (not spellings) in this load, and how many of them arrived
-    /// with no owner. The second must read 0 before the observation window
+    /// Private ROWS (not spellings) in this load, and how many places in it
+    /// nobody can reach: private rows that arrived with no owner, org rows
+    /// carrying a `local/` alias, and keys a folded collision left ownerless
+    /// (see [`merge`]). The second must read 0 before the observation window
     /// opens (`plans/project-membership.md` §5 step 3).
     private_rows: usize,
     private_rows_without_owner: usize,
@@ -122,27 +124,40 @@ fn owner_of(row: &RegisteredPath) -> String {
     row.owner_user_id.clone()
 }
 
-/// Insert one spelling, resolving a folded collision toward REFUSAL.
+/// Insert one spelling, resolving a folded collision toward REFUSAL, and
+/// answer whether the collision left a key nobody can reach that a row's
+/// owner could reach before.
 ///
-/// The spelling and status keep the last row's, as before. The OWNER does
-/// not: two rows of different owners under one key make the key ambiguous,
-/// and an ambiguous owner is nobody's — admitting whichever row loaded last
-/// would hand one account the other's project. The class is private if
-/// either row is.
-fn merge(folded: &mut BTreeMap<String, Match>, key: String, m: Match) {
-    let merged = match folded.remove(&key) {
-        Some(prev) if prev.owner != m.owner => Match {
-            owner: String::new(),
-            private: prev.private || m.private,
-            ..m
-        },
-        Some(prev) => Match {
-            private: prev.private || m.private,
-            ..m
-        },
-        None => m,
+/// Only the SPELLING keeps the last row's. Everything an authorization reads
+/// resolves toward refusal, whatever order the rows loaded in:
+///
+/// - the OWNER: two rows of different owners under one key make the key
+///   ambiguous, and an ambiguous owner is nobody's — admitting whichever row
+///   loaded last would hand one account the other's project;
+/// - the CLASS: private if either row is, so an org row loaded after a
+///   private row's alias cannot turn that key into an org one;
+/// - the STATUS: archived if either row is, so a write is refused.
+fn merge(folded: &mut BTreeMap<String, Match>, key: String, m: Match) -> bool {
+    let Some(prev) = folded.remove(&key) else {
+        folded.insert(key, m);
+        return false;
+    };
+    let private = prev.private || m.private;
+    let owner = if prev.owner == m.owner {
+        m.owner.clone()
+    } else {
+        String::new()
+    };
+    let made_ownerless =
+        private && owner.is_empty() && !(prev.owner.is_empty() && m.owner.is_empty());
+    let merged = Match {
+        private,
+        owner,
+        archived: prev.archived || m.archived,
+        ..m
     };
     folded.insert(key, merged);
+    made_ownerless
 }
 
 /// Whether a wire status is ARCHIVED.
@@ -172,6 +187,11 @@ impl Loaded {
             if is_private_class(&row.path) {
                 private_rows += 1;
                 without_owner += usize::from(owner.is_empty());
+            } else if row.aliases.iter().any(|a| is_private_class(a)) {
+                // AN ORG ROW WITH A `local/` ALIAS: that spelling is private by
+                // its path and carries the org row's empty owner, so nobody
+                // can reach it. Counted, so the gauge sees every such row.
+                without_owner += 1;
             }
             let archived = is_archived(row.status);
             let private = is_private_class(&row.path);
@@ -186,7 +206,7 @@ impl Loaded {
         }
         let mut loaded = Self::from_matches(matches);
         loaded.private_rows = private_rows;
-        loaded.private_rows_without_owner = without_owner;
+        loaded.private_rows_without_owner += without_owner;
         loaded
     }
 
@@ -217,6 +237,7 @@ impl Loaded {
                 .map(|m| (m.path.as_str(), m.owner.as_str(), m.private)),
         );
         let mut folded: BTreeMap<String, Match> = BTreeMap::new();
+        let mut made_ownerless = 0;
         for (key, m) in matches
             .into_iter()
             // THE BARE RESERVED SEGMENT IS DROPPED HERE TOO. The tier
@@ -229,13 +250,13 @@ impl Loaded {
             .filter(|m| !m.path.eq_ignore_ascii_case("local"))
             .map(|m| (m.path.to_ascii_lowercase(), m))
         {
-            merge(&mut folded, key, m);
+            made_ownerless += usize::from(merge(&mut folded, key, m));
         }
         Self {
             folded,
             private,
             private_rows: 0,
-            private_rows_without_owner: 0,
+            private_rows_without_owner: made_ownerless,
         }
     }
 
