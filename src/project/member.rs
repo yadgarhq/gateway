@@ -17,6 +17,11 @@
 //! everybody, silently. The owner comparison also requires a NON-EMPTY owner,
 //! so a trusted-headers caller who sent no user cannot match an empty one.
 //!
+//! **THE CLASS IS THE ROW'S, NOT THE SPELLING'S.** A private row with an alias
+//! spelled outside `local/` is still private when claimed through the alias;
+//! either the row's path or the matched spelling being under `local/` makes it
+//! private, so a cross-class alias can only fail closed.
+//!
 //! **THE SUBTREE, NOT JUST THE ROW.** task-db scopes a read, an edit and a
 //! transition to the claimed project AND everything beneath it
 //! (`Reach::within`). While ledger 641 lets a `local/<account>/…` row be
@@ -24,7 +29,10 @@
 //! beneath a caller's own, so a caller is a member only if it owns the resolved
 //! row and every private row strictly beneath it. A create cannot reach a
 //! deeper row, but `Access` cannot tell a create from an edit, so creates take
-//! the same rule and fail closed (plan §3, "The read path").
+//! the same rule and fail closed (plan §3, "The read path"). An ORG row takes
+//! the subtree half too: no org path lies under `local/`, so the beneath set is
+//! empty and every attested user is admitted, unless a private row's alias is
+//! spelled beneath it — and then the org claim would reach that private row.
 
 use std::collections::BTreeMap;
 
@@ -46,6 +54,8 @@ pub(super) struct Landed<'a> {
     pub exact: bool,
     pub archived: bool,
     pub owner: &'a str,
+    /// The landed row's class, from the row's own path at load.
+    pub private: bool,
 }
 
 /// Decide one resolved claim for one caller.
@@ -61,7 +71,7 @@ pub(super) fn verdict(
     access: Access,
     user_id: &str,
 ) -> Verdict {
-    if is_private_class(landed.path) && !is_member(registered, landed, user_id) {
+    if !is_member(registered, landed, user_id) {
         return Verdict::Refuse(Reason::NotMember);
     }
     if landed.archived && access == Access::Write {
@@ -72,14 +82,15 @@ pub(super) fn verdict(
     }
 }
 
-/// Whether `user_id` owns the landed private row and every private row
-/// strictly beneath it.
+/// Whether `user_id` may reach the landed row: it owns every private row
+/// strictly beneath it, and, when the landed row is itself private, that row.
 ///
 /// EXACT BYTES, no case fold: a user id is an iam-issued identifier, not a
 /// path, and nothing in this estate folds it.
 fn is_member(registered: &impl Registered, landed: &Landed<'_>, user_id: &str) -> bool {
     let owns = |owner: &str| !owner.is_empty() && owner == user_id;
-    owns(landed.owner)
+    let private = landed.private || is_private_class(landed.path);
+    (!private || owns(landed.owner))
         && registered
             .private_owners_beneath(landed.path)
             .into_iter()
@@ -98,14 +109,16 @@ pub struct PrivateIndex {
 }
 
 impl PrivateIndex {
-    /// Index every private spelling — paths and aliases alike — with its row's
-    /// owner. Org spellings are dropped: no org path lies under `local/`.
-    pub fn build<'a>(spellings: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+    /// Index every spelling of a private row — paths and aliases alike, an
+    /// alias spelled outside `local/` included — with its row's owner.
+    /// `private` is the row's class; a spelling under `local/` is indexed
+    /// whatever its row says, so a cross-class alias fails closed.
+    pub fn build<'a>(spellings: impl IntoIterator<Item = (&'a str, &'a str, bool)>) -> Self {
         Self {
             by_path: spellings
                 .into_iter()
-                .filter(|(path, _)| is_private_class(path))
-                .map(|(path, owner)| (path.to_ascii_lowercase(), owner.to_string()))
+                .filter(|(path, _, private)| *private || is_private_class(path))
+                .map(|(path, owner, _)| (path.to_ascii_lowercase(), owner.to_string()))
                 .collect(),
         }
     }

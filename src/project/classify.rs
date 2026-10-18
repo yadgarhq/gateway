@@ -64,11 +64,15 @@ pub enum Outcome {
     /// empty on a private row whose load predates the owner field — which is
     /// why the CLASS is read from `path` and never from this (see
     /// [`super::member`]).
+    ///
+    /// `private` is the landed ROW's class, read from the row's own path: an
+    /// alias spelled outside `local/` still names a private row.
     Resolved {
         path: String,
         exact: bool,
         archived: bool,
         owner: String,
+        private: bool,
     },
     /// One of the four refusal classes.
     Refused(Refusal),
@@ -176,6 +180,7 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
         path: matched,
         archived,
         owner,
+        private,
     }) = matched
     else {
         // NO REGISTERED ANCESTOR. Which refusal that is depends on the
@@ -205,6 +210,7 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
         path: matched,
         archived,
         owner,
+        private,
     }
 }
 
@@ -223,6 +229,11 @@ pub struct Match {
     /// only on a private (`local/…`) row. An alias carries its ROW's owner, as
     /// it carries its row's status.
     pub owner: String,
+    /// Whether the ROW this path or alias belongs to is private, read from the
+    /// row's own path at load. An alias carries its row's class: reading the
+    /// class off an alias spelled outside `local/` would make a private row
+    /// org for whoever claimed the alias.
+    pub private: bool,
 }
 
 /// What [`classify`] needs from a loaded registry, and no more.

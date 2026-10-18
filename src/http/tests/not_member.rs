@@ -35,21 +35,17 @@ fn state_owning(mode: Mode) -> std::sync::Arc<crate::http::AppState> {
         ("local/alice/notes/deep", "mallory", ProjectStatus::Active),
         ("local/alice/attic", "alice", ProjectStatus::Archived),
     ]
-    .map(|(path, owner, status)| {
-        (
-            owner.to_string(),
-            RegisteredPath {
-                path: path.to_string(),
-                status: status as i32,
-                aliases: Vec::new(),
-            },
-        )
+    .map(|(path, owner, status)| RegisteredPath {
+        path: path.to_string(),
+        status: status as i32,
+        aliases: Vec::new(),
+        owner_user_id: owner.to_string(),
     });
     let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
     std::sync::Arc::get_mut(&mut state)
         .expect("the state is not shared yet")
         .projects = std::sync::Arc::new(Validator::new(
-        Registry::loaded_owned(rows.into_iter().collect()),
+        Registry::loaded_from(rows.into_iter().collect()),
         mode,
         tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
     ));

@@ -110,16 +110,16 @@ pub struct Loaded {
     private_rows_without_owner: usize,
 }
 
-/// The stored owner of one loaded row.
+/// The stored owner of one loaded row: `RegisteredPath.owner_user_id`
+/// (proto v1.20.0), empty on every org row.
 ///
-/// **A STUB UNTIL `RegisteredPath.owner_user_id` IS TAGGED (car P0), and it
-/// FAILS CLOSED.** It answers `""` for every row, so every private row reads as
-/// owned by nobody and every call into one counts `PROJECT_NOT_MEMBER` —
-/// `plans/project-membership.md` §5 step 2. The class is the PATH, so an
-/// absent owner can never turn a private row into an org one. Once P0 is
-/// tagged this becomes `row.owner_user_id.clone()`, and nothing else changes.
-fn owner_of(_row: &RegisteredPath) -> String {
-    String::new()
+/// **AN EMPTY OWNER ON A PRIVATE ROW FAILS CLOSED.** A `project` older than
+/// car P2 sends `""` for every row, and the class is the PATH, so that row
+/// stays private, matches nobody, and every call into it counts
+/// `PROJECT_NOT_MEMBER` — `plans/project-membership.md` §5 step 2. It never
+/// turns a private row into an org one.
+fn owner_of(row: &RegisteredPath) -> String {
+    row.owner_user_id.clone()
 }
 
 /// Whether a wire status is ARCHIVED.
@@ -139,11 +139,9 @@ impl Loaded {
         Self::from_owned(rows.into_iter().map(|row| (owner_of(&row), row)))
     }
 
-    /// The set from rows whose owners are stated beside them.
-    ///
-    /// The seam [`Self::from_registered`] goes through, and the one tests use to
-    /// load private rows WITH owners while the wire field does not exist yet.
-    pub fn from_owned(rows: impl IntoIterator<Item = (String, RegisteredPath)>) -> Self {
+    /// The set from rows whose owners are stated beside them, as
+    /// [`owner_of`] read them.
+    fn from_owned(rows: impl IntoIterator<Item = (String, RegisteredPath)>) -> Self {
         let mut private_rows = 0;
         let mut without_owner = 0;
         let mut matches = Vec::new();
@@ -153,11 +151,13 @@ impl Loaded {
                 without_owner += usize::from(owner.is_empty());
             }
             let archived = is_archived(row.status);
+            let private = is_private_class(&row.path);
             for path in std::iter::once(row.path).chain(row.aliases) {
                 matches.push(Match {
                     path,
                     archived,
                     owner: owner.clone(),
+                    private,
                 });
             }
         }
@@ -176,6 +176,7 @@ impl Loaded {
                 path,
                 status: ProjectStatus::Active as i32,
                 aliases: Vec::new(),
+                owner_user_id: String::new(),
             };
             (String::new(), row)
         }))
@@ -194,8 +195,11 @@ impl Loaded {
             .filter(|m| !m.path.eq_ignore_ascii_case("local"))
             .map(|m| (m.path.to_ascii_lowercase(), m))
             .collect();
-        let private =
-            PrivateIndex::build(folded.values().map(|m| (m.path.as_str(), m.owner.as_str())));
+        let private = PrivateIndex::build(
+            folded
+                .values()
+                .map(|m| (m.path.as_str(), m.owner.as_str(), m.private)),
+        );
         Self {
             folded,
             private,
@@ -270,13 +274,6 @@ impl Registry {
     /// For tests and for nothing else, like [`Self::loaded_with`].
     pub fn loaded_from(rows: Vec<RegisteredPath>) -> Self {
         Self::holding(Loaded::from_registered(rows))
-    }
-
-    /// A registry holding exactly these rows, each with its stated owner.
-    ///
-    /// For tests and for nothing else, like [`Self::loaded_with`].
-    pub fn loaded_owned(rows: Vec<(String, RegisteredPath)>) -> Self {
-        Self::holding(Loaded::from_owned(rows))
     }
 
     fn holding(loaded: Loaded) -> Self {

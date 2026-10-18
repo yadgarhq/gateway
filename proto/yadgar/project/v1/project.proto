@@ -27,18 +27,22 @@ enum ProjectStatus {
 }
 
 // WHAT A PROJECT DOES NOT DECLARE, AND WHY THAT IS A DECISION RATHER THAN AN
-// OMISSION (ledger 644). There is no owner on this message and no visibility.
+// OMISSION (ledger 644). There is no visibility ladder on this message, and its
+// owner arrives through `Meta`, not as a field of its own.
 //
 // `project-db/src/path.rs` describes two classes sharing one namespace and told
-// apart by the FIRST SEGMENT alone — an organisation project `<org>/<repo>`
+// apart by the FIRST SEGMENT alone: an organisation project `<org>/<repo>`
 // "visible to everyone", and a private one beneath the reserved `local` segment
-// "visible only to the account that owns it". NOTHING CAN ENFORCE EITHER. The
-// merged table (`project-db/src/schema.rs`, migration 1) carries `created_by`
-// and `updated_by` and no third identity column, and D12 names those two as
-// AUDIT identity, distinct from ownership.
+// "visible only to the account that owns it". A private row HAS an owner: the
+// store carries it as `owner_user_id` (project-db migration 6), and
+// `Meta.owner_user_id` is where this contract reports it. The gateway's
+// membership check (ADR-0947, `plans/project-membership.md`) will enforce it
+// once the gateway runs under Enforcing. This message enforces nothing. D12
+// names `created_by` and `updated_by` as AUDIT identity, distinct from
+// ownership.
 //
-// Declaring the fields here would not close that, because what is missing is
-// three rulings rather than two columns:
+// What stays undeclared is a second visibility ladder, because what is missing
+// is rulings rather than columns:
 //
 // - D27 is one deployment and one organisation, and D12 draws the consequence
 //   in as many words: no `org_id` field exists, because hosting several
@@ -57,8 +61,8 @@ enum ProjectStatus {
 //   paragraph exists to prevent.
 //
 // A contract that guessed at an authorisation model would be worse than one
-// that omits it. These fields are additive on the day the rulings land; a wrong
-// shape is one every consumer has already compiled against.
+// that omits it. A field added for a ruled need is additive; a wrong shape is
+// one every consumer has already compiled against.
 message Project {
   yadgar.common.v1.Meta meta = 1;
 
@@ -408,17 +412,22 @@ service ProjectDbService {
 // not.
 // ---------------------------------------------------------------------------
 
-// One registered path, and the three fields a resolution walk reads.
+// One registered path, and the fields the gateway reads from the loaded set:
+// the path, status and aliases a resolution walk reads, and the owner of a
+// private row that the membership check reads after it.
 //
 // NOT `Project`, AND THE DEVIATION IS RULED RATHER THAN PREFERRED.
 // `plans/project-registry-callers.md` §1 names what the load returns — "every
-// live path, its status, and its aliases" — which is exactly these three, and
-// the estate's own precedent points the other way (`FindTasksResponse` returns
-// the storage entity `yadgar.task.v1.Task`). The second reason is the one that
-// would otherwise arrive by surprise: `Project` carries `Meta`, and who OWNS a
-// project is unresolved — see the note above that message. A load shape that
-// echoed the row would begin shipping an ownership answer to every caller on
-// the day the column lands, before anything ruled what it means.
+// live path, its status, and its aliases" — and `plans/project-membership.md`
+// (ADR-0947) adds one field, the owner of a private row, because the gateway's
+// membership check reads it on every call into such a row. The estate's own
+// precedent points the other way (`FindTasksResponse` returns the storage
+// entity `yadgar.task.v1.Task`). The second reason is what stays out:
+// `Project` carries `Meta` (`team_id`, `visibility`, `created_by`,
+// `updated_by`), `display_name` and `last_seen_at`, and no hot-path check
+// reads any of them. Ownership ships here as ONE ruled field rather than as an
+// echo of the row, so a column added to `Meta` later does not reach every
+// caller of the load before anything rules what it means.
 message RegisteredPath {
   string path = 1;
 
@@ -437,6 +446,32 @@ message RegisteredPath {
   // reason (`project-db/src/read.rs`); a walk over this set is the same walk
   // and needs the same two inputs.
   repeated string aliases = 3;
+
+  // The registrant of a PRIVATE-class row: the one user the gateway admits to
+  // the row once membership is enforced (ADR-0947,
+  // `plans/project-membership.md`). This message enforces nothing, and under
+  // Counting every caller is still served.
+  //
+  // EMPTY ON EVERY ORG ROW, and the class is read from `path`, NOT from this
+  // field. A row is private iff its first segment equals `local` compared
+  // ASCII-case-insensitively — the same fold as
+  // `ProjectServiceListProjectsResponse.paths` — so `LOCAL/x` is private. Any
+  // other first segment is org. Never decide the class by whether this is set.
+  //
+  // EMPTY ON A PRIVATE ROW IS A MISSING OWNER, NEVER AN ORG ROW: the `project`
+  // or `project-db` serving the load predates relaying it, or the store is
+  // defective. A caller MUST treat that row as owned by nobody (fail closed).
+  // proto3 gives a bare `string` no presence bit, so empty means absent.
+  //
+  // The row's stored owner, which `project-db` relays as `Meta.owner_user_id`.
+  // `ck_project_class_path` makes it non-null exactly on `local/%` rows, and
+  // `ck_project_class` makes it and `source_repo` mutually exclusive.
+  //
+  // SENT TO EVERY CALLER OF THE LOAD. `ProjectService.ListProjects` checks no
+  // caller identity: any workload the chart's NetworkPolicy admits, with a
+  // leaf the internal CA issued, receives every owner id. Only the gateway is
+  // meant to call it; no code enforces that.
+  string owner_user_id = 4;
 }
 
 // The registry LOAD: every registered path, so a caller answers "what does this
@@ -530,11 +565,11 @@ message ProjectServiceListProjectsResponse {
 // WHAT IT DOES NOT CARRY, stated because the absence is a decision: no caller
 // identity. Resolution today is over ONE global namespace of paths, and no
 // field of this request could change the answer. The private class beneath
-// `local` is what changes that — a private path is owned, and resolving one for
-// the wrong account is ledger 651 — and closing that ruling adds the caller's
-// attested identity here as a new field. It is not declared in advance because
-// a field nothing reads, that LOOKS like an identity, is read later as a
-// verified one (ADR-0534).
+// `local` is what changes who may use a resolved path, and the plan chose to
+// answer that in the gateway, against the loaded set (the owner on
+// `RegisteredPath`, ADR-0947), rather than by sending the caller's identity
+// here. A field nothing reads, that LOOKS like an identity, is read later as a
+// verified one (ADR-0534), so none is declared.
 message ProjectServiceResolveProjectRequest {
   string candidate_path = 1;
 }

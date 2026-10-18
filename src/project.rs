@@ -399,13 +399,14 @@ impl Validator {
                 .await;
         };
 
-        let (path, exact, archived, owner) = match classify(loaded.as_ref(), claimed) {
+        let (path, exact, archived, owner, private) = match classify(loaded.as_ref(), claimed) {
             Outcome::Resolved {
                 path,
                 exact,
                 archived,
                 owner,
-            } => (path, exact, archived, owner),
+                private,
+            } => (path, exact, archived, owner, private),
             Outcome::Refused(refusal) => return self.decide(refusal, request_id).await,
         };
         let landed = member::Landed {
@@ -413,6 +414,7 @@ impl Validator {
             exact,
             archived,
             owner: &owner,
+            private,
         };
         // A REFUSAL IS NOT A RESOLUTION, so a membership or archived refusal
         // moves the refusal series ONLY: exactly one series per call, as above.

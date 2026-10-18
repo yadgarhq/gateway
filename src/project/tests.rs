@@ -66,6 +66,7 @@ fn an_exactly_registered_path_resolves_to_itself() {
             exact: true,
             archived: false,
             owner: String::new(),
+            private: false,
         }
     );
 }
@@ -89,6 +90,7 @@ fn a_subpath_resolves_to_its_nearest_registered_ancestor() {
             exact: false,
             archived: false,
             owner: String::new(),
+            private: false,
         }
     );
 }
@@ -166,6 +168,7 @@ fn a_private_subpath_resolves_to_its_registered_ancestor() {
             exact: false,
             archived: false,
             owner: String::new(),
+            private: true,
         }
     );
 }
@@ -207,6 +210,7 @@ fn the_walk_folds_ascii_case_in_both_directions() {
             exact: true,
             archived: false,
             owner: String::new(),
+            private: false,
         }
     );
     // THE ROW'S SPELLING, NOT THE CALLER'S. The store's resolver answers the
@@ -220,6 +224,7 @@ fn the_walk_folds_ascii_case_in_both_directions() {
             exact: false,
             archived: false,
             owner: String::new(),
+            private: false,
         }
     );
 }
@@ -1075,6 +1080,7 @@ fn row(path: &str, status: ProjectStatus, aliases: &[&str]) -> RegisteredPath {
         path: path.to_string(),
         status: status as i32,
         aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+        owner_user_id: String::new(),
     }
 }
 
@@ -1273,6 +1279,7 @@ fn a_write_beneath_an_archived_ancestor_is_refused_and_a_read_lands_on_it() {
             exact: false,
             archived: true,
             owner: String::new(),
+            private: false,
         }
     );
     let (answer, snapshotter) = checked_as(
