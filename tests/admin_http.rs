@@ -48,7 +48,8 @@ use yadgar_gateway::pb::yadgar::common::v1::{Meta, UnverifiedActor};
 use yadgar_gateway::pb::yadgar::iam::v1::{
     iam_service_server::{IamService, IamServiceServer},
     CreateUserRequest, CreateUserResponse, IssueEnrolmentRequest, IssueEnrolmentResponse,
-    ResolveCredentialResponse, SetUserAdminRequest, SetUserAdminResponse,
+    ResolveCredentialResponse, RevokeAllCredentialsRequest, RevokeAllCredentialsResponse,
+    SetUserAdminRequest, SetUserAdminResponse,
 };
 use yadgar_gateway::source::TrustBoundary;
 
@@ -98,6 +99,11 @@ struct Received {
     /// ADR-0943's revoke instruction, AS IT ARRIVED. `None` means what it means
     /// on `demands_zero_credential_admin`: the request shape has no such field.
     revokes_existing_credentials: Option<bool>,
+    /// The `user_id` the request TARGETED, recorded for `RevokeAllCredentials`
+    /// only (ADR-0945): that verb's wire assertion is about whose credentials
+    /// are revoked. `None` on the other verbs means "not recorded here", not
+    /// "absent on the wire".
+    target_user_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -115,7 +121,7 @@ impl Log {
     }
 }
 
-/// An `iam` that resolves one canned identity and records the three
+/// An `iam` that resolves one canned identity and records the four
 /// administrative RPCs it is asked for.
 struct AdminIam {
     answer: ResolveCredentialResponse,
@@ -128,9 +134,27 @@ struct AdminIam {
     /// endpoint-scoping property: the enrolment refusal's body must be
     /// unreachable from a verb that is not an enrolment.
     refuse_create_user: Option<tonic::Status>,
+    /// How this stub answers `RevokeAllCredentials` (ADR-0945).
+    revoke: RevokeAnswer,
 }
 
-/// Write the stub's whole `IamService` impl: four real methods and nine refusals.
+/// What the stub's `RevokeAllCredentials` does after recording the request.
+#[derive(Clone, Default)]
+enum RevokeAnswer {
+    /// Answer `{revoked: REVOKED_COUNT}`.
+    #[default]
+    Count,
+    /// Refuse with this status.
+    Refuse(tonic::Status),
+    /// Never answer, so the gateway's own deadline is what ends the call.
+    Hang,
+}
+
+/// The count the stub's `RevokeAllCredentials` answers. Not 0 and not 1, so an
+/// echo that hardcoded either is visible.
+const REVOKED_COUNT: u32 = 3;
+
+/// Write the stub's whole `IamService` impl: five real methods and nine refusals.
 ///
 /// **THE MACRO EMITS `#[tonic::async_trait]` ITSELF, and it has to.** That
 /// attribute rewrites every `async fn` in the block into the boxed future the
@@ -162,6 +186,7 @@ macro_rules! admin_iam_service {
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
                     demands_zero_credential_admin: None,
                     revokes_existing_credentials: None,
+                    target_user_id: None,
                 });
                 if let Some(refusal) = self.refuse_create_user.clone() {
                     return Err(refusal);
@@ -186,6 +211,7 @@ macro_rules! admin_iam_service {
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
                     demands_zero_credential_admin: Some(r.require_zero_credential_admin),
                     revokes_existing_credentials: Some(r.revoke_existing_credentials),
+                    target_user_id: None,
                 });
                 // RECORDED BEFORE THE REFUSAL, deliberately: a refusing stub
                 // must still let a test read what arrived, or the refusal path
@@ -218,8 +244,33 @@ macro_rules! admin_iam_service {
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
                     demands_zero_credential_admin: None,
                     revokes_existing_credentials: None,
+                    target_user_id: None,
                 });
                 Ok(tonic::Response::new(SetUserAdminResponse {}))
+            }
+
+            async fn revoke_all_credentials(
+                &self,
+                req: tonic::Request<RevokeAllCredentialsRequest>,
+            ) -> Result<tonic::Response<RevokeAllCredentialsResponse>, tonic::Status> {
+                let r = req.into_inner();
+                self.log.push(Received {
+                    verb: "RevokeAllCredentials",
+                    actor: r.unverified_actor,
+                    has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
+                    demands_zero_credential_admin: None,
+                    revokes_existing_credentials: None,
+                    target_user_id: Some(r.user_id),
+                });
+                // RECORDED BEFORE THE ANSWER, for `issue_enrolment`'s reason: a
+                // refusal or a stall must still let a test read what arrived.
+                match self.revoke.clone() {
+                    RevokeAnswer::Count => Ok(tonic::Response::new(RevokeAllCredentialsResponse {
+                        revoked: REVOKED_COUNT,
+                    })),
+                    RevokeAnswer::Refuse(status) => Err(status),
+                    RevokeAnswer::Hang => std::future::pending().await,
+                }
             }
 
             $(
@@ -231,7 +282,7 @@ macro_rules! admin_iam_service {
                     tonic::Status,
                 > {
                     Err(tonic::Status::unimplemented(
-                        "this stub answers ResolveCredential and the three administrative verbs",
+                        "this stub answers ResolveCredential and the four administrative verbs",
                     ))
                 }
             )*
@@ -280,6 +331,7 @@ async fn gateway(answer: ResolveCredentialResponse) -> (Arc<AppState>, Arc<Log>)
 struct Refusals {
     issue_enrolment: Option<tonic::Status>,
     create_user: Option<tonic::Status>,
+    revoke: RevokeAnswer,
 }
 
 /// [`gateway`], with a stub `iam` that REFUSES the named verbs.
@@ -301,6 +353,7 @@ async fn gateway_with(
                 resolves: Arc::new(AtomicUsize::new(0)),
                 refuse_issue_enrolment: refusals.issue_enrolment,
                 refuse_create_user: refusals.create_user,
+                revoke: refusals.revoke,
             }))
             .serve_with_incoming(incoming)
             .await
@@ -397,7 +450,7 @@ fn as_admin() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// The three verbs, with a body each, as an ADMINISTRATOR would send them.
+/// The four verbs, with a body each, as an ADMINISTRATOR would send them.
 fn admin_verbs() -> Vec<(&'static str, String)> {
     vec![
         (
@@ -411,6 +464,10 @@ fn admin_verbs() -> Vec<(&'static str, String)> {
         (
             "/admin/set-user-admin",
             format!(r#"{{"user_id":"{OTHER_ID}","is_admin":true}}"#),
+        ),
+        (
+            "/admin/revoke-credentials",
+            format!(r#"{{"user_id":"{OTHER_ID}"}}"#),
         ),
     ]
 }
@@ -1031,5 +1088,370 @@ async fn the_enrolment_refusal_body_is_unreachable_from_create_user() {
         ),
         "unchanged from today: this change gives `iam` no new reason to refuse create-user, so \
          the opaque catch-all stays rather than a body invented for a case that does not exist"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `/admin/revoke-credentials` (ADR-0945, ledger 1626)
+// ---------------------------------------------------------------------------
+
+const REVOKE: &str = "/admin/revoke-credentials";
+
+/// The 404 body for a user `iam` does not hold. Asserted byte for byte, so an
+/// unregistered route's 404 (axum's empty body) cannot pass for it.
+const REVOKE_NOT_FOUND_BODY: &str = r#"{"error":"no such user"}"#;
+
+/// `admin_timeout`'s body, which every upstream stall answers with.
+const UNAVAILABLE_BODY: &str = r#"{"error":"the administrative service is unavailable"}"#;
+
+/// POST to [`REVOKE`] and return the raw body text, so a test can compare it
+/// byte for byte.
+async fn revoke_raw(
+    state: Arc<AppState>,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, String) {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(REVOKE)
+        .header("content-type", "application/json");
+    for (name, value) in extra {
+        req = req.header(*name, *value);
+    }
+    let req = req
+        .body(Body::from(body.to_string()))
+        .expect("the request builds");
+    let resp = router(state)
+        .oneshot(req)
+        .await
+        .expect("the router answers");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.expect("a body");
+    (
+        status,
+        String::from_utf8(bytes.to_vec()).expect("a UTF-8 body"),
+    )
+}
+
+fn revoke_body(user_id: &str) -> String {
+    format!(r#"{{"user_id":"{user_id}"}}"#)
+}
+
+#[tokio::test]
+async fn revoke_refuses_a_non_administrator_before_iam() {
+    let (state, log) = gateway(resolved(false)).await;
+    let (status, _) = revoke_raw(state, &revoke_body(OTHER_ID), &as_admin()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a resolved caller whose is_admin is false must be refused"
+    );
+    assert!(
+        log.drain().is_empty(),
+        "the refusal must come before RevokeAllCredentials is sent"
+    );
+}
+
+/// THE BOOTSTRAP TOKEN NEVER REACHES THIS VERB (ADR-0945): 403, no RPC, and
+/// the ACCEPTED counter does not move. The control in the same recorder is a
+/// bootstrap create-user that DOES move it, so an absent counter cannot pass
+/// for an unchanged one.
+#[tokio::test]
+async fn revoke_refuses_the_bootstrap_token_without_counting_an_acceptance() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let local = metrics::set_default_local_recorder(&recorder);
+
+    let (state, log) = gateway(resolved(true)).await;
+    let (control, _) = post(
+        Arc::clone(&state),
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        &[(BOOTSTRAP_HEADER, BOOTSTRAP_SECRET)],
+    )
+    .await;
+    assert_eq!(
+        control,
+        StatusCode::OK,
+        "the control: the bootstrap token creates an administrator"
+    );
+    log.drain();
+
+    let (status, _) = revoke_raw(
+        state,
+        &revoke_body(OTHER_ID),
+        &[(BOOTSTRAP_HEADER, BOOTSTRAP_SECRET)],
+    )
+    .await;
+    drop(local);
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the bootstrap token must be refused on revoke-credentials"
+    );
+    assert!(
+        log.drain().is_empty(),
+        "the bootstrap refusal must come before RevokeAllCredentials is sent"
+    );
+    let accepted: Vec<u64> = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(key, _, _, _)| key.key().name() == "yadgar_gateway_bootstrap_accepted_total")
+        .filter_map(|(_, _, _, value)| match value {
+            metrics_util::debugging::DebugValue::Counter(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        accepted,
+        vec![1],
+        "ACCEPTED must count the control's acceptance and nothing for the revoke attempt"
+    );
+}
+
+#[tokio::test]
+async fn revoke_refuses_an_administrator_targeting_themselves() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, _) = revoke_raw(state, &revoke_body(ADMIN_ID), &as_admin()).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an administrator may not revoke their own credentials"
+    );
+    assert!(
+        log.drain().is_empty(),
+        "the self-target refusal must come before RevokeAllCredentials is sent"
+    );
+}
+
+/// THE CANONICAL CHECK RUNS BEFORE THE SELF-TARGET CHECK. `iam-db`'s id column
+/// compares case-insensitively and the cache eviction compares bytes, so the
+/// caller's own id in upper case is the case that must be a 400: a 403 would
+/// mean the self check judged a non-canonical id, and an RPC would mean the
+/// rows were revoked while the cache kept answering for the TTL.
+#[tokio::test]
+async fn revoke_refuses_a_non_canonical_id_before_the_self_target_check() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, _) = revoke_raw(state, &revoke_body(&ADMIN_ID.to_uppercase()), &as_admin()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "the caller's own id in upper case must be a 400, not a 403 and not an RPC"
+    );
+    assert!(
+        log.drain().is_empty(),
+        "a non-canonical id must never reach RevokeAllCredentials"
+    );
+}
+
+#[tokio::test]
+async fn revoke_refuses_every_non_canonical_shape() {
+    let bare = OTHER_ID.trim_start_matches("yadgar:user:");
+    let mixed_case = OTHER_ID.replace("8a4e", "8A4E");
+    let padded = format!("{OTHER_ID} ");
+    let braced = format!("yadgar:user:{{{bare}}}");
+    let simple = OTHER_ID.replace('-', "");
+    let upper_prefix = OTHER_ID.replace("yadgar:user:", "YADGAR:USER:");
+    for id in [
+        mixed_case.as_str(),
+        padded.as_str(),
+        bare,
+        braced.as_str(),
+        simple.as_str(),
+        upper_prefix.as_str(),
+        "",
+    ] {
+        let (state, log) = gateway(resolved(true)).await;
+        let (status, _) = revoke_raw(state, &revoke_body(id), &as_admin()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a user_id outside iam-db's canonical form must be a 400"
+        );
+        assert!(
+            log.drain().is_empty(),
+            "a non-canonical id must never reach RevokeAllCredentials"
+        );
+    }
+}
+
+#[tokio::test]
+async fn revoke_refuses_a_malformed_body() {
+    let unknown = format!(r#"{{"user_id":"{OTHER_ID}","everywhere":true}}"#);
+    for body in [
+        "{}",
+        r#"{"user_id":7}"#,
+        r#"{"user_id":null}"#,
+        r#"{"user_id":["a"]}"#,
+        unknown.as_str(),
+        "[]",
+        "not json",
+    ] {
+        let (state, log) = gateway(resolved(true)).await;
+        let (status, _) = revoke_raw(state, body, &as_admin()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a missing, non-string or unknown key must be a 400"
+        );
+        assert!(
+            log.drain().is_empty(),
+            "a malformed body must never reach RevokeAllCredentials"
+        );
+    }
+}
+
+/// The guard runs: a cross-origin browser request is refused with the guard's
+/// own body and reaches nothing, while the same request with no Origin goes
+/// through. An attested administrator is used so that the refusal cannot be
+/// the bootstrap exclusion's 403.
+#[tokio::test]
+async fn revoke_refuses_a_cross_origin_request() {
+    let (state, log) = gateway(resolved(true)).await;
+    let mut headers = as_admin();
+    headers.push(("origin", "https://attacker.example"));
+    let (status, body) = revoke_raw(Arc::clone(&state), &revoke_body(OTHER_ID), &headers).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::FORBIDDEN, r#"{"error":"origin not allowed"}"#),
+        "an unknown browser origin must be refused by the guard"
+    );
+    assert!(
+        log.drain().is_empty(),
+        "a cross-origin request must never reach RevokeAllCredentials"
+    );
+
+    let (control, _) = revoke_raw(state, &revoke_body(OTHER_ID), &as_admin()).await;
+    assert_eq!(
+        control,
+        StatusCode::OK,
+        "the control: the same request with no Origin is served"
+    );
+}
+
+/// What ARRIVED at `iam`: the target, the attested actor and D9's key.
+#[tokio::test]
+async fn revoke_sends_the_target_and_the_actor_on_the_wire() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, _) = revoke_raw(state, &revoke_body(OTHER_ID), &as_admin()).await;
+    assert_eq!(status, StatusCode::OK, "an administrator is served");
+    assert_eq!(
+        log.drain(),
+        vec![Received {
+            verb: "RevokeAllCredentials",
+            actor: Some(UnverifiedActor {
+                user_id: ADMIN_ID.to_string(),
+            }),
+            has_idempotency_key: true,
+            demands_zero_credential_admin: None,
+            revokes_existing_credentials: None,
+            target_user_id: Some(OTHER_ID.to_string()),
+        }],
+        "exactly one RevokeAllCredentials carrying the target, the resolved actor and a key"
+    );
+}
+
+#[tokio::test]
+async fn revoke_answers_the_user_id_and_the_count() {
+    let (state, _log) = gateway(resolved(true)).await;
+    let (status, body) = revoke_raw(state, &revoke_body(OTHER_ID), &as_admin()).await;
+    assert_eq!(status, StatusCode::OK, "an administrator is served");
+    let answer: Value = serde_json::from_str(&body).expect("a JSON body");
+    assert_eq!(
+        answer,
+        serde_json::json!({ "user_id": OTHER_ID, "revoked": REVOKED_COUNT }),
+        "the 200 echoes user_id and the revoked count iam answered"
+    );
+}
+
+/// NOT_FOUND IS 404 HERE AND NOWHERE ELSE. The arrival assertion is what
+/// stops axum's own 404 for an unregistered route passing for this one.
+#[tokio::test]
+async fn revoke_answers_404_for_a_user_iam_does_not_hold() {
+    let (state, log) = gateway_with(
+        resolved(true),
+        Refusals {
+            revoke: RevokeAnswer::Refuse(tonic::Status::not_found("no iam_user row")),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, body) = revoke_raw(state, &revoke_body(OTHER_ID), &as_admin()).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::NOT_FOUND, REVOKE_NOT_FOUND_BODY),
+        "an upstream NOT_FOUND is a 404 with the constant body"
+    );
+    assert_eq!(
+        log.drain().len(),
+        1,
+        "the 404 must come from iam's answer, not from a missing route"
+    );
+}
+
+/// The mirror: create-user meeting NOT_FOUND keeps the opaque 503, so the 404
+/// mapping is scoped to revoke-credentials.
+#[tokio::test]
+async fn not_found_stays_opaque_on_create_user() {
+    let (state, _log) = gateway_with(
+        resolved(true),
+        Refusals {
+            create_user: Some(tonic::Status::not_found("not found")),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, answer) = post(
+        state,
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        &as_admin(),
+    )
+    .await;
+    assert_eq!(
+        (status, answer.to_string().as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_BODY),
+        "NOT_FOUND on create-user stays the opaque 503"
+    );
+}
+
+/// AN `iam` THAT STALLS: the gateway's own deadline ends the call with the
+/// opaque 503. The clock is paused, so the deadline elapses without the test
+/// waiting for it; the arrival assertion shows the stall was in the RPC and
+/// not in the attestation.
+#[tokio::test(start_paused = true)]
+async fn revoke_answers_503_when_iam_stalls() {
+    let (state, log) = gateway_with(
+        resolved(true),
+        Refusals {
+            revoke: RevokeAnswer::Hang,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, body) = revoke_raw(state, &revoke_body(OTHER_ID), &as_admin()).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_BODY),
+        "a stalled RevokeAllCredentials is the opaque 503"
+    );
+    assert_eq!(
+        log.drain().len(),
+        1,
+        "the stall must be in RevokeAllCredentials itself"
+    );
+}
+
+/// An invariant guard rather than a red-first test: no administrative verb is
+/// an MCP tool (ADR-0492), and this one is no exception.
+#[test]
+fn revoke_credentials_is_not_an_mcp_tool() {
+    assert!(
+        !yadgar_gateway::tools::SERVED
+            .iter()
+            .any(|name| name.contains("revoke")),
+        "an administrative verb is never an MCP tool (ADR-0492)"
     );
 }

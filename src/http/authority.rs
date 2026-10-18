@@ -332,7 +332,7 @@ pub(super) fn bootstrap_authority(
 /// counter label, joined to this 403 by the request id.
 ///
 /// **SCOPED BY ENDPOINT, AND THAT IS NOT A BRANCH ON THE MESSAGE.** This function
-/// renders all three administrative endpoints. An arm keyed on the CODE alone
+/// renders every administrative endpoint. An arm keyed on the CODE alone
 /// would answer a sentence about enrolment to a caller who was creating a user —
 /// the same overclaiming that made the exclusion message above false,
 /// re-introduced by the change that fixes it. `create-user` and `set-user-admin`

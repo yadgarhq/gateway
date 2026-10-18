@@ -1,7 +1,7 @@
 //! The administrative surface's decisions, apart from its plumbing (ADR-0492,
 //! D73, ledger 638).
 //!
-//! `http.rs` owns the three handlers — the routes, the bodies, the upstream
+//! `http.rs` owns the four handlers — the routes, the bodies, the upstream
 //! calls. **This module owns everything about them that can be got wrong without
 //! failing**, because every one of those decisions is a per-handler function call
 //! in a language whose compiler cannot notice one is missing. Put here, each is a
@@ -20,6 +20,7 @@
 //!    two-verb half of this from `iam`'s side: "create an admin, or promote
 //!    one … IT IS CHECKED AT THE GATEWAY" — that sentence predates ADR-0655 and
 //!    is a `proto` repo carrier of the same stale claim, tracked separately.
+//!    ADR-0945's `RevokeCredentials` is never admitted, on any value.
 //! 3. **[`Authority::actor`]** — what ADR-0534's relay carries, and on which path
 //!    it carries nothing.
 //! 4. **[`is_self_demotion`]** — D73's exclusion, which `iam.proto:664` defers to
@@ -46,7 +47,8 @@ use crate::pb::yadgar::common::v1::UnverifiedActor;
 /// assumed, because the closed-set reasoning below enumerates the verbs and a
 /// third one appearing silently would make that enumeration wrong. (`iam-db`'s
 /// per-conjunct refusal counter under ADR-0655 is a DIFFERENT signal — refusals,
-/// not acceptances — and replaces nothing here.)
+/// not acceptances — and replaces nothing here.) ADR-0945's `RevokeCredentials`
+/// is the fourth verb and never reaches this counter.
 ///
 /// # Why a metric exists for something a log line already says
 ///
@@ -71,7 +73,7 @@ use crate::pb::yadgar::common::v1::UnverifiedActor;
 /// D67 forbids a label a caller can influence, which rules out the token, the
 /// presented value and anything derived from either. It does not rule out
 /// `verb`, whose only three reachable values here are closed by [`Verb`] —
-/// `CreateUser`, `SetUserAdmin` and, since ADR-0655, `IssueEnrolment`. That label
+/// `CreateUser`, `SetUserAdmin`, `IssueEnrolment` (not `RevokeCredentials`). That label
 /// is omitted anyway, because **it would not change what the operator does**:
 /// any of the three sends them to enumerate the administrators `iam` holds and to
 /// rotate the Secret, and the split buys a dashboard nobody has. The scrape
@@ -91,12 +93,12 @@ use crate::pb::yadgar::common::v1::UnverifiedActor;
 /// what decides the shape of `deploy`'s alerting rule.
 pub const ACCEPTED: &str = "yadgar_gateway_bootstrap_accepted_total";
 
-/// The three administrative verbs `/admin` serves.
+/// The four administrative verbs `/admin` serves.
 ///
 /// **A CLOSED ENUM RATHER THAN A STRING**, for `tools::SERVED`'s reason one
 /// module over: the set has to be stated once so that widening it is an edit to
 /// the set rather than an arm added somewhere nobody is looking. Every rule below
-/// matches on it exhaustively, so a fourth verb does not compile until each rule
+/// matches on it exhaustively, so a fifth verb does not compile until each rule
 /// has said what it means for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
@@ -112,6 +114,8 @@ pub enum Verb {
     /// `iam.SetUserAdmin`. Promote or demote. The bootstrap token reaches the
     /// promotion half only.
     SetUserAdmin,
+    /// `iam.RevokeAllCredentials` (ADR-0945). Never the bootstrap token.
+    RevokeCredentials,
 }
 
 impl Verb {
@@ -189,6 +193,8 @@ impl Verb {
             // narrowing that ADR-0655 actually buys is the zero-credential
             // predicate at `iam-db`, inside the write; see the doc comment.
             Verb::IssueEnrolment => true,
+            // NEVER (ADR-0945): a shared secret must not sign anybody out.
+            Verb::RevokeCredentials => false,
         }
     }
 }

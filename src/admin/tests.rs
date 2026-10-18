@@ -138,6 +138,21 @@ fn the_bootstrap_token_reaches_create_an_admin_promote_one_and_enrol_one() {
     );
 }
 
+/// ADR-0945: the bootstrap token never reaches `RevokeCredentials`, on either
+/// value of the flag. A revoke request carries no flag; both values are
+/// asserted so that a `wants_admin`-gated arm cannot pass.
+#[test]
+fn the_bootstrap_token_never_revokes_credentials() {
+    assert!(
+        !Verb::RevokeCredentials.accepts_bootstrap(true),
+        "the bootstrap token must never revoke credentials"
+    );
+    assert!(
+        !Verb::RevokeCredentials.accepts_bootstrap(false),
+        "the bootstrap token must never revoke credentials, whatever the flag"
+    );
+}
+
 /// §6, and the row §9 names: assert ABSENCE, not an empty string.
 #[test]
 fn the_bootstrap_path_stamps_no_actor_at_all() {

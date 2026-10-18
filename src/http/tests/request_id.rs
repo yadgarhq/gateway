@@ -75,7 +75,7 @@ macro_rules! recording_iam_service {
                     header: header_of(&req),
                     scope: None,
                 });
-                // AN ADMINISTRATOR, so the three `/admin` verbs get past
+                // AN ADMINISTRATOR, so the four `/admin` verbs get past
                 // `authorise` and reach the RPC this file is about.
                 Ok(tonic::Response::new(ResolveCredentialResponse {
                     user_id: "u-that-iam-resolved".to_string(),
@@ -117,6 +117,7 @@ recording_iam_service! {
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
     set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
+    revoke_all_credentials(RevokeAllCredentialsRequest) -> RevokeAllCredentialsResponse;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,7 +373,7 @@ async fn enrol_hands_iam_the_id_on_its_own_record() {
     assert_all_carry(&arrivals, &["redeem_enrolment"], &id);
 }
 
-/// The three administrative verbs: the attestation AND the verb carry the SAME
+/// The four administrative verbs: the attestation AND the verb carry the SAME
 /// id, because both are one inbound request.
 #[tokio::test]
 async fn each_admin_verb_hands_iam_one_id_for_attestation_and_verb() {
@@ -391,6 +392,11 @@ async fn each_admin_verb_hands_iam_one_id_for_attestation_and_verb() {
             "/admin/set-user-admin",
             r#"{"user_id":"yadgar:user:someone-else","is_admin":true}"#,
             "set_user_admin",
+        ),
+        (
+            "/admin/revoke-credentials",
+            r#"{"user_id":"yadgar:user:0192f3c1-8a4e-7c2d-9b11-000000000002"}"#,
+            "revoke_all_credentials",
         ),
     ];
     for (path, body, rpc) in verbs {

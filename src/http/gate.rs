@@ -120,16 +120,17 @@ pub(super) fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
 ///
 /// `Some` is a response the caller must be sent; `None` means carry on.
 ///
-/// **FIVE CALLERS NOW AND THIS COMMENT USED TO SAY TWO**, which is how an
+/// **SIX CALLERS NOW AND THIS COMMENT USED TO SAY TWO**, which is how an
 /// enumeration that reads as complete stops being one — the failure `login`'s
 /// "the two 400s" already cost this file once. `/auth/login` and `/auth/enrol`
 /// are the two UNAUTHENTICATED ones; `/admin/create-user`,
-/// `/admin/issue-enrolment` and `/admin/set-user-admin` are the three
-/// administrative ones, and they call it for a reason that is not symmetry.
+/// `/admin/issue-enrolment`, `/admin/set-user-admin` and
+/// `/admin/revoke-credentials` are the four administrative ones, and they call
+/// it for a reason that is not symmetry.
 /// `origin_ok` lives here rather than in a layer, so an `/admin` route that
 /// skipped this would have no `Origin` check and no throttle — reproducing the
 /// bug this function was written to fix, on the surface where a cross-origin POST
-/// buys an administrator. The `limits` parameter is why the three do not thereby
+/// buys an administrator. The `limits` parameter is why the four do not thereby
 /// share login's budget.
 ///
 /// # Everything decided here is decided WITHOUT the body, and that is the point
@@ -268,7 +269,7 @@ pub(super) async fn guard(
 
 /// The 429 every endpoint behind [`guard`] answers with.
 ///
-/// **FIVE, NOT TWO** — the two credential endpoints and the three administrative
+/// **SIX, NOT TWO** — the two credential endpoints and the four administrative
 /// ones. See [`guard`] for why the count is spelled out rather than left as
 /// "both".
 ///

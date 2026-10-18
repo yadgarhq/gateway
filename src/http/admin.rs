@@ -1,6 +1,7 @@
-//! The three administrative endpoints (ADR-0492, D73).
+//! The four administrative endpoints (ADR-0492, D73, ADR-0945).
 //!
-//! Split out of [`super`] for the file-size ceiling. WHO is allowed to reach
+//! Split out of [`super`] for the file-size ceiling; the fourth,
+//! `revoke-credentials`, lives in [`revoke`] for the same reason. WHO is allowed to reach
 //! them is [`super::authority`]'s, and the split is deliberate in that
 //! direction: these handlers do the work, and none of them decides the
 //! authorization.
@@ -9,6 +10,8 @@ use super::authority::*;
 use super::dispatch::*;
 use super::gate::*;
 use super::*;
+
+pub(in crate::http) mod revoke;
 
 /// This module's routes. See [`super::dispatch::routes`] for why each set is
 /// registered beside its own handlers.
@@ -39,6 +42,12 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route(
             "/admin/set-user-admin",
             post(admin_set_user_admin).fallback(method_not_allowed),
+        )
+        // ADR-0945. Above the layer and out of `tools::SERVED`, like the three
+        // above it.
+        .route(
+            "/admin/revoke-credentials",
+            post(revoke::admin_revoke_credentials).fallback(method_not_allowed),
         )
 }
 
