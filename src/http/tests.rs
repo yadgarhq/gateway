@@ -3015,3 +3015,6 @@ mod request_deadlines;
 
 /// What each upstream is handed as D67's join key (ledger 1248).
 mod request_id;
+
+/// ADR-0941 through the router: archived projects refuse writes, serve reads.
+mod archived;

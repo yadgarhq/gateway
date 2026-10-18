@@ -105,6 +105,10 @@ pub(super) async fn authorise(
             // mints a scope with none. The bootstrap path never needed one.
             project_id: None,
             instance_id: header(headers, "x-yadgar-instance"),
+            // UNREAD: `attest_admin` checks no project, so nothing consults
+            // this. The default is stated rather than left to `..Default` so
+            // the literal stays exhaustive like the one on `tools_call`.
+            access: crate::project::Access::default(),
         },
         request_id,
     )

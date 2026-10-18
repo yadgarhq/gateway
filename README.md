@@ -351,6 +351,21 @@ about the answer changes until `projectValidation.mode` says `enforcing`.
 | `PROJECT_UNREGISTERED_PERSONAL` | a `local/` path with no registered ancestor (ADR-0605)                            | `400`, write a marker file and use the project-create tool |
 | `PROJECT_UNRESOLVABLE`          | no registered ancestor at all, and not under `local/`                             | `400`, **no remediation** — ask a human                    |
 | `PROJECT_REGISTRY_UNAVAILABLE`  | the registry has NEVER loaded, so no claim can be checked (ADR-0674)              | `503`, and a reason distinct from all four above           |
+| `PROJECT_ARCHIVED`              | the claim RESOLVES to an archived project and the tool WRITES (ADR-0941)          | `400`; a read of the same project is served                |
+
+An archived project refuses WRITES and still answers READS (ADR-0941): archive
+keeps history, so `find_tasks` and `read_task` resolve as usual, and
+`create_task`, `edit_task` and `transition_task` count under `PROJECT_ARCHIVED`.
+Whether a call writes comes from the tool name — the rule that also sets
+`CallRecord.kind`. The registry load carries each row's status, and an alias
+carries the status of the row it names. Archived rows are NOT dropped from the
+walk, so a claim BENEATH an archived project lands on it and its write is refused
+too — the resolved project is archived; a live project deeper in the path still
+wins, as the deepest match always does. An archived namespace anchor is still an
+anchor: the answer stays `PROJECT_UNREGISTERED_ORG`. Only
+`PROJECT_STATUS_ARCHIVED` counts as archived; `UNSPECIFIED` and unknown values are
+served. Like every other state, it is counted and served under `counting` and
+answered under `enforcing`.
 
 A namespace anchor is resolved THROUGH and is never a landing site, including when
 it is named exactly: a registered `yadgarhq` exists to say "this repository is not

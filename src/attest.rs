@@ -247,6 +247,14 @@ pub struct Claimed<'a> {
     pub user_id: Option<&'a str>,
     pub project_id: Option<&'a str>,
     pub instance_id: Option<&'a str>,
+    /// Whether the call reads or writes, from the TOOL the caller named.
+    ///
+    /// A claim like the three above — the caller chose the tool — and carried
+    /// here rather than as an eighth argument to [`attest`] for that reason.
+    /// [`crate::project::Validator::check`] reads it: a write to an archived
+    /// project is refused and a read of one is served (ADR-0941). Defaults to
+    /// `Write`, the answer that cannot let a write through by omission.
+    pub access: crate::project::Access,
 }
 
 /// What one lookup established about the caller.

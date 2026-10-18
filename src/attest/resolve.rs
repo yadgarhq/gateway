@@ -50,13 +50,18 @@ pub async fn attest(
     claimed: Claimed<'_>,
     request_id: String,
 ) -> Result<Attested, AttestError> {
+    let access = claimed.access;
     let attested = attested(how, iam, cache, credential, claimed, request_id).await?;
     // COUNTED ALWAYS, REFUSED ONLY WHERE THE DEPLOYMENT SAYS SO. In the shipped
     // `counting` mode this returns `Ok` for every claim, having recorded which
     // terminal state it reached — see `crate::project`, whose whole subject is
     // why the counted stage exists before the enforcing one.
     projects
-        .check(&attested.scope.project_id, &attested.scope.request_id)
+        .check(
+            &attested.scope.project_id,
+            access,
+            &attested.scope.request_id,
+        )
         .await
         .map_err(AttestError::Project)?;
     Ok(attested)
