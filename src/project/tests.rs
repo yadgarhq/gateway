@@ -810,7 +810,7 @@ async fn stub_project_recording(
 }
 
 /// A `ProjectService` that records the `x-yadgar-request-id` each `ListProjects`
-/// arrived with and answers an empty page.
+/// arrived with and answers two pages per load.
 struct ListingProject {
     request_ids: Arc<Mutex<Vec<Option<String>>>>,
 }
@@ -841,7 +841,13 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
             .get(crate::upstream::request_id::HEADER)
             .map(|v| v.to_str().expect("an ASCII header").to_string());
         self.request_ids.lock().unwrap().push(header);
-        Ok(tonic::Response::new(Default::default()))
+        // TWO PAGES PER LOAD: the first names a next token, the second ends it.
+        let mut answer =
+            crate::pb::yadgar::project::v1::ProjectServiceListProjectsResponse::default();
+        if req.get_ref().page_token.is_empty() {
+            answer.next_page_token = "page-2".to_string();
+        }
+        Ok(tonic::Response::new(answer))
     }
 
     async fn sync_projects(
@@ -857,11 +863,12 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
     }
 }
 
-/// THE REGISTRY POLL STAMPS A FRESH `x-yadgar-request-id` ON EACH LOAD (ledger 1254).
+/// THE REGISTRY POLL STAMPS ONE FRESH `x-yadgar-request-id` PER LOAD (ledger 1254).
 ///
-/// The mutation this reds: build the poll's client over the bare channel, as
-/// `load` did, so `ListProjects` arrives with no header. A second mutation,
-/// minting once outside the loop, reds the distinctness assertion.
+/// Every page of one load shares the id, and the next load carries another.
+/// The mutations this reds: build the client over the bare channel (no header),
+/// mint inside the page loop (pages differ), or mint once outside `run`'s loop
+/// (loads share an id).
 #[tokio::test]
 async fn each_registry_poll_sends_its_own_well_formed_request_id() {
     let request_ids = Arc::new(Mutex::new(Vec::new()));
@@ -889,22 +896,25 @@ async fn each_registry_poll_sends_its_own_well_formed_request_id() {
 
     let _registry = Registry::start(channel, Duration::from_millis(20));
     for _ in 0..200 {
-        if request_ids.lock().unwrap().len() >= 2 {
+        if request_ids.lock().unwrap().len() >= 4 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    // Arrivals are sequential: pages 1 and 2 of load one, then of load two.
     let seen = request_ids.lock().unwrap().clone();
-    assert!(seen.len() >= 2, "the stub saw fewer than two polls");
-    for header in &seen {
+    assert!(seen.len() >= 4, "the stub saw fewer than two full loads");
+    for header in &seen[..4] {
         let id = header
             .as_deref()
             .expect("every poll carries x-yadgar-request-id");
         let parsed = uuid::Uuid::parse_str(id).expect("the id is a UUID");
         assert_eq!(parsed.get_version_num(), 7, "the id is a UUIDv7");
     }
-    assert_ne!(seen[0], seen[1], "two polls must not share one id");
+    assert_eq!(seen[0], seen[1], "both pages of one load share one id");
+    assert_eq!(seen[2], seen[3], "both pages of one load share one id");
+    assert_ne!(seen[0], seen[2], "two loads must not share one id");
 }
 
 /// One `ResolveProject` answer for the anchor these tests refuse beneath.
