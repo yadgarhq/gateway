@@ -223,3 +223,25 @@ fn a_bind_conflict_names_the_listen_address() {
 
     drop(held);
 }
+
+/// THE BOOT GATE, through the real binary (`plans/project-membership.md` car
+/// P3): ENFORCING with trusted headers refuses to start, naming both settings.
+/// The unit test proves the function; this proves `main` calls it.
+#[test]
+fn enforcing_with_trusted_headers_refuses_boot_naming_both_settings() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "YADGAR_PROJECT_VALIDATION_MODE");
+    vars.push(("YADGAR_PROJECT_VALIDATION_MODE", "enforcing"));
+    vars.push(("YADGAR_TRUST_UNAUTHENTICATED_HEADERS", "1"));
+    let (status, stderr) = run_to_exit(&vars);
+    let line = refusal_line(status, &stderr);
+    for named in [
+        "YADGAR_PROJECT_VALIDATION_MODE",
+        "YADGAR_TRUST_UNAUTHENTICATED_HEADERS",
+    ] {
+        assert!(
+            line.contains(named),
+            "the refusal must name {named}: {line}"
+        );
+    }
+}

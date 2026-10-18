@@ -3023,3 +3023,7 @@ mod archived;
 /// `/admin/revoke-credentials` (ADR-0945): the canonical id check and the
 /// refusals that need no answering `iam`.
 mod revoke;
+
+/// `PROJECT_NOT_MEMBER` through the router: every tool, the 403, and one
+/// answer for every non-owner (`plans/project-membership.md` car P3).
+mod not_member;

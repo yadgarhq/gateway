@@ -240,6 +240,11 @@ pub(super) fn sentence(reason: Reason, anchor: Option<&str>, source_repo: Option
         // NOT ABOUT THE CALLER AT ALL (ADR-0674), and the sentence says so
         // plainly: an operator reading this next to the four above must not have
         // to guess which of the two conditions they are in.
+        Reason::NotMember => "this personal project belongs to another account. Use your own \
+                              local/<account>/... project; a personal project is reachable only \
+                              by the account that registered it."
+            .to_string(),
+
         Reason::RegistryUnavailable => "this gateway has not loaded the project registry yet, so \
                                         it cannot check which project this call names. Nothing \
                                         is wrong with the workspace or the credential. Retry; if \

@@ -337,3 +337,38 @@ pub fn http_configuration() -> Result<
     };
     Ok((allowed_origins, trust, credential_limits, admin_limits))
 }
+
+/// Refuse to boot when project validation ENFORCES but identity is a header
+/// the caller wrote (`plans/project-membership.md` car P3).
+///
+/// Under trusted headers `user_id` is whatever `X-Yadgar-User` says, so the
+/// owner check on a private project would compare a stored owner with a
+/// caller-named identity and enforce nothing — a refusal that reads as
+/// protection without being one (ADR-0947). Counting refuses nobody, so it
+/// boots with either source; Enforcing boots only with `iam` attestation.
+///
+/// Takes the values ALREADY RESOLVED rather than reading the environment
+/// again, so it adds no read to the boot order and can name no different
+/// value from the ones this process acts on.
+///
+/// # Errors
+///
+/// Enforcing together with trusted headers, naming both settings and both
+/// chart keys.
+pub fn refuse_unverifiable_enforcement(
+    attestation: &Attestation,
+    mode: yadgar_gateway::project::Mode,
+) -> Result<(), String> {
+    match (attestation, mode) {
+        (Attestation::TrustedHeaders, yadgar_gateway::project::Mode::Enforcing) => Err(
+            "YADGAR_PROJECT_VALIDATION_MODE is \"enforcing\" (chart: projectValidation.mode) \
+             while YADGAR_TRUST_UNAUTHENTICATED_HEADERS=1 (chart: trustUnauthenticatedHeaders) \
+             takes the caller's identity from a header it wrote. A personal project's owner \
+             check would then compare against a caller-named identity and enforce nothing, so \
+             this gateway refuses to start. Attest identity through iam, or keep project \
+             validation at \"counting\"."
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}

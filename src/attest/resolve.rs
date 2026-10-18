@@ -60,6 +60,7 @@ pub async fn attest(
         .check(
             &attested.scope.project_id,
             access,
+            &attested.scope.user_id,
             &attested.scope.request_id,
         )
         .await

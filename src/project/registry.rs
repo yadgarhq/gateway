@@ -39,7 +39,8 @@ use crate::pb::yadgar::project::v1::{
     RegisteredPath,
 };
 
-use super::classify::{Match, Registered};
+use super::classify::{is_private_class, Match, Registered};
+use super::member::PrivateIndex;
 
 /// Whether this replica has EVER loaded the registry: `1` after the first
 /// successful load, `0` before it.
@@ -52,6 +53,15 @@ use super::classify::{Match, Registered};
 /// at all.
 pub const LOADED: &str = "yadgar_gateway_project_registry_loaded";
 
+/// Private ROWS in the last load that arrived with no owner
+/// (`plans/project-membership.md` §5 step 3). Every such row is unreachable by
+/// anybody, so it must read 0 before the observation window opens.
+///
+/// **SET ON EVERY LOAD, AND NOT AT BOOT.** [`LOADED`] already says whether a
+/// load ever happened; a `0` published before one would read as "every owner
+/// arrived" about a set nobody has seen.
+pub const PRIVATE_WITHOUT_OWNER: &str = "yadgar_gateway_project_registry_private_without_owner";
+
 /// How long one `ListProjects` page may take before the load is abandoned and
 /// retried.
 ///
@@ -60,80 +70,6 @@ pub const LOADED: &str = "yadgar_gateway_project_registry_loaded";
 /// expensive, and nothing about a deployment changes what a stalled page should
 /// cost a background task.
 const PAGE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
-
-/// The environment variable naming the load cadence, in seconds.
-pub const POLL: &str = "YADGAR_PROJECT_REGISTRY_POLL_SECONDS";
-
-/// ONE cadence, serving two jobs, and ADR-0674 names only the first.
-///
-/// The ADR requires a retry cadence: a gateway whose load failed asks again.
-/// The same interval is also what REFRESHES a set that loaded successfully, and
-/// that second job is not a liberty taken with the ruling — it is forced by two
-/// facts. `project` publishes no registry-change event yet
-/// (`project.proto`: "Only the first of the three is in this release"), so a
-/// load is the only way a newly registered project becomes resolvable. And the
-/// refusal counter is what GATES the enforcement flip, so a counter computed
-/// against the registry as it was at boot would go on counting every repository
-/// seeded since — making the gate unreadable until somebody restarted every
-/// pod, for a reason nothing would explain.
-///
-/// # Errors
-///
-/// Absent, empty, not a whole number of seconds, or zero. No compiled-in
-/// default (ADR-0569).
-/// The same cadence, from this process's environment.
-///
-/// # Errors
-///
-/// See [`poll_from_lookup`], which this is.
-pub fn poll_from_env() -> Result<Duration, RetryError> {
-    poll_from_lookup(|key| std::env::var(key).ok())
-}
-
-pub fn poll_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Duration, RetryError> {
-    let raw = lookup(POLL).ok_or(RetryError::Absent)?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(RetryError::Empty);
-    }
-    let seconds: u64 = trimmed.parse().map_err(|source| RetryError::Unparsable {
-        value: trimmed.to_string(),
-        source,
-    })?;
-    if seconds == 0 {
-        return Err(RetryError::Zero);
-    }
-    Ok(Duration::from_secs(seconds))
-}
-
-/// A cadence this deployment did not state, or stated unusably.
-#[derive(Debug, thiserror::Error)]
-pub enum RetryError {
-    #[error(
-        "{POLL} is not set. It is how often this gateway asks `project` for the registered set — \
-         the retry after a failed load and the refresh after a successful one. There is no \
-         compiled-in default (ADR-0569): an interval nobody chose decides how long a newly \
-         registered project stays unresolvable, and how hard an unreachable `project` is \
-         hammered."
-    )]
-    Absent,
-
-    #[error("{POLL} is set and has no value. That is different from being absent and is reported separately.")]
-    Empty,
-
-    #[error("{POLL} is {value:?}, which is not a whole number of seconds.")]
-    Unparsable {
-        value: String,
-        #[source]
-        source: std::num::ParseIntError,
-    },
-
-    #[error(
-        "{POLL} is 0. A load every zero seconds is a busy loop against `project`, so it is \
-         refused rather than read as \"never\" or \"as fast as possible\"."
-    )]
-    Zero,
-}
 
 /// Every registered path and alias, folded for comparison.
 ///
@@ -164,6 +100,26 @@ pub struct Loaded {
     /// later release stamps is the row's spelling and not the caller's — the
     /// same answer `ProjectDbService.ResolveProject` gives.
     folded: BTreeMap<String, Match>,
+    /// Every private spelling with its row's owner, sorted, for the subtree
+    /// rule — built once per load, never per call.
+    private: PrivateIndex,
+    /// Private ROWS (not spellings) in this load, and how many of them arrived
+    /// with no owner. The second must read 0 before the observation window
+    /// opens (`plans/project-membership.md` §5 step 3).
+    private_rows: usize,
+    private_rows_without_owner: usize,
+}
+
+/// The stored owner of one loaded row.
+///
+/// **A STUB UNTIL `RegisteredPath.owner_user_id` IS TAGGED (car P0), and it
+/// FAILS CLOSED.** It answers `""` for every row, so every private row reads as
+/// owned by nobody and every call into one counts `PROJECT_NOT_MEMBER` —
+/// `plans/project-membership.md` §5 step 2. The class is the PATH, so an
+/// absent owner can never turn a private row into an org one. Once P0 is
+/// tagged this becomes `row.owner_user_id.clone()`, and nothing else changes.
+fn owner_of(_row: &RegisteredPath) -> String {
+    String::new()
 }
 
 /// Whether a wire status is ARCHIVED.
@@ -180,39 +136,83 @@ impl Loaded {
     /// The set, from the rows `ListProjects` answered: every path and every
     /// alias, each carrying its row's status.
     pub fn from_registered(rows: impl IntoIterator<Item = RegisteredPath>) -> Self {
-        Self::from_matches(rows.into_iter().flat_map(|row| {
+        Self::from_owned(rows.into_iter().map(|row| (owner_of(&row), row)))
+    }
+
+    /// The set from rows whose owners are stated beside them.
+    ///
+    /// The seam [`Self::from_registered`] goes through, and the one tests use to
+    /// load private rows WITH owners while the wire field does not exist yet.
+    pub fn from_owned(rows: impl IntoIterator<Item = (String, RegisteredPath)>) -> Self {
+        let mut private_rows = 0;
+        let mut without_owner = 0;
+        let mut matches = Vec::new();
+        for (owner, row) in rows {
+            if is_private_class(&row.path) {
+                private_rows += 1;
+                without_owner += usize::from(owner.is_empty());
+            }
             let archived = is_archived(row.status);
-            std::iter::once(row.path)
-                .chain(row.aliases)
-                .map(move |path| Match { path, archived })
-        }))
+            for path in std::iter::once(row.path).chain(row.aliases) {
+                matches.push(Match {
+                    path,
+                    archived,
+                    owner: owner.clone(),
+                });
+            }
+        }
+        let mut loaded = Self::from_matches(matches);
+        loaded.private_rows = private_rows;
+        loaded.private_rows_without_owner = without_owner;
+        loaded
     }
 
     /// The set from bare spellings, every one of them ACTIVE.
     ///
     /// For tests that do not care about status, which is nearly all of them.
     pub fn from_paths(paths: impl IntoIterator<Item = String>) -> Self {
-        Self::from_matches(paths.into_iter().map(|path| Match {
-            path,
-            archived: false,
+        Self::from_owned(paths.into_iter().map(|path| {
+            let row = RegisteredPath {
+                path,
+                status: ProjectStatus::Active as i32,
+                aliases: Vec::new(),
+            };
+            (String::new(), row)
         }))
     }
 
-    fn from_matches(matches: impl IntoIterator<Item = Match>) -> Self {
+    fn from_matches(matches: Vec<Match>) -> Self {
+        let folded: BTreeMap<String, Match> = matches
+            .into_iter()
+            // THE BARE RESERVED SEGMENT IS DROPPED HERE TOO. The tier
+            // already refuses to emit it, so this is the second half of a
+            // guard neither half closes alone — and the walk in
+            // `super::classify` drops it a third time, from the CANDIDATE's
+            // chain. A row at `local` is the nearest registered ancestor of
+            // every private path in the estate, so the cost of one
+            // redundant check is nothing beside what it prevents.
+            .filter(|m| !m.path.eq_ignore_ascii_case("local"))
+            .map(|m| (m.path.to_ascii_lowercase(), m))
+            .collect();
+        let private =
+            PrivateIndex::build(folded.values().map(|m| (m.path.as_str(), m.owner.as_str())));
         Self {
-            folded: matches
-                .into_iter()
-                // THE BARE RESERVED SEGMENT IS DROPPED HERE TOO. The tier
-                // already refuses to emit it, so this is the second half of a
-                // guard neither half closes alone — and the walk in
-                // `super::classify` drops it a third time, from the CANDIDATE's
-                // chain. A row at `local` is the nearest registered ancestor of
-                // every private path in the estate, so the cost of one
-                // redundant check is nothing beside what it prevents.
-                .filter(|m| !m.path.eq_ignore_ascii_case("local"))
-                .map(|m| (m.path.to_ascii_lowercase(), m))
-                .collect(),
+            folded,
+            private,
+            private_rows: 0,
+            private_rows_without_owner: 0,
         }
+    }
+
+    /// Private rows in this load, for the load line.
+    pub fn private_rows(&self) -> usize {
+        self.private_rows
+    }
+
+    /// Private rows that arrived with no owner — every one of them is
+    /// unreachable by anybody until its owner loads.
+    pub fn private_rows_without_owner(&self) -> usize {
+        self.private_rows_without_owner
     }
 
     /// How many paths this replica resolved against, for the boot line.
@@ -228,6 +228,10 @@ impl Loaded {
 impl Registered for Loaded {
     fn registered_as(&self, path: &str) -> Option<Match> {
         self.folded.get(&path.to_ascii_lowercase()).cloned()
+    }
+
+    fn private_owners_beneath(&self, path: &str) -> Vec<&str> {
+        self.private.beneath(path)
     }
 }
 
@@ -266,6 +270,13 @@ impl Registry {
     /// For tests and for nothing else, like [`Self::loaded_with`].
     pub fn loaded_from(rows: Vec<RegisteredPath>) -> Self {
         Self::holding(Loaded::from_registered(rows))
+    }
+
+    /// A registry holding exactly these rows, each with its stated owner.
+    ///
+    /// For tests and for nothing else, like [`Self::loaded_with`].
+    pub fn loaded_owned(rows: Vec<(String, RegisteredPath)>) -> Self {
+        Self::holding(Loaded::from_owned(rows))
     }
 
     fn holding(loaded: Loaded) -> Self {
@@ -329,22 +340,32 @@ async fn run(project: Channel, poll: Duration, registry: Registry) {
 }
 
 /// Install a freshly loaded set, and publish the gauge for it.
-fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
+pub(super) fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
     let loaded = Loaded::from_registered(rows);
     let count = loaded.len();
+    let (private_rows, without_owner) =
+        (loaded.private_rows(), loaded.private_rows_without_owner());
     let first = registry.loaded().is_none();
     registry.install(loaded);
     // AFTER THE SET IS INSTALLED, never before: a gauge saying the registry is
     // loaded while the request path still answers `None` is a window in which the
     // instrument disagrees with the service.
     metrics::gauge!(LOADED).set(1.0);
+    metrics::gauge!(PRIVATE_WITHOUT_OWNER).set(without_owner as f64);
     if first {
         tracing::info!(
             paths = count,
+            private_rows,
+            private_rows_without_owner = without_owner,
             "the project registry is loaded; claimed workspaces resolve against it"
         );
     } else {
-        tracing::debug!(paths = count, "the project registry was refreshed");
+        tracing::debug!(
+            paths = count,
+            private_rows,
+            private_rows_without_owner = without_owner,
+            "the project registry was refreshed"
+        );
     }
 }
 
