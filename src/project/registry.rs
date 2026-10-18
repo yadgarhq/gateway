@@ -375,7 +375,14 @@ fn report(registry: &Registry, e: &tonic::Status, poll: Duration) {
 
 /// One whole load: every page, until the token comes back empty.
 async fn load(project: &Channel) -> Result<Vec<RegisteredPath>, tonic::Status> {
-    let mut client = ProjectServiceClient::new(project.clone());
+    // ONE FRESH ID PER LOAD, minted here (D67). The poll has no inbound call whose
+    // id it could inherit, so it is its own call; every page of one load shares
+    // the id and the next load gets another. Sent so `project` and `project-db`
+    // can join their records for it (ledger 1254).
+    let mut client = ProjectServiceClient::new(crate::upstream::request_id::carrying(
+        project.clone(),
+        &crate::request_id(),
+    ));
     let mut out = Vec::new();
     let mut token = String::new();
     loop {

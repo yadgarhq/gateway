@@ -809,6 +809,104 @@ async fn stub_project_recording(
     (channel, request_ids)
 }
 
+/// A `ProjectService` that records the `x-yadgar-request-id` each `ListProjects`
+/// arrived with and answers an empty page.
+struct ListingProject {
+    request_ids: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[tonic::async_trait]
+impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for ListingProject {
+    async fn resolve_project(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "this stub answers ListProjects and nothing else",
+        ))
+    }
+
+    async fn list_projects(
+        &self,
+        req: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceListProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceListProjectsResponse>,
+        tonic::Status,
+    > {
+        let header = req
+            .metadata()
+            .get(crate::upstream::request_id::HEADER)
+            .map(|v| v.to_str().expect("an ASCII header").to_string());
+        self.request_ids.lock().unwrap().push(header);
+        Ok(tonic::Response::new(Default::default()))
+    }
+
+    async fn sync_projects(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "this stub answers ListProjects and nothing else",
+        ))
+    }
+}
+
+/// THE REGISTRY POLL STAMPS A FRESH `x-yadgar-request-id` ON EACH LOAD (ledger 1254).
+///
+/// The mutation this reds: build the poll's client over the bare channel, as
+/// `load` did, so `ListProjects` arrives with no header. A second mutation,
+/// minting once outside the loop, reds the distinctness assertion.
+#[tokio::test]
+async fn each_registry_poll_sends_its_own_well_formed_request_id() {
+    let request_ids = Arc::new(Mutex::new(Vec::new()));
+    let served = Arc::clone(&request_ids);
+    let incoming = tonic::transport::server::TcpIncoming::bind(
+        "127.0.0.1:0".parse().expect("a loopback address"),
+    )
+    .expect("the stub binds");
+    let addr = incoming.local_addr().expect("a bound port");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                crate::pb::yadgar::project::v1::project_service_server::ProjectServiceServer::new(
+                    ListingProject {
+                        request_ids: served,
+                    },
+                ),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("a URI")
+        .connect_lazy();
+
+    let _registry = Registry::start(channel, Duration::from_millis(20));
+    for _ in 0..200 {
+        if request_ids.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let seen = request_ids.lock().unwrap().clone();
+    assert!(seen.len() >= 2, "the stub saw fewer than two polls");
+    for header in &seen {
+        let id = header
+            .as_deref()
+            .expect("every poll carries x-yadgar-request-id");
+        let parsed = uuid::Uuid::parse_str(id).expect("the id is a UUID");
+        assert_eq!(parsed.get_version_num(), 7, "the id is a UUIDv7");
+    }
+    assert_ne!(seen[0], seen[1], "two polls must not share one id");
+}
+
 /// One `ResolveProject` answer for the anchor these tests refuse beneath.
 ///
 /// **THE LITERAL IS EXHAUSTIVE ON PURPOSE.** A `..Default::default()` here would
