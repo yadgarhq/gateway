@@ -653,3 +653,61 @@ async fn an_admin_client_that_sends_no_origin_is_unaffected() {
         "no Origin means a non-browser client, which must reach iam"
     );
 }
+
+/// `/admin/revoke-credentials` calls `guard()` and spends its OWN bucket
+/// (ADR-0945). The first request is refused by the bootstrap exclusion, which
+/// still spends the token; the second is the throttle. A 403 then 429 can only
+/// come from a handler that ran the throttle before judging authority.
+#[tokio::test]
+async fn the_revoke_credentials_route_is_throttled_on_its_own_key() {
+    let state = state_with_admin(
+        TrustBoundary::Hops(1),
+        wide(),
+        CredentialLimits {
+            attributed: one_token(),
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
+    );
+    let forwarded = format!("203.0.113.1, {REAL_CLIENT}");
+    let body = r#"{"user_id":"yadgar:user:0192f3c1-8a4e-7c2d-9b11-000000000002"}"#;
+
+    assert_eq!(
+        admin(
+            Arc::clone(&state),
+            "/admin/revoke-credentials",
+            body,
+            None,
+            Some(&forwarded)
+        )
+        .await,
+        StatusCode::FORBIDDEN,
+        "the first request spends the token and meets the bootstrap exclusion"
+    );
+    assert_eq!(
+        admin(
+            Arc::clone(&state),
+            "/admin/revoke-credentials",
+            body,
+            None,
+            Some(&forwarded)
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the second request must be throttled: revoke-credentials must call guard()"
+    );
+    assert_ne!(
+        admin(
+            Arc::clone(&state),
+            "/admin/create-user",
+            CREATE_ADMIN,
+            None,
+            Some(&forwarded)
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "revoke-credentials has its own key; emptying it must not refuse create-user"
+    );
+}

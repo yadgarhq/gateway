@@ -71,19 +71,21 @@ const AUTH_ENROL: &str = "auth/enrol";
 /// same for both and splitting it would halve every count.
 const AUTH_MODULE: &str = "auth";
 
-/// The three administrative endpoints' labels (ADR-0492, D73, ledger 638).
+/// The four administrative endpoints' labels (ADR-0492, D73, ledger 638,
+/// ADR-0945).
 ///
 /// PATHS rather than MCP methods, for [`AUTH_LOGIN`]'s reason — that is what they
 /// are — and `&'static` and closed for D67's.
 ///
-/// **THREE VALUES AND NOT ONE, because these ARE the throttle keys.** [`guard`]
-/// passes `endpoint` straight to `Limiter::check_source`, so one label across the
-/// three verbs would be one bucket across them: an administrator's ordinary work
+/// **ONE VALUE PER VERB AND NOT ONE, because these ARE the throttle keys.**
+/// [`guard`] passes `endpoint` straight to `Limiter::check_source`, so one label
+/// across the verbs would be one bucket across them: an administrator's ordinary work
 /// would spend the budget that bounds a bootstrap-token brute force, and the
 /// operator watching that budget could not tell the two apart.
 const ADMIN_CREATE_USER: &str = "admin/create-user";
 const ADMIN_ISSUE_ENROLMENT: &str = "admin/issue-enrolment";
 const ADMIN_SET_USER_ADMIN: &str = "admin/set-user-admin";
+const ADMIN_REVOKE_CREDENTIALS: &str = "admin/revoke-credentials";
 
 /// Where a caller presents D73's bootstrap token.
 ///
@@ -193,7 +195,7 @@ pub struct AppState {
     /// What bounds the two unauthenticated endpoints (task 497). See
     /// [`CredentialLimits`].
     pub credential_limits: CredentialLimits,
-    /// What bounds the three administrative endpoints (§3.2).
+    /// What bounds the four administrative endpoints (§3.2).
     ///
     /// **A THIRD AND FOURTH BUCKET RATHER THAN A SHARE OF
     /// [`Self::credential_limits`].** Sharing login's would make an

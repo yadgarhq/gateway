@@ -437,9 +437,25 @@ fn message(subject: &str, sid: &str, payload: &[u8]) -> Vec<u8> {
 /// was.
 struct StubIam {
     resolves: Arc<AtomicUsize>,
+    /// Users whose credentials `RevokeAllCredentials` has revoked. A token of
+    /// [`TARGET`] stops resolving once [`TARGET`] is in here.
+    revoked: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Where `RevokeAllCredentials` publishes `CREDENTIAL_REVOKED`, as `iam`
+    /// does after its commit (ADR-0945). `None` for the stub that only resolves.
+    publish: Option<mpsc::UnboundedSender<(String, Vec<u8>)>>,
 }
 
-/// One real method and twelve refusals.
+/// ADR-0945's end-to-end fixtures: an administrator and the user whose
+/// credentials they revoke, both in `iam-db`'s canonical id form because the
+/// route refuses any other.
+const ADMIN: &str = "yadgar:user:0192f3c1-8a4e-7c2d-9b11-3f91000000ad";
+const TARGET: &str = "yadgar:user:0192f3c1-8a4e-7c2d-9b11-3f91000000ee";
+/// The administrator's bearer token. Every other token not starting with
+/// [`TARGET_TOKEN`] resolves to [`USER`], exactly as before.
+const ADMIN_TOKEN: &str = "tok-the-administrator";
+const TARGET_TOKEN: &str = "tok-target-";
+
+/// Two real methods and twelve refusals.
 ///
 /// **THE MACRO EMITS `#[tonic::async_trait]` ITSELF, and it has to.** That
 /// attribute rewrites every `async fn` in the block into the boxed future the
@@ -452,15 +468,26 @@ macro_rules! stub_iam_service {
         impl IamService for StubIam {
             async fn resolve_credential(
                 &self,
-                _: tonic::Request<yadgar_gateway::pb::yadgar::iam::v1::ResolveCredentialRequest>,
+                req: tonic::Request<yadgar_gateway::pb::yadgar::iam::v1::ResolveCredentialRequest>,
             ) -> Result<tonic::Response<ResolveCredentialResponse>, tonic::Status> {
                 self.resolves.fetch_add(1, Ordering::SeqCst);
+                let token = req.into_inner().token;
+                let user_id = if token == ADMIN_TOKEN {
+                    ADMIN
+                } else if token.starts_with(TARGET_TOKEN) {
+                    if self.revoked.lock().expect("not poisoned").iter().any(|u| u == TARGET) {
+                        return Err(tonic::Status::unauthenticated("revoked"));
+                    }
+                    TARGET
+                } else {
+                    USER
+                };
                 Ok(tonic::Response::new(ResolveCredentialResponse {
-                    user_id: USER.to_string(),
+                    user_id: user_id.to_string(),
                     team_ids: Vec::new(),
                     valid_for_seconds: TTL.as_secs() as i64,
                     rate_limit_overrides: Vec::new(),
-                    is_admin: false,
+                    is_admin: user_id == ADMIN,
                     // ABSENT, because this suite is about eviction and states no
                     // policy. It is also the honest shape for the property the
                     // file records: no invalidation subject carries a setting
@@ -469,13 +496,33 @@ macro_rules! stub_iam_service {
                 }))
             }
 
+            async fn revoke_all_credentials(
+                &self,
+                req: tonic::Request<yadgar_gateway::pb::yadgar::iam::v1::RevokeAllCredentialsRequest>,
+            ) -> Result<
+                tonic::Response<yadgar_gateway::pb::yadgar::iam::v1::RevokeAllCredentialsResponse>,
+                tonic::Status,
+            > {
+                let user_id = req.into_inner().user_id;
+                self.revoked.lock().expect("not poisoned").push(user_id.clone());
+                // AFTER THE "COMMIT", as `iam` publishes (ADR-0945).
+                if let Some(publish) = &self.publish {
+                    publish
+                        .send((REVOKED.to_string(), user_id.into_bytes()))
+                        .expect("the broker is still running");
+                }
+                Ok(tonic::Response::new(
+                    yadgar_gateway::pb::yadgar::iam::v1::RevokeAllCredentialsResponse { revoked: 2 },
+                ))
+            }
+
             $(
                 async fn $method(
                     &self,
                     _: tonic::Request<yadgar_gateway::pb::yadgar::iam::v1::$req>,
                 ) -> Result<tonic::Response<yadgar_gateway::pb::yadgar::iam::v1::$resp>, tonic::Status> {
                     Err(tonic::Status::unimplemented(
-                        "this stub answers ResolveCredential and nothing else",
+                        "this stub answers ResolveCredential and RevokeAllCredentials only",
                     ))
                 }
             )*
@@ -499,6 +546,13 @@ stub_iam_service! {
 }
 
 async fn stub_iam() -> (Channel, Arc<AtomicUsize>) {
+    stub_iam_publishing(None).await
+}
+
+/// [`stub_iam`], whose `RevokeAllCredentials` publishes on `publish`.
+async fn stub_iam_publishing(
+    publish: Option<mpsc::UnboundedSender<(String, Vec<u8>)>>,
+) -> (Channel, Arc<AtomicUsize>) {
     let resolves = Arc::new(AtomicUsize::new(0));
     // `TcpIncoming::bind` on port 0 takes an ephemeral port and KEEPS the
     // listener, so there is no window between discovering the port and serving on
@@ -510,7 +564,11 @@ async fn stub_iam() -> (Channel, Arc<AtomicUsize>) {
     let counted = Arc::clone(&resolves);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(IamServiceServer::new(StubIam { resolves: counted }))
+            .add_service(IamServiceServer::new(StubIam {
+                resolves: counted,
+                revoked: Arc::default(),
+                publish,
+            }))
             .serve_with_incoming(incoming)
             .await
     });
@@ -1207,5 +1265,157 @@ async fn a_late_refusal_takes_the_gauge_back_down_from_one() {
         series[0], 0.0,
         "the broker refused this subscription after the boot window and {CONSUMING_GAUGE} is \
          still 1, so a replica that has gone dark reports itself healthy for the life of the pod"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0945 end to end: `/admin/revoke-credentials`, `iam`'s publish, eviction.
+// ---------------------------------------------------------------------------
+
+/// A gateway whose credential cache is the one the consumer evicts from, as
+/// `boot/wiring.rs` wires it.
+fn revoking_gateway(iam: Channel) -> Arc<yadgar_gateway::http::AppState> {
+    let wide = || yadgar_gateway::http::CredentialLimits {
+        attributed: yadgar_gateway::limit::Bucket {
+            rate: 600.0,
+            burst: 600.0,
+        },
+        unattributed: yadgar_gateway::limit::Bucket {
+            rate: 600.0,
+            burst: 600.0,
+        },
+    };
+    Arc::new(yadgar_gateway::http::AppState {
+        attestation: Attestation::Iam,
+        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        iam,
+        credentials: Credentials::new(TTL),
+        limiter: yadgar_gateway::limit::Limiter::new(
+            "127.0.0.1:1",
+            None,
+            yadgar_gateway::limit::Limits::parse("task.write=600:600", "600:600")
+                .expect("the limits parse"),
+            Duration::from_millis(200),
+            1,
+            None,
+        )
+        .expect("the limiter opens"),
+        allowed_origins: Vec::new(),
+        trust: yadgar_gateway::source::TrustBoundary::Undeclared,
+        credential_limits: wide(),
+        admin_limits: wide(),
+        bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
+        tools_poll_interval: Duration::from_secs(600),
+        projects: Arc::new(yadgar_gateway::project::Validator::new(
+            yadgar_gateway::project::Registry::never_loaded(),
+            yadgar_gateway::project::Mode::Counting,
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        )),
+    })
+}
+
+/// Resolve `token` through the cache and answer the user id, or `None` when
+/// the attestation is refused.
+async fn resolves_to(iam: &Channel, cache: &Credentials, token: &str) -> Option<String> {
+    attest(
+        &Attestation::Iam,
+        iam,
+        cache,
+        &yadgar_gateway::project::Validator::new(
+            yadgar_gateway::project::Registry::never_loaded(),
+            yadgar_gateway::project::Mode::Counting,
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        ),
+        Some(&format!("Bearer {token}")),
+        Claimed {
+            project_id: Some("zeta/invalidation"),
+            ..Claimed::default()
+        },
+        "REQ".to_string(),
+    )
+    .await
+    .ok()
+    .map(|attested| attested.scope.user_id)
+}
+
+#[tokio::test]
+async fn an_admin_revoke_stops_the_targets_tokens_resolving_before_the_ttl() {
+    use tower::ServiceExt;
+
+    let rig = broker(None).await;
+    let (iam, resolves) = stub_iam_publishing(Some(rig.push.clone())).await;
+    let state = revoking_gateway(iam.clone());
+
+    let (evicted_tx, mut evicted) = mpsc::unbounded_channel::<String>();
+    let consumer_state = Arc::clone(&state);
+    let consuming = invalidate::start(
+        Some(Broker::new(format!("nats://{}", rig.addr), None)),
+        move |user_id: &str| {
+            consumer_state.credentials.forget_user(user_id);
+            let _ = evicted_tx.send(user_id.to_string());
+        },
+    )
+    .await;
+    assert!(consuming, "the consumer did not connect to the broker");
+
+    // TWO TOKENS FOR THE TARGET, CACHED: the second round costs no resolve.
+    for token in ["tok-target-laptop", "tok-target-desktop"] {
+        assert_eq!(
+            resolves_to(&iam, &state.credentials, token)
+                .await
+                .as_deref(),
+            Some(TARGET),
+            "the target's token resolves before the revoke"
+        );
+    }
+    let before = resolves.load(Ordering::SeqCst);
+    for token in ["tok-target-laptop", "tok-target-desktop"] {
+        resolves_to(&iam, &state.credentials, token).await;
+    }
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        before,
+        "both target tokens must be cached before the revoke, or this test proves nothing"
+    );
+
+    let request = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/admin/revoke-credentials")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+        .body(axum::body::Body::from(format!(
+            r#"{{"user_id":"{TARGET}"}}"#
+        )))
+        .expect("the request builds");
+    let response = yadgar_gateway::http::router(Arc::clone(&state))
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "the administrator's revoke is served"
+    );
+
+    let got = tokio::time::timeout(DEADLINE, evicted.recv())
+        .await
+        .expect("the consumer acted on the revocation within the deadline")
+        .expect("and the consumer is still running");
+    assert_eq!(got, TARGET, "the eviction names the revoked user");
+
+    // THE ASSERTION THAT BITES: long before the 300s TTL, both tokens go back
+    // to iam and are refused there.
+    let evicted_at = resolves.load(Ordering::SeqCst);
+    for token in ["tok-target-laptop", "tok-target-desktop"] {
+        assert_eq!(
+            resolves_to(&iam, &state.credentials, token).await,
+            None,
+            "a revoked token must stop resolving once the publish is consumed"
+        );
+    }
+    assert_eq!(
+        resolves.load(Ordering::SeqCst),
+        evicted_at + 2,
+        "both target tokens must be resolved against iam again, not answered from the cache"
     );
 }

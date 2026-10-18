@@ -1422,7 +1422,7 @@ struct StubIam {
     resolves: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// Write the stub's whole `IamService` impl: one real method and twelve refusals.
+/// Write the stub's whole `IamService` impl: one real method and thirteen refusals.
 ///
 /// **THE MACRO EMITS THE `#[tonic::async_trait]` ATTRIBUTE TOO, and it has to.**
 /// That attribute is a proc macro that rewrites every `async fn` in the block into
@@ -1474,6 +1474,7 @@ stub_iam_service! {
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
     set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
+    revoke_all_credentials(RevokeAllCredentialsRequest) -> RevokeAllCredentialsResponse;
 }
 
 /// Serve `answer` as `iam`, and return a channel pointed at it plus the counter of
@@ -3018,3 +3019,7 @@ mod request_id;
 
 /// ADR-0941 through the router: archived projects refuse writes, serve reads.
 mod archived;
+
+/// `/admin/revoke-credentials` (ADR-0945): the canonical id check and the
+/// refusals that need no answering `iam`.
+mod revoke;
