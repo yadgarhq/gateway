@@ -53,7 +53,17 @@ pub enum Outcome {
     ///
     /// `exact` is false when the claim had no row of its own — D52's soft
     /// landing, which `ResolveProject` reports under the same name.
-    Resolved { path: String, exact: bool },
+    ///
+    /// `archived` is the status of the row the walk LANDED on, which for a soft
+    /// landing is the ancestor's: a claim beneath an archived project resolves
+    /// to that archived project (ADR-0941). Whether that refuses depends on
+    /// whether the call writes, which this function is not told — see
+    /// [`super::Validator::check`].
+    Resolved {
+        path: String,
+        exact: bool,
+        archived: bool,
+    },
     /// One of the four refusal classes.
     Refused(Refusal),
 }
@@ -156,7 +166,11 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
         .into_iter()
         .find_map(|ancestor| registered.registered_as(ancestor));
 
-    let Some(matched) = matched else {
+    let Some(Match {
+        path: matched,
+        archived,
+    }) = matched
+    else {
         // NO REGISTERED ANCESTOR. Which refusal that is depends on the
         // namespace, and only `local/` has a remediation that ends in creating
         // something — so anything outside it takes the class with no
@@ -171,6 +185,10 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     // A NAMESPACE ANCHOR IS NEVER A LANDING SITE (ADR-0673), and an EXACT match
     // on one is refused too: the claim `yadgarhq` names a namespace, and a
     // namespace has no task counter of its own that work may join.
+    //
+    // DECIDED BEFORE STATUS: an archived anchor is still an anchor, and the
+    // caller's repository is still unregistered. Telling it the namespace is
+    // archived would answer a question it did not ask.
     if !matched.contains('/') {
         return Outcome::Refused(Refusal::under_anchor(&matched));
     }
@@ -178,7 +196,21 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     Outcome::Resolved {
         exact: matched.eq_ignore_ascii_case(claimed),
         path: matched,
+        archived,
     }
+}
+
+/// One registered path or alias the walk matched, with its row's status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Match {
+    /// The REGISTERED spelling — see [`Registered::registered_as`].
+    pub path: String,
+    /// Whether the row this path or alias belongs to is ARCHIVED (ADR-0941).
+    ///
+    /// An alias carries its ROW's status: a rename is an alias and never a
+    /// rewrite (D53), so the old spelling of an archived project is that same
+    /// archived project.
+    pub archived: bool,
 }
 
 /// What [`classify`] needs from a loaded registry, and no more.
@@ -189,11 +221,11 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
 /// not carry.
 pub trait Registered {
     /// The REGISTERED spelling of this exact path, comparing ASCII case folded,
-    /// or `None` when no row holds it.
+    /// with its row's status — or `None` when no row holds it.
     ///
     /// It answers the spelling rather than a bool because the fold makes them
     /// differ, and the registered one is what the store's own resolver returns —
     /// see [`classify`]. A `bool` here is what let an earlier revision answer
     /// the CALLER's spelling as the resolved path.
-    fn registered_as(&self, path: &str) -> Option<String>;
+    fn registered_as(&self, path: &str) -> Option<Match>;
 }

@@ -252,6 +252,10 @@ pub(super) async fn tools_call(
     // Minted here, never read from the request (D67). See `crate::request_id`.
     let request_id = crate::request_id();
 
+    // Read or write, decided ONCE: attestation needs it for ADR-0941 and the
+    // limiter and the record below need it for D74 and D67.
+    let kind = kind_of(name);
+
     // THE USER IS RESOLVED FROM THE CREDENTIAL AND THE OTHER TWO ARE CLAIMED, and
     // the split is ADR-0488's rule applied field by field. `x-yadgar-user` is not
     // passed on the `iam` path at all — a self-asserted username is forgeable by
@@ -268,6 +272,14 @@ pub(super) async fn tools_call(
             user_id: header(headers, "x-yadgar-user"),
             project_id: header(headers, "x-yadgar-project"),
             instance_id: header(headers, "x-yadgar-instance"),
+            // FROM THE TOOL NAME, by the rule that decides `CallRecord.kind`:
+            // one answer to "is this a write" for the roll-ups and for
+            // ADR-0941's archived-project refusal alike.
+            access: if kind == Kind::Write {
+                crate::project::Access::Write
+            } else {
+                crate::project::Access::Read
+            },
         },
         request_id.clone(),
     )
@@ -294,7 +306,6 @@ pub(super) async fn tools_call(
     // rather than one per request, and a caller ROTATING tokens still misses every
     // time. Throttling the lookup itself would need a bucket keyed on something
     // known before the identity is, which is the caller's own claim.
-    let kind = kind_of(name);
     if let Some(refusal) =
         throttled(&state, id, &scope, label, module, kind, &attested.limits).await
     {

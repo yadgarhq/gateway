@@ -299,6 +299,7 @@ async fn the_trusted_header_path_states_no_policy_rather_than_inventing_one() {
             user_id: Some("max"),
             project_id: Some("acme/demo"),
             instance_id: None,
+            access: crate::project::Access::Read,
         },
         "REQ-11".to_string(),
     )
@@ -432,6 +433,7 @@ async fn scope_carries_the_request_id_it_was_given() {
             user_id: Some("max"),
             project_id: Some("acme/demo"),
             instance_id: Some("i-1"),
+            access: crate::project::Access::Read,
         },
         "REQ-3".to_string(),
     )
@@ -459,6 +461,7 @@ async fn an_incomplete_claim_is_refused_rather_than_defaulted() {
             user_id: None,
             project_id: Some("acme/demo"),
             instance_id: None,
+            access: crate::project::Access::Read,
         },
         "REQ-4".to_string(),
     )
@@ -495,6 +498,7 @@ async fn a_credentialless_request_under_iam_never_reaches_the_upstream() {
             user_id: Some("forged-by-the-caller"),
             project_id: Some("acme/demo"),
             instance_id: None,
+            access: crate::project::Access::Read,
         },
         "REQ-5".to_string(),
     )

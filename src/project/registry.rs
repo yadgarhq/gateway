@@ -35,10 +35,11 @@ use std::time::Duration;
 use tonic::transport::Channel;
 
 use crate::pb::yadgar::project::v1::{
-    project_service_client::ProjectServiceClient, ProjectServiceListProjectsRequest,
+    project_service_client::ProjectServiceClient, ProjectServiceListProjectsRequest, ProjectStatus,
+    RegisteredPath,
 };
 
-use super::classify::Registered;
+use super::classify::{Match, Registered};
 
 /// Whether this replica has EVER loaded the registry: `1` after the first
 /// successful load, `0` before it.
@@ -148,22 +149,58 @@ pub enum RetryError {
 /// caller that dropped archived rows would resolve a candidate to a DIFFERENT
 /// ancestor than the fallback rpc resolves it to — two answers for one path,
 /// differing only in which route the caller took.
+///
+/// **STATUS IS CARRIED, THOUGH, per path AND per alias (ADR-0941).** An archived
+/// project refuses writes, so the walk must say what it landed on. Each alias
+/// takes its ROW's status: the load once flattened rows into bare strings, and
+/// that lost the link from an alias to the row it names.
 pub struct Loaded {
-    /// Keyed on the LOWERCASED path, valued with the spelling the tier answered.
+    /// Keyed on the LOWERCASED path, valued with the spelling the tier answered
+    /// and its row's status.
     ///
     /// Folded once here rather than on both sides of every comparison, because
     /// every comparison in the store's walk folds ASCII case and this one must
-    /// stay the same comparison. The VALUE is kept because the resolved path a
+    /// stay the same comparison. The spelling is kept because the resolved path a
     /// later release stamps is the row's spelling and not the caller's — the
     /// same answer `ProjectDbService.ResolveProject` gives.
-    folded: BTreeMap<String, String>,
+    folded: BTreeMap<String, Match>,
+}
+
+/// Whether a wire status is ARCHIVED.
+///
+/// **ONLY `PROJECT_STATUS_ARCHIVED` IS.** `UNSPECIFIED` is what a tier that
+/// predates the field sends for every row, and a value this build does not know
+/// is a status nobody here has ruled on. Reading either as archived would refuse
+/// every write in the estate the day enforcement is switched on.
+fn is_archived(status: i32) -> bool {
+    status == ProjectStatus::Archived as i32
 }
 
 impl Loaded {
-    /// The set, from whatever spellings the tier answered with.
+    /// The set, from the rows `ListProjects` answered: every path and every
+    /// alias, each carrying its row's status.
+    pub fn from_registered(rows: impl IntoIterator<Item = RegisteredPath>) -> Self {
+        Self::from_matches(rows.into_iter().flat_map(|row| {
+            let archived = is_archived(row.status);
+            std::iter::once(row.path)
+                .chain(row.aliases)
+                .map(move |path| Match { path, archived })
+        }))
+    }
+
+    /// The set from bare spellings, every one of them ACTIVE.
+    ///
+    /// For tests that do not care about status, which is nearly all of them.
     pub fn from_paths(paths: impl IntoIterator<Item = String>) -> Self {
+        Self::from_matches(paths.into_iter().map(|path| Match {
+            path,
+            archived: false,
+        }))
+    }
+
+    fn from_matches(matches: impl IntoIterator<Item = Match>) -> Self {
         Self {
-            folded: paths
+            folded: matches
                 .into_iter()
                 // THE BARE RESERVED SEGMENT IS DROPPED HERE TOO. The tier
                 // already refuses to emit it, so this is the second half of a
@@ -172,8 +209,8 @@ impl Loaded {
                 // chain. A row at `local` is the nearest registered ancestor of
                 // every private path in the estate, so the cost of one
                 // redundant check is nothing beside what it prevents.
-                .filter(|p| !p.eq_ignore_ascii_case("local"))
-                .map(|p| (p.to_ascii_lowercase(), p))
+                .filter(|m| !m.path.eq_ignore_ascii_case("local"))
+                .map(|m| (m.path.to_ascii_lowercase(), m))
                 .collect(),
         }
     }
@@ -189,7 +226,7 @@ impl Loaded {
 }
 
 impl Registered for Loaded {
-    fn registered_as(&self, path: &str) -> Option<String> {
+    fn registered_as(&self, path: &str) -> Option<Match> {
         self.folded.get(&path.to_ascii_lowercase()).cloned()
     }
 }
@@ -221,8 +258,19 @@ impl Registry {
     /// For tests and for nothing else — the shipped binary reaches its set
     /// through [`Self::start`].
     pub fn loaded_with(paths: impl IntoIterator<Item = String>) -> Self {
+        Self::holding(Loaded::from_paths(paths))
+    }
+
+    /// A registry holding exactly these rows, loaded, with their statuses.
+    ///
+    /// For tests and for nothing else, like [`Self::loaded_with`].
+    pub fn loaded_from(rows: Vec<RegisteredPath>) -> Self {
+        Self::holding(Loaded::from_registered(rows))
+    }
+
+    fn holding(loaded: Loaded) -> Self {
         Self {
-            current: Arc::new(RwLock::new(Some(Arc::new(Loaded::from_paths(paths))))),
+            current: Arc::new(RwLock::new(Some(Arc::new(loaded)))),
         }
     }
 
@@ -273,7 +321,7 @@ impl Registry {
 async fn run(project: Channel, poll: Duration, registry: Registry) {
     loop {
         match load(&project).await {
-            Ok(paths) => install(&registry, paths),
+            Ok(rows) => install(&registry, rows),
             Err(e) => report(&registry, &e, poll),
         }
         tokio::time::sleep(poll).await;
@@ -281,8 +329,8 @@ async fn run(project: Channel, poll: Duration, registry: Registry) {
 }
 
 /// Install a freshly loaded set, and publish the gauge for it.
-fn install(registry: &Registry, paths: Vec<String>) {
-    let loaded = Loaded::from_paths(paths);
+fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
+    let loaded = Loaded::from_registered(rows);
     let count = loaded.len();
     let first = registry.loaded().is_none();
     registry.install(loaded);
@@ -326,7 +374,7 @@ fn report(registry: &Registry, e: &tonic::Status, poll: Duration) {
 }
 
 /// One whole load: every page, until the token comes back empty.
-async fn load(project: &Channel) -> Result<Vec<String>, tonic::Status> {
+async fn load(project: &Channel) -> Result<Vec<RegisteredPath>, tonic::Status> {
     let mut client = ProjectServiceClient::new(project.clone());
     let mut out = Vec::new();
     let mut token = String::new();
@@ -349,10 +397,9 @@ async fn load(project: &Channel) -> Result<Vec<String>, tonic::Status> {
                 )))
             }
         };
-        for registered in page.paths {
-            out.push(registered.path);
-            out.extend(registered.aliases);
-        }
+        // WHOLE ROWS, not their strings: an alias is only as archived as the
+        // row it names, and flattening here is what lost that (ADR-0941).
+        out.extend(page.paths);
         if page.next_page_token.is_empty() {
             return Ok(out);
         }
