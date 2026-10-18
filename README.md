@@ -224,11 +224,11 @@ ADR-0492's administrative surface (D73, ledger 638). **These are never MCP
 tools**: no name of theirs is in `tools::SERVED`, so `tools/call` cannot dispatch
 to one and `tools/list` cannot advertise one.
 
-| path                     | body                                               | answers                               |
-| ------------------------ | -------------------------------------------------- | ------------------------------------- |
-| `/admin/create-user`     | `external_id`, `display_name`, optional `is_admin` | `{"user_id": ...}`                    |
-| `/admin/issue-enrolment` | `user_id`                                          | `{"token": ..., "enrolment_id": ...}` |
-| `/admin/set-user-admin`  | `user_id`, `is_admin` (a required boolean)         | `{"user_id": ..., "is_admin": ...}`   |
+| path                     | body                                                          | answers                                                                                  |
+| ------------------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `/admin/create-user`     | `external_id`, `display_name`, optional `is_admin`            | `{"user_id": ...}`                                                                       |
+| `/admin/issue-enrolment` | `user_id`, optional `revoke_existing_credentials` (a boolean) | `{"token": ..., "enrolment_id": ..., "revoke_existing_credentials": <bool, as applied>}` |
+| `/admin/set-user-admin`  | `user_id`, `is_admin` (a required boolean)                    | `{"user_id": ..., "is_admin": ...}`                                                      |
 
 The `user_id` `/admin/create-user` returns is the one the other two take.
 
@@ -246,6 +246,19 @@ The `user_id` `/admin/create-user` returns is the one the other two take.
   (ADR-0655, as amended by ADR-0656). That last predicate is enforced inside
   `iam-db`'s write, never at this gateway. A request carrying the header is
   judged by these rules alone and never falls back to the attested path.
+
+**`revoke_existing_credentials: true` makes a re-enrolment a containing reset**
+(ADR-0943): when the enrolment is redeemed, every credential the user held is
+revoked in the same `iam-db` transaction that replaces the password. Absent, a
+reset replaces the password and existing credentials keep working. Only an
+attested administrator may set it; the bootstrap path answers
+`403 {"error":"the bootstrap token may not revoke existing credentials"}` before
+`iam` is called. `iam` publishes the cache eviction on redemption, so a revoked
+token stops resolving at once; a missed publish leaves it resolving from a
+replica's cache for at most `YADGAR_CREDENTIAL_TTL_SECONDS`.
+The `200` echoes `revoke_existing_credentials` as applied. Unknown JSON keys are
+ignored, so a misspelt field is a plain reset; a client that asked for a revoke
+must check the echo.
 
 **An absent or empty bootstrap Secret DISABLES the bootstrap path**, answering
 `503 {"error":"the bootstrap token is not configured"}` — never a comparison
@@ -313,7 +326,8 @@ path that has no actor to relay — and a log line is not an audit trail. ADR-04
 
 ## The workspace a caller claims, and why nothing is refused yet
 
-Every `tools/call` and every `/admin/*` request carries `x-yadgar-project`. Until
+Every `tools/call` carries `x-yadgar-project`. `/admin/*` is not project-scoped
+(ledger 1545): it neither requires nor checks the header. Until
 ledger 881 the gateway checked that the header was PRESENT and nothing else: the
 value went into the `Scope` unexamined, and `task-db` bound it straight into the
 row. A caller could name any string on a write, and the named project's
@@ -337,6 +351,21 @@ about the answer changes until `projectValidation.mode` says `enforcing`.
 | `PROJECT_UNREGISTERED_PERSONAL` | a `local/` path with no registered ancestor (ADR-0605)                            | `400`, write a marker file and use the project-create tool |
 | `PROJECT_UNRESOLVABLE`          | no registered ancestor at all, and not under `local/`                             | `400`, **no remediation** — ask a human                    |
 | `PROJECT_REGISTRY_UNAVAILABLE`  | the registry has NEVER loaded, so no claim can be checked (ADR-0674)              | `503`, and a reason distinct from all four above           |
+| `PROJECT_ARCHIVED`              | the claim RESOLVES to an archived project and the tool WRITES (ADR-0941)          | `400`; a read of the same project is served                |
+
+An archived project refuses WRITES and still answers READS (ADR-0941): archive
+keeps history, so `find_tasks` and `read_task` resolve as usual, and
+`create_task`, `edit_task` and `transition_task` count under `PROJECT_ARCHIVED`.
+Whether a call writes comes from the tool name — the rule that also sets
+`CallRecord.kind`. The registry load carries each row's status, and an alias
+carries the status of the row it names. Archived rows are NOT dropped from the
+walk, so a claim BENEATH an archived project lands on it and its write is refused
+too — the resolved project is archived; a live project deeper in the path still
+wins, as the deepest match always does. An archived namespace anchor is still an
+anchor: the answer stays `PROJECT_UNREGISTERED_ORG`. Only
+`PROJECT_STATUS_ARCHIVED` counts as archived; `UNSPECIFIED` and unknown values are
+served. Like every other state, it is counted and served under `counting` and
+answered under `enforcing`.
 
 A namespace anchor is resolved THROUGH and is never a landing site, including when
 it is named exactly: a registered `yadgarhq` exists to say "this repository is not

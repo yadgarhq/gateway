@@ -95,6 +95,9 @@ struct Received {
     /// repository green. The only way to assert a message is absent is to look
     /// at the one that arrived.
     demands_zero_credential_admin: Option<bool>,
+    /// ADR-0943's revoke instruction, AS IT ARRIVED. `None` means what it means
+    /// on `demands_zero_credential_admin`: the request shape has no such field.
+    revokes_existing_credentials: Option<bool>,
 }
 
 #[derive(Default)]
@@ -158,6 +161,7 @@ macro_rules! admin_iam_service {
                     actor: r.unverified_actor,
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
                     demands_zero_credential_admin: None,
+                    revokes_existing_credentials: None,
                 });
                 if let Some(refusal) = self.refuse_create_user.clone() {
                     return Err(refusal);
@@ -181,6 +185,7 @@ macro_rules! admin_iam_service {
                     actor: r.unverified_actor,
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
                     demands_zero_credential_admin: Some(r.require_zero_credential_admin),
+                    revokes_existing_credentials: Some(r.revoke_existing_credentials),
                 });
                 // RECORDED BEFORE THE REFUSAL, deliberately: a refusing stub
                 // must still let a test read what arrived, or the refusal path
@@ -212,6 +217,7 @@ macro_rules! admin_iam_service {
                     actor: r.unverified_actor,
                     has_idempotency_key: r.idempotency.is_some_and(|i| !i.key.is_empty()),
                     demands_zero_credential_admin: None,
+                    revokes_existing_credentials: None,
                 });
                 Ok(tonic::Response::new(SetUserAdminResponse {}))
             }
@@ -385,9 +391,8 @@ async fn post(
 fn as_admin() -> Vec<(&'static str, &'static str)> {
     vec![
         ("authorization", "Bearer a-real-token"),
-        // REQUIRED, exactly as on `tools/call`: `Attested` carries a `Scope` and
-        // a `Scope` names a workspace, which the gateway does not have to supply
-        // and must not invent.
+        // SENT BY MANY CLIENTS AND NOT REQUIRED: `/admin` is not project-scoped
+        // (ledger 1545), so the header is ignored here. Tests below send none.
         ("x-yadgar-project", "acme/demo"),
     ]
 }
@@ -455,6 +460,53 @@ async fn a_resolved_non_administrator_is_refused_every_administrative_verb() {
              is not a refusal"
         );
     }
+}
+
+/// Headers of an administrator who names NO workspace (ledger 1545).
+fn as_admin_without_project() -> Vec<(&'static str, &'static str)> {
+    vec![("authorization", "Bearer a-real-token")]
+}
+
+/// **`/admin` IS NOT PROJECT-SCOPED (ledger 1545).** A bearer administrator
+/// with no `x-yadgar-project` is admitted, as the bootstrap path always was.
+/// The credential is still resolved through `iam`, so attestation is not skipped.
+#[tokio::test]
+async fn an_administrator_with_no_project_header_reaches_every_administrative_verb() {
+    for (path, body) in admin_verbs() {
+        let (state, _log) = gateway(resolved(true)).await;
+        let (status, answer) = post(state, path, &body, &as_admin_without_project()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{path} must not demand a workspace; got {answer}"
+        );
+    }
+}
+
+/// Dropping the header must not drop the admin check: a resolved
+/// non-administrator with no project header is 403, before `iam` is written to.
+#[tokio::test]
+async fn a_non_administrator_with_no_project_header_is_still_403() {
+    for (path, body) in admin_verbs() {
+        let (state, log) = gateway(resolved(false)).await;
+        let (status, answer) = post(state, path, &body, &as_admin_without_project()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {answer}");
+        assert!(log.drain().is_empty(), "{path} must refuse before iam");
+    }
+}
+
+/// Dropping the header must not drop attestation: no credential is still 401.
+#[tokio::test]
+async fn no_credential_and_no_project_header_is_still_401() {
+    let (state, _log) = gateway(resolved(true)).await;
+    let (status, _) = post(
+        state,
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada","is_admin":false}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// A caller presenting no credential at all is 401, not 403.
@@ -749,6 +801,128 @@ async fn an_attested_administrator_demands_nothing_on_the_wire() {
         "an ATTESTED administrator must demand nothing: the demand only narrows, and narrowing \
          this path breaks re-enrolment as forgotten-password recovery"
     );
+    assert_eq!(
+        received[0].revokes_existing_credentials,
+        Some(false),
+        "an absent `revoke_existing_credentials` must arrive false, or every recovery signs the \
+         person out everywhere (ADR-0943)"
+    );
+    assert_eq!(
+        answer["revoke_existing_credentials"], false,
+        "the 200 echoes the instruction AS APPLIED, so an absent one reads back false"
+    );
+}
+
+/// ADR-0943: an ATTESTED administrator may ask a re-enrolment to revoke every
+/// credential its target holds, and the instruction must ARRIVE at `iam` — a
+/// proto3 `bool` the handler forgot to copy reads as `false` and the containing
+/// reset silently becomes a plain one.
+#[tokio::test]
+async fn an_attested_administrator_can_ask_to_revoke_existing_credentials() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, answer) = post(
+        state,
+        "/admin/issue-enrolment",
+        &format!(r#"{{"user_id":"{OTHER_ID}","revoke_existing_credentials":true}}"#),
+        &as_admin(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {answer}");
+
+    let received = log.drain();
+    assert_eq!(
+        received.len(),
+        1,
+        "issue-enrolment reached iam exactly once"
+    );
+    assert_eq!(received[0].revokes_existing_credentials, Some(true));
+    assert_eq!(
+        received[0].demands_zero_credential_admin,
+        Some(false),
+        "the instruction changes nothing about the demand"
+    );
+    assert_eq!(
+        answer["revoke_existing_credentials"], true,
+        "the 200 echoes the instruction AS APPLIED (ledger 1579)"
+    );
+}
+
+/// LEDGER 1579: THE TYPO FALSE GREEN, and the echo is what exposes it. Unknown
+/// JSON keys are ignored, so a client that misspells the field gets a 200 and a
+/// plain reset — the old tokens keep working and nothing said so. The 200 now
+/// states what was applied, so a client that asked for a revoke can see it did
+/// not get one.
+#[tokio::test]
+async fn a_misspelt_revoke_instruction_reads_back_as_not_applied() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, answer) = post(
+        state,
+        "/admin/issue-enrolment",
+        &format!(r#"{{"user_id":"{OTHER_ID}","revoke_existing_credential":true}}"#),
+        &as_admin(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {answer}");
+    assert_eq!(log.drain()[0].revokes_existing_credentials, Some(false));
+    assert_eq!(
+        answer["revoke_existing_credentials"], false,
+        "a misspelt key is not the instruction, and the answer must say none was applied"
+    );
+}
+
+/// ADR-0943: THE BOOTSTRAP PATH NEVER CARRIES THE REVOKE INSTRUCTION. Refused
+/// here with a 403, and refused BEFORE `iam` is called — `iam-db` would refuse
+/// the pair too, but a request that never leaves the gateway cannot depend on it.
+#[tokio::test]
+async fn the_bootstrap_path_refuses_the_revoke_instruction() {
+    let (state, log) = gateway(resolved(true)).await;
+    let (status, answer) = post(
+        state,
+        "/admin/issue-enrolment",
+        &format!(r#"{{"user_id":"{OTHER_ID}","revoke_existing_credentials":true}}"#),
+        &[(BOOTSTRAP_HEADER, BOOTSTRAP_SECRET)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "got {answer}");
+    assert_eq!(
+        answer["error"],
+        "the bootstrap token may not revoke existing credentials"
+    );
+    assert!(
+        log.drain().is_empty(),
+        "a refused bootstrap request must not reach iam at all"
+    );
+}
+
+/// A `revoke_existing_credentials` that is not a JSON boolean is a 400, before
+/// any authorisation and before `iam`: `"true"` or `1` is not an instruction to
+/// sign somebody out everywhere, and guessing what was meant is not a kindness.
+///
+/// THREE SHAPES, ONE RULE (ledger 1579): a string, a number and `null`. `1` is
+/// the truthy reading a lenient parser would take, and `null` the one a client
+/// serialising an unset optional would send; neither is a boolean, so neither
+/// is guessed at.
+#[tokio::test]
+async fn a_non_boolean_revoke_instruction_is_refused() {
+    for value in [r#""true""#, "1", "null"] {
+        let (state, log) = gateway(resolved(true)).await;
+        let (status, answer) = post(
+            state,
+            "/admin/issue-enrolment",
+            &format!(r#"{{"user_id":"{OTHER_ID}","revoke_existing_credentials":{value}}}"#),
+            &as_admin(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{value} must be refused; got {answer}"
+        );
+        assert!(
+            log.drain().is_empty(),
+            "a malformed request ({value}) must not reach iam"
+        );
+    }
 }
 
 /// An upstream `PERMISSION_DENIED` on enrolment renders as ONE 403 with ONE

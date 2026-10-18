@@ -17,6 +17,7 @@ use std::time::Duration;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
 use super::*;
+use crate::pb::yadgar::project::v1::{ProjectStatus, RegisteredPath};
 
 /// A registry holding exactly the paths a test names.
 ///
@@ -63,6 +64,7 @@ fn an_exactly_registered_path_resolves_to_itself() {
         Outcome::Resolved {
             path: "yadgarhq/docs".to_string(),
             exact: true,
+            archived: false,
         }
     );
 }
@@ -84,6 +86,7 @@ fn a_subpath_resolves_to_its_nearest_registered_ancestor() {
         Outcome::Resolved {
             path: "yadgarhq/docs".to_string(),
             exact: false,
+            archived: false,
         }
     );
 }
@@ -159,6 +162,7 @@ fn a_private_subpath_resolves_to_its_registered_ancestor() {
         Outcome::Resolved {
             path: "local/max/git/alpha".to_string(),
             exact: false,
+            archived: false,
         }
     );
 }
@@ -198,6 +202,7 @@ fn the_walk_folds_ascii_case_in_both_directions() {
         Outcome::Resolved {
             path: "yadgarhq/docs".to_string(),
             exact: true,
+            archived: false,
         }
     );
     // THE ROW'S SPELLING, NOT THE CALLER'S. The store's resolver answers the
@@ -209,6 +214,7 @@ fn the_walk_folds_ascii_case_in_both_directions() {
         Outcome::Resolved {
             path: "Acme/Forecast".to_string(),
             exact: false,
+            archived: false,
         }
     );
 }
@@ -259,6 +265,19 @@ fn a_value_that_is_not_a_project_path_is_refused_before_resolution() {
 /// THREAD-LOCAL and this binary runs its tests in parallel, so a global one
 /// would race every other emitter.
 fn checked(registry: Registry, mode: Mode, claimed: &str) -> (Result<(), Denied>, Snapshotter) {
+    // A WRITE, because every class above refuses a read and a write alike — so
+    // the existing table keeps the stricter of the two inputs. The one class
+    // that turns on the difference is ADR-0941's, driven through `checked_as`.
+    checked_as(registry, mode, Access::Write, claimed)
+}
+
+/// [`checked`], stating whether the call reads or writes.
+fn checked_as(
+    registry: Registry,
+    mode: Mode,
+    access: Access,
+    claimed: &str,
+) -> (Result<(), Denied>, Snapshotter) {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -268,7 +287,7 @@ fn checked(registry: Registry, mode: Mode, claimed: &str) -> (Result<(), Denied>
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(claimed, "a-request-id")
+                .check(claimed, access, "a-request-id")
                 .await
         })
     });
@@ -474,6 +493,7 @@ fn the_unloaded_registry_reason_is_distinct_from_every_refusal_reason() {
         Reason::UnregisteredOrg,
         Reason::UnregisteredPersonal,
         Reason::Unresolvable,
+        Reason::Archived,
     ]
     .iter()
     .map(|r| r.token())
@@ -542,11 +562,11 @@ fn a_loaded_set_drops_the_bare_reserved_segment_it_should_never_have_been_sent()
     assert_eq!(loaded.len(), 2, "both spellings of the reserved root go");
     assert!(!loaded.is_empty());
     assert_eq!(
-        loaded.registered_as("YADGARHQ").as_deref(),
+        loaded.registered_as("YADGARHQ").map(|m| m.path).as_deref(),
         Some("yadgarhq"),
         "the walk answers the spelling the tier registered, folding the candidate's case"
     );
-    assert_eq!(loaded.registered_as("local"), None);
+    assert!(loaded.registered_as("local").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +756,20 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
             "this stub answers ResolveProject and nothing else",
         ))
     }
+
+    // proto v1.17.0's seeder-only verb (ADR-0936). This gateway never calls it;
+    // `build_server(true)` makes every stub of the trait implement it.
+    async fn sync_projects(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "this stub answers ResolveProject and nothing else",
+        ))
+    }
 }
 
 /// Serve one `ResolveProject` answer, and return a channel pointed at it.
@@ -773,6 +807,114 @@ async fn stub_project_recording(
         .expect("a URI")
         .connect_lazy();
     (channel, request_ids)
+}
+
+/// A `ProjectService` that records the `x-yadgar-request-id` each `ListProjects`
+/// arrived with and answers two pages per load.
+struct ListingProject {
+    request_ids: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[tonic::async_trait]
+impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for ListingProject {
+    async fn resolve_project(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "this stub answers ListProjects and nothing else",
+        ))
+    }
+
+    async fn list_projects(
+        &self,
+        req: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceListProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceListProjectsResponse>,
+        tonic::Status,
+    > {
+        let header = req
+            .metadata()
+            .get(crate::upstream::request_id::HEADER)
+            .map(|v| v.to_str().expect("an ASCII header").to_string());
+        self.request_ids.lock().unwrap().push(header);
+        // TWO PAGES PER LOAD: the first names a next token, the second ends it.
+        let mut answer =
+            crate::pb::yadgar::project::v1::ProjectServiceListProjectsResponse::default();
+        if req.get_ref().page_token.is_empty() {
+            answer.next_page_token = "page-2".to_string();
+        }
+        Ok(tonic::Response::new(answer))
+    }
+
+    async fn sync_projects(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "this stub answers ListProjects and nothing else",
+        ))
+    }
+}
+
+/// THE REGISTRY POLL STAMPS ONE FRESH `x-yadgar-request-id` PER LOAD (ledger 1254).
+///
+/// Every page of one load shares the id, and the next load carries another.
+/// The mutations this reds: build the client over the bare channel (no header),
+/// mint inside the page loop (pages differ), or mint once outside `run`'s loop
+/// (loads share an id).
+#[tokio::test]
+async fn each_registry_poll_sends_its_own_well_formed_request_id() {
+    let request_ids = Arc::new(Mutex::new(Vec::new()));
+    let served = Arc::clone(&request_ids);
+    let incoming = tonic::transport::server::TcpIncoming::bind(
+        "127.0.0.1:0".parse().expect("a loopback address"),
+    )
+    .expect("the stub binds");
+    let addr = incoming.local_addr().expect("a bound port");
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(
+                crate::pb::yadgar::project::v1::project_service_server::ProjectServiceServer::new(
+                    ListingProject {
+                        request_ids: served,
+                    },
+                ),
+            )
+            .serve_with_incoming(incoming)
+            .await
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("a URI")
+        .connect_lazy();
+
+    let _registry = Registry::start(channel, Duration::from_millis(20));
+    for _ in 0..200 {
+        if request_ids.lock().unwrap().len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Arrivals are sequential: pages 1 and 2 of load one, then of load two.
+    let seen = request_ids.lock().unwrap().clone();
+    assert!(seen.len() >= 4, "the stub saw fewer than two full loads");
+    for header in &seen[..4] {
+        let id = header
+            .as_deref()
+            .expect("every poll carries x-yadgar-request-id");
+        let parsed = uuid::Uuid::parse_str(id).expect("the id is a UUID");
+        assert_eq!(parsed.get_version_num(), 7, "the id is a UUIDv7");
+    }
+    assert_eq!(seen[0], seen[1], "both pages of one load share one id");
+    assert_eq!(seen[2], seen[3], "both pages of one load share one id");
+    assert_ne!(seen[0], seen[2], "two loads must not share one id");
 }
 
 /// One `ResolveProject` answer for the anchor these tests refuse beneath.
@@ -893,7 +1035,7 @@ async fn an_enforced_refusal_dials_resolve_project_carrying_the_request_id() {
     let (project, request_ids) =
         stub_project_recording(answered("yadgarhq", "yadgarhq/estate")).await;
     let answer = Validator::new(estate(), Mode::Enforcing, project)
-        .check("yadgarhq/gateway", "the-id-on-this-call")
+        .check("yadgarhq/gateway", Access::Write, "the-id-on-this-call")
         .await;
 
     assert!(
@@ -905,4 +1047,294 @@ async fn an_enforced_refusal_dials_resolve_project_carrying_the_request_id() {
         vec![Some("the-id-on-this-call".to_string())],
         "exactly one ResolveProject, carrying the id `check` was handed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0941: an archived project refuses writes; reads still answer.
+//
+// **THE REFUSAL FOLLOWS THE MODE, LIKE EVERY OTHER CLASS.** Counted and served
+// under `counting`, answered under `enforcing` — so the stage-5 gate reads an
+// archived write the way it reads any other would-be refusal. That is a
+// judgement recorded in the PR, not a ruling ADR-0941 makes: its consequences
+// say "confirm with Max".
+// ---------------------------------------------------------------------------
+
+/// One registered row as `ListProjects` answers it.
+fn row(path: &str, status: ProjectStatus, aliases: &[&str]) -> RegisteredPath {
+    RegisteredPath {
+        path: path.to_string(),
+        status: status as i32,
+        aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+    }
+}
+
+/// The estate with one archived repository, one archived parent whose child is
+/// live, and one archived row that was renamed (its old spelling is an alias).
+fn archive_estate() -> Registry {
+    Registry::loaded_from(vec![
+        row("yadgarhq", ProjectStatus::Active, &[]),
+        row("yadgarhq/docs", ProjectStatus::Active, &[]),
+        row("yadgarhq/old", ProjectStatus::Archived, &["yadgarhq/older"]),
+        row("yadgarhq/mono", ProjectStatus::Archived, &[]),
+        row("yadgarhq/mono/live", ProjectStatus::Active, &[]),
+    ])
+}
+
+/// COUNTING: an archived write is served, and counted under its own reason.
+///
+/// It moves `PROJECT_ARCHIVED` and NOT the resolution counter: every path
+/// through `check` increments exactly one series, so a write the gate would
+/// refuse must not also read as a healthy resolution.
+#[test]
+fn an_archived_write_is_counted_and_served_under_counting() {
+    let (answer, snapshotter) = checked_as(
+        archive_estate(),
+        Mode::Counting,
+        Access::Write,
+        "yadgarhq/old",
+    );
+    assert!(
+        answer.is_ok(),
+        "counting refuses nobody: {:?}",
+        answer.err()
+    );
+    let snapshot = snapshotter.snapshot().into_vec();
+    let names: BTreeSet<String> = snapshot
+        .iter()
+        .map(|(k, _, _, _)| k.key().name().to_string())
+        .collect();
+    assert!(
+        !names.contains("yadgar_gateway_project_resolution_total"),
+        "an archived write is a would-be refusal, not a resolution: {names:?}"
+    );
+    let (_, snapshotter) = checked_as(
+        archive_estate(),
+        Mode::Counting,
+        Access::Write,
+        "yadgarhq/old",
+    );
+    assert_eq!(
+        counted(
+            snapshotter,
+            "yadgar_gateway_project_refusal_total",
+            ("reason", "PROJECT_ARCHIVED")
+        ),
+        Some(1)
+    );
+}
+
+/// ENFORCING: the same write is refused, with the archived reason.
+#[test]
+fn an_archived_write_is_refused_under_enforcement() {
+    let (answer, snapshotter) = checked_as(
+        archive_estate(),
+        Mode::Enforcing,
+        Access::Write,
+        "yadgarhq/old",
+    );
+    let denied = answer.expect_err("an archived project refuses writes (ADR-0941)");
+    assert_eq!(denied.reason.token(), "PROJECT_ARCHIVED");
+    assert!(
+        denied.prose.contains("archived"),
+        "the prose names the state: {}",
+        denied.prose
+    );
+    assert_eq!(
+        counted(
+            snapshotter,
+            "yadgar_gateway_project_refusal_total",
+            ("reason", "PROJECT_ARCHIVED")
+        ),
+        Some(1)
+    );
+}
+
+/// A READ of an archived project answers, in either mode, as a resolution.
+///
+/// ADR-0941: archive must not lose history (ADR-0934's archive-not-delete).
+#[test]
+fn an_archived_read_is_served_and_counted_as_a_resolution() {
+    for mode in [Mode::Counting, Mode::Enforcing] {
+        let (answer, snapshotter) =
+            checked_as(archive_estate(), mode, Access::Read, "yadgarhq/old");
+        assert!(
+            answer.is_ok(),
+            "{mode:?}: a read still answers: {:?}",
+            answer.err()
+        );
+        assert_eq!(
+            counted(
+                snapshotter,
+                "yadgar_gateway_project_resolution_total",
+                ("outcome", "exact")
+            ),
+            Some(1),
+            "{mode:?}: an archived read is an ordinary resolution"
+        );
+    }
+}
+
+/// An ACTIVE project's write is untouched by any of this.
+#[test]
+fn an_active_write_is_unaffected_under_enforcement() {
+    let (answer, snapshotter) = checked_as(
+        archive_estate(),
+        Mode::Enforcing,
+        Access::Write,
+        "yadgarhq/docs",
+    );
+    assert!(answer.is_ok(), "{:?}", answer.err());
+    assert_eq!(
+        counted(
+            snapshotter,
+            "yadgar_gateway_project_resolution_total",
+            ("outcome", "exact")
+        ),
+        Some(1)
+    );
+}
+
+/// An ALIAS carries the status of the row it names.
+///
+/// The load used to flatten each row into bare strings, so the link from an
+/// alias to its row's status was lost. A rename is an alias and never a rewrite
+/// (D53), so the old spelling of an archived project is that same archived
+/// project, and its write is refused the same way.
+#[test]
+fn an_alias_of_an_archived_row_refuses_writes_the_same_way() {
+    let (answer, _) = checked_as(
+        archive_estate(),
+        Mode::Enforcing,
+        Access::Write,
+        "yadgarhq/older",
+    );
+    assert_eq!(
+        answer
+            .expect_err("the alias names the archived row")
+            .reason
+            .token(),
+        "PROJECT_ARCHIVED"
+    );
+    let (answer, _) = checked_as(
+        archive_estate(),
+        Mode::Enforcing,
+        Access::Read,
+        "YadgarHQ/Older",
+    );
+    assert!(
+        answer.is_ok(),
+        "a read through the alias answers: {:?}",
+        answer.err()
+    );
+}
+
+/// THE ANCESTOR CASE. A claim BENEATH an archived project lands on it (D52's
+/// soft landing walks rows without consulting status), and the resolved project
+/// is archived — so the write is refused.
+///
+/// ADR-0941 refuses a write "whose RESOLVED project is ARCHIVED", and the
+/// `PROJECT_STATUS_ARCHIVED` comment in `project.proto` says the same of a
+/// caller that "resolves a candidate for a WRITE and gets this status". Neither
+/// names the subpath case, so this is the reading both imply.
+///
+/// MUTATION THIS CATCHES: filter archived rows out of the loaded set. The walk
+/// then skips `yadgarhq/mono`, lands on the anchor `yadgarhq`, and the reason
+/// becomes `PROJECT_UNREGISTERED_ORG` — a remediation telling the caller to
+/// register a project that is registered already.
+#[test]
+fn a_write_beneath_an_archived_ancestor_is_refused_and_a_read_lands_on_it() {
+    let (answer, _) = checked_as(
+        archive_estate(),
+        Mode::Enforcing,
+        Access::Write,
+        "yadgarhq/mono/other",
+    );
+    assert_eq!(
+        answer
+            .expect_err("the resolved project is archived")
+            .reason
+            .token(),
+        "PROJECT_ARCHIVED"
+    );
+    assert_eq!(
+        outcome(&archive_estate(), "yadgarhq/mono/other"),
+        Outcome::Resolved {
+            path: "yadgarhq/mono".to_string(),
+            exact: false,
+            archived: true,
+        }
+    );
+    let (answer, snapshotter) = checked_as(
+        archive_estate(),
+        Mode::Enforcing,
+        Access::Read,
+        "yadgarhq/mono/other",
+    );
+    assert!(answer.is_ok(), "{:?}", answer.err());
+    assert_eq!(
+        counted(
+            snapshotter,
+            "yadgar_gateway_project_resolution_total",
+            ("outcome", "ancestor")
+        ),
+        Some(1)
+    );
+}
+
+/// The DEEPEST match still wins: a live child of an archived parent takes
+/// writes, and so does a claim beneath that live child.
+#[test]
+fn a_live_project_beneath_an_archived_parent_takes_writes() {
+    for claimed in ["yadgarhq/mono/live", "yadgarhq/mono/live/deep"] {
+        let (answer, _) = checked_as(archive_estate(), Mode::Enforcing, Access::Write, claimed);
+        assert!(answer.is_ok(), "{claimed}: {:?}", answer.err());
+    }
+}
+
+/// An archived ANCHOR is still an anchor: the namespace rule (ADR-0673) is
+/// decided before status, so the caller is told the repository is
+/// unregistered, not that the namespace is archived.
+#[test]
+fn an_archived_namespace_anchor_stays_an_unregistered_org_refusal() {
+    let registry = Registry::loaded_from(vec![row("acme", ProjectStatus::Archived, &[])]);
+    let (answer, _) = checked_as(registry, Mode::Enforcing, Access::Write, "acme/forecast");
+    assert_eq!(
+        answer
+            .expect_err("refused through the anchor")
+            .reason
+            .token(),
+        "PROJECT_UNREGISTERED_ORG"
+    );
+}
+
+/// ONLY `PROJECT_STATUS_ARCHIVED` refuses. `UNSPECIFIED` — what a tier that
+/// predates the field sends for every row — and any value this build does not
+/// know are served: reading either as archived would refuse every write in the
+/// estate the day enforcement is switched on.
+#[test]
+fn an_unspecified_or_unknown_status_is_not_archived() {
+    let mut unknown = row("yadgarhq/future", ProjectStatus::Active, &[]);
+    unknown.status = 99;
+    let registry = Registry::loaded_from(vec![
+        row("yadgarhq/legacy", ProjectStatus::Unspecified, &[]),
+        unknown,
+    ]);
+    for claimed in ["yadgarhq/legacy", "yadgarhq/future"] {
+        let (answer, _) = checked_as(registry.clone(), Mode::Enforcing, Access::Write, claimed);
+        assert!(answer.is_ok(), "{claimed}: {:?}", answer.err());
+    }
+}
+
+/// The archived prose never repeats the caller's claim, like every other class.
+#[test]
+fn the_archived_refusal_does_not_echo_the_callers_value() {
+    let (answer, _) = checked_as(
+        archive_estate(),
+        Mode::Enforcing,
+        Access::Write,
+        "yadgarhq/old/sentinel",
+    );
+    let denied = answer.expect_err("refused");
+    assert!(!denied.prose.contains("sentinel"), "{}", denied.prose);
+    assert!(!denied.to_string().contains("sentinel"), "{denied}");
 }

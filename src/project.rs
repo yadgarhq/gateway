@@ -35,6 +35,11 @@
 //! and not this module's. The four here are [`Reason`], plus a fifth condition
 //! that is not a refusal of the CALLER at all: see [`Reason::RegistryUnavailable`].
 //!
+//! **A SIXTH, ADR-0941's, TURNS ON WHAT THE CALL DOES.** A claim that RESOLVES
+//! to an archived project is refused for a write and served for a read — see
+//! [`Reason::Archived`] and [`Access`]. Every other state is decided from the
+//! claim alone.
+//!
 //! **TWO OBSERVABLES, AND THE SECOND ONE IS WHAT MAKES THE FLIP DECIDABLE.**
 //! [`REFUSALS`] counts what would be refused; [`RESOLUTIONS`] counts what
 //! resolved. The stage-5 gate reads the first as ZERO over a window and the
@@ -51,7 +56,7 @@ mod classify;
 mod registry;
 mod remediate;
 
-pub use classify::{classify, is_well_formed, Outcome, Registered};
+pub use classify::{classify, is_well_formed, Match, Outcome, Registered};
 pub use registry::{poll_from_env, poll_from_lookup, Loaded, Registry, RetryError, LOADED, POLL};
 
 /// Every terminal state this module can reach, counted by reason.
@@ -124,6 +129,21 @@ pub enum Reason {
     /// interlock. A separate counter would let the gate read clean during the
     /// one condition under which enforcement refuses everybody.
     RegistryUnavailable,
+
+    /// The claim RESOLVED, to an ARCHIVED project, and the call writes
+    /// (ADR-0941).
+    ///
+    /// **THE ONLY CLASS DECIDED BY THE CALL AS WELL AS THE CLAIM.** A read of
+    /// the same project resolves normally: archive keeps history (ADR-0934's
+    /// archive-not-delete), so it must stay readable. A claim BENEATH an
+    /// archived project lands on it by D52's soft landing and is refused the
+    /// same way — the resolved project is archived.
+    ///
+    /// **IT FOLLOWS THE MODE LIKE EVERY OTHER CLASS**: counted and served under
+    /// [`Mode::Counting`], answered under [`Mode::Enforcing`]. ADR-0941 leaves
+    /// that open ("confirm with Max"); the reading here is that the stage-5 gate
+    /// should see archived writes the way it sees every other would-be refusal.
+    Archived,
 }
 
 impl Reason {
@@ -138,6 +158,7 @@ impl Reason {
             Self::UnregisteredPersonal => "PROJECT_UNREGISTERED_PERSONAL",
             Self::Unresolvable => "PROJECT_UNRESOLVABLE",
             Self::RegistryUnavailable => "PROJECT_REGISTRY_UNAVAILABLE",
+            Self::Archived => "PROJECT_ARCHIVED",
         }
     }
 }
@@ -146,6 +167,21 @@ impl fmt::Display for Reason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.token())
     }
+}
+
+/// Whether a call reads or writes, as far as ADR-0941 is concerned.
+///
+/// An enum rather than a `bool` so a call site says which it means. Derived from
+/// the TOOL NAME at dispatch (`crate::tools::is_write`), the same derivation
+/// that decides `CallRecord.kind` — one rule for "is this a write", not two.
+///
+/// **THE DEFAULT IS `Write`**, because the default is what a site that forgot to
+/// say gets, and forgetting must not let a write into an archived project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Access {
+    Read,
+    #[default]
+    Write,
 }
 
 /// One classified refusal, before any prose is composed for it.
@@ -321,9 +357,18 @@ impl Validator {
     ///
     /// Only in [`Mode::Enforcing`], and then once per terminal state.
     ///
+    /// `access` says whether the call writes: a write to an ARCHIVED project is a
+    /// refusal of its own (ADR-0941), and a read of one is an ordinary
+    /// resolution.
+    ///
     /// `request_id` is the call's D67 id, carried to `project` if a refusal
     /// dials it (ledger 1248).
-    pub async fn check(&self, claimed: &str, request_id: &str) -> Result<(), Denied> {
+    pub async fn check(
+        &self,
+        claimed: &str,
+        access: Access,
+        request_id: &str,
+    ) -> Result<(), Denied> {
         let Some(loaded) = self.registry.loaded() else {
             // THE REGISTRY HAS NEVER LOADED (ADR-0674). Counted, because the
             // gate must not flip while this is happening; refused only under
@@ -337,6 +382,12 @@ impl Validator {
         };
 
         match classify(loaded.as_ref(), claimed) {
+            // AN ARCHIVED WRITE IS A REFUSAL AND NOT A RESOLUTION, so it moves
+            // the refusal series ONLY: exactly one series per call, as above.
+            Outcome::Resolved { archived: true, .. } if access == Access::Write => {
+                self.decide(Refusal::bare(Reason::Archived), request_id)
+                    .await
+            }
             Outcome::Resolved { exact, .. } => {
                 metrics::counter!(
                     RESOLUTIONS,

@@ -231,6 +231,13 @@ pub(super) async fn admin_issue_enrolment(
             r#"{"error":"`user_id` is required"}"#,
         );
     };
+    let Some(revoke) = revoke_instruction(&req) else {
+        call.fail("INVALID_ARGUMENT");
+        return text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"`revoke_existing_credentials` must be a boolean"}"#,
+        );
+    };
 
     let authority = match authorise(
         &state,
@@ -255,6 +262,11 @@ pub(super) async fn admin_issue_enrolment(
         }
     };
 
+    if let Some(refused) = bootstrap_revoke_refusal(&authority, revoke) {
+        call.fail("PERMISSION_DENIED");
+        return refused;
+    }
+
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
         state.iam.clone(),
         &request_id,
@@ -275,6 +287,8 @@ pub(super) async fn admin_issue_enrolment(
         // clear it would turn ADR-0655's narrow grant back into the unrestricted
         // one. The variant is the only input.
         require_zero_credential_admin: authority.demands_zero_credential_admin(),
+        // FROM THE BODY, unlike the demand: see `revoke_instruction` (ADR-0943).
+        revoke_existing_credentials: revoke,
     });
     let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
         Ok(Ok(r)) => r.into_inner(),
@@ -285,6 +299,8 @@ pub(super) async fn admin_issue_enrolment(
     let rendered = json!({
         "token": resp.token,
         "enrolment_id": resp.enrolment_id,
+        // AS APPLIED — see `revoke_instruction` for why it is echoed.
+        "revoke_existing_credentials": revoke,
     })
     .to_string();
     call.finish(Outcome {
@@ -409,4 +425,46 @@ pub(super) async fn admin_set_user_admin(
         ..Default::default()
     });
     text(StatusCode::OK, &rendered)
+}
+
+/// ADR-0943's optional `revoke_existing_credentials` on `/admin/issue-enrolment`.
+///
+/// ABSENT IS `false` — the reset path exactly as it was. PRESENT MUST BE A JSON
+/// BOOLEAN, and anything else is `None`, which the caller answers with a 400:
+/// `"true"` and `1` are not an instruction to sign somebody out everywhere, and
+/// `admin_set_user_admin` already refuses to guess at a truthiness reading on
+/// the same grounds.
+///
+/// FROM THE REQUEST BODY, AND THAT IS NOT `admin_issue_enrolment`'s "never from
+/// the request body" rule broken. That rule is about the demand, which only ever
+/// NARROWS the bootstrap grant, so a caller who could clear it would widen it.
+/// This instruction only ever withdraws credentials, only an attested
+/// administrator may set it ([`bootstrap_revoke_refusal`]), and its absence is
+/// the reset path exactly as it was.
+///
+/// THE 200 ECHOES THE VALUE AS APPLIED (ledger 1579). An unknown JSON key is
+/// ignored, so a misspelt field is a 200 and a plain reset with every old token
+/// still working; the echo is how a client that asked for a revoke learns it
+/// did not get one.
+fn revoke_instruction(req: &Value) -> Option<bool> {
+    match req.get("revoke_existing_credentials") {
+        None => Some(false),
+        Some(v) => v.as_bool(),
+    }
+}
+
+/// ADR-0943: THE BOOTSTRAP PATH NEVER CARRIES THE REVOKE INSTRUCTION.
+///
+/// Refused at this gateway, before `iam` is called, rather than left to
+/// `iam-db`'s own refusal of the demand and the instruction together: a request
+/// that never leaves the gateway cannot depend on the tier below. See
+/// `Authority::may_revoke_existing_credentials` for why the bootstrap token has
+/// nothing to revoke in the first place.
+fn bootstrap_revoke_refusal(authority: &Authority, revoke: bool) -> Option<Response> {
+    (revoke && !authority.may_revoke_existing_credentials()).then(|| {
+        text(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"the bootstrap token may not revoke existing credentials"}"#,
+        )
+    })
 }

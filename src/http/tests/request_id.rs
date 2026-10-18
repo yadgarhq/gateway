@@ -441,6 +441,20 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
             "the registry here is loaded_with",
         ))
     }
+
+    // proto v1.17.0's seeder-only verb (ADR-0936). This gateway never calls it;
+    // `build_server(true)` makes every stub of the trait implement it.
+    async fn sync_projects(
+        &self,
+        _: tonic::Request<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsRequest>,
+    ) -> Result<
+        tonic::Response<crate::pb::yadgar::project::v1::ProjectServiceSyncProjectsResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "the gateway never calls SyncProjects",
+        ))
+    }
 }
 
 /// `tools/call` under ENFORCEMENT, claiming a workspace the registry refuses

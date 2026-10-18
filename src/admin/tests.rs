@@ -171,6 +171,18 @@ fn only_the_bootstrap_path_demands_a_zero_credential_admin() {
 }
 
 #[test]
+fn only_an_attested_administrator_may_revoke_existing_credentials() {
+    assert!(
+        !Authority::Bootstrap.may_revoke_existing_credentials(),
+        "the bootstrap token never carries ADR-0943's revoke instruction"
+    );
+    assert!(
+        Authority::Administrator("yadgar:user:abc".to_string()).may_revoke_existing_credentials(),
+        "an attested administrator's re-enrolment is the reset ADR-0943 lets revoke"
+    );
+}
+
+#[test]
 fn an_administrator_stamps_their_resolved_id() {
     assert_eq!(
         Authority::Administrator("yadgar:user:abc".to_string()).actor(),

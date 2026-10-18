@@ -228,6 +228,15 @@ pub(super) fn sentence(reason: Reason, anchor: Option<&str>, source_repo: Option
                                  checkout should be registered as."
             .to_string(),
 
+        // THE PROJECT EXISTS AND IS KEPT; it no longer takes writes (ADR-0941).
+        // The sentence names neither the claim nor the resolved row, for this
+        // module's rule — and because the caller sent the path it already has.
+        Reason::Archived => "the project this workspace resolves to is archived, so it accepts \
+                             no writes (ADR-0941). Reads of its existing records still answer. \
+                             Ask your operator whether this checkout should be registered as a \
+                             different project, or the archived one reactivated."
+            .to_string(),
+
         // NOT ABOUT THE CALLER AT ALL (ADR-0674), and the sentence says so
         // plainly: an operator reading this next to the four above must not have
         // to guess which of the two conditions they are in.
