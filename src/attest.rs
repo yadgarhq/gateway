@@ -24,16 +24,18 @@
 //!   - `project_id` — CLAIMED, and legitimately so. It is a workspace fact, it
 //!     changes as a person moves between checkouts, and a token cannot carry it.
 //!
-//!     **CLAIMED IS NO LONGER UNEXAMINED (ledger 881).** The value is still the
-//!     caller's own and is still what this scope carries — but it is now CHECKED
-//!     against the registry [`crate::project`] loaded from `ProjectService`, and
-//!     the outcome is counted under
-//!     `yadgar_gateway_project_refusal_total{reason}`. In the shipped `counting`
-//!     mode that check refuses nobody and changes nothing about this scope; the
-//!     resolved path replaces the claim when the deployment flips to
-//!     `enforcing`, which is the one behaviour change `plans/project-validation.md`
-//!     gates. So this bullet says CLAIMED rather than RESOLVED on purpose:
-//!     claiming the opposite before the flip would be the more dangerous error.
+//!     **CLAIMED IS NO LONGER UNEXAMINED (ledger 881).** The value is the
+//!     caller's own, and it is CHECKED against the registry [`crate::project`]
+//!     loaded from `ProjectService`; the outcome is counted under
+//!     `yadgar_gateway_project_refusal_total{reason}`. What the scope then
+//!     carries depends on the mode, and [`attest`] is the one place it is set:
+//!     under `counting`, the shipped value, the check refuses nobody and the
+//!     scope carries the CLAIM unchanged; under `enforcing`, the scope carries
+//!     the RESOLVED path — the registered spelling of the row the claim landed
+//!     on, an ancestor for a marker-file subpath (D52) — and [`Attested::exact`]
+//!     says which. That substitution is the one behaviour change
+//!     `plans/project-validation.md` gates, which is why it moves with the flip
+//!     and never ships under counting.
 //!   - `instance_id` — CLAIMED, for the same reason, and it is a session marker
 //!     rather than an identity.
 //!
@@ -308,6 +310,13 @@ pub struct Attested {
     /// the case ADR-0492 minted the bootstrap token for, so it is a gap the design
     /// already fills rather than one this default opens.
     pub is_admin: bool,
+    /// Whether the claim had a registered row of its own: `Some(false)` is
+    /// D52's soft landing on an ancestor, and rides back in the tool result.
+    ///
+    /// **`Some` ONLY UNDER ENFORCEMENT**, where `scope.project_id` is the
+    /// resolved path. `None` under counting, where the scope carries the claim
+    /// and the caller is told nothing — and on `/admin`, which checks no project.
+    pub exact: Option<bool>,
 }
 #[cfg(test)]
 mod tests;

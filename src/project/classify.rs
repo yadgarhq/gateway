@@ -169,7 +169,7 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     // THE ANSWER IS THE REGISTERED SPELLING AND NOT THE CANDIDATE'S, which is
     // what `ProjectDbService.ResolveProject` answers too: it returns the ROW's
     // path. The two differ whenever the fold matched — and the resolved path is
-    // what a later release stamps on the record, so answering the caller's
+    // what enforcement stamps on the record, so answering the caller's
     // spelling would mint a second spelling of one partition key, which is the
     // failure the registry exists to prevent.
     let matched = chain(claimed)

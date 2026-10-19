@@ -1072,3 +1072,108 @@ fn a_ttl_above_the_ceiling_is_refused_rather_than_clamped() {
     // and a cache entry may not outlive the thing it caches.
     assert_eq!(MAX_TTL_SECONDS, 300);
 }
+
+// -----------------------------------------------------------------------
+// Stamping (`plans/project-validation.md` stage 5).
+//
+// **EVERY CLAIM BELOW RESOLVES TO A PATH THAT DIFFERS FROM IT, OR IS EXACT.**
+// A claim that resolved to itself under counting would leave a mutant that
+// stamps in counting mode alive: there would be nothing different to stamp.
+// -----------------------------------------------------------------------
+
+/// A marker-file subpath beneath `yadgarhq/docs`, with no row of its own.
+const STAMP_SUBPATH: &str = "yadgarhq/docs/services/api";
+
+/// `yadgarhq/docs` in a spelling the fold matches and the row does not hold.
+const STAMP_FOLDED: &str = "YadgarHQ/Docs";
+
+/// A validator over the anchor `yadgarhq` and the row `yadgarhq/docs`.
+fn stamping(mode: crate::project::Mode) -> crate::project::Validator {
+    use crate::pb::yadgar::project::v1::{ProjectStatus, RegisteredPath};
+    let rows = ["yadgarhq", "yadgarhq/docs"].map(|path| RegisteredPath {
+        path: path.to_string(),
+        status: ProjectStatus::Active as i32,
+        aliases: Vec::new(),
+        owner_user_id: String::new(),
+    });
+    crate::project::Validator::new(
+        crate::project::Registry::loaded_from(rows.into_iter().collect()),
+        mode,
+        nowhere(),
+    )
+}
+
+/// Attest `claimed` through the trusted-header arm, under `mode`.
+async fn attest_claiming(
+    mode: crate::project::Mode,
+    claimed: &str,
+) -> Result<Attested, AttestError> {
+    attest(
+        &Attestation::TrustedHeaders,
+        &nowhere(),
+        &Credentials::new(TEST_TTL),
+        &stamping(mode),
+        None,
+        Claimed {
+            user_id: Some("max"),
+            project_id: Some(claimed),
+            instance_id: None,
+            access: crate::project::Access::Read,
+        },
+        "REQ-STAMP".to_string(),
+    )
+    .await
+}
+
+/// A marker-file subpath lands at its registered ancestor, and says so.
+///
+/// MUTATION THIS CATCHES: never stamping under enforcement — the claim is kept
+/// and `exact` stays absent.
+#[tokio::test]
+async fn under_enforcement_a_subpath_claim_is_stamped_with_its_ancestor() {
+    let attested = attest_claiming(crate::project::Mode::Enforcing, STAMP_SUBPATH)
+        .await
+        .expect("a soft landing is not a refusal");
+    assert_eq!(attested.scope.project_id, "yadgarhq/docs");
+    assert_eq!(attested.exact, Some(false));
+}
+
+/// An exact claim keeps its row; a case-folded one gets the REGISTERED
+/// spelling, which is the store's answer and the partition key's one spelling.
+#[tokio::test]
+async fn under_enforcement_an_exact_claim_is_stamped_with_its_registered_spelling() {
+    for claimed in ["yadgarhq/docs", STAMP_FOLDED] {
+        let attested = attest_claiming(crate::project::Mode::Enforcing, claimed)
+            .await
+            .expect("an exact claim attests");
+        assert_eq!(attested.scope.project_id, "yadgarhq/docs", "{claimed}");
+        assert_eq!(attested.exact, Some(true), "{claimed}");
+    }
+}
+
+/// Under counting the claim is what the scope carries, and nothing is said.
+///
+/// MUTATION THIS CATCHES: stamping under counting — both claims resolve to a
+/// path that differs from them.
+#[tokio::test]
+async fn under_counting_the_claim_is_kept_and_no_exact_is_carried() {
+    for claimed in [STAMP_SUBPATH, STAMP_FOLDED] {
+        let attested = attest_claiming(crate::project::Mode::Counting, claimed)
+            .await
+            .expect("counting refuses nobody");
+        assert_eq!(attested.scope.project_id, claimed);
+        assert_eq!(attested.exact, None, "{claimed}");
+    }
+}
+
+/// A refusal under enforcement is still the refusal it was.
+#[tokio::test]
+async fn under_enforcement_a_refusal_is_unchanged() {
+    let err = attest_claiming(crate::project::Mode::Enforcing, "nobody/x")
+        .await
+        .expect_err("an unresolvable claim is refused");
+    assert!(
+        matches!(&err, AttestError::Project(d) if d.reason == crate::project::Reason::Unresolvable),
+        "got {err:?}"
+    );
+}

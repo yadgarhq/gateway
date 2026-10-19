@@ -367,6 +367,23 @@ pub(super) fn shape(
     }
 }
 
+/// D52's soft landing, made visible in the result the caller is already reading
+/// (`plans/project-registry-callers.md` §4): under enforcement the result's
+/// `_meta` names the path the call was stamped with and whether the claim had a
+/// row of its own — on a tool failure too, because the scope was stamped either
+/// way. `None`, which is every counting call, returns `payload` untouched, so
+/// counting changes no byte of the answer.
+pub(super) fn with_resolution(mut payload: Value, resolution: Option<(String, bool)>) -> Value {
+    let result = payload.get_mut("result").and_then(Value::as_object_mut);
+    if let (Some((path, exact)), Some(result)) = (resolution, result) {
+        result.insert(
+            "_meta".to_string(),
+            json!({ meta_keys::PROJECT_RESOLUTION: { "resolvedPath": path, "exact": exact } }),
+        );
+    }
+    payload
+}
+
 /// Read or write, for `CallRecord.kind`. A wrong answer here makes read and
 /// write traffic indistinguishable in the roll-ups.
 pub(super) fn kind_of(name: &str) -> Kind {

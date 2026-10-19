@@ -22,13 +22,11 @@
 //!
 //! So [`Mode::Counting`] is the shipped value, every terminal state increments
 //! its counter, and the call then proceeds EXACTLY as it did before this module
-//! existed — including the `Scope` it is stamped with. The resolved path is
-//! deliberately NOT substituted for the claim here: a call that returns its
-//! normal answer while writing into a different `project_id` than it did
-//! yesterday has not "proceeded as before", and a silent change of partition
-//! key is the harm this whole plan exists to prevent. Stamping the resolved
-//! path moves with the flip, so the flip is the one behaviour change and the
-//! one thing to revert.
+//! existed — including the `Scope` it is stamped with. Counting never stamps:
+//! a call that returns its normal answer while writing into a different
+//! `project_id` than it did yesterday has not "proceeded as before". Under
+//! [`Mode::Enforcing`] the resolved path REPLACES the claim (see [`Stamp`]), so
+//! the flip is the one behaviour change and the one thing to revert.
 //!
 //! **THE FIVE TERMINAL STATES** are the plan's taxonomy. `MISSING_WORKSPACE` —
 //! no header at all — shipped long ago and is [`crate::attest::AttestError`]'s
@@ -254,6 +252,17 @@ pub struct Denied {
     pub prose: String,
 }
 
+/// What an ENFORCING resolution stamps on the call (stage 5, D52).
+///
+/// `path` is the REGISTERED spelling of the row the claim landed on, and
+/// replaces the claim in the `Scope`; `exact` is false on a soft landing and
+/// rides back in the tool result. Never built under [`Mode::Counting`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    pub path: String,
+    pub exact: bool,
+}
+
 /// Whether a classified refusal is answered or only counted.
 ///
 /// **NO COMPILED-IN DEFAULT (ADR-0569).** An absent or unrecognised value
@@ -390,6 +399,18 @@ impl Validator {
         user_id: &str,
         request_id: &str,
     ) -> Result<(), Denied> {
+        let resolved = self.resolve(claimed, access, user_id, request_id);
+        resolved.await.map(drop)
+    }
+
+    /// [`Self::check`], answering the [`Stamp`] — `Some` only under enforcement.
+    pub async fn resolve(
+        &self,
+        claimed: &str,
+        access: Access,
+        user_id: &str,
+        request_id: &str,
+    ) -> Result<Option<Stamp>, Denied> {
         let Some(loaded) = self.registry.loaded() else {
             // THE REGISTRY HAS NEVER LOADED (ADR-0674). Counted, because the
             // gate must not flip while this is happening; refused only under
@@ -439,13 +460,13 @@ impl Validator {
                     "outcome" => if exact { "exact" } else { "ancestor" },
                 )
                 .increment(1);
-                Ok(())
+                Ok((self.mode == Mode::Enforcing).then_some(Stamp { path, exact }))
             }
         }
     }
 
     /// Count one refusal, and answer it only under enforcement.
-    async fn decide(&self, refusal: Refusal, request_id: &str) -> Result<(), Denied> {
+    async fn decide(&self, refusal: Refusal, request_id: &str) -> Result<Option<Stamp>, Denied> {
         metrics::counter!(REFUSALS, "reason" => refusal.reason.token()).increment(1);
 
         if self.mode == Mode::Counting {
@@ -463,7 +484,7 @@ impl Validator {
                 reason = %refusal.reason,
                 "the claimed workspace would be refused under enforcement; counted and served"
             );
-            return Ok(());
+            return Ok(None);
         }
 
         Err(remediate::compose(&self.project, refusal, request_id).await)
