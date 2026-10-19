@@ -65,8 +65,9 @@ pub enum Outcome {
     /// why the CLASS is read from `path` and never from this (see
     /// [`super::member`]).
     ///
-    /// `private` is the landed ROW's class, read from the row's own path: an
-    /// alias spelled outside `local/` still names a private row.
+    /// `private` is true when the landed ROW is private OR the spelling that hit
+    /// is: an alias spelled outside `local/` still names a private row, and an
+    /// org row's `local/` alias stays unreachable.
     Resolved {
         path: String,
         exact: bool,
@@ -169,19 +170,27 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     // THE ANSWER IS THE REGISTERED SPELLING AND NOT THE CANDIDATE'S, which is
     // what `ProjectDbService.ResolveProject` answers too: it returns the ROW's
     // path. The two differ whenever the fold matched — and the resolved path is
-    // what a later release stamps on the record, so answering the caller's
+    // what enforcement stamps on the record, so answering the caller's
     // spelling would mint a second spelling of one partition key, which is the
     // failure the registry exists to prevent.
+    //
+    // `hit` IS THE SPELLING THE CHAIN MATCHED, and it decides `exact`: a hit at
+    // the claim itself is exact, whether it is the row's path or an ALIAS —
+    // `ResolveProject` compares the matched spelling too (`via_alias`). Reading
+    // `exact` off the canonical path would call a bare alias a soft landing.
     let matched = chain(claimed)
         .into_iter()
-        .find_map(|ancestor| registered.registered_as(ancestor));
+        .find_map(|ancestor| registered.registered_as(ancestor).map(|m| (ancestor, m)));
 
-    let Some(Match {
-        path: matched,
-        archived,
-        owner,
-        private,
-    }) = matched
+    let Some((
+        hit,
+        Match {
+            path: matched,
+            archived,
+            owner,
+            private,
+        },
+    )) = matched
     else {
         // NO REGISTERED ANCESTOR. Which refusal that is depends on the
         // namespace, and only `local/` has a remediation that ends in creating
@@ -201,12 +210,17 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     // DECIDED BEFORE STATUS: an archived anchor is still an anchor, and the
     // caller's repository is still unregistered. Telling it the namespace is
     // archived would answer a question it did not ask.
-    if !matched.contains('/') {
-        return Outcome::Refused(Refusal::under_anchor(&matched));
+    //
+    // THE SPELLING THAT HIT AND THE ROW IT NAMES ARE BOTH CHECKED: an alias of
+    // an anchor, or a single-segment alias of a deeper row, is an anchor by
+    // whichever of the two is a single segment — fail toward the refusal.
+    if !hit.contains('/') || !matched.contains('/') {
+        let anchor = if matched.contains('/') { hit } else { &matched };
+        return Outcome::Refused(Refusal::under_anchor(anchor));
     }
 
     Outcome::Resolved {
-        exact: matched.eq_ignore_ascii_case(claimed),
+        exact: hit.len() == claimed.len(),
         path: matched,
         archived,
         owner,
@@ -217,7 +231,8 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
 /// One registered path or alias the walk matched, with its row's status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
-    /// The REGISTERED spelling — see [`Registered::registered_as`].
+    /// The ROW's registered path — for an alias too, which resolves to its row
+    /// as `ResolveProject` resolves it. See [`Registered::registered_as`].
     pub path: String,
     /// Whether the row this path or alias belongs to is ARCHIVED (ADR-0941).
     ///
@@ -229,10 +244,11 @@ pub struct Match {
     /// only on a private (`local/…`) row. An alias carries its ROW's owner, as
     /// it carries its row's status.
     pub owner: String,
-    /// Whether the ROW this path or alias belongs to is private, read from the
-    /// row's own path at load. An alias carries its row's class: reading the
-    /// class off an alias spelled outside `local/` would make a private row
-    /// org for whoever claimed the alias.
+    /// Whether the ROW this path or alias belongs to is private, OR this
+    /// spelling itself is (`local/…`), decided at load. An alias carries its
+    /// row's class — reading the class off an alias spelled outside `local/`
+    /// would make a private row org for whoever claimed the alias — and an org
+    /// row's `local/` alias is private by its spelling, so it fails closed.
     pub private: bool,
 }
 
@@ -243,12 +259,14 @@ pub struct Match {
 /// that nothing in this module can reach for a field the real loaded set does
 /// not carry.
 pub trait Registered {
-    /// The REGISTERED spelling of this exact path, comparing ASCII case folded,
-    /// with its row's status — or `None` when no row holds it.
+    /// The ROW that holds this exact path, comparing ASCII case folded, with its
+    /// status — or `None` when no row holds it. `Match.path` is the row's
+    /// registered path, which for an ALIAS is the row's canonical path and not
+    /// the alias.
     ///
-    /// It answers the spelling rather than a bool because the fold makes them
-    /// differ, and the registered one is what the store's own resolver returns —
-    /// see [`classify`]. A `bool` here is what let an earlier revision answer
+    /// It answers the path rather than a bool because the fold and the alias
+    /// make them differ, and the row's path is what the store's own resolver
+    /// returns — see [`classify`]. A `bool` here is what let an earlier revision answer
     /// the CALLER's spelling as the resolved path.
     fn registered_as(&self, path: &str) -> Option<Match>;
 

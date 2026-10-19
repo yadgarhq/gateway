@@ -3055,3 +3055,7 @@ mod foreign_local;
 /// ADR-0959: `GET /auth/whoami` answers the caller's own id and `local/`
 /// segment, and refuses exactly as an attested `/admin` route does.
 mod whoami;
+
+/// Stage 5's stamping through the router: the resolved path and `exact` under
+/// enforcement, and the counting body byte-identical to before.
+mod stamping;

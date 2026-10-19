@@ -51,13 +51,15 @@ pub async fn attest(
     request_id: String,
 ) -> Result<Attested, AttestError> {
     let access = claimed.access;
-    let attested = attested(how, iam, cache, credential, claimed, request_id).await?;
-    // COUNTED ALWAYS, REFUSED ONLY WHERE THE DEPLOYMENT SAYS SO. In the shipped
-    // `counting` mode this returns `Ok` for every claim, having recorded which
-    // terminal state it reached — see `crate::project`, whose whole subject is
-    // why the counted stage exists before the enforcing one.
-    projects
-        .check(
+    let mut attested = attested(how, iam, cache, credential, claimed, request_id).await?;
+    // COUNTED ALWAYS, REFUSED AND STAMPED ONLY WHERE THE DEPLOYMENT SAYS SO.
+    // In the shipped `counting` mode this answers `Ok(None)` for every claim,
+    // having recorded which terminal state it reached, and the scope keeps the
+    // claim. Under `enforcing` a resolution answers the registered path the
+    // claim landed on, and that path REPLACES the claim — by assignment, so the
+    // only `Scope { … }` literal stays in [`scope`].
+    let stamp = projects
+        .resolve(
             &attested.scope.project_id,
             access,
             &attested.scope.user_id,
@@ -65,6 +67,10 @@ pub async fn attest(
         )
         .await
         .map_err(AttestError::Project)?;
+    if let Some(stamp) = stamp {
+        attested.scope.project_id = stamp.path;
+        attested.exact = Some(stamp.exact);
+    }
     Ok(attested)
 }
 
@@ -117,6 +123,8 @@ async fn attested(
 ) -> Result<Attested, AttestError> {
     match how {
         Attestation::TrustedHeaders => Ok(Attested {
+            // Nothing is resolved yet: `attest` sets it under enforcement.
+            exact: None,
             limits: Overrides::default(),
             // FALSE, and the field's own comment carries the argument: no
             // credential was resolved here, so there is nothing that could have
@@ -205,8 +213,9 @@ async fn attested(
 /// line that looks like the two beside it. A rule saying "do not trust the header"
 /// would have been as true and as easy to break.
 ///
-/// `project_id` and `instance_id` ARE claimed, and stay so: a workspace is not a
-/// fact about a credential, and the token cannot carry it.
+/// `project_id` and `instance_id` ARE claimed: a workspace is not a fact about a
+/// credential, and the token cannot carry it. Under enforcement [`attest`] then
+/// replaces the claimed project with the resolved one; nothing here does.
 ///
 /// **`iam` ANSWERS `Ok` FOR A CREDENTIAL THAT DOES NOT RESOLVE, and reading that
 /// as a success is an authentication bypass.** `iam-db` returns an empty response
@@ -255,6 +264,8 @@ pub(super) fn from_resolved(
         return Err(AttestError::Upstream(tonic::Code::Unauthenticated));
     }
     Ok(Attested {
+        // Nothing is resolved yet: `attest` sets it under enforcement.
+        exact: None,
         limits: overrides_from(resolved.rate_limit_overrides)?,
         // D73'S FLAG, ARRIVING AT LAST. It has been on the wire since
         // `ResolveCredentialResponse` grew it and was discarded here, so the

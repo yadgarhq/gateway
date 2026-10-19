@@ -42,6 +42,9 @@ use crate::pb::yadgar::project::v1::{
 use super::classify::{is_private_class, Match, Registered};
 use super::member::PrivateIndex;
 
+mod fold;
+use fold::merge;
+
 /// Whether this replica has EVER loaded the registry: `1` after the first
 /// successful load, `0` before it.
 ///
@@ -91,14 +94,13 @@ const PAGE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC
 /// takes its ROW's status: the load once flattened rows into bare strings, and
 /// that lost the link from an alias to the row it names.
 pub struct Loaded {
-    /// Keyed on the LOWERCASED path, valued with the spelling the tier answered
-    /// and its row's status.
+    /// Keyed on the LOWERCASED spelling (path or alias), valued with its ROW's
+    /// path as the tier answered it, status, owner and class.
     ///
     /// Folded once here rather than on both sides of every comparison, because
     /// every comparison in the store's walk folds ASCII case and this one must
-    /// stay the same comparison. The spelling is kept because the resolved path a
-    /// later release stamps is the row's spelling and not the caller's — the
-    /// same answer `ProjectDbService.ResolveProject` gives.
+    /// stay the same comparison. The row's path is what enforcement stamps — the
+    /// answer `ProjectDbService.ResolveProject` gives (`p.path`).
     folded: BTreeMap<String, Match>,
     /// Every private spelling with its row's owner, sorted, for the subtree
     /// rule — built once per load, never per call.
@@ -122,42 +124,6 @@ pub struct Loaded {
 /// turns a private row into an org one.
 fn owner_of(row: &RegisteredPath) -> String {
     row.owner_user_id.clone()
-}
-
-/// Insert one spelling, resolving a folded collision toward REFUSAL, and
-/// answer whether the collision left a key nobody can reach that a row's
-/// owner could reach before.
-///
-/// Only the SPELLING keeps the last row's. Everything an authorization reads
-/// resolves toward refusal, whatever order the rows loaded in:
-///
-/// - the OWNER: two rows of different owners under one key make the key
-///   ambiguous, and an ambiguous owner is nobody's — admitting whichever row
-///   loaded last would hand one account the other's project;
-/// - the CLASS: private if either row is, so an org row loaded after a
-///   private row's alias cannot turn that key into an org one;
-/// - the STATUS: archived if either row is, so a write is refused.
-fn merge(folded: &mut BTreeMap<String, Match>, key: String, m: Match) -> bool {
-    let Some(prev) = folded.remove(&key) else {
-        folded.insert(key, m);
-        return false;
-    };
-    let private = prev.private || m.private;
-    let owner = if prev.owner == m.owner {
-        m.owner.clone()
-    } else {
-        String::new()
-    };
-    let made_ownerless =
-        private && owner.is_empty() && !(prev.owner.is_empty() && m.owner.is_empty());
-    let merged = Match {
-        private,
-        owner,
-        archived: prev.archived || m.archived,
-        ..m
-    };
-    folded.insert(key, merged);
-    made_ownerless
 }
 
 /// Whether a wire status is ARCHIVED.
@@ -195,13 +161,24 @@ impl Loaded {
             }
             let archived = is_archived(row.status);
             let private = is_private_class(&row.path);
-            for path in std::iter::once(row.path).chain(row.aliases) {
-                matches.push(Match {
-                    path,
-                    archived,
-                    owner: owner.clone(),
-                    private,
-                });
+            // An alias answers its ROW's path, as `ResolveProject` does (`p.path`),
+            // and is PRIVATE if its row or its own spelling is: an org row's
+            // `local/` alias stays unreachable (fail closed, as counted above).
+            let m = Match {
+                path: row.path.clone(),
+                archived,
+                owner,
+                private,
+            };
+            for spelling in std::iter::once(row.path).chain(row.aliases) {
+                let private = m.private || is_private_class(&spelling);
+                matches.push((
+                    spelling,
+                    Match {
+                        private,
+                        ..m.clone()
+                    },
+                ));
             }
         }
         let mut loaded = Self::from_matches(matches);
@@ -225,16 +202,17 @@ impl Loaded {
         }))
     }
 
-    fn from_matches(matches: Vec<Match>) -> Self {
-        // THE INDEX IS BUILT FROM EVERY SPELLING, BEFORE THE FOLD BELOW
-        // DEDUPLICATES THEM. Two spellings that fold to one key are two owners,
-        // and the subtree rule must see both: a map that kept the last would
-        // drop a foreign owner beneath a caller's row by an accident of order.
+    fn from_matches(matches: Vec<(String, Match)>) -> Self {
+        // Each pair is (spelling, its row's Match). THE INDEX IS BUILT FROM
+        // EVERY SPELLING, BEFORE THE FOLD BELOW DEDUPLICATES THEM. Two spellings
+        // that fold to one key are two owners, and the subtree rule must see
+        // both: a map that kept the last would drop a foreign owner beneath a
+        // caller's row by an accident of order.
         let private = PrivateIndex::build(
             matches
                 .iter()
-                .filter(|m| !m.path.eq_ignore_ascii_case("local"))
-                .map(|m| (m.path.as_str(), m.owner.as_str(), m.private)),
+                .filter(|(s, _)| !s.eq_ignore_ascii_case("local"))
+                .map(|(s, m)| (s.as_str(), m.owner.as_str(), m.private)),
         );
         let mut folded: BTreeMap<String, Match> = BTreeMap::new();
         let mut made_ownerless = 0;
@@ -247,8 +225,8 @@ impl Loaded {
             // chain. A row at `local` is the nearest registered ancestor of
             // every private path in the estate, so the cost of one
             // redundant check is nothing beside what it prevents.
-            .filter(|m| !m.path.eq_ignore_ascii_case("local"))
-            .map(|m| (m.path.to_ascii_lowercase(), m))
+            .filter(|(s, _)| !s.eq_ignore_ascii_case("local"))
+            .map(|(s, m)| (s.to_ascii_lowercase(), m))
         {
             made_ownerless += usize::from(merge(&mut folded, key, m));
         }

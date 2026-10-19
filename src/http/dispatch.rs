@@ -316,8 +316,14 @@ pub(super) async fn tools_call(
     let call = Call::start(SERVICE, label, kind, observed(request_id, &scope));
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    // Set ONLY under enforcement, where `scope.project_id` is the stamped path.
+    let resolution = attested
+        .exact
+        .map(|exact| (scope.project_id.clone(), exact));
     let outcome = tools::call(state.task.clone(), scope, name, &args).await;
     let (status, rows, payload) = shape(id, outcome);
+    let claimed = header(headers, "x-yadgar-project").unwrap_or_default();
+    let payload = with_resolution(payload, claimed, resolution);
 
     // Serialise ONCE, and measure exactly what goes on the wire.
     //
