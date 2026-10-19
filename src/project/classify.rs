@@ -65,8 +65,9 @@ pub enum Outcome {
     /// why the CLASS is read from `path` and never from this (see
     /// [`super::member`]).
     ///
-    /// `private` is the landed ROW's class, read from the row's own path: an
-    /// alias spelled outside `local/` still names a private row.
+    /// `private` is true when the landed ROW is private OR the spelling that hit
+    /// is: an alias spelled outside `local/` still names a private row, and an
+    /// org row's `local/` alias stays unreachable.
     Resolved {
         path: String,
         exact: bool,
@@ -243,10 +244,11 @@ pub struct Match {
     /// only on a private (`local/…`) row. An alias carries its ROW's owner, as
     /// it carries its row's status.
     pub owner: String,
-    /// Whether the ROW this path or alias belongs to is private, read from the
-    /// row's own path at load. An alias carries its row's class: reading the
-    /// class off an alias spelled outside `local/` would make a private row
-    /// org for whoever claimed the alias.
+    /// Whether the ROW this path or alias belongs to is private, OR this
+    /// spelling itself is (`local/…`), decided at load. An alias carries its
+    /// row's class — reading the class off an alias spelled outside `local/`
+    /// would make a private row org for whoever claimed the alias — and an org
+    /// row's `local/` alias is private by its spelling, so it fails closed.
     pub private: bool,
 }
 
@@ -257,12 +259,14 @@ pub struct Match {
 /// that nothing in this module can reach for a field the real loaded set does
 /// not carry.
 pub trait Registered {
-    /// The REGISTERED spelling of this exact path, comparing ASCII case folded,
-    /// with its row's status — or `None` when no row holds it.
+    /// The ROW that holds this exact path, comparing ASCII case folded, with its
+    /// status — or `None` when no row holds it. `Match.path` is the row's
+    /// registered path, which for an ALIAS is the row's canonical path and not
+    /// the alias.
     ///
-    /// It answers the spelling rather than a bool because the fold makes them
-    /// differ, and the registered one is what the store's own resolver returns —
-    /// see [`classify`]. A `bool` here is what let an earlier revision answer
+    /// It answers the path rather than a bool because the fold and the alias
+    /// make them differ, and the row's path is what the store's own resolver
+    /// returns — see [`classify`]. A `bool` here is what let an earlier revision answer
     /// the CALLER's spelling as the resolved path.
     fn registered_as(&self, path: &str) -> Option<Match>;
 

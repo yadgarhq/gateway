@@ -1290,3 +1290,65 @@ fn an_org_rows_local_alias_is_refused_as_not_member() {
         "PROJECT_NOT_MEMBER"
     );
 }
+
+/// Aliases that make an ANCHOR out of either side of a match: `olddocs` is a
+/// single-segment alias of a deep row, and `yadgarhq-old/ns` is a
+/// multi-segment alias of the anchor `yadgarhq`.
+fn anchor_aliased() -> Registry {
+    Registry::loaded_from(vec![
+        rendered("yadgarhq", "", ACTIVE, &["yadgarhq-old/ns"]),
+        rendered("yadgarhq/docs", "", ACTIVE, &["olddocs"]),
+    ])
+}
+
+/// THE ANCHOR RULE READS BOTH SIDES OF A MATCH (ADR-0673): the spelling that
+/// hit, and the row it names. A single segment on EITHER side is an anchor,
+/// and nothing lands on an anchor.
+///
+/// MUTATIONS THIS CATCHES: the row-only rule (`olddocs` would land on
+/// `yadgarhq/docs`), and the hit-only rule (`yadgarhq-old/ns` would land on
+/// the anchor `yadgarhq` itself).
+#[test]
+fn under_counting_an_alias_on_either_side_of_an_anchor_is_unregistered_org() {
+    for claimed in [
+        "olddocs",
+        "olddocs/x",
+        "yadgarhq-old/ns",
+        "yadgarhq-old/ns/x",
+    ] {
+        let (answer, snapshotter) = as_user(
+            anchor_aliased(),
+            Mode::Counting,
+            Access::Read,
+            "carol",
+            claimed,
+        );
+        assert!(answer.is_ok(), "{claimed}: counting serves");
+        assert_eq!(
+            the_one_series(&snapshotter),
+            refused("PROJECT_UNREGISTERED_ORG"),
+            "{claimed}"
+        );
+    }
+}
+
+/// The anchor a refusal names is the single-segment side: the alias that hit
+/// when the ROW is deep, the row when the row is the anchor. The remediation
+/// is composed from it.
+///
+/// MUTATION THIS CATCHES: always naming the row, which names `yadgarhq/docs` —
+/// not an anchor at all — for `olddocs`.
+#[test]
+fn the_refusal_names_the_single_segment_side_as_the_anchor() {
+    let registry = anchor_aliased();
+    for (claimed, anchor) in [("olddocs/x", "olddocs"), ("yadgarhq-old/ns", "yadgarhq")] {
+        assert_eq!(
+            outcome(&registry, claimed),
+            Outcome::Refused(Refusal {
+                reason: Reason::UnregisteredOrg,
+                anchor: Some(anchor.to_string()),
+            }),
+            "{claimed}"
+        );
+    }
+}

@@ -81,7 +81,8 @@ pub(super) struct Landed<'a> {
     pub exact: bool,
     pub archived: bool,
     pub owner: &'a str,
-    /// The landed row's class, from the row's own path at load.
+    /// Private if the landed row OR the spelling that hit is (see
+    /// `classify::Match::private`).
     pub private: bool,
 }
 
