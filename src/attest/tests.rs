@@ -1185,18 +1185,20 @@ async fn under_enforcement_a_refusal_is_unchanged() {
 
 /// An alias claim is stamped with the ROW's canonical path, as
 /// `ResolveProject` answers it — never the alias spelling, which would be a
-/// second partition key for one project. Not exact: the claim is not the row.
+/// second partition key for one project. A BARE alias is exact, as
+/// `ResolveProject` answers it (`via_alias`); a subpath beneath it is not.
 ///
 /// MUTATION THIS CATCHES: the loaded set answering the alias spelling as the
-/// match's path (the defect gateway#125's review found).
+/// match's path (the defect gateway#125's review found), and `exact` read off
+/// the canonical path rather than off where the claim's chain hit.
 #[tokio::test]
 async fn under_enforcement_an_alias_claim_is_stamped_with_the_canonical_path() {
     let beneath = format!("{STAMP_ALIAS}/services/api");
-    for claimed in [STAMP_ALIAS, beneath.as_str()] {
+    for (claimed, exact) in [(STAMP_ALIAS, true), (beneath.as_str(), false)] {
         let attested = attest_claiming(crate::project::Mode::Enforcing, claimed)
             .await
             .expect("an alias resolves");
         assert_eq!(attested.scope.project_id, "yadgarhq/docs", "{claimed}");
-        assert_eq!(attested.exact, Some(false), "{claimed}");
+        assert_eq!(attested.exact, Some(exact), "{claimed}");
     }
 }

@@ -172,16 +172,24 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     // what enforcement stamps on the record, so answering the caller's
     // spelling would mint a second spelling of one partition key, which is the
     // failure the registry exists to prevent.
+    //
+    // `hit` IS THE SPELLING THE CHAIN MATCHED, and it decides `exact`: a hit at
+    // the claim itself is exact, whether it is the row's path or an ALIAS —
+    // `ResolveProject` compares the matched spelling too (`via_alias`). Reading
+    // `exact` off the canonical path would call a bare alias a soft landing.
     let matched = chain(claimed)
         .into_iter()
-        .find_map(|ancestor| registered.registered_as(ancestor));
+        .find_map(|ancestor| registered.registered_as(ancestor).map(|m| (ancestor, m)));
 
-    let Some(Match {
-        path: matched,
-        archived,
-        owner,
-        private,
-    }) = matched
+    let Some((
+        hit,
+        Match {
+            path: matched,
+            archived,
+            owner,
+            private,
+        },
+    )) = matched
     else {
         // NO REGISTERED ANCESTOR. Which refusal that is depends on the
         // namespace, and only `local/` has a remediation that ends in creating
@@ -201,12 +209,17 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     // DECIDED BEFORE STATUS: an archived anchor is still an anchor, and the
     // caller's repository is still unregistered. Telling it the namespace is
     // archived would answer a question it did not ask.
-    if !matched.contains('/') {
-        return Outcome::Refused(Refusal::under_anchor(&matched));
+    //
+    // THE SPELLING THAT HIT AND THE ROW IT NAMES ARE BOTH CHECKED: an alias of
+    // an anchor, or a single-segment alias of a deeper row, is an anchor by
+    // whichever of the two is a single segment — fail toward the refusal.
+    if !hit.contains('/') || !matched.contains('/') {
+        let anchor = if matched.contains('/') { hit } else { &matched };
+        return Outcome::Refused(Refusal::under_anchor(anchor));
     }
 
     Outcome::Resolved {
-        exact: matched.eq_ignore_ascii_case(claimed),
+        exact: hit.len() == claimed.len(),
         path: matched,
         archived,
         owner,

@@ -214,7 +214,7 @@ fn the_walk_folds_ascii_case_in_both_directions() {
         }
     );
     // THE ROW'S SPELLING, NOT THE CALLER'S. The store's resolver answers the
-    // ROW's `path`, and the resolved path is what a later release stamps on the
+    // ROW's `path`, and the resolved path is what enforcement stamps on the
     // record — so answering the caller's spelling would mint a second spelling
     // of one partition key.
     assert_eq!(

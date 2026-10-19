@@ -1243,3 +1243,50 @@ fn ruling_e_holds_for_non_owners_the_foreign_check_admits() {
         }
     }
 }
+
+/// An org row carrying an alias, and an org row carrying a `local/` alias.
+fn aliased() -> Registry {
+    Registry::loaded_from(vec![
+        rendered("acme", "", ACTIVE, &[]),
+        rendered("acme/docs", "", ACTIVE, &["acme/old-docs"]),
+        rendered("acme/wiki", "", ACTIVE, &["local/carol/wiki"]),
+    ])
+}
+
+/// COUNTING MOVES THE SAME SERIES IT DID BEFORE STAMPING, for alias claims.
+///
+/// A bare alias claim is EXACT, as `ResolveProject` answers it (`via_alias`):
+/// the claim matched a registered spelling at depth zero. An alias subpath is
+/// a soft landing. MUTATION THIS CATCHES: computing `exact` from the row's
+/// canonical path, which turns a bare alias into `ancestor` (gateway#125).
+#[test]
+fn under_counting_a_bare_alias_claim_counts_exact_and_its_subpath_ancestor() {
+    for (claimed, outcome) in [("acme/old-docs", "exact"), ("acme/old-docs/x", "ancestor")] {
+        let (answer, snapshotter) =
+            as_user(aliased(), Mode::Counting, Access::Read, "carol", claimed);
+        assert!(answer.is_ok(), "{claimed}: counting serves");
+        assert_eq!(
+            the_one_series(&snapshotter),
+            (RESOLVED.to_string(), outcome.to_string()),
+            "{claimed}"
+        );
+    }
+}
+
+/// An org row's `local/` alias reaches nobody, and a claim spelled with it is
+/// `PROJECT_NOT_MEMBER`: the spelling is private by its path, whichever row it
+/// names. MUTATION THIS CATCHES: reading the class off the row's canonical
+/// path only, which admits the claim (gateway#125).
+#[test]
+fn an_org_rows_local_alias_is_refused_as_not_member() {
+    let claimed = "local/carol/wiki";
+    let (answer, snapshotter) = as_user(aliased(), Mode::Counting, Access::Read, "carol", claimed);
+    assert!(answer.is_ok(), "counting serves");
+    assert_eq!(the_one_series(&snapshotter), refused("PROJECT_NOT_MEMBER"));
+
+    let (answer, _) = as_user(aliased(), Mode::Enforcing, Access::Read, "carol", claimed);
+    assert_eq!(
+        answer.expect_err("refused").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
+}
