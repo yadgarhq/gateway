@@ -23,6 +23,11 @@ pub const POLL: &str = "YADGAR_PROJECT_REGISTRY_POLL_SECONDS";
 /// seeded since — making the gate unreadable until somebody restarted every
 /// pod, for a reason nothing would explain.
 ///
+/// **A CEILING, NOT THE ONLY INTERVAL (ledger 1668).** While the registry has
+/// NEVER loaded, `super::retry` asks sooner — doubling from one second, capped
+/// at this value — because that is the one state in which no claim can be
+/// checked. Once a set is held, every load waits exactly this long.
+///
 /// # Errors
 ///
 /// Absent, empty, not a whole number of seconds, or zero. No compiled-in

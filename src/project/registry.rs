@@ -373,19 +373,17 @@ impl Registry {
     }
 }
 
-/// Load, then keep loading at the stated cadence.
+/// Load, then keep loading — on [`super::retry`]'s schedule (ledger 1668).
 ///
 /// Each arm is its own function, and not only for the complexity gate: what to do
 /// with a set that loaded and what to say about one that did not are different
 /// decisions, and the second one turns on a state the first one changes.
 async fn run(project: Channel, poll: Duration, registry: Registry) {
-    loop {
-        match load(&project).await {
-            Ok(rows) => install(&registry, rows),
-            Err(e) => report(&registry, &e, poll),
-        }
-        tokio::time::sleep(poll).await;
-    }
+    let loader = move || {
+        let project = project.clone();
+        async move { load(&project).await }
+    };
+    super::retry::drive(loader, poll, registry).await;
 }
 
 /// Install a freshly loaded set, and publish the gauge for it.
@@ -424,11 +422,14 @@ pub(super) fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
 /// checked at all on this replica. With a stale one, everything still resolves and
 /// only a recent registration is missing — and reporting that as an error would
 /// send somebody hunting an outage that is not happening.
-fn report(registry: &Registry, e: &tonic::Status, poll: Duration) {
+///
+/// `retry` is the wait before the NEXT load, which differs from the poll while
+/// nothing has loaded (ledger 1668) — so the log states the real one.
+pub(super) fn report(registry: &Registry, e: &tonic::Status, retry: Duration) {
     if registry.loaded().is_none() {
         tracing::error!(
             error = %e,
-            retry_secs = poll.as_secs(),
+            retry_secs = retry.as_secs(),
             "the project registry has NEVER loaded, so no claimed workspace can be checked on \
              this replica (ADR-0674). Unscoped surfaces — login, enrolment, health — are \
              unaffected."
@@ -436,7 +437,7 @@ fn report(registry: &Registry, e: &tonic::Status, poll: Duration) {
     } else {
         tracing::warn!(
             error = %e,
-            retry_secs = poll.as_secs(),
+            retry_secs = retry.as_secs(),
             "the project registry could not be refreshed; the previously loaded set stays in \
              force"
         );

@@ -1378,3 +1378,7 @@ fn the_archived_refusal_does_not_echo_the_callers_value() {
 /// Membership (`plans/project-membership.md` car P3): who may reach a resolved
 /// project, and the gauge that says whether a load carried its owners.
 mod member;
+
+/// The first load retries on a short doubling schedule, then settles on the
+/// poll (ledger 1668).
+mod retry;
