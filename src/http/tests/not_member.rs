@@ -17,6 +17,7 @@ use crate::attest::{AttestError, Attestation};
 use crate::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 use crate::pb::yadgar::project::v1::{ProjectStatus, RegisteredPath};
 use crate::project::{Denied, Mode, Reason, Registry, Validator};
+use crate::test_accounts::{id, path};
 
 const TOOLS: [&str; 5] = [
     "find_tasks",
@@ -35,11 +36,11 @@ fn state_owning(mode: Mode) -> std::sync::Arc<crate::http::AppState> {
         ("local/alice/notes/deep", "mallory", ProjectStatus::Active),
         ("local/alice/attic", "alice", ProjectStatus::Archived),
     ]
-    .map(|(path, owner, status)| RegisteredPath {
-        path: path.to_string(),
+    .map(|(p, owner, status)| RegisteredPath {
+        path: path(p),
         status: status as i32,
         aliases: Vec::new(),
-        owner_user_id: owner.to_string(),
+        owner_user_id: id(owner),
     });
     let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
     std::sync::Arc::get_mut(&mut state)
@@ -74,8 +75,8 @@ async fn call(mode: Mode, user: &str, project: &str, tool: &str) -> (StatusCode,
     let req = post()
         .header(headers::METHOD, "tools/call")
         .header(headers::NAME, tool)
-        .header("x-yadgar-user", user)
-        .header("x-yadgar-project", project)
+        .header("x-yadgar-user", id(user))
+        .header("x-yadgar-project", path(project))
         .header("x-yadgar-instance", "i-1")
         .body(Body::from(body.to_string()))
         .expect("request");

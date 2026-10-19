@@ -288,6 +288,17 @@ fn checked_as(
     access: Access,
     claimed: &str,
 ) -> (Result<(), Denied>, Snapshotter) {
+    checked_by(registry, mode, access, "a-user", claimed)
+}
+
+/// [`checked_as`], stating who calls.
+fn checked_by(
+    registry: Registry,
+    mode: Mode,
+    access: Access,
+    user: &str,
+    claimed: &str,
+) -> (Result<(), Denied>, Snapshotter) {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -297,7 +308,7 @@ fn checked_as(
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(claimed, access, "a-user", "a-request-id")
+                .check(claimed, access, user, "a-request-id")
                 .await
         })
     });
@@ -448,7 +459,14 @@ fn every_refusal_class_increments_its_own_reason() {
         ("local/max/git/beta", "PROJECT_UNREGISTERED_PERSONAL"),
         ("acme/forecast", "PROJECT_UNRESOLVABLE"),
     ] {
-        let (answer, snapshotter) = checked(estate(), Mode::Counting, claimed);
+        // THE PERSONAL PROBE CLAIMS ITS OWN ACCOUNT'S SEGMENT: under ADR-0954 a
+        // claim into another account's segment is `PROJECT_NOT_MEMBER` whether
+        // or not it is registered, so `UNREGISTERED_PERSONAL` is reachable only
+        // by the account the segment names.
+        let user = crate::test_accounts::id("max");
+        let claimed = crate::test_accounts::path(claimed);
+        let (answer, snapshotter) =
+            checked_by(estate(), Mode::Counting, Access::Write, &user, &claimed);
         assert!(answer.is_ok(), "counting mode refuses nobody");
         assert_eq!(
             counted(

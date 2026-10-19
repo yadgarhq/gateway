@@ -16,6 +16,17 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 
 use super::super::registry::install;
 use super::*;
+use crate::test_accounts::{id, path};
+
+/// One row as `ListProjects` answers it, with handles rendered (ADR-0954).
+fn rendered(p: &str, owner: &str, status: ProjectStatus, aliases: &[&str]) -> RegisteredPath {
+    let aliases: Vec<String> = aliases.iter().map(|a| path(a)).collect();
+    let aliases: Vec<&str> = aliases.iter().map(String::as_str).collect();
+    RegisteredPath {
+        owner_user_id: id(owner),
+        ..row(&path(p), status, &aliases)
+    }
+}
 
 const ACTIVE: ProjectStatus = ProjectStatus::Active;
 const ARCHIVED: ProjectStatus = ProjectStatus::Archived;
@@ -24,10 +35,7 @@ const ARCHIVED: ProjectStatus = ProjectStatus::Archived;
 fn owned(rows: &[(&str, &str, ProjectStatus)]) -> Registry {
     Registry::loaded_from(
         rows.iter()
-            .map(|(path, owner, status)| RegisteredPath {
-                owner_user_id: (*owner).to_string(),
-                ..row(path, *status, &[])
-            })
+            .map(|(p, owner, status)| rendered(p, owner, *status, &[]))
             .collect(),
     )
 }
@@ -73,7 +81,7 @@ fn as_user(
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(claimed, access, user, "a-request-id")
+                .check(&path(claimed), access, &id(user), "a-request-id")
                 .await
         })
     });
@@ -187,10 +195,12 @@ fn every_membership_arm_counts_one_series_and_refuses_only_under_enforcement() {
         arm("bob", "local", Read, (REFUSED, "PROJECT_UNRESOLVABLE")),
         arm(
             "bob",
-            "local/carol",
+            "local/bob",
             Write,
             (REFUSED, "PROJECT_UNREGISTERED_PERSONAL"),
         ),
+        // another account's unregistered segment (ADR-0954).
+        arm("bob", "local/carol", Write, NOT_MEMBER),
         // a private row loaded with no owner is nobody's: fail closed.
         arm("bob", "local/bob/blank", Read, NOT_MEMBER),
         arm("bob", "local/bob/blank", Write, NOT_MEMBER),
@@ -257,30 +267,32 @@ fn the_index_answers_owners_strictly_beneath_a_path() {
     let registry = members();
     let loaded = registry.loaded().expect("loaded");
     assert_eq!(
-        loaded.private_owners_beneath("local/alice/notes"),
-        vec!["mallory"]
+        loaded.private_owners_beneath(&path("local/alice/notes")),
+        vec![id("mallory")]
     );
     assert_eq!(
-        loaded.private_owners_beneath("LOCAL/Alice/Notes"),
-        vec!["mallory"]
+        loaded.private_owners_beneath(&path("LOCAL/Alice/Notes")),
+        vec![id("mallory")]
     );
     assert!(
-        loaded.private_owners_beneath("local/alice/solo").is_empty(),
+        loaded
+            .private_owners_beneath(&path("local/alice/solo"))
+            .is_empty(),
         "`local/alice/solo-x` shares a prefix and is not beneath"
     );
     assert!(
         loaded
-            .private_owners_beneath("local/alice/notes/deep")
+            .private_owners_beneath(&path("local/alice/notes/deep"))
             .is_empty(),
         "strictly beneath: a row is not beneath itself"
     );
-    let mut under_alice = loaded.private_owners_beneath("local/alice");
+    let mut under_alice = loaded.private_owners_beneath(&path("local/alice"));
     under_alice.sort_unstable();
-    assert_eq!(
-        under_alice,
-        vec!["alice", "alice", "alice", "mallory", "mallory"]
-    );
-    assert_eq!(loaded.private_owners_beneath("local/bob"), vec![""]);
+    let (a, m) = (id("alice"), id("mallory"));
+    let mut expected = vec![a.as_str(), a.as_str(), a.as_str(), m.as_str(), m.as_str()];
+    expected.sort_unstable();
+    assert_eq!(under_alice, expected);
+    assert_eq!(loaded.private_owners_beneath(&path("local/bob")), vec![""]);
     assert!(loaded.private_owners_beneath("yadgarhq").is_empty());
 }
 
@@ -343,8 +355,8 @@ fn a_private_row_loaded_without_its_owner_fails_closed_and_moves_the_gauge() {
         install(
             &registry,
             vec![
-                row("yadgarhq/docs", ACTIVE, &[]),
-                row("local/bob/x", ACTIVE, &["local/bob/x-old"]),
+                rendered("yadgarhq/docs", "", ACTIVE, &[]),
+                rendered("local/bob/x", "", ACTIVE, &["local/bob/x-old"]),
             ],
         );
     });
@@ -462,11 +474,8 @@ fn the_reason_set_is_closed_and_includes_not_member() {
 // ---------------------------------------------------------------------------
 
 /// One row as `ListProjects` answers it, owner on the wire.
-fn wire(path: &str, owner: &str) -> RegisteredPath {
-    RegisteredPath {
-        owner_user_id: owner.to_string(),
-        ..row(path, ACTIVE, &[])
-    }
+fn wire(p: &str, owner: &str) -> RegisteredPath {
+    rendered(p, owner, ACTIVE, &[])
 }
 
 /// A private row LOADED FROM THE WIRE carries its owner, so its owner is
@@ -478,8 +487,10 @@ fn wire(path: &str, owner: &str) -> RegisteredPath {
 fn a_private_row_loaded_from_the_wire_carries_its_owner() {
     let loaded = Loaded::from_registered(vec![wire("local/alice/x", "alice")]);
     assert_eq!(
-        loaded.registered_as("local/alice/x").map(|m| m.owner),
-        Some("alice".to_string())
+        loaded
+            .registered_as(&path("local/alice/x"))
+            .map(|m| m.owner),
+        Some(id("alice"))
     );
     assert_eq!(loaded.private_rows(), 1);
     assert_eq!(loaded.private_rows_without_owner(), 0);
@@ -549,11 +560,8 @@ fn a_private_row_loaded_from_the_wire_without_an_owner_fails_closed() {
 // ---------------------------------------------------------------------------
 
 /// A row with its owner and aliases on the wire.
-fn wire_aliased(path: &str, owner: &str, aliases: &[&str]) -> RegisteredPath {
-    RegisteredPath {
-        owner_user_id: owner.to_string(),
-        ..row(path, ACTIVE, aliases)
-    }
+fn wire_aliased(p: &str, owner: &str, aliases: &[&str]) -> RegisteredPath {
+    rendered(p, owner, ACTIVE, aliases)
 }
 
 /// HOLE 1: the class was read from the MATCHED SPELLING, so an alias of a
@@ -734,8 +742,8 @@ fn the_index_ignores_a_trailing_slash_on_the_queried_path() {
     let registry = members();
     let loaded = registry.loaded().expect("loaded");
     assert_eq!(
-        loaded.private_owners_beneath("local/alice/notes/"),
-        vec!["mallory"]
+        loaded.private_owners_beneath(&format!("{}/", path("local/alice/notes"))),
+        vec![id("mallory")]
     );
 }
 
@@ -819,18 +827,18 @@ fn a_reload_swaps_the_paths_and_the_index_as_one_state() {
         answer.expect_err("refused").reason.token(),
         "PROJECT_NOT_MEMBER"
     );
+    // THE NEW ROW IS IN THE PATH MAP: alice's claim of it is not
+    // `UNREGISTERED_PERSONAL` but lands on mallory's row (a ledger 641
+    // mis-registration in alice's segment) and is refused as not hers.
     let (answer, snapshotter) = as_user(
         registry,
         Mode::Counting,
         Access::Read,
-        "mallory",
+        "alice",
         "local/alice/notes/deep",
     );
     assert!(answer.is_ok());
-    assert_eq!(
-        the_one_series(&snapshotter),
-        (RESOLVED.to_string(), "exact".to_string())
-    );
+    assert_eq!(the_one_series(&snapshotter), refused("PROJECT_NOT_MEMBER"));
 }
 
 // ---------------------------------------------------------------------------
@@ -961,4 +969,219 @@ fn the_not_member_prose_fits_an_org_claim_too() {
     for leaked in ["acme", "team", "alice", "bob"] {
         assert!(!prose.contains(leaked), "{leaked} leaked into: {prose}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0954 (ledger 1651): another account's `local/` segment hides existence.
+// ---------------------------------------------------------------------------
+
+/// Alice's and Bob's ids as `iam-db` mints them, and Alice's segment.
+const ALICE: &str = "yadgar:user:0192f0a0-0000-7000-8000-00000000a11c";
+const BOB: &str = "yadgar:user:0192f0a0-0000-7000-9000-000000000b0b";
+const SEG_A: &str = "0192f0a0-0000-7000-8000-00000000a11c";
+
+/// Alice's registered private row, under her own segment.
+fn alice_estate() -> Registry {
+    Registry::loaded_from(vec![
+        wire_aliased("yadgarhq/docs", "", &[]),
+        wire_aliased(&format!("local/{SEG_A}/reg"), ALICE, &[]),
+    ])
+}
+
+fn under_a(rest: &str) -> String {
+    format!("local/{SEG_A}/{rest}")
+}
+
+/// The segment is the id minus `yadgar:user:`, and only for the canonical id.
+#[test]
+fn the_account_segment_is_the_canonical_id_without_its_prefix() {
+    assert_eq!(account_segment(ALICE), Some(SEG_A));
+    for not_canonical in [
+        "",
+        "alice",
+        SEG_A,
+        "yadgar:user:0192F0A0-0000-7000-8000-00000000A11C",
+        "YADGAR:USER:0192f0a0-0000-7000-8000-00000000a11c",
+        "yadgar:user:0192f0a0-0000-4000-8000-00000000a11c",
+        "yadgar:user: 0192f0a0-0000-7000-8000-00000000a11c",
+        "yadgar:user:0192f0a0-0000-7000-8000-00000000a11c ",
+    ] {
+        assert_eq!(account_segment(not_canonical), None, "{not_canonical:?}");
+    }
+}
+
+/// ANOTHER ACCOUNT'S UNREGISTERED PATH: one 403 `PROJECT_NOT_MEMBER`, counted
+/// as such — no longer `PROJECT_UNREGISTERED_PERSONAL`, which would tell Bob
+/// the path is free.
+#[test]
+fn another_accounts_unregistered_path_is_not_member() {
+    let (answer, snapshotter) = as_user(
+        alice_estate(),
+        Mode::Counting,
+        Access::Read,
+        BOB,
+        &under_a("nothere"),
+    );
+    assert!(answer.is_ok());
+    assert_eq!(the_one_series(&snapshotter), refused("PROJECT_NOT_MEMBER"));
+    let (answer, _) = as_user(
+        alice_estate(),
+        Mode::Enforcing,
+        Access::Write,
+        BOB,
+        &under_a("nothere"),
+    );
+    assert_eq!(
+        answer.expect_err("refused").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
+}
+
+/// REGISTERED, UNREGISTERED AND SOFT-LANDED claims into another account's
+/// segment get the SAME reason and the SAME sentence.
+#[test]
+fn another_accounts_registered_unregistered_and_landed_paths_answer_alike() {
+    let answers: BTreeSet<(String, String)> = ["nothere", "reg", "reg/deeper", "nothere/deeper"]
+        .into_iter()
+        .map(|rest| {
+            let (answer, _) = as_user(
+                alice_estate(),
+                Mode::Enforcing,
+                Access::Read,
+                BOB,
+                &under_a(rest),
+            );
+            let denied = answer.expect_err(rest);
+            (denied.reason.token().to_string(), denied.prose)
+        })
+        .collect();
+    assert_eq!(answers.len(), 1, "one answer: {answers:?}");
+    assert_eq!(answers.iter().next().expect("one").0, "PROJECT_NOT_MEMBER");
+}
+
+/// THE CALLER'S OWN SEGMENT IS UNCHANGED: unregistered stays
+/// `PROJECT_UNREGISTERED_PERSONAL`, registered resolves, soft landing lands.
+#[test]
+fn the_callers_own_segment_keeps_todays_answers() {
+    let (answer, _) = as_user(
+        alice_estate(),
+        Mode::Enforcing,
+        Access::Write,
+        ALICE,
+        &under_a("nothere"),
+    );
+    assert_eq!(
+        answer.expect_err("own, unregistered").reason.token(),
+        "PROJECT_UNREGISTERED_PERSONAL"
+    );
+    let (answer, snapshotter) = as_user(
+        alice_estate(),
+        Mode::Counting,
+        Access::Write,
+        ALICE,
+        &under_a("reg"),
+    );
+    assert!(answer.is_ok());
+    assert_eq!(
+        the_one_series(&snapshotter),
+        (RESOLVED.to_string(), "exact".to_string())
+    );
+    let (answer, snapshotter) = as_user(
+        alice_estate(),
+        Mode::Counting,
+        Access::Write,
+        ALICE,
+        &under_a("reg/deeper"),
+    );
+    assert!(answer.is_ok());
+    assert_eq!(
+        the_one_series(&snapshotter),
+        (RESOLVED.to_string(), "ancestor".to_string())
+    );
+}
+
+/// CASE-VARIANT SEGMENTS. The store folds ASCII case, so an upper-cased
+/// segment names the same account: Alice's own upper-cased claim lands on her
+/// row, and Bob's is foreign however it is cased — `LOCAL/` included.
+#[test]
+fn a_case_variant_segment_is_compared_as_the_store_compares_it() {
+    let upper = SEG_A.to_ascii_uppercase();
+    for claimed in [
+        format!("local/{upper}/reg"),
+        format!("LOCAL/{upper}/nothere"),
+        format!("Local/{SEG_A}/reg"),
+    ] {
+        let (answer, _) = as_user(alice_estate(), Mode::Enforcing, Access::Read, BOB, &claimed);
+        assert_eq!(
+            answer.expect_err(&claimed).reason.token(),
+            "PROJECT_NOT_MEMBER",
+            "{claimed}"
+        );
+    }
+    let (answer, _) = as_user(
+        alice_estate(),
+        Mode::Enforcing,
+        Access::Read,
+        ALICE,
+        &format!("local/{upper}/reg"),
+    );
+    assert!(answer.is_ok(), "{:?}", answer.err());
+}
+
+/// AN EMPTY OR NON-CANONICAL `user_id` NAMES NO ACCOUNT: every `local/<seg>/…`
+/// claim is foreign to it, Alice's included, even spelled as Alice's id in
+/// upper case. Org claims are unaffected.
+#[test]
+fn an_empty_or_non_canonical_user_id_owns_no_segment() {
+    for user in [
+        "",
+        "not-an-id",
+        SEG_A,
+        "yadgar:user:0192F0A0-0000-7000-8000-00000000A11C",
+    ] {
+        for rest in ["reg", "nothere"] {
+            let (answer, _) = as_user(
+                alice_estate(),
+                Mode::Enforcing,
+                Access::Read,
+                user,
+                &under_a(rest),
+            );
+            assert_eq!(
+                answer.expect_err(user).reason.token(),
+                "PROJECT_NOT_MEMBER",
+                "{user:?} {rest}"
+            );
+        }
+        let (answer, _) = as_user(
+            alice_estate(),
+            Mode::Enforcing,
+            Access::Read,
+            user,
+            "yadgarhq/docs",
+        );
+        assert!(answer.is_ok(), "{user:?}: {:?}", answer.err());
+    }
+}
+
+/// BARE `local` KEEPS TODAY'S ANSWER, and a two-segment foreign claim is
+/// foreign like any other.
+#[test]
+fn bare_local_is_unchanged_and_a_bare_foreign_segment_is_not_member() {
+    let (answer, _) = as_user(alice_estate(), Mode::Enforcing, Access::Read, BOB, "local");
+    assert_eq!(
+        answer.expect_err("bare").reason.token(),
+        "PROJECT_UNRESOLVABLE"
+    );
+    let (answer, _) = as_user(
+        alice_estate(),
+        Mode::Enforcing,
+        Access::Read,
+        BOB,
+        &format!("local/{SEG_A}"),
+    );
+    assert_eq!(
+        answer.expect_err("segment").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
 }
