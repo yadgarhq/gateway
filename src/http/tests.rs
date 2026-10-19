@@ -3027,3 +3027,7 @@ mod revoke;
 /// `PROJECT_NOT_MEMBER` through the router: every tool, the 403, and one
 /// answer for every non-owner (`plans/project-membership.md` car P3).
 mod not_member;
+
+/// ADR-0954 through the router: another account's `local/` segment answers
+/// the same bytes whether its paths are registered or not (ledger 1651).
+mod foreign_local;

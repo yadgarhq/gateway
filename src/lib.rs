@@ -22,6 +22,9 @@ pub mod source;
 pub mod tools;
 pub mod upstream;
 
+#[cfg(test)]
+pub mod test_accounts;
+
 /// What this binary answers `server/discover` with, stamped at build time.
 ///
 /// **NOT `CARGO_PKG_VERSION`.** Nothing has ever written a version into

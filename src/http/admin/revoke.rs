@@ -21,45 +21,10 @@ use super::super::gate::*;
 use super::super::*;
 use crate::pb::yadgar::iam::v1::RevokeAllCredentialsRequest;
 
-/// The prefix `iam-db` mints every user id with: `yadgar:user:<uuidv7>`.
-const USER_ID_PREFIX: &str = "yadgar:user:";
-
-/// Whether `id` is spelt EXACTLY as `iam-db` stores it.
-///
-/// # Why a spelling check, and why it comes before the self-target check
-///
-/// `iam-db` mints `format!("yadgar:user:{}", Uuid::now_v7())`: the prefix, then
-/// a lowercase, hyphenated 8-4-4-4-12 uuid of version 7 and RFC 4122 variant.
-/// Its `id` column compares case- and accent-insensitively, so a variant
-/// spelling still finds the row and revokes it. The cache eviction does not:
-/// `forget_user` compares bytes against the id `iam` resolved, and `iam`
-/// publishes the id it was SENT. A variant spelling would revoke every row and
-/// evict nothing, and each token would keep resolving from a replica's cache
-/// for the credential TTL.
-///
-/// The same reasoning orders the checks. The self-target check is also a byte
-/// compare, so the caller's own id in upper case would pass it, and the caller
-/// would revoke their own credentials. Refusing every non-canonical spelling
-/// first makes the byte compare exact.
-///
-/// ASCII only: an accented or padded spelling fails the length or the
-/// character test.
-pub(in crate::http) fn is_canonical_user_id(id: &str) -> bool {
-    let Some(uuid) = id.strip_prefix(USER_ID_PREFIX) else {
-        return false;
-    };
-    let bytes = uuid.as_bytes();
-    if bytes.len() != 36 {
-        return false;
-    }
-    let shape_ok = bytes.iter().enumerate().all(|(i, &b)| match i {
-        8 | 13 | 18 | 23 => b == b'-',
-        _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
-    });
-    // VERSION 7 AND THE RFC 4122 VARIANT, which every id `iam-db` has minted
-    // carries: `Uuid::now_v7` is the only minting site in its history.
-    shape_ok && bytes[14] == b'7' && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
-}
+/// The canonical-id check, shared with the project membership check
+/// (ADR-0954), which reads the same spelling to derive an account segment.
+/// One definition, so the two cannot disagree on what `iam-db` mints.
+pub(in crate::http) use crate::project::is_canonical_user_id;
 
 /// The one field this route reads, or the message its 400 carries.
 ///

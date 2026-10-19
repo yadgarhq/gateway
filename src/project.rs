@@ -52,12 +52,14 @@ use std::fmt;
 
 use tonic::transport::Channel;
 
+mod account;
 mod classify;
 mod member;
 mod poll;
 mod registry;
 mod remediate;
 
+pub use account::{account_segment, is_canonical_user_id};
 pub use classify::{classify, is_well_formed, Match, Outcome, Registered};
 pub use poll::{poll_from_env, poll_from_lookup, RetryError, POLL};
 pub use registry::{Loaded, Registry, LOADED, PRIVATE_WITHOUT_OWNER};
@@ -398,6 +400,16 @@ impl Validator {
                 .decide(Refusal::bare(Reason::RegistryUnavailable), request_id)
                 .await;
         };
+
+        // A CLAIM INTO ANOTHER ACCOUNT'S `local/` SEGMENT IS REFUSED BEFORE ANYTHING
+        // IN THE LOADED SET IS CONSULTED (ADR-0954, Max's ruling on F3). Registered or
+        // not, soft landing or not, it is one answer — so the answer cannot
+        // say which of another account's paths exist.
+        if member::is_foreign_private(claimed, user_id) {
+            return self
+                .decide(Refusal::bare(Reason::NotMember), request_id)
+                .await;
+        }
 
         let (path, exact, archived, owner, private) = match classify(loaded.as_ref(), claimed) {
             Outcome::Resolved {

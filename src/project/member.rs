@@ -36,8 +36,35 @@
 
 use std::collections::BTreeSet;
 
-use super::classify::{is_private_class, Registered};
+use super::account::account_segment;
+use super::classify::{is_private_class, is_well_formed, Registered};
 use super::{Access, Reason};
+
+/// Whether `claimed` is a well-formed `local/<seg>/…` claim whose account
+/// segment is NOT the caller's own (ADR-0954, Max's ruling on F3).
+///
+/// **DECIDED FROM THE CLAIM AND THE CALLER ALONE, NEVER FROM THE REGISTRY.**
+/// That is what hides existence: a foreign claim is refused the same way
+/// whether the path is registered, unregistered or soft-lands on a registered
+/// ancestor, so no answer depends on another account's rows.
+///
+/// - A malformed claim is NOT decided here: the grammar refusal comes first,
+///   as everywhere (`classify`), and never echoes the value.
+/// - Bare `local` is not a private-class claim (no segment), so it keeps
+///   today's `PROJECT_UNRESOLVABLE`.
+/// - The segment compares ASCII-CASE-INSENSITIVELY, as the store's
+///   `utf8mb4_general_ci` collation compares the path: an upper-cased spelling
+///   of the caller's own segment names the caller's own rows, and an
+///   upper-cased spelling of anybody else's is still foreign.
+/// - A caller whose `user_id` is not canonical has no segment, so every
+///   `local/<seg>/…` claim is foreign to it ([`account_segment`]).
+pub(super) fn is_foreign_private(claimed: &str, user_id: &str) -> bool {
+    if !is_well_formed(claimed) || !is_private_class(claimed) {
+        return false;
+    }
+    let segment = claimed.split('/').nth(1).unwrap_or_default();
+    account_segment(user_id).is_none_or(|own| !own.eq_ignore_ascii_case(segment))
+}
 
 /// What one resolved claim comes to, before anything is counted.
 #[derive(Debug, PartialEq, Eq)]
