@@ -112,39 +112,78 @@ async fn under_counting_the_body_is_byte_identical_to_before() {
     );
 }
 
-/// D52's soft landing, made visible: the ancestor is named and `exact` is
-/// false.
+/// The resolution entry under `_meta`, if any.
+fn resolution(body: &str) -> Option<Value> {
+    parsed(body)
+        .pointer("/result/_meta")
+        .and_then(|m| m.get(KEY))
+        .cloned()
+}
+
+/// The text of the result's LAST content item.
+fn last_text(body: &str) -> Option<String> {
+    let v = parsed(body);
+    let items = v.pointer("/result/content")?.as_array()?;
+    Some(items.last()?.get("text")?.as_str()?.to_string())
+}
+
+/// The note the model reads, for `claimed` resolving to [`ROW`].
+fn note(claimed: &str) -> String {
+    format!("project claim \"{claimed}\" resolved to \"{ROW}\"")
+}
+
+/// D52's soft landing, made visible: the ancestor is named, `exact` is false,
+/// and a content note tells the model.
 ///
-/// MUTATION THIS CATCHES: never stamping under enforcement — the key is
-/// absent and the row reds.
+/// MUTATION THIS CATCHES: never stamping under enforcement, or dropping the
+/// content note.
 #[tokio::test]
 async fn under_enforcement_a_subpath_claim_lands_at_its_ancestor_with_exact_false() {
     let (status, body) = call(Mode::Enforcing, SUBPATH).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        parsed(&body)
-            .pointer("/result/_meta")
-            .and_then(|m| m.get(KEY)),
-        Some(&json!({ "resolvedPath": ROW, "exact": false })),
+        resolution(&body),
+        Some(json!({ "resolvedPath": ROW, "exact": false })),
         "{body}"
     );
+    assert_eq!(last_text(&body), Some(note(SUBPATH)), "{body}");
 }
 
-/// An exact claim keeps its own row, and says so. A case-folded spelling is
-/// still exact, and the REGISTERED spelling is what is stamped.
+/// A case-folded claim is exact, but the caller is still told: the stamped
+/// spelling differs from what it typed (Max's ruling, 2026-10-19).
+///
+/// MUTATION THIS CATCHES: emitting only when `!exact`.
 #[tokio::test]
-async fn under_enforcement_an_exact_claim_keeps_its_path_with_exact_true() {
-    for claimed in [ROW, "YadgarHQ/Docs"] {
-        let (status, body) = call(Mode::Enforcing, claimed).await;
-        assert_eq!(status, StatusCode::OK, "{claimed}: {body}");
-        assert_eq!(
-            parsed(&body)
-                .pointer("/result/_meta")
-                .and_then(|m| m.get(KEY)),
-            Some(&json!({ "resolvedPath": ROW, "exact": true })),
-            "{claimed}: {body}"
-        );
-    }
+async fn under_enforcement_a_case_folded_claim_is_told_its_registered_spelling() {
+    let folded = "YadgarHQ/Docs";
+    let (status, body) = call(Mode::Enforcing, folded).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        resolution(&body),
+        Some(json!({ "resolvedPath": ROW, "exact": true })),
+        "{body}"
+    );
+    assert_eq!(last_text(&body), Some(note(folded)), "{body}");
+}
+
+/// A claim byte-identical to its row is stamped unchanged and NOTHING is said:
+/// no key, no note — `plans/project-registry-callers.md` §3 as amended.
+///
+/// MUTATION THIS CATCHES: emitting on every resolution.
+#[tokio::test]
+async fn under_enforcement_a_byte_identical_claim_is_told_nothing() {
+    let (status, body) = call(Mode::Enforcing, ROW).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(resolution(&body), None, "{body}");
+    assert_eq!(parsed(&body).pointer("/result/_meta"), None, "{body}");
+    assert_eq!(
+        parsed(&body)
+            .pointer("/result/content")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "no note is appended: {body}"
+    );
 }
 
 /// A refusal under enforcement is the same bytes it was before stamping.
@@ -155,23 +194,34 @@ async fn under_enforcement_a_refusal_is_byte_identical_to_before() {
     assert_eq!(body, GOLDEN_REFUSED, "a refusal is unchanged by stamping");
 }
 
-/// The resolution MERGES into a result `_meta` that already holds keys, so a
-/// key another layer set is never overwritten by stamping.
+/// The resolution MERGES into a result `_meta` that already holds keys, and the
+/// note is APPENDED after the existing content, which is left as it was.
 ///
-/// MUTATION THIS CATCHES: inserting a fresh `_meta` object over the old one.
+/// MUTATION THIS CATCHES: inserting a fresh `_meta` object over the old one,
+/// or rewriting the content items.
 #[test]
-fn the_resolution_merges_into_an_existing_result_meta() {
+fn the_resolution_merges_into_existing_meta_and_appends_to_content() {
     let payload = json!({ "jsonrpc": "2.0", "id": 1, "result": {
+        "content": [{ "type": "text", "text": "the tool's own answer" }],
         "resultType": "complete",
         "_meta": { "io.yadgarhq/somethingElse": 7 },
     }});
-    let merged = crate::http::call::with_resolution(payload, Some((ROW.to_string(), false)));
+    let merged =
+        crate::http::call::with_resolution(payload, SUBPATH, Some((ROW.to_string(), false)));
     assert_eq!(
         merged.pointer("/result/_meta"),
         Some(&json!({
             "io.yadgarhq/somethingElse": 7,
             KEY: { "resolvedPath": ROW, "exact": false },
         })),
+        "{merged}"
+    );
+    assert_eq!(
+        merged.pointer("/result/content"),
+        Some(&json!([
+            { "type": "text", "text": "the tool's own answer" },
+            { "type": "text", "text": note(SUBPATH) },
+        ])),
         "{merged}"
     );
 }

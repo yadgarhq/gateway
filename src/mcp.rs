@@ -58,7 +58,8 @@ pub mod meta_keys {
     /// Which registered project a `tools/call` was stamped with, and whether
     /// the claim had a row of its own: `{"resolvedPath": …, "exact": …}`, the
     /// names `ResolveProjectResponse` gives the same two facts. Carried in the
-    /// RESULT's `_meta`, only under enforcement — see `http::call::with_resolution`.
+    /// RESULT's `_meta`, only under enforcement and only when the stamped path
+    /// differs from the claim as typed — see `http::call::with_resolution`.
     pub const PROJECT_RESOLUTION: &str = "io.yadgarhq/projectResolution";
 }
 

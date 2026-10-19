@@ -368,22 +368,34 @@ pub(super) fn shape(
 }
 
 /// D52's soft landing, made visible in the result the caller is already reading
-/// (`plans/project-registry-callers.md` §4): under enforcement the result's
-/// `_meta` names the path the call was stamped with and whether the claim had a
-/// row of its own — on a tool failure too, because the scope was stamped either
-/// way. `None`, which is every counting call, returns `payload` untouched, so
-/// counting changes no byte of the answer.
-pub(super) fn with_resolution(mut payload: Value, resolution: Option<(String, bool)>) -> Value {
-    let Some((path, exact)) = resolution else {
+/// (`plans/project-registry-callers.md` §4, and §3 as amended by Max's ruling of
+/// 2026-10-19): under enforcement, WHENEVER the stamped path differs from the
+/// claim as typed — an ancestor landing, a case fold, an alias — the result's
+/// `_meta` names the stamped path and whether the claim had a row of its own,
+/// and one text item is APPENDED to `content` so a model that reads only
+/// `content` sees it too. A claim byte-identical to its row is told nothing.
+///
+/// Both ride a tool failure as well, because the scope was stamped either way.
+/// The `_meta` key is MERGED into any `_meta` already there, and existing
+/// content items are never touched. `None`, which is every counting call,
+/// returns `payload` untouched, so counting changes no byte of the answer.
+pub(super) fn with_resolution(
+    mut payload: Value,
+    claimed: &str,
+    resolution: Option<(String, bool)>,
+) -> Value {
+    let Some((path, exact)) = resolution.filter(|(path, _)| path != claimed) else {
         return payload;
     };
-    // MERGED into any `_meta` the result already holds, never written over it.
-    let meta = payload
-        .get_mut("result")
-        .and_then(Value::as_object_mut)
-        .map(|result| result.entry("_meta").or_insert_with(|| json!({})))
-        .and_then(Value::as_object_mut);
-    if let Some(meta) = meta {
+    let Some(result) = payload.get_mut("result").and_then(Value::as_object_mut) else {
+        return payload;
+    };
+    if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
+        let note = format!("project claim \"{claimed}\" resolved to \"{path}\"");
+        content.push(json!({ "type": "text", "text": note }));
+    }
+    let meta = result.entry("_meta").or_insert_with(|| json!({}));
+    if let Some(meta) = meta.as_object_mut() {
         let resolved = json!({ "resolvedPath": path, "exact": exact });
         meta.insert(meta_keys::PROJECT_RESOLUTION.to_string(), resolved);
     }

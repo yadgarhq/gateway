@@ -322,7 +322,8 @@ pub(super) async fn tools_call(
         .map(|exact| (scope.project_id.clone(), exact));
     let outcome = tools::call(state.task.clone(), scope, name, &args).await;
     let (status, rows, payload) = shape(id, outcome);
-    let payload = with_resolution(payload, resolution);
+    let claimed = header(headers, "x-yadgar-project").unwrap_or_default();
+    let payload = with_resolution(payload, claimed, resolution);
 
     // Serialise ONCE, and measure exactly what goes on the wire.
     //
