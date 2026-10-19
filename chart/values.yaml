@@ -832,7 +832,7 @@ sourceAddress:
 cors:
   allowedOrigins: ""
 
-# WHAT BOUNDS THE TWO UNAUTHENTICATED ENDPOINTS (ledger 497).
+# WHAT BOUNDS THE TWO UNAUTHENTICATED ENDPOINTS (ledger 497), AND /auth/whoami.
 #
 # /auth/login and /auth/enrol are the only surfaces a stranger reaches with no
 # credential, and each costs `iam` a full Argon2id verification whether or not
@@ -842,6 +842,13 @@ cors:
 # D74'S BUCKETS CANNOT COVER THEM. Those key on (user, module, kind), and a login
 # has no user until it succeeds. These bucket on the SOURCE ADDRESS instead, in
 # their own key space, with their own rates — the numbers below.
+#
+# THEY ALSO BOUND /auth/whoami (ADR-0959), which is ATTESTED, not unauthenticated,
+# and costs no Argon2id: each request costs `iam` at most one ResolveCredential
+# lookup (a hash lookup, cached per token). What it offers a stranger holding a
+# pile of tokens is a liveness answer for each one, so it is a credential surface.
+# It draws these rates on its OWN key (`auth/whoami`) and never spends login's
+# budget.
 #
 # `<rate>:<burst>`, the same spelling rateLimit above uses: `rate` is the
 # sustained refill per second and `burst` is the bucket's size.

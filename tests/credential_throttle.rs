@@ -1,4 +1,4 @@
-//! What bounds `/auth/login` and `/auth/enrol` (task 497, ADR-0491).
+//! What bounds `/auth/login`, `/auth/enrol` and `/auth/whoami` (task 497, ADR-0491, ADR-0959).
 //!
 //! # The assertion that matters, and the one that does not
 //!
@@ -540,6 +540,79 @@ async fn the_admin_surface_is_bounded_by_its_own_bucket_and_not_login_s() {
         StatusCode::TOO_MANY_REQUESTS,
         "the admin surface must call guard(): an unthrottled one is a bootstrap-token brute force \
          with no bound at all"
+    );
+}
+
+/// One `GET /auth/whoami` from [`PROXY`], carrying `forwarded`.
+async fn whoami(state: Arc<AppState>, forwarded: &str) -> StatusCode {
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri("/auth/whoami")
+        .header("authorization", "Bearer some-token")
+        .header("x-forwarded-for", forwarded)
+        .body(Body::empty())
+        .expect("the request builds");
+    request.extensions_mut().insert(ConnectInfo(
+        PROXY
+            .parse::<SocketAddr>()
+            .expect("the peer address parses"),
+    ));
+    router(state)
+        .oneshot(request)
+        .await
+        .expect("the router answers")
+        .status()
+}
+
+#[tokio::test]
+async fn whoami_is_bounded_by_its_own_bucket_at_the_credential_rates() {
+    // ADR-0959: whoami passes `guard` under its own `auth/whoami` key, at
+    // `credential_limits`. The router unit tests drive it with no `ConnectInfo`
+    // and so never reach a bucket; this is the only test that does.
+    //
+    // CREDENTIAL buckets hold ONE token and ADMIN buckets are WIDE, so the two
+    // mutants this pins answer differently:
+    //   - the label changed to `auth/login` shares login's emptied bucket, so
+    //     the FIRST whoami is a 429;
+    //   - `admin_limits` in place of `credential_limits` draws from the wide
+    //     bucket, so the SECOND whoami is not a 429.
+    let state = state_with_admin(
+        TrustBoundary::Hops(1),
+        CredentialLimits {
+            attributed: one_token(),
+            unattributed: Bucket {
+                rate: 600.0,
+                burst: 600.0,
+            },
+        },
+        wide(),
+    );
+    let forwarded = format!("203.0.113.1, {REAL_CLIENT}");
+
+    // Empty LOGIN's bucket.
+    assert_eq!(
+        login(Arc::clone(&state), Some(&forwarded)).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        login(Arc::clone(&state), Some(&forwarded)).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "login's bucket is now empty"
+    );
+
+    // whoami still has its own token. It spends it and goes on to `iam`, which
+    // is unreachable here: an opaque 503, not a 429.
+    assert_eq!(
+        whoami(Arc::clone(&state), &forwarded).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "whoami has its own bucket; login's empty one must not refuse it"
+    );
+
+    // AND THAT BUCKET IS SIZED BY `credential_limits`: its one token is spent.
+    assert_eq!(
+        whoami(Arc::clone(&state), &forwarded).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "whoami's bucket must be drawn at credential_limits rates, not admin_limits"
     );
 }
 

@@ -1,10 +1,12 @@
-//! The HTTP surface: POST only, stateless.
+//! The HTTP surface: stateless, and POST everywhere but `GET /auth/whoami`.
 //!
-//! THREE paths, and the asymmetry is the thing to know. `/` is MCP and every call
-//! through it carries a credential the gateway resolves against `iam`.
+//! THREE paths matter here, and the asymmetry is the thing to know. `/` is MCP and
+//! every call through it carries a credential the gateway resolves against `iam`.
 //! `/auth/login` and `/auth/enrol` are not MCP and carry none — they are where a
 //! client with no credential gets one (D75, D73), so they are the only
-//! unauthenticated surfaces this server has.
+//! unauthenticated surfaces this server has. `/admin/*` and `/auth/whoami`
+//! (ADR-0959) are attested like `/`, and refuse a dead credential with one
+//! rendering, `authority::attested_refusal`.
 //!
 //! **All three answer an upstream refusal by ONE rule** (ADR-0507, superseding
 //! ADR-0506): `UNAUTHENTICATED` is 401, and every other gRPC code is one opaque
@@ -19,7 +21,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde_json::{json, Value};
@@ -46,6 +48,7 @@ mod authority;
 mod call;
 mod dispatch;
 mod gate;
+mod whoami;
 
 pub use answer::{login_status, opaque_status};
 
@@ -269,6 +272,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(dispatch::routes())
         .merge(auth::routes())
         .merge(admin::routes())
+        .merge(whoami::routes())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             MAX_BODY_BYTES,
         ))

@@ -119,14 +119,7 @@ pub(super) async fn authorise(
             // THE ONLY PLACE THE REAL REASON IS WRITTEN DOWN, the same split
             // every other handler here makes.
             tracing::warn!(error = %e, endpoint, "administrative attestation failed");
-            let answer = attest_answer(&e);
-            return Err(Refusal::new(
-                answer.label,
-                text(
-                    answer.status,
-                    &json!({ "error": answer.message }).to_string(),
-                ),
-            ));
+            return Err(attested_refusal(&e));
         }
     };
 
@@ -148,6 +141,25 @@ pub(super) async fn authorise(
         ));
     }
     Ok(Authority::Administrator(attested.scope.user_id))
+}
+
+/// What a non-MCP attested route answers when the credential does not attest.
+///
+/// **ONE RENDERING FOR EVERY SUCH ROUTE, and that is the property, not tidiness.**
+/// `/admin/*` and `/auth/whoami` (ADR-0959) must refuse a missing, unknown,
+/// revoked or unverifiable credential with the SAME BYTES: a route whose refusal
+/// differed would tell a caller holding stolen tokens something the other route
+/// does not. Two copies of this literal are two things that can drift; one
+/// function cannot. [`attest_answer`] chooses the status and the label.
+pub(super) fn attested_refusal(e: &attest::AttestError) -> Box<Refusal> {
+    let answer = attest_answer(e);
+    Refusal::new(
+        answer.label,
+        text(
+            answer.status,
+            &json!({ "error": answer.message }).to_string(),
+        ),
+    )
 }
 
 /// The bootstrap branch of [`authorise`]. See that function for the order.

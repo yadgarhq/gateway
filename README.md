@@ -35,14 +35,14 @@ cutoff.
 
 Consequences here:
 
-|                   |                                                                                                                                                                                                                                                          |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                                                                                                                                  |
-| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login`, `POST /auth/enrol` and the four `POST /admin/*` verbs are the non-MCP paths. **An administrative verb is never an MCP tool** (ADR-0492). |
-| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                                                                                                                                     |
-| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`.                                                                                                            |
-| `resultType`      | Required on every result. This server only returns `complete`.                                                                                                                                                                                           |
-| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                                                                                                                  |
+|                   |                                                                                                                                                                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                                                                                                                                                      |
+| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login`, `POST /auth/enrol`, `GET /auth/whoami` and the four `POST /admin/*` verbs are the non-MCP paths. **An administrative verb is never an MCP tool** (ADR-0492). |
+| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                                                                                                                                                         |
+| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`.                                                                                                                                |
+| `resultType`      | Required on every result. This server only returns `complete`.                                                                                                                                                                                                               |
+| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                                                                                                                                      |
 
 ## Identity
 
@@ -298,6 +298,35 @@ accepted bootstrap token, which is the only observability available on the one
 path that has no actor to relay — and a log line is not an audit trail. ADR-0492's
 "a leak is loud and lands in the audit trail" premise is therefore unmet.
 
+### `GET /auth/whoami`
+
+ADR-0959. The caller's own identity, for building a private `local/<account_segment>/…`
+project path (ADR-0954) without hardcoding a uuid:
+
+```sh
+curl -sS -H "Authorization: Bearer $TOKEN" https://<gateway-host>/auth/whoami
+# 200 {"account_segment":"0192f0a0-…","user_id":"yadgar:user:0192f0a0-…"}
+```
+
+**Attested like `/` and `/admin/*`**: the bearer token is resolved through
+`iam.ResolveCredential` by the same `attest::attest_admin` the `/admin` routes use,
+which needs no `x-yadgar-project`. The answer is the resolved caller and nothing
+else. `x-yadgar-user` is ignored under `iam` attestation, and the route reads no
+query or body, so nothing in the request can name another account.
+
+`account_segment` is `project::account_segment(user_id)`. It is `null` for an id
+not spelt as `iam-db` mints it, which only the development trusted-headers path
+can produce.
+
+**A dead credential gets the `/admin` refusal, byte for byte.** A missing, unknown
+or revoked token is that route's `401`; an unreachable `iam` is its opaque `503`.
+Both routes render through `authority::attested_refusal`, and a test compares the
+whole response against `/admin/create-user`.
+
+It passes the same `guard` as the other non-MCP routes: the `Origin` check, then a
+source-address bucket at `credentialLimits` rates under its own `auth/whoami` key,
+so it never spends login's budget.
+
 ## Configuration
 
 | Variable                                                                                           | required? — and what the chart renders                                                                                                               |                                                                                                                                                                                                                                                                                                   |
@@ -330,7 +359,7 @@ path that has no actor to relay — and a log line is not an audit trail. ADR-04
 | `NATS_TLS_CA_FILE`                                                                                 | required when `NATS_TLS_ENABLED` is `1` — `/var/run/config/nats-ca/ca.pem` from `nats.tls.caSecret`                                                  | the ONLY trust store for the broker, on every dial and reconnect: no platform or public root is added. Unreadable, or holding no certificate, EXITS at boot naming the path                                                                                                                       |
 | `NATS_TLS_CLIENT_CERT_FILE` / `NATS_TLS_CLIENT_KEY_FILE`                                           | unset; rendered with `NATS_TLS_ENABLED=1` when `clientCertificate.secret` is set                                                                     | the same `gateway-client-tls` leaf the gRPC hops present, so a broker at `clientAuth: required` can verify this gateway. Both or neither; unreadable EXITS. `NATS_TLS_DOMAIN` is refused: async-nats verifies the `NATS_URL` host                                                                 |
 | `YADGAR_TRUSTED_PROXY_HOPS`                                                                        | always rendered, empty included; UNSET is the declared `Undeclared` state (an argued ADR-0569 exception)                                             | how many proxies append to `X-Forwarded-For` in front. Unset RECORDS NO SOURCE ADDRESS; a non-number EXITS at boot                                                                                                                                                                                |
-| `YADGAR_LOGIN_RATE_LIMIT`                                                                          | required — from `credentialLimits.attributed`                                                                                                        | `<rate>:<burst>` for `/auth/login` and `/auth/enrol`, per ATTRIBUTABLE client address                                                                                                                                                                                                             |
+| `YADGAR_LOGIN_RATE_LIMIT`                                                                          | required — from `credentialLimits.attributed`                                                                                                        | `<rate>:<burst>` for `/auth/login`, `/auth/enrol` and `/auth/whoami` (each its own bucket), per ATTRIBUTABLE client address                                                                                                                                                                       |
 | `YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT`                                                             | required — from `credentialLimits.unattributed`                                                                                                      | the same, per OBSERVED HOP, which is what applies while no trust boundary is declared                                                                                                                                                                                                             |
 | `YADGAR_ADMIN_RATE_LIMIT`                                                                          | required — from `adminLimits.attributed`                                                                                                             | `<rate>:<burst>` for the four `/admin/*` verbs, per ATTRIBUTABLE client address. A THIRD bucket rather than a share of login's, and each verb keys its own within it                                                                                                                              |
 | `YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT`                                                             | required — from `adminLimits.unattributed`                                                                                                           | the same, per OBSERVED HOP                                                                                                                                                                                                                                                                        |
