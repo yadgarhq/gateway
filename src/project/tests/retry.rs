@@ -118,3 +118,80 @@ async fn a_registry_that_never_loads_keeps_retrying_at_the_poll_once_the_backoff
     assert_eq!(&times[..9], &[0, 1, 3, 7, 15, 31, 63, 123, 183]);
     assert!(registry.loaded().is_none());
 }
+
+/// A `MakeWriter` that keeps every formatted log line for the test to read.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The `retry_secs` an operator reads is the wait the loop really takes.
+///
+/// Without this, `report` handed the poll instead of the delay logs
+/// `retry_secs=60` while the replica retries after one second, and every other
+/// test here stays green.
+#[tokio::test(start_paused = true)]
+async fn the_logged_retry_secs_is_the_real_delay_before_the_next_load() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(captured.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Fail, fail (never loaded: 1 s, then 2 s), succeed, then a failed refresh
+    // (loaded: the poll).
+    let script = Arc::new(Mutex::new(vec![false, false, true, false].into_iter()));
+    let loader = move || {
+        let script = Arc::clone(&script);
+        async move {
+            match script.lock().expect("script").next() {
+                Some(true) => Ok(vec![row("yadgarhq/docs", ProjectStatus::Active, &[])]),
+                _ => Err(tonic::Status::deadline_exceeded(
+                    "ListProjects did not answer",
+                )),
+            }
+        }
+    };
+    // Same task, so the thread-local subscriber sees every event. 70 s covers
+    // calls at 0, 1, 3 and 63, and stops before the next one at 123.
+    let ran = tokio::time::timeout(
+        Duration::from_secs(70),
+        drive(loader, POLL, Registry::never_loaded()),
+    )
+    .await;
+    assert!(ran.is_err(), "drive never returns");
+
+    let text = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf8");
+    let logged: Vec<(String, u64)> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|event| {
+            let secs = event["fields"]["retry_secs"].as_u64()?;
+            Some((event["level"].as_str()?.to_string(), secs))
+        })
+        .collect();
+    assert_eq!(
+        logged,
+        vec![
+            ("ERROR".to_string(), 1),
+            ("ERROR".to_string(), 2),
+            ("WARN".to_string(), 60),
+        ]
+    );
+}

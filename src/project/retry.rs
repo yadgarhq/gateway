@@ -19,6 +19,13 @@
 //! the first minute instead of one, and the steady-state load on an unreachable
 //! `project` unchanged.
 //!
+//! **WHAT THAT BUYS, MEASURED FROM THE END OF EACH LOAD.** The wait starts when
+//! a load ends, so a load that times out adds its own 5 s: asks land at about
+//! 0, 6, 13, 22, 35 and 56 s against a `project` that stalls, and at 0, 1, 3, 7,
+//! 15, 31 and 63 s against one that refuses fast. A replica therefore loads at
+//! most ONE backoff step plus one load after `project` becomes ready — about
+//! 32 s plus load time at worst with a 60 s poll, against up to 60 s before.
+//!
 //! **AFTER THE FIRST SUCCESS, NEVER AGAIN.** A failed refresh leaves the
 //! previous set in force (ADR-0674) and the gateway is not degraded, so it
 //! retries at the poll exactly as before. The fast schedule applies only while
