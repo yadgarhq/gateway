@@ -58,6 +58,7 @@ mod member;
 mod poll;
 mod registry;
 mod remediate;
+mod retry;
 
 pub use account::{account_segment, is_canonical_user_id};
 pub use classify::{classify, is_well_formed, Match, Outcome, Registered};
