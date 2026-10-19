@@ -120,13 +120,14 @@ pub(super) fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
 ///
 /// `Some` is a response the caller must be sent; `None` means carry on.
 ///
-/// **SIX CALLERS NOW AND THIS COMMENT USED TO SAY TWO**, which is how an
+/// **SEVEN CALLERS NOW AND THIS COMMENT USED TO SAY TWO**, which is how an
 /// enumeration that reads as complete stops being one — the failure `login`'s
 /// "the two 400s" already cost this file once. `/auth/login` and `/auth/enrol`
 /// are the two UNAUTHENTICATED ones; `/admin/create-user`,
 /// `/admin/issue-enrolment`, `/admin/set-user-admin` and
 /// `/admin/revoke-credentials` are the four administrative ones, and they call
-/// it for a reason that is not symmetry.
+/// it for a reason that is not symmetry. `/auth/whoami` (ADR-0959) is the
+/// seventh: attested, on `credential_limits` under its own label.
 /// `origin_ok` lives here rather than in a layer, so an `/admin` route that
 /// skipped this would have no `Origin` check and no throttle — reproducing the
 /// bug this function was written to fix, on the surface where a cross-origin POST
@@ -269,8 +270,8 @@ pub(super) async fn guard(
 
 /// The 429 every endpoint behind [`guard`] answers with.
 ///
-/// **SIX, NOT TWO** — the two credential endpoints and the four administrative
-/// ones. See [`guard`] for why the count is spelled out rather than left as
+/// **SEVEN, NOT TWO** — the two credential endpoints, the four administrative
+/// ones and `/auth/whoami`. See [`guard`] for why the count is spelled out rather than left as
 /// "both".
 ///
 /// **OPAQUE, and deliberately more so than [`refusal`].** That one names the

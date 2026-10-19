@@ -1420,6 +1420,14 @@ struct StubIam {
     /// answer passes identically whether the answer came from `iam` or from a
     /// cache, and a cache that never caches would look exactly like this one.
     resolves: Arc<std::sync::atomic::AtomicUsize>,
+    /// A gRPC refusal to answer INSTEAD of `answer`, or `None` to answer it.
+    ///
+    /// `iam` has two ways to say a credential is dead: the empty `Ok` that
+    /// `iamdb.proto` names for an unknown, revoked or expired one, and an
+    /// `UNAUTHENTICATED` status — the shape `tests/credential_invalidation.rs`'s
+    /// fake gives a revoked token. Without this field only the first was
+    /// reachable here.
+    refusal: Option<tonic::Code>,
 }
 
 /// Write the stub's whole `IamService` impl: one real method and thirteen refusals.
@@ -1444,6 +1452,9 @@ macro_rules! stub_iam_service {
             > {
                 self.resolves
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(code) = self.refusal {
+                    return Err(tonic::Status::new(code, "refused by the stub"));
+                }
                 Ok(tonic::Response::new(self.answer.clone()))
             }
 
@@ -1485,6 +1496,14 @@ stub_iam_service! {
 async fn stub_iam(
     answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
 ) -> (Channel, Arc<std::sync::atomic::AtomicUsize>) {
+    stub_iam_refusing(answer, None).await
+}
+
+/// [`stub_iam`], with `ResolveCredential` answering `refusal` when it is `Some`.
+async fn stub_iam_refusing(
+    answer: crate::pb::yadgar::iam::v1::ResolveCredentialResponse,
+    refusal: Option<tonic::Code>,
+) -> (Channel, Arc<std::sync::atomic::AtomicUsize>) {
     let resolves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let incoming =
         tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
@@ -1497,6 +1516,7 @@ async fn stub_iam(
                 crate::pb::yadgar::iam::v1::iam_service_server::IamServiceServer::new(StubIam {
                     answer,
                     resolves: counted,
+                    refusal,
                 }),
             )
             .serve_with_incoming(incoming)
@@ -3031,3 +3051,7 @@ mod not_member;
 /// ADR-0954 through the router: another account's `local/` segment answers
 /// the same bytes whether its paths are registered or not (ledger 1651).
 mod foreign_local;
+
+/// ADR-0959: `GET /auth/whoami` answers the caller's own id and `local/`
+/// segment, and refuses exactly as an attested `/admin` route does.
+mod whoami;
