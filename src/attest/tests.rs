@@ -1087,14 +1087,19 @@ const STAMP_SUBPATH: &str = "yadgarhq/docs/services/api";
 /// `yadgarhq/docs` in a spelling the fold matches and the row does not hold.
 const STAMP_FOLDED: &str = "YadgarHQ/Docs";
 
+/// A former spelling of `yadgarhq/docs`, held as an ALIAS on its row (D53).
+const STAMP_ALIAS: &str = "yadgarhq/old-docs";
+
 /// A validator over the anchor `yadgarhq` and the row `yadgarhq/docs`.
 fn stamping(mode: crate::project::Mode) -> crate::project::Validator {
     use crate::pb::yadgar::project::v1::{ProjectStatus, RegisteredPath};
-    let rows = ["yadgarhq", "yadgarhq/docs"].map(|path| RegisteredPath {
-        path: path.to_string(),
-        status: ProjectStatus::Active as i32,
-        aliases: Vec::new(),
-        owner_user_id: String::new(),
+    let rows = [("yadgarhq", None), ("yadgarhq/docs", Some(STAMP_ALIAS))].map(|(path, alias)| {
+        RegisteredPath {
+            path: path.to_string(),
+            status: ProjectStatus::Active as i32,
+            aliases: alias.into_iter().map(str::to_string).collect(),
+            owner_user_id: String::new(),
+        }
     });
     crate::project::Validator::new(
         crate::project::Registry::loaded_from(rows.into_iter().collect()),
@@ -1176,4 +1181,22 @@ async fn under_enforcement_a_refusal_is_unchanged() {
         matches!(&err, AttestError::Project(d) if d.reason == crate::project::Reason::Unresolvable),
         "got {err:?}"
     );
+}
+
+/// An alias claim is stamped with the ROW's canonical path, as
+/// `ResolveProject` answers it — never the alias spelling, which would be a
+/// second partition key for one project. Not exact: the claim is not the row.
+///
+/// MUTATION THIS CATCHES: the loaded set answering the alias spelling as the
+/// match's path (the defect gateway#125's review found).
+#[tokio::test]
+async fn under_enforcement_an_alias_claim_is_stamped_with_the_canonical_path() {
+    let beneath = format!("{STAMP_ALIAS}/services/api");
+    for claimed in [STAMP_ALIAS, beneath.as_str()] {
+        let attested = attest_claiming(crate::project::Mode::Enforcing, claimed)
+            .await
+            .expect("an alias resolves");
+        assert_eq!(attested.scope.project_id, "yadgarhq/docs", "{claimed}");
+        assert_eq!(attested.exact, Some(false), "{claimed}");
+    }
 }

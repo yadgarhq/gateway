@@ -217,7 +217,8 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
 /// One registered path or alias the walk matched, with its row's status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
-    /// The REGISTERED spelling — see [`Registered::registered_as`].
+    /// The ROW's registered path — for an alias too, which resolves to its row
+    /// as `ResolveProject` resolves it. See [`Registered::registered_as`].
     pub path: String,
     /// Whether the row this path or alias belongs to is ARCHIVED (ADR-0941).
     ///

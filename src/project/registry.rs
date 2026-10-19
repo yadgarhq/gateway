@@ -195,13 +195,15 @@ impl Loaded {
             }
             let archived = is_archived(row.status);
             let private = is_private_class(&row.path);
-            for path in std::iter::once(row.path).chain(row.aliases) {
-                matches.push(Match {
-                    path,
-                    archived,
-                    owner: owner.clone(),
-                    private,
-                });
+            // An alias answers its ROW's path, as `ResolveProject` does (`p.path`).
+            let m = Match {
+                path: row.path.clone(),
+                archived,
+                owner,
+                private,
+            };
+            for spelling in std::iter::once(row.path).chain(row.aliases) {
+                matches.push((spelling, m.clone()));
             }
         }
         let mut loaded = Self::from_matches(matches);
@@ -225,16 +227,17 @@ impl Loaded {
         }))
     }
 
-    fn from_matches(matches: Vec<Match>) -> Self {
-        // THE INDEX IS BUILT FROM EVERY SPELLING, BEFORE THE FOLD BELOW
-        // DEDUPLICATES THEM. Two spellings that fold to one key are two owners,
-        // and the subtree rule must see both: a map that kept the last would
-        // drop a foreign owner beneath a caller's row by an accident of order.
+    fn from_matches(matches: Vec<(String, Match)>) -> Self {
+        // Each pair is (spelling, its row's Match). THE INDEX IS BUILT FROM
+        // EVERY SPELLING, BEFORE THE FOLD BELOW DEDUPLICATES THEM. Two spellings
+        // that fold to one key are two owners, and the subtree rule must see
+        // both: a map that kept the last would drop a foreign owner beneath a
+        // caller's row by an accident of order.
         let private = PrivateIndex::build(
             matches
                 .iter()
-                .filter(|m| !m.path.eq_ignore_ascii_case("local"))
-                .map(|m| (m.path.as_str(), m.owner.as_str(), m.private)),
+                .filter(|(s, _)| !s.eq_ignore_ascii_case("local"))
+                .map(|(s, m)| (s.as_str(), m.owner.as_str(), m.private)),
         );
         let mut folded: BTreeMap<String, Match> = BTreeMap::new();
         let mut made_ownerless = 0;
@@ -247,8 +250,8 @@ impl Loaded {
             // chain. A row at `local` is the nearest registered ancestor of
             // every private path in the estate, so the cost of one
             // redundant check is nothing beside what it prevents.
-            .filter(|m| !m.path.eq_ignore_ascii_case("local"))
-            .map(|m| (m.path.to_ascii_lowercase(), m))
+            .filter(|(s, _)| !s.eq_ignore_ascii_case("local"))
+            .map(|(s, m)| (s.to_ascii_lowercase(), m))
         {
             made_ownerless += usize::from(merge(&mut folded, key, m));
         }

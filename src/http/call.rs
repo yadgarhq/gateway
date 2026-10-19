@@ -374,12 +374,18 @@ pub(super) fn shape(
 /// way. `None`, which is every counting call, returns `payload` untouched, so
 /// counting changes no byte of the answer.
 pub(super) fn with_resolution(mut payload: Value, resolution: Option<(String, bool)>) -> Value {
-    let result = payload.get_mut("result").and_then(Value::as_object_mut);
-    if let (Some((path, exact)), Some(result)) = (resolution, result) {
-        result.insert(
-            "_meta".to_string(),
-            json!({ meta_keys::PROJECT_RESOLUTION: { "resolvedPath": path, "exact": exact } }),
-        );
+    let Some((path, exact)) = resolution else {
+        return payload;
+    };
+    // MERGED into any `_meta` the result already holds, never written over it.
+    let meta = payload
+        .get_mut("result")
+        .and_then(Value::as_object_mut)
+        .map(|result| result.entry("_meta").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut);
+    if let Some(meta) = meta {
+        let resolved = json!({ "resolvedPath": path, "exact": exact });
+        meta.insert(meta_keys::PROJECT_RESOLUTION.to_string(), resolved);
     }
     payload
 }

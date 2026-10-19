@@ -154,3 +154,24 @@ async fn under_enforcement_a_refusal_is_byte_identical_to_before() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body, GOLDEN_REFUSED, "a refusal is unchanged by stamping");
 }
+
+/// The resolution MERGES into a result `_meta` that already holds keys, so a
+/// key another layer set is never overwritten by stamping.
+///
+/// MUTATION THIS CATCHES: inserting a fresh `_meta` object over the old one.
+#[test]
+fn the_resolution_merges_into_an_existing_result_meta() {
+    let payload = json!({ "jsonrpc": "2.0", "id": 1, "result": {
+        "resultType": "complete",
+        "_meta": { "io.yadgarhq/somethingElse": 7 },
+    }});
+    let merged = crate::http::call::with_resolution(payload, Some((ROW.to_string(), false)));
+    assert_eq!(
+        merged.pointer("/result/_meta"),
+        Some(&json!({
+            "io.yadgarhq/somethingElse": 7,
+            KEY: { "resolvedPath": ROW, "exact": false },
+        })),
+        "{merged}"
+    );
+}
