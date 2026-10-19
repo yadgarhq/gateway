@@ -242,8 +242,9 @@ pub(super) fn sentence(reason: Reason, anchor: Option<&str>, source_repo: Option
         // it. It names neither the claim, the owner nor which shape it was.
         Reason::NotMember => "this call would reach a personal project that belongs to another \
                               account. A personal project, and everything beneath it, is \
-                              reachable only by the account that registered it; use your own \
-                              local/<account>/... project."
+                              reachable only by the account that registered it. Use your own \
+                              local/<your-user-uuid>/... project, where <your-user-uuid> is \
+                              your user id without its yadgar:user: prefix (ADR-0954)."
             .to_string(),
 
         // NOT ABOUT THE CALLER AT ALL (ADR-0674), and the sentence says so

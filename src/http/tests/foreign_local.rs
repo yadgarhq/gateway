@@ -36,8 +36,17 @@ fn state() -> std::sync::Arc<crate::http::AppState> {
     state
 }
 
-/// One `tools/call` by `user` claiming `project`: status and RAW body bytes.
-async fn call(user: &str, project: &str, tool: &str) -> (StatusCode, Vec<u8>) {
+/// The whole response: status, every header (name and value, in order), and
+/// the RAW body bytes — so "byte-identical" covers all of it.
+#[derive(Debug, PartialEq, Eq)]
+struct Whole {
+    status: StatusCode,
+    headers: Vec<(String, Vec<u8>)>,
+    body: Vec<u8>,
+}
+
+/// One `tools/call` by `user` claiming `project`.
+async fn call(user: &str, project: &str, tool: &str) -> Whole {
     let arguments = if tool == "create_task" {
         json!({ "title": "t" })
     } else {
@@ -67,11 +76,20 @@ async fn call(user: &str, project: &str, tool: &str) -> (StatusCode, Vec<u8>) {
         .await
         .expect("the router answers");
     let status = resp.status();
-    let bytes = to_bytes(resp.into_body(), usize::MAX)
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+        .collect();
+    let body = to_bytes(resp.into_body(), usize::MAX)
         .await
         .expect("read the body")
         .to_vec();
-    (status, bytes)
+    Whole {
+        status,
+        headers,
+        body,
+    }
 }
 
 fn reason(bytes: &[u8]) -> Option<Value> {
@@ -86,23 +104,29 @@ fn reason(bytes: &[u8]) -> Option<Value> {
 /// Alice's paths exist.
 #[tokio::test]
 async fn another_accounts_paths_answer_byte_identically_registered_or_not() {
-    let (status, unregistered) = call(BOB, &format!("local/{SEG_A}/nothere"), "find_tasks").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(reason(&unregistered), Some(json!("PROJECT_NOT_MEMBER")));
+    let unregistered = call(BOB, &format!("local/{SEG_A}/nothere"), "find_tasks").await;
+    assert_eq!(unregistered.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        reason(&unregistered.body),
+        Some(json!("PROJECT_NOT_MEMBER"))
+    );
+    assert!(
+        !unregistered.headers.is_empty(),
+        "the response carries headers"
+    );
     for (rest, tool) in [
         ("reg", "find_tasks"),
         ("reg/deeper", "find_tasks"),
         ("reg", "create_task"),
         ("nothere", "edit_task"),
     ] {
-        let (status, other) = call(BOB, &format!("local/{SEG_A}/{rest}"), tool).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{rest} {tool}");
+        let other = call(BOB, &format!("local/{SEG_A}/{rest}"), tool).await;
         assert_eq!(
             other,
             unregistered,
-            "{rest} {tool}: {} vs {}",
-            String::from_utf8_lossy(&other),
-            String::from_utf8_lossy(&unregistered)
+            "{rest} {tool}: the whole response must match — status, headers and body: {} vs {}",
+            String::from_utf8_lossy(&other.body),
+            String::from_utf8_lossy(&unregistered.body)
         );
     }
 }
@@ -111,11 +135,14 @@ async fn another_accounts_paths_answer_byte_identically_registered_or_not() {
 /// registered row is reached.
 #[tokio::test]
 async fn the_callers_own_unregistered_path_keeps_unregistered_personal() {
-    let (status, body) = call(ALICE, &format!("local/{SEG_A}/nothere"), "create_task").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(reason(&body), Some(json!("PROJECT_UNREGISTERED_PERSONAL")));
+    let own = call(ALICE, &format!("local/{SEG_A}/nothere"), "create_task").await;
+    assert_eq!(own.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reason(&own.body),
+        Some(json!("PROJECT_UNREGISTERED_PERSONAL"))
+    );
 
-    let (status, body) = call(ALICE, &format!("local/{SEG_A}/reg"), "find_tasks").await;
-    assert_ne!(status, StatusCode::FORBIDDEN);
-    assert_eq!(reason(&body), None);
+    let reg = call(ALICE, &format!("local/{SEG_A}/reg"), "find_tasks").await;
+    assert_ne!(reg.status, StatusCode::FORBIDDEN);
+    assert_eq!(reason(&reg.body), None);
 }

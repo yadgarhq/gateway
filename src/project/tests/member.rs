@@ -813,6 +813,7 @@ fn a_reload_swaps_the_paths_and_the_index_as_one_state() {
             vec![
                 wire_aliased("local/alice/notes", "alice", &[]),
                 wire_aliased("local/alice/notes/deep", "mallory", &[]),
+                wire_aliased("local/alice/fresh", "alice", &[]),
             ],
         );
     });
@@ -827,18 +828,23 @@ fn a_reload_swaps_the_paths_and_the_index_as_one_state() {
         answer.expect_err("refused").reason.token(),
         "PROJECT_NOT_MEMBER"
     );
-    // THE NEW ROW IS IN THE PATH MAP: alice's claim of it is not
-    // `UNREGISTERED_PERSONAL` but lands on mallory's row (a ledger 641
-    // mis-registration in alice's segment) and is refused as not hers.
+    // THE PATH MAP RELOADED: `local/alice/fresh` exists only in the second
+    // load, so alice's claim of it resolves EXACTLY. A stale path map would
+    // answer `PROJECT_UNREGISTERED_PERSONAL`. The refusal above shows the
+    // INDEX reloaded (mallory's row beneath `notes` is new); this shows the
+    // MAP did, so neither half can lag the other unnoticed.
     let (answer, snapshotter) = as_user(
         registry,
         Mode::Counting,
-        Access::Read,
+        Access::Write,
         "alice",
-        "local/alice/notes/deep",
+        "local/alice/fresh",
     );
     assert!(answer.is_ok());
-    assert_eq!(the_one_series(&snapshotter), refused("PROJECT_NOT_MEMBER"));
+    assert_eq!(
+        the_one_series(&snapshotter),
+        (RESOLVED.to_string(), "exact".to_string())
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,4 +1190,56 @@ fn bare_local_is_unchanged_and_a_bare_foreign_segment_is_not_member() {
         answer.expect_err("segment").reason.token(),
         "PROJECT_NOT_MEMBER"
     );
+}
+
+/// RULING E, ON A NON-OWNER WHO STILL REACHES `verdict`. Every claim into
+/// another account's segment now stops at the ADR-0954 foreign check, so the
+/// ownership-before-archived order needs cases the foreign check admits:
+///
+/// - an ARCHIVED, OWNERLESS row in the caller's OWN segment (a pre-P2 load),
+///   written by the segment's own account;
+/// - an ORG-SPELLED ALIAS of another account's ARCHIVED private row, written
+///   through the alias.
+///
+/// Both are non-members, so both answer `PROJECT_NOT_MEMBER` — never
+/// `PROJECT_ARCHIVED`, which would tell a non-owner the row's status.
+///
+/// MUTATION THIS CATCHES: swap the two `if`s in `member::verdict` (archived
+/// before membership) — both cases then answer `PROJECT_ARCHIVED`.
+#[test]
+fn ruling_e_holds_for_non_owners_the_foreign_check_admits() {
+    let registry = || {
+        owned(&[
+            ("acme/anchor", "", ACTIVE),
+            ("local/bob/attic", "", ARCHIVED),
+            ("local/alice/vault", "alice", ARCHIVED),
+        ])
+    };
+    let aliased = || {
+        Registry::loaded_from(vec![
+            rendered("acme/anchor", "", ACTIVE, &[]),
+            rendered("local/alice/vault", "alice", ARCHIVED, &["acme/vault"]),
+        ])
+    };
+    for (registry, claimed) in [(registry(), "local/bob/attic"), (aliased(), "acme/vault")] {
+        for mode in [Mode::Counting, Mode::Enforcing] {
+            let (answer, snapshotter) =
+                as_user(registry.clone(), mode, Access::Write, "bob", claimed);
+            match mode {
+                Mode::Counting => {
+                    assert!(answer.is_ok());
+                    assert_eq!(
+                        the_one_series(&snapshotter),
+                        refused("PROJECT_NOT_MEMBER"),
+                        "{claimed}"
+                    );
+                }
+                Mode::Enforcing => assert_eq!(
+                    answer.expect_err(claimed).reason.token(),
+                    "PROJECT_NOT_MEMBER",
+                    "{claimed}"
+                ),
+            }
+        }
+    }
 }
