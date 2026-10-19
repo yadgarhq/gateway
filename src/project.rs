@@ -53,11 +53,14 @@ use std::fmt;
 use tonic::transport::Channel;
 
 mod classify;
+mod member;
+mod poll;
 mod registry;
 mod remediate;
 
 pub use classify::{classify, is_well_formed, Match, Outcome, Registered};
-pub use registry::{poll_from_env, poll_from_lookup, Loaded, Registry, RetryError, LOADED, POLL};
+pub use poll::{poll_from_env, poll_from_lookup, RetryError, POLL};
+pub use registry::{Loaded, Registry, LOADED, PRIVATE_WITHOUT_OWNER};
 
 /// Every terminal state this module can reach, counted by reason.
 ///
@@ -144,6 +147,16 @@ pub enum Reason {
     /// that open ("confirm with Max"); the reading here is that the stage-5 gate
     /// should see archived writes the way it sees every other would-be refusal.
     Archived,
+
+    /// The claim RESOLVED, to a PRIVATE (`local/…`) project the caller does not
+    /// own, for a read or a write (`plans/project-membership.md`, ADR-0947).
+    ///
+    /// **ONE ANSWER FOR EVERY NON-OWNER.** Decided before [`Self::Archived`] on a
+    /// private row (Max's ruling E), so a non-owner learns nothing about the
+    /// row's status, and the same 403 answers a read and a write. Org rows admit
+    /// every attested user and never reach this class (ruling 3). See
+    /// [`member`] for the subtree rule and why a missing owner fails closed.
+    NotMember,
 }
 
 impl Reason {
@@ -159,6 +172,7 @@ impl Reason {
             Self::Unresolvable => "PROJECT_UNRESOLVABLE",
             Self::RegistryUnavailable => "PROJECT_REGISTRY_UNAVAILABLE",
             Self::Archived => "PROJECT_ARCHIVED",
+            Self::NotMember => "PROJECT_NOT_MEMBER",
         }
     }
 }
@@ -361,12 +375,16 @@ impl Validator {
     /// refusal of its own (ADR-0941), and a read of one is an ordinary
     /// resolution.
     ///
+    /// `user_id` is the attested caller, compared with a private row's stored
+    /// owner — see [`member`].
+    ///
     /// `request_id` is the call's D67 id, carried to `project` if a refusal
     /// dials it (ledger 1248).
     pub async fn check(
         &self,
         claimed: &str,
         access: Access,
+        user_id: &str,
         request_id: &str,
     ) -> Result<(), Denied> {
         let Some(loaded) = self.registry.loaded() else {
@@ -381,14 +399,28 @@ impl Validator {
                 .await;
         };
 
-        match classify(loaded.as_ref(), claimed) {
-            // AN ARCHIVED WRITE IS A REFUSAL AND NOT A RESOLUTION, so it moves
-            // the refusal series ONLY: exactly one series per call, as above.
-            Outcome::Resolved { archived: true, .. } if access == Access::Write => {
-                self.decide(Refusal::bare(Reason::Archived), request_id)
-                    .await
-            }
-            Outcome::Resolved { exact, .. } => {
+        let (path, exact, archived, owner, private) = match classify(loaded.as_ref(), claimed) {
+            Outcome::Resolved {
+                path,
+                exact,
+                archived,
+                owner,
+                private,
+            } => (path, exact, archived, owner, private),
+            Outcome::Refused(refusal) => return self.decide(refusal, request_id).await,
+        };
+        let landed = member::Landed {
+            path: &path,
+            exact,
+            archived,
+            owner: &owner,
+            private,
+        };
+        // A REFUSAL IS NOT A RESOLUTION, so a membership or archived refusal
+        // moves the refusal series ONLY: exactly one series per call, as above.
+        match member::verdict(loaded.as_ref(), &landed, access, user_id) {
+            member::Verdict::Refuse(reason) => self.decide(Refusal::bare(reason), request_id).await,
+            member::Verdict::Resolution { exact } => {
                 metrics::counter!(
                     RESOLUTIONS,
                     "outcome" => if exact { "exact" } else { "ancestor" },
@@ -396,7 +428,6 @@ impl Validator {
                 .increment(1);
                 Ok(())
             }
-            Outcome::Refused(refusal) => self.decide(refusal, request_id).await,
         }
     }
 

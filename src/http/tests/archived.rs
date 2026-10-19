@@ -31,6 +31,7 @@ fn state_archiving(mode: Mode) -> std::sync::Arc<crate::http::AppState> {
         path: path.to_string(),
         status: status as i32,
         aliases: Vec::new(),
+        owner_user_id: String::new(),
     });
     let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
     std::sync::Arc::get_mut(&mut state)

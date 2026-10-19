@@ -290,6 +290,14 @@ pub(super) fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
 /// STORE answer, and this gateway answers its own caller in the protocol that
 /// caller speaks.
 ///
+/// **A NON-MEMBER IS A 403 (`plans/project-membership.md`, ruling C).** The
+/// request is well formed and names a real project; the caller may not reach
+/// it. Label `PERMISSION_DENIED`, the one `http/gate.rs` uses for its 403 and
+/// one `yadgar_telemetry::grpc::status_name` already produces. The JSON-RPC
+/// code stays `INVALID_REQUEST`, because no JSON-RPC code means "forbidden":
+/// the HTTP status and `error.data.reason` carry the distinction. A read and a
+/// write get the same answer (ruling E).
+///
 /// **ONE CONDITION IS NOT THE CALLER'S FAULT (ADR-0674).** A gateway that has
 /// never loaded the registry cannot check a claim, so it answers 503 with a
 /// retryable label: 400 would tell a caller to fix a request that is correct, and
@@ -303,30 +311,38 @@ pub(super) fn attest_answer(e: &attest::AttestError) -> AttestAnswer {
 /// because it is something to do and not a value to branch on. What it never
 /// contains is the caller's own claimed value — see `crate::project::remediate`.
 fn project_answer(denied: &crate::project::Denied) -> AttestAnswer {
-    let unavailable = matches!(denied.reason, crate::project::Reason::RegistryUnavailable);
+    use crate::project::Reason;
+    // ONE MATCH FOR ALL THREE FIELDS, so they cannot disagree. INTERNAL_ERROR
+    // when it is not a caller error, for the reason the `Upstream` arm above
+    // gives: a client told its request was invalid stops retrying something
+    // worth retrying. Every label is FROM THE SAME CLOSED SET AS EVERY OTHER
+    // LABEL HERE (ADR-0558): a value `yadgar_telemetry`'s `status_name`
+    // produces, so a dashboard counts it where it already counts its kind.
+    let (status, code, label) = match denied.reason {
+        Reason::RegistryUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            codes::INTERNAL_ERROR,
+            "UNAVAILABLE",
+        ),
+        Reason::NotMember => (
+            StatusCode::FORBIDDEN,
+            codes::INVALID_REQUEST,
+            "PERMISSION_DENIED",
+        ),
+        Reason::Invalid
+        | Reason::UnregisteredOrg
+        | Reason::UnregisteredPersonal
+        | Reason::Unresolvable
+        | Reason::Archived => (
+            StatusCode::BAD_REQUEST,
+            codes::INVALID_REQUEST,
+            "INVALID_ARGUMENT",
+        ),
+    };
     AttestAnswer {
-        status: if unavailable {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            StatusCode::BAD_REQUEST
-        },
-        // INTERNAL_ERROR when it is not a caller error, for the reason the
-        // `Upstream` arm above gives: a client told its request was invalid stops
-        // retrying something worth retrying.
-        code: if unavailable {
-            codes::INTERNAL_ERROR
-        } else {
-            codes::INVALID_REQUEST
-        },
-        // FROM THE SAME CLOSED SET AS EVERY OTHER LABEL HERE (ADR-0558): the two
-        // values `yadgar_telemetry`'s `status_name` produces for these
-        // conditions, so a dashboard counts them where it already counts their
-        // kind.
-        label: if unavailable {
-            "UNAVAILABLE"
-        } else {
-            "INVALID_ARGUMENT"
-        },
+        status,
+        code,
+        label,
         message: denied.prose.clone(),
         data: Some(json!({ "reason": denied.reason.token() })),
     }

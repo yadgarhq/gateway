@@ -1,0 +1,964 @@
+//! Membership (`plans/project-membership.md` car P3, ADR-0947): an org project
+//! admits every attested user, a private (`local/…`) project admits only its
+//! stored owner for reads AND writes, and every miss is counted as
+//! `PROJECT_NOT_MEMBER` before it refuses.
+//!
+//! **LITERALS, per [`super`]'s rule (ADR-0599):** every token and series name
+//! below is spelled out rather than read through the constant under test.
+//!
+//! **OWNERS ARRIVE ON THE WIRE** (`RegisteredPath.owner_user_id`, proto
+//! v1.20.0), so every registry here loads through the real mapping in
+//! `Loaded::from_registered`.
+
+use std::collections::BTreeSet;
+
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+use super::super::registry::install;
+use super::*;
+
+const ACTIVE: ProjectStatus = ProjectStatus::Active;
+const ARCHIVED: ProjectStatus = ProjectStatus::Archived;
+
+/// A registry from literal `(path, owner, status)` rows.
+fn owned(rows: &[(&str, &str, ProjectStatus)]) -> Registry {
+    Registry::loaded_from(
+        rows.iter()
+            .map(|(path, owner, status)| RegisteredPath {
+                owner_user_id: (*owner).to_string(),
+                ..row(path, *status, &[])
+            })
+            .collect(),
+    )
+}
+
+/// One corner of an estate with private rows in every shape the rule meets.
+///
+/// - `local/alice/notes/deep` is a MIS-REGISTERED row beneath alice's own
+///   (ledger 641 lets it exist), owned by mallory.
+/// - `local/alice/solo-x` shares `local/alice/solo`'s prefix and is NOT beneath
+///   it: `-` sorts before `/`, so an index that ranged on the bare prefix
+///   would count it.
+/// - `local/bob/blank` loaded with no owner, the shape a pre-P2 `project` sends.
+/// - `LOCAL/max/x` is registered upper-case; the store folds ASCII case.
+fn members() -> Registry {
+    owned(&[
+        ("yadgarhq", "", ACTIVE),
+        ("yadgarhq/docs", "", ACTIVE),
+        ("yadgarhq/old", "", ARCHIVED),
+        ("local/alice/notes", "alice", ACTIVE),
+        ("local/alice/notes/deep", "mallory", ACTIVE),
+        ("local/alice/solo", "alice", ACTIVE),
+        ("local/alice/solo-x", "mallory", ACTIVE),
+        ("local/alice/attic", "alice", ARCHIVED),
+        ("local/bob/blank", "", ACTIVE),
+        ("LOCAL/max/x", "max", ACTIVE),
+    ])
+}
+
+/// Run one `check` as `user` and return its answer beside the snapshot.
+fn as_user(
+    registry: Registry,
+    mode: Mode,
+    access: Access,
+    user: &str,
+    claimed: &str,
+) -> (Result<(), Denied>, Snapshotter) {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let answer = metrics::with_local_recorder(&recorder, || {
+        rt.block_on(async {
+            Validator::new(registry, mode, dead_channel())
+                .check(claimed, access, user, "a-request-id")
+                .await
+        })
+    });
+    (answer, snapshotter)
+}
+
+/// Every `(series, label value)` one call incremented, with its count.
+fn series(snapshotter: &Snapshotter) -> Vec<(String, String, u64)> {
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| match value {
+            DebugValue::Counter(n) => Some((
+                key.key().name().to_string(),
+                key.key()
+                    .labels()
+                    .map(|l| l.value().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                n,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What one call counted, as exactly ONE `(series, label)` — the property
+/// `Validator::check` promises on every path.
+fn the_one_series(snapshotter: &Snapshotter) -> (String, String) {
+    let all = series(snapshotter);
+    assert_eq!(
+        all.iter().map(|(_, _, n)| n).sum::<u64>(),
+        1,
+        "exactly one series per call: {all:?}"
+    );
+    let (name, label, _) = all.into_iter().next().expect("one series");
+    (name, label)
+}
+
+const REFUSED: &str = "yadgar_gateway_project_refusal_total";
+const RESOLVED: &str = "yadgar_gateway_project_resolution_total";
+
+fn refused(reason: &str) -> (String, String) {
+    (REFUSED.to_string(), reason.to_string())
+}
+
+/// One arm of the rule: who calls, what, how, and the one series it counts.
+struct Arm {
+    user: &'static str,
+    claimed: &'static str,
+    access: Access,
+    counts: (&'static str, &'static str),
+}
+
+fn arm(
+    user: &'static str,
+    claimed: &'static str,
+    access: Access,
+    counts: (&'static str, &'static str),
+) -> Arm {
+    Arm {
+        user,
+        claimed,
+        access,
+        counts,
+    }
+}
+
+const NOT_MEMBER: (&str, &str) = (REFUSED, "PROJECT_NOT_MEMBER");
+const EXACT: (&str, &str) = (RESOLVED, "exact");
+
+/// **THE TABLE.** Every arm in plan car P3's red list that `check` alone can
+/// decide, each asserted to count exactly one series in COUNTING and to be
+/// served there — and, where it refuses, to be refused under ENFORCING with the
+/// same reason.
+///
+/// MUTATIONS THIS CATCHES: ignore `user_id`; compare owners case-folded; read
+/// the class from "owner present" instead of from the path; check archived
+/// before ownership on a private row; let `""` match `""`; drop the subtree
+/// rule; range the subtree index on the bare prefix.
+#[test]
+fn every_membership_arm_counts_one_series_and_refuses_only_under_enforcement() {
+    use Access::{Read, Write};
+    let arms = [
+        // org rows admit every attested user (ruling 3), reads and writes.
+        arm("bob", "yadgarhq/docs", Write, EXACT),
+        arm("bob", "yadgarhq/docs", Read, EXACT),
+        // a private row admits its owner.
+        arm("alice", "local/alice/solo", Write, EXACT),
+        arm("alice", "local/alice/solo", Read, EXACT),
+        // ...and nobody else, for writes AND reads (ruling A).
+        arm("bob", "local/alice/solo", Write, NOT_MEMBER),
+        arm("bob", "local/alice/solo", Read, NOT_MEMBER),
+        // the subtree rule: alice owns the row, mallory owns one beneath it.
+        arm("alice", "local/alice/notes", Read, NOT_MEMBER),
+        arm("alice", "local/alice/notes", Write, NOT_MEMBER),
+        // archived private row (ruling E): ownership first.
+        arm("bob", "local/alice/attic", Read, NOT_MEMBER),
+        arm("bob", "local/alice/attic", Write, NOT_MEMBER),
+        arm(
+            "alice",
+            "local/alice/attic",
+            Write,
+            (REFUSED, "PROJECT_ARCHIVED"),
+        ),
+        arm("alice", "local/alice/attic", Read, EXACT),
+        // archived org row (ruling D): archived, for anybody.
+        arm("bob", "yadgarhq/old", Write, (REFUSED, "PROJECT_ARCHIVED")),
+        // claims above any private row never reach membership.
+        arm("bob", "local", Read, (REFUSED, "PROJECT_UNRESOLVABLE")),
+        arm(
+            "bob",
+            "local/carol",
+            Write,
+            (REFUSED, "PROJECT_UNREGISTERED_PERSONAL"),
+        ),
+        // a private row loaded with no owner is nobody's: fail closed.
+        arm("bob", "local/bob/blank", Read, NOT_MEMBER),
+        arm("bob", "local/bob/blank", Write, NOT_MEMBER),
+        arm("", "local/bob/blank", Write, NOT_MEMBER),
+        // the path fold: `LOCAL/` is the private root too.
+        arm("max", "local/max/x", Write, EXACT),
+        arm("bob", "local/max/x", Write, NOT_MEMBER),
+        // soft landing under a private row checks the LANDED row's owner.
+        arm(
+            "alice",
+            "local/alice/solo/sub",
+            Write,
+            (RESOLVED, "ancestor"),
+        ),
+        arm("bob", "local/alice/solo/sub", Write, NOT_MEMBER),
+    ];
+    for a in arms {
+        let what = format!("{} {:?} {}", a.user, a.access, a.claimed);
+        let (answer, snapshotter) = as_user(members(), Mode::Counting, a.access, a.user, a.claimed);
+        assert!(
+            answer.is_ok(),
+            "{what}: counting serves: {:?}",
+            answer.err()
+        );
+        assert_eq!(
+            the_one_series(&snapshotter),
+            (a.counts.0.to_string(), a.counts.1.to_string()),
+            "{what}"
+        );
+
+        let (answer, _) = as_user(members(), Mode::Enforcing, a.access, a.user, a.claimed);
+        match a.counts {
+            (RESOLVED, _) => assert!(answer.is_ok(), "{what}: {:?}", answer.err()),
+            (_, reason) => assert_eq!(answer.expect_err(&what).reason.token(), reason, "{what}"),
+        }
+    }
+}
+
+/// The `create_task` shape: a WRITE under a row with a foreign private row
+/// beneath it is refused too, deliberately.
+///
+/// A create lands at the resolved path only and could not reach the deeper
+/// row, but `Access` cannot tell a create from an edit, and the plan rules
+/// that this fails closed rather than growing a third `Access` value for a
+/// shape that needs ledger 641's defect to exist (§3, "The read path").
+#[test]
+fn a_create_under_a_foreign_private_row_is_refused_too_strictly_on_purpose() {
+    let (answer, _) = as_user(
+        members(),
+        Mode::Enforcing,
+        Access::Write,
+        "alice",
+        "local/alice/notes",
+    );
+    assert_eq!(
+        answer.expect_err("refused, deliberately").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
+}
+
+/// THE SUBTREE INDEX ITSELF: strictly beneath, folded, and not a prefix match.
+#[test]
+fn the_index_answers_owners_strictly_beneath_a_path() {
+    let registry = members();
+    let loaded = registry.loaded().expect("loaded");
+    assert_eq!(
+        loaded.private_owners_beneath("local/alice/notes"),
+        vec!["mallory"]
+    );
+    assert_eq!(
+        loaded.private_owners_beneath("LOCAL/Alice/Notes"),
+        vec!["mallory"]
+    );
+    assert!(
+        loaded.private_owners_beneath("local/alice/solo").is_empty(),
+        "`local/alice/solo-x` shares a prefix and is not beneath"
+    );
+    assert!(
+        loaded
+            .private_owners_beneath("local/alice/notes/deep")
+            .is_empty(),
+        "strictly beneath: a row is not beneath itself"
+    );
+    let mut under_alice = loaded.private_owners_beneath("local/alice");
+    under_alice.sort_unstable();
+    assert_eq!(
+        under_alice,
+        vec!["alice", "alice", "alice", "mallory", "mallory"]
+    );
+    assert_eq!(loaded.private_owners_beneath("local/bob"), vec![""]);
+    assert!(loaded.private_owners_beneath("yadgarhq").is_empty());
+}
+
+/// A non-owner's read and write of one private row get ONE answer.
+///
+/// Ruling E: the same reason, the same prose, whether or not the row is
+/// archived, so a non-owner learns nothing about the row.
+#[test]
+fn a_non_owner_gets_one_answer_for_reads_writes_and_archived_rows() {
+    let prose: BTreeSet<String> = [
+        (Access::Read, "local/alice/solo"),
+        (Access::Write, "local/alice/solo"),
+        (Access::Read, "local/alice/attic"),
+        (Access::Write, "local/alice/attic"),
+    ]
+    .into_iter()
+    .map(|(access, claimed)| {
+        let (answer, _) = as_user(members(), Mode::Enforcing, access, "bob", claimed);
+        let denied = answer.expect_err("a non-owner is refused");
+        assert_eq!(denied.reason.token(), "PROJECT_NOT_MEMBER");
+        denied.prose
+    })
+    .collect();
+    assert_eq!(
+        prose.len(),
+        1,
+        "one sentence for every non-owner: {prose:?}"
+    );
+}
+
+/// THE PROSE NEVER CARRIES THE CLAIM, THE OWNER OR THE CALLER.
+#[test]
+fn the_not_member_prose_repeats_nothing_the_caller_or_the_row_said() {
+    let (answer, _) = as_user(
+        members(),
+        Mode::Enforcing,
+        Access::Write,
+        "sentinel-caller",
+        "local/alice/solo/sentinel-sub",
+    );
+    let prose = answer.expect_err("refused").prose;
+    for leaked in ["sentinel", "alice", "solo"] {
+        assert!(!prose.contains(leaked), "{leaked} leaked into: {prose}");
+    }
+}
+
+/// THE REAL LOAD PATH FAILS CLOSED, and the gauge says so.
+///
+/// `install` loads through `Loaded::from_registered`, and these rows carry an
+/// empty `owner_user_id` — what a `project` older than car P2 sends. So a
+/// private row loaded this way is nobody's: its would-be owner's write counts
+/// `PROJECT_NOT_MEMBER`, and the gauge reads 1 — the loud answer §5 step 3
+/// requires before the observation window opens.
+#[test]
+fn a_private_row_loaded_without_its_owner_fails_closed_and_moves_the_gauge() {
+    let registry = Registry::never_loaded();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        install(
+            &registry,
+            vec![
+                row("yadgarhq/docs", ACTIVE, &[]),
+                row("local/bob/x", ACTIVE, &["local/bob/x-old"]),
+            ],
+        );
+    });
+    let gauge = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .find(|(key, _, _, _)| {
+            key.key().name() == "yadgar_gateway_project_registry_private_without_owner"
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Gauge(g) => g.into_inner(),
+            other => panic!("a gauge, got {other:?}"),
+        });
+    assert_eq!(
+        gauge,
+        Some(1.0),
+        "one private ROW without an owner, its alias not counted twice"
+    );
+
+    let (answer, snapshotter) = as_user(
+        registry,
+        Mode::Counting,
+        Access::Write,
+        "bob",
+        "local/bob/x",
+    );
+    assert!(answer.is_ok());
+    assert_eq!(the_one_series(&snapshotter), refused("PROJECT_NOT_MEMBER"));
+}
+
+/// An all-org load reads the gauge as PRESENT and zero.
+#[test]
+fn an_all_org_load_publishes_the_gauge_as_zero() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        install(
+            &Registry::never_loaded(),
+            vec![row("yadgarhq/docs", ACTIVE, &[])],
+        );
+    });
+    let present = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .any(|(key, _, _, value)| {
+            key.key().name() == "yadgar_gateway_project_registry_private_without_owner"
+                && matches!(value, DebugValue::Gauge(g) if g.into_inner() == 0.0)
+        });
+    assert!(
+        present,
+        "the gauge must be present and 0 after a clean load"
+    );
+}
+
+/// No registry: the availability reason only, whoever calls.
+#[test]
+fn with_no_registry_membership_is_never_reached() {
+    let (answer, snapshotter) = as_user(
+        Registry::never_loaded(),
+        Mode::Counting,
+        Access::Read,
+        "bob",
+        "local/alice/solo",
+    );
+    assert!(answer.is_ok());
+    assert_eq!(
+        the_one_series(&snapshotter),
+        refused("PROJECT_REGISTRY_UNAVAILABLE")
+    );
+}
+
+/// THE CLOSED SET (ADR-0558), every token spelled out. A seventh reason that
+/// is added without being listed here reds this test.
+#[test]
+fn the_reason_set_is_closed_and_includes_not_member() {
+    let tokens: Vec<&str> = [
+        Reason::Invalid,
+        Reason::UnregisteredOrg,
+        Reason::UnregisteredPersonal,
+        Reason::Unresolvable,
+        Reason::RegistryUnavailable,
+        Reason::Archived,
+        Reason::NotMember,
+    ]
+    .iter()
+    .map(|r| match r {
+        // EXHAUSTIVE on purpose: a new variant fails to compile here.
+        Reason::Invalid
+        | Reason::UnregisteredOrg
+        | Reason::UnregisteredPersonal
+        | Reason::Unresolvable
+        | Reason::RegistryUnavailable
+        | Reason::Archived
+        | Reason::NotMember => r.token(),
+    })
+    .collect();
+    assert_eq!(
+        tokens,
+        vec![
+            "PROJECT_INVALID",
+            "PROJECT_UNREGISTERED_ORG",
+            "PROJECT_UNREGISTERED_PERSONAL",
+            "PROJECT_UNRESOLVABLE",
+            "PROJECT_REGISTRY_UNAVAILABLE",
+            "PROJECT_ARCHIVED",
+            "PROJECT_NOT_MEMBER",
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The registry load maps `RegisteredPath.owner_user_id` (proto v1.20.0, P0).
+// ---------------------------------------------------------------------------
+
+/// One row as `ListProjects` answers it, owner on the wire.
+fn wire(path: &str, owner: &str) -> RegisteredPath {
+    RegisteredPath {
+        owner_user_id: owner.to_string(),
+        ..row(path, ACTIVE, &[])
+    }
+}
+
+/// A private row LOADED FROM THE WIRE carries its owner, so its owner is
+/// served — the mapping is real, not the empty stub.
+///
+/// MUTATION THIS CATCHES: map every owner to `""` (the P3a stub) — the owner
+/// is then refused and the row counts as owned by nobody.
+#[test]
+fn a_private_row_loaded_from_the_wire_carries_its_owner() {
+    let loaded = Loaded::from_registered(vec![wire("local/alice/x", "alice")]);
+    assert_eq!(
+        loaded.registered_as("local/alice/x").map(|m| m.owner),
+        Some("alice".to_string())
+    );
+    assert_eq!(loaded.private_rows(), 1);
+    assert_eq!(loaded.private_rows_without_owner(), 0);
+
+    let registry = Registry::loaded_from(vec![wire("local/alice/x", "alice")]);
+    let (answer, snapshotter) = as_user(
+        registry,
+        Mode::Enforcing,
+        Access::Write,
+        "alice",
+        "local/alice/x",
+    );
+    assert!(answer.is_ok(), "{:?}", answer.err());
+    assert_eq!(
+        the_one_series(&snapshotter),
+        (RESOLVED.to_string(), "exact".to_string())
+    );
+}
+
+/// An org row carries `""`, and every attested user reaches it.
+#[test]
+fn an_org_row_loaded_from_the_wire_carries_no_owner() {
+    let loaded = Loaded::from_registered(vec![wire("yadgarhq/docs", "")]);
+    assert_eq!(
+        loaded.registered_as("yadgarhq/docs").map(|m| m.owner),
+        Some(String::new())
+    );
+    assert_eq!(loaded.private_rows(), 0);
+    let (answer, _) = as_user(
+        Registry::loaded_from(vec![wire("yadgarhq/docs", "")]),
+        Mode::Enforcing,
+        Access::Write,
+        "bob",
+        "yadgarhq/docs",
+    );
+    assert!(answer.is_ok());
+}
+
+/// A private row that arrives from the wire with an EMPTY owner fails closed:
+/// nobody reaches it, not even a caller who sent no user.
+#[test]
+fn a_private_row_loaded_from_the_wire_without_an_owner_fails_closed() {
+    let loaded = Loaded::from_registered(vec![
+        wire("local/bob/x", ""),
+        wire("local/alice/y", "alice"),
+    ]);
+    assert_eq!(loaded.private_rows(), 2);
+    assert_eq!(loaded.private_rows_without_owner(), 1);
+    for user in ["bob", ""] {
+        let (answer, _) = as_user(
+            Registry::loaded_from(vec![wire("local/bob/x", "")]),
+            Mode::Enforcing,
+            Access::Read,
+            user,
+            "local/bob/x",
+        );
+        assert_eq!(
+            answer.expect_err("nobody owns it").reason.token(),
+            "PROJECT_NOT_MEMBER",
+            "user {user:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Security review (adversarial pass on `member.rs`).
+// ---------------------------------------------------------------------------
+
+/// A row with its owner and aliases on the wire.
+fn wire_aliased(path: &str, owner: &str, aliases: &[&str]) -> RegisteredPath {
+    RegisteredPath {
+        owner_user_id: owner.to_string(),
+        ..row(path, ACTIVE, aliases)
+    }
+}
+
+/// HOLE 1: the class was read from the MATCHED SPELLING, so an alias of a
+/// private row spelled outside `local/` made that row org for anybody who
+/// claimed the alias. The class is the ROW's path.
+///
+/// MUTATION THIS CATCHES: decide the class from the landed spelling only.
+#[test]
+fn an_org_spelled_alias_of_a_private_row_is_still_private() {
+    let registry = || {
+        Registry::loaded_from(vec![
+            wire_aliased("acme/anchor", "", &[]),
+            wire_aliased("local/alice/p", "alice", &["acme/p"]),
+        ])
+    };
+    for access in [Access::Read, Access::Write] {
+        let (answer, snapshotter) = as_user(registry(), Mode::Counting, access, "bob", "acme/p");
+        assert!(answer.is_ok());
+        assert_eq!(
+            the_one_series(&snapshotter),
+            refused("PROJECT_NOT_MEMBER"),
+            "{access:?}"
+        );
+        let (answer, _) = as_user(registry(), Mode::Enforcing, access, "alice", "acme/p");
+        assert!(
+            answer.is_ok(),
+            "the owner still reaches it: {:?}",
+            answer.err()
+        );
+    }
+}
+
+/// HOLE 2: an ORG row skipped the subtree rule, so a private row reachable
+/// beneath it through an org-spelled alias was read by anybody claiming the
+/// org row. Every row, org included, requires owning every private row
+/// beneath it.
+#[test]
+fn an_org_row_with_a_private_row_beneath_it_takes_the_subtree_rule() {
+    let registry = || {
+        Registry::loaded_from(vec![
+            wire_aliased("acme/team", "", &[]),
+            wire_aliased("local/alice/q", "alice", &["acme/team/q"]),
+        ])
+    };
+    let (answer, _) = as_user(
+        registry(),
+        Mode::Enforcing,
+        Access::Read,
+        "bob",
+        "acme/team",
+    );
+    assert_eq!(
+        answer
+            .expect_err("bob would reach alice's row")
+            .reason
+            .token(),
+        "PROJECT_NOT_MEMBER"
+    );
+    let (answer, _) = as_user(
+        registry(),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "acme/team",
+    );
+    assert!(answer.is_ok(), "{:?}", answer.err());
+}
+
+/// CHECKED, NOT A HOLE: malformed private claims never resolve, `Local/` is
+/// private, and `local/alice` is not a prefix of `local/alicex`.
+#[test]
+fn malformed_folded_and_prefix_claims_never_admit_a_non_owner() {
+    let registry = || {
+        Registry::loaded_from(vec![
+            wire_aliased("local/alice/p", "alice", &[]),
+            wire_aliased("local/alicex/p", "mallory", &[]),
+        ])
+    };
+    let dot = ".";
+    for claimed in [
+        "local/alice/p/".to_string(),
+        "local//alice/p".to_string(),
+        format!("local/alice/{dot}/p"),
+        format!("local/alice/{dot}{dot}/alice/p"),
+    ] {
+        let (answer, _) = as_user(registry(), Mode::Enforcing, Access::Read, "bob", &claimed);
+        assert_eq!(
+            answer.expect_err(&claimed).reason.token(),
+            "PROJECT_INVALID",
+            "{claimed}"
+        );
+    }
+    for claimed in ["Local/alice/p", "LOCAL/ALICE/P"] {
+        let (answer, _) = as_user(registry(), Mode::Enforcing, Access::Read, "bob", claimed);
+        assert_eq!(
+            answer.expect_err(claimed).reason.token(),
+            "PROJECT_NOT_MEMBER"
+        );
+    }
+    let (answer, _) = as_user(
+        registry(),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/p",
+    );
+    assert!(
+        answer.is_ok(),
+        "mallory's local/alicex/p is not beneath: {:?}",
+        answer.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Security review 2: the loaded set and the private-owner index stay one state.
+// ---------------------------------------------------------------------------
+
+/// HOLE 3: two spellings that FOLD TO ONE KEY kept only the last row's owner,
+/// in the path map and in the index alike. A foreign owner beneath a caller's
+/// row could be dropped by an alias collision, and the subtree rule then
+/// passed. Every owner of every spelling must stay in the index, whatever
+/// order the rows arrive in.
+#[test]
+fn a_folded_collision_beneath_a_row_keeps_every_owner_in_the_index() {
+    let rows = vec![
+        wire_aliased("local/alice/notes", "alice", &[]),
+        wire_aliased("local/alice/notes/deep", "mallory", &[]),
+        wire_aliased("local/alice/other", "alice", &["LOCAL/alice/notes/deep"]),
+    ];
+    for order in [rows.clone(), rows.into_iter().rev().collect()] {
+        let (answer, _) = as_user(
+            Registry::loaded_from(order),
+            Mode::Enforcing,
+            Access::Read,
+            "alice",
+            "local/alice/notes",
+        );
+        assert_eq!(
+            answer.expect_err("mallory's row is beneath").reason.token(),
+            "PROJECT_NOT_MEMBER"
+        );
+    }
+}
+
+/// HOLE 4: when two rows of DIFFERENT owners fold to the claimed key, the
+/// last one loaded won, so whoever owned it was admitted to the other's row.
+/// An ambiguous owner is nobody's.
+#[test]
+fn a_claim_whose_spelling_two_owners_share_admits_nobody() {
+    let rows = vec![
+        wire_aliased("local/alice/p", "alice", &[]),
+        wire_aliased("local/bob/q", "bob", &["Local/Alice/P"]),
+    ];
+    for order in [rows.clone(), rows.into_iter().rev().collect::<Vec<_>>()] {
+        for user in ["alice", "bob"] {
+            let (answer, _) = as_user(
+                Registry::loaded_from(order.clone()),
+                Mode::Enforcing,
+                Access::Write,
+                user,
+                "local/alice/p",
+            );
+            assert_eq!(
+                answer.expect_err(user).reason.token(),
+                "PROJECT_NOT_MEMBER",
+                "{user}"
+            );
+        }
+    }
+}
+
+/// HOLE 5: `private_owners_beneath` with a trailing slash ranged on `p//`
+/// and found nothing, which reads as "nobody beneath" — a pass. Not reachable
+/// through `classify` today (the grammar refuses a trailing slash), closed so
+/// no later caller can open it.
+#[test]
+fn the_index_ignores_a_trailing_slash_on_the_queried_path() {
+    let registry = members();
+    let loaded = registry.loaded().expect("loaded");
+    assert_eq!(
+        loaded.private_owners_beneath("local/alice/notes/"),
+        vec!["mallory"]
+    );
+}
+
+/// CHECKED: an ARCHIVED foreign row beneath still blocks — status is not
+/// filtered out of the index, so archiving a row never opens its subtree.
+#[test]
+fn an_archived_foreign_row_beneath_still_blocks() {
+    let registry = owned(&[
+        ("local/alice/notes", "alice", ACTIVE),
+        ("local/alice/notes/deep", "mallory", ARCHIVED),
+    ]);
+    let (answer, _) = as_user(
+        registry,
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert_eq!(
+        answer.expect_err("blocked").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
+}
+
+/// CHECKED: an EMPTY load refuses a private claim under enforcement, and
+/// counts it under counting. It never admits.
+#[test]
+fn an_empty_load_fails_closed_for_private_claims() {
+    let (answer, _) = as_user(
+        Registry::loaded_from(Vec::new()),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert_eq!(
+        answer.expect_err("nothing loaded").reason.token(),
+        "PROJECT_UNREGISTERED_PERSONAL"
+    );
+}
+
+/// CHECKED: a reload swaps the path map AND the index together. After a
+/// second load adds a foreign row beneath, the owner of the parent is refused
+/// and the new row resolves — neither half lags the other.
+#[test]
+fn a_reload_swaps_the_paths_and_the_index_as_one_state() {
+    let registry = Registry::never_loaded();
+    let recorder = DebuggingRecorder::new();
+    metrics::with_local_recorder(&recorder, || {
+        install(
+            &registry,
+            vec![wire_aliased("local/alice/notes", "alice", &[])],
+        );
+    });
+    let (answer, _) = as_user(
+        registry.clone(),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert!(answer.is_ok(), "{:?}", answer.err());
+
+    metrics::with_local_recorder(&recorder, || {
+        install(
+            &registry,
+            vec![
+                wire_aliased("local/alice/notes", "alice", &[]),
+                wire_aliased("local/alice/notes/deep", "mallory", &[]),
+            ],
+        );
+    });
+    let (answer, _) = as_user(
+        registry.clone(),
+        Mode::Enforcing,
+        Access::Read,
+        "alice",
+        "local/alice/notes",
+    );
+    assert_eq!(
+        answer.expect_err("refused").reason.token(),
+        "PROJECT_NOT_MEMBER"
+    );
+    let (answer, snapshotter) = as_user(
+        registry,
+        Mode::Counting,
+        Access::Read,
+        "mallory",
+        "local/alice/notes/deep",
+    );
+    assert!(answer.is_ok());
+    assert_eq!(
+        the_one_series(&snapshotter),
+        (RESOLVED.to_string(), "exact".to_string())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review of #121 at 68d8f30: F1, F2, F4, F5.
+// ---------------------------------------------------------------------------
+
+/// Both load orders of `rows`.
+fn both_orders(rows: Vec<RegisteredPath>) -> [Vec<RegisteredPath>; 2] {
+    let reversed = rows.iter().cloned().rev().collect();
+    [rows, reversed]
+}
+
+/// F1, DIFFERENT-OWNER ARM: an org row and a private row's alias fold to one
+/// non-`local/` key. Whichever loads last, the merged key stays PRIVATE and
+/// ownerless, so nobody — the org's users or the private owner — is admitted.
+///
+/// MUTATION THIS CATCHES: drop `private: prev.private || m.private` from the
+/// different-owner arm of `merge` — with the org row last the key reads as an
+/// org row and admits everyone.
+#[test]
+fn an_org_row_colliding_with_an_owned_private_alias_admits_nobody_in_either_order() {
+    for order in both_orders(vec![
+        wire_aliased("acme/team", "", &[]),
+        wire_aliased("local/alice/p", "alice", &["acme/team"]),
+    ]) {
+        for user in ["bob", "alice"] {
+            let (answer, _) = as_user(
+                Registry::loaded_from(order.clone()),
+                Mode::Enforcing,
+                Access::Read,
+                user,
+                "acme/team",
+            );
+            assert_eq!(answer.expect_err(user).reason.token(), "PROJECT_NOT_MEMBER");
+        }
+    }
+}
+
+/// F1, SAME-OWNER ARM, and the LIVE shape: project v0.3.7 sends `""` for every
+/// owner, so an org row and a private row's alias collide with EQUAL owners.
+///
+/// MUTATION THIS CATCHES: drop `private: prev.private || m.private` from the
+/// same-owner arm — with the org row last the key reads as org and admits
+/// everyone.
+#[test]
+fn an_org_row_colliding_with_an_ownerless_private_alias_admits_nobody_in_either_order() {
+    for order in both_orders(vec![
+        wire_aliased("acme/team", "", &[]),
+        wire_aliased("local/alice/p", "", &["acme/team"]),
+    ]) {
+        let (answer, _) = as_user(
+            Registry::loaded_from(order),
+            Mode::Enforcing,
+            Access::Write,
+            "bob",
+            "acme/team",
+        );
+        assert_eq!(
+            answer.expect_err("bob").reason.token(),
+            "PROJECT_NOT_MEMBER"
+        );
+    }
+}
+
+/// F2: a collision of an ARCHIVED and an ACTIVE row resolves toward refusal in
+/// either order — a write is `PROJECT_ARCHIVED`, never served.
+#[test]
+fn a_collision_with_an_archived_row_refuses_writes_in_either_order() {
+    for order in both_orders(vec![
+        RegisteredPath {
+            owner_user_id: String::new(),
+            ..row("acme/x", ARCHIVED, &[])
+        },
+        wire_aliased("acme/y", "", &["acme/x"]),
+    ]) {
+        let (answer, _) = as_user(
+            Registry::loaded_from(order),
+            Mode::Enforcing,
+            Access::Write,
+            "bob",
+            "acme/x",
+        );
+        assert_eq!(
+            answer.expect_err("archived").reason.token(),
+            "PROJECT_ARCHIVED"
+        );
+    }
+}
+
+/// F4: the gauge counts EVERY spelling nobody can reach, not only private rows
+/// by path: an org row carrying a `local/` alias, and a key `merge` made
+/// ownerless.
+#[test]
+fn the_gauge_counts_org_rows_with_local_aliases_and_keys_made_ownerless() {
+    for order in both_orders(vec![
+        wire_aliased("acme/docs", "", &["local/carol/docs"]),
+        wire_aliased("local/alice/p", "alice", &[]),
+        wire_aliased("local/bob/q", "bob", &["Local/Alice/P"]),
+    ]) {
+        let loaded = Loaded::from_registered(order);
+        assert_eq!(
+            loaded.private_rows_without_owner(),
+            2,
+            "one org row with a local/ alias, one key two owners share"
+        );
+    }
+}
+
+/// F5: an ORG claim refused under the subtree rule is not told that its own
+/// project is personal; the sentence fits both cases and still leaks nothing.
+#[test]
+fn the_not_member_prose_fits_an_org_claim_too() {
+    let (answer, _) = as_user(
+        Registry::loaded_from(vec![
+            wire_aliased("acme/team", "", &[]),
+            wire_aliased("local/alice/q", "alice", &["acme/team/q"]),
+        ]),
+        Mode::Enforcing,
+        Access::Read,
+        "bob",
+        "acme/team",
+    );
+    let prose = answer.expect_err("refused").prose;
+    assert!(
+        !prose.contains("this personal project"),
+        "an org claim is not a personal project: {prose}"
+    );
+    for leaked in ["acme", "team", "alice", "bob"] {
+        assert!(!prose.contains(leaked), "{leaked} leaked into: {prose}");
+    }
+}

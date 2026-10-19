@@ -212,3 +212,33 @@ impl Drop for MintedCa {
         let _ = std::fs::remove_file(&self.0);
     }
 }
+
+/// THE BOOT GATE (`plans/project-membership.md` car P3): ENFORCING with
+/// trusted headers refuses to start, naming both settings, because the owner
+/// check would then compare against a caller-named identity and enforce
+/// nothing.
+#[test]
+fn enforcing_with_trusted_headers_refuses_to_boot_naming_both_settings() {
+    use yadgar_gateway::attest::Attestation;
+    use yadgar_gateway::project::Mode;
+
+    let err = super::refuse_unverifiable_enforcement(&Attestation::TrustedHeaders, Mode::Enforcing)
+        .expect_err("enforcing plus trusted headers must not boot");
+    for named in [
+        "YADGAR_PROJECT_VALIDATION_MODE",
+        "YADGAR_TRUST_UNAUTHENTICATED_HEADERS",
+        "projectValidation.mode",
+        "trustUnauthenticatedHeaders",
+    ] {
+        assert!(err.contains(named), "the refusal must name {named}: {err}");
+    }
+    assert!(
+        super::refuse_unverifiable_enforcement(&Attestation::TrustedHeaders, Mode::Counting)
+            .is_ok(),
+        "counting with trusted headers boots: it refuses nobody"
+    );
+    assert!(
+        super::refuse_unverifiable_enforcement(&Attestation::Iam, Mode::Enforcing).is_ok(),
+        "enforcing with iam attestation boots"
+    );
+}

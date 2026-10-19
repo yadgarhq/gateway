@@ -65,6 +65,8 @@ fn an_exactly_registered_path_resolves_to_itself() {
             path: "yadgarhq/docs".to_string(),
             exact: true,
             archived: false,
+            owner: String::new(),
+            private: false,
         }
     );
 }
@@ -87,6 +89,8 @@ fn a_subpath_resolves_to_its_nearest_registered_ancestor() {
             path: "yadgarhq/docs".to_string(),
             exact: false,
             archived: false,
+            owner: String::new(),
+            private: false,
         }
     );
 }
@@ -163,6 +167,8 @@ fn a_private_subpath_resolves_to_its_registered_ancestor() {
             path: "local/max/git/alpha".to_string(),
             exact: false,
             archived: false,
+            owner: String::new(),
+            private: true,
         }
     );
 }
@@ -203,6 +209,8 @@ fn the_walk_folds_ascii_case_in_both_directions() {
             path: "yadgarhq/docs".to_string(),
             exact: true,
             archived: false,
+            owner: String::new(),
+            private: false,
         }
     );
     // THE ROW'S SPELLING, NOT THE CALLER'S. The store's resolver answers the
@@ -215,6 +223,8 @@ fn the_walk_folds_ascii_case_in_both_directions() {
             path: "Acme/Forecast".to_string(),
             exact: false,
             archived: false,
+            owner: String::new(),
+            private: false,
         }
     );
 }
@@ -287,7 +297,7 @@ fn checked_as(
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(claimed, access, "a-request-id")
+                .check(claimed, access, "a-user", "a-request-id")
                 .await
         })
     });
@@ -1035,7 +1045,12 @@ async fn an_enforced_refusal_dials_resolve_project_carrying_the_request_id() {
     let (project, request_ids) =
         stub_project_recording(answered("yadgarhq", "yadgarhq/estate")).await;
     let answer = Validator::new(estate(), Mode::Enforcing, project)
-        .check("yadgarhq/gateway", Access::Write, "the-id-on-this-call")
+        .check(
+            "yadgarhq/gateway",
+            Access::Write,
+            "a-user",
+            "the-id-on-this-call",
+        )
         .await;
 
     assert!(
@@ -1065,6 +1080,7 @@ fn row(path: &str, status: ProjectStatus, aliases: &[&str]) -> RegisteredPath {
         path: path.to_string(),
         status: status as i32,
         aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
+        owner_user_id: String::new(),
     }
 }
 
@@ -1262,6 +1278,8 @@ fn a_write_beneath_an_archived_ancestor_is_refused_and_a_read_lands_on_it() {
             path: "yadgarhq/mono".to_string(),
             exact: false,
             archived: true,
+            owner: String::new(),
+            private: false,
         }
     );
     let (answer, snapshotter) = checked_as(
@@ -1338,3 +1356,7 @@ fn the_archived_refusal_does_not_echo_the_callers_value() {
     assert!(!denied.prose.contains("sentinel"), "{}", denied.prose);
     assert!(!denied.to_string().contains("sentinel"), "{denied}");
 }
+
+/// Membership (`plans/project-membership.md` car P3): who may reach a resolved
+/// project, and the gauge that says whether a load carried its owners.
+mod member;

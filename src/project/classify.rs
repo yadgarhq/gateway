@@ -59,10 +59,20 @@ pub enum Outcome {
     /// to that archived project (ADR-0941). Whether that refuses depends on
     /// whether the call writes, which this function is not told — see
     /// [`super::Validator::check`].
+    ///
+    /// `owner` is the landed row's stored owner: empty on every org row, and
+    /// empty on a private row whose load predates the owner field — which is
+    /// why the CLASS is read from `path` and never from this (see
+    /// [`super::member`]).
+    ///
+    /// `private` is the landed ROW's class, read from the row's own path: an
+    /// alias spelled outside `local/` still names a private row.
     Resolved {
         path: String,
         exact: bool,
         archived: bool,
+        owner: String,
+        private: bool,
     },
     /// One of the four refusal classes.
     Refused(Refusal),
@@ -73,7 +83,7 @@ pub enum Outcome {
 /// THE SEGMENT, NEVER THE PREFIX, for `project-db`'s own reason: `locals` is a
 /// different organisation that merely shares five characters, and
 /// `starts_with("local")` files its work under the reserved root.
-fn is_private_class(claimed: &str) -> bool {
+pub(super) fn is_private_class(claimed: &str) -> bool {
     claimed
         .split_once('/')
         .is_some_and(|(root, _)| root.eq_ignore_ascii_case(RESERVED_ROOT))
@@ -169,6 +179,8 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
     let Some(Match {
         path: matched,
         archived,
+        owner,
+        private,
     }) = matched
     else {
         // NO REGISTERED ANCESTOR. Which refusal that is depends on the
@@ -197,6 +209,8 @@ pub fn classify(registered: &impl Registered, claimed: &str) -> Outcome {
         exact: matched.eq_ignore_ascii_case(claimed),
         path: matched,
         archived,
+        owner,
+        private,
     }
 }
 
@@ -211,6 +225,15 @@ pub struct Match {
     /// rewrite (D53), so the old spelling of an archived project is that same
     /// archived project.
     pub archived: bool,
+    /// The stored owner of the row this path or alias belongs to: non-empty
+    /// only on a private (`local/…`) row. An alias carries its ROW's owner, as
+    /// it carries its row's status.
+    pub owner: String,
+    /// Whether the ROW this path or alias belongs to is private, read from the
+    /// row's own path at load. An alias carries its row's class: reading the
+    /// class off an alias spelled outside `local/` would make a private row
+    /// org for whoever claimed the alias.
+    pub private: bool,
 }
 
 /// What [`classify`] needs from a loaded registry, and no more.
@@ -228,4 +251,13 @@ pub trait Registered {
     /// see [`classify`]. A `bool` here is what let an earlier revision answer
     /// the CALLER's spelling as the resolved path.
     fn registered_as(&self, path: &str) -> Option<Match>;
+
+    /// The stored owner of every registered PRIVATE row strictly beneath
+    /// `path`, an empty owner included as `""`.
+    ///
+    /// The membership check needs it because a read, an edit and a transition
+    /// reach the claimed project's whole SUBTREE in task-db (`Reach::within`),
+    /// so owning the resolved row is not enough while a deeper private row can
+    /// belong to somebody else (ledger 641). See [`super::member`].
+    fn private_owners_beneath(&self, path: &str) -> Vec<&str>;
 }
