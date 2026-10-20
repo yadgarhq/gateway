@@ -153,7 +153,23 @@ sha2 = "0.11"
 # `cargo tree -e normal -i aws-lc-rs` matches no package, and every rustls path
 # under this crate resolves to `ring v0.17.14`. So this adds NO native dependency
 # the build image did not already have to satisfy.
-async-nats = "0.50"
+# `websockets` is dropped from the 0.50.0 default set: its only user is
+# tokio-websockets -> webpki-roots 0.26.11, which RUSTSEC-2026-0381 flags and
+# which has no patched 0.26 release. The gateway never dials ws:// or wss://.
+async-nats = { version = "0.50", default-features = false, features = [
+  "server_2_10",
+  "server_2_11",
+  "server_2_12",
+  "server_2_14",
+  "service",
+  "ring",
+  "jetstream",
+  "nkeys",
+  "crypto",
+  "object-store",
+  "kv",
+  "nuid",
+] }
 # `StreamExt::merge`, so both invalidation subscriptions are drained by one loop
 # rather than by two tasks that would each have to be supervised. Already in this
 # tree by way of tonic, so it adds nothing to the build.
