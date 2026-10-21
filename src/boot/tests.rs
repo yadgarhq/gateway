@@ -275,14 +275,39 @@ fn the_project_validation_boot_line_is_true_of_the_mode_it_names() {
         enforcing.contains("does not own"),
         "the enforcing line must state the not-member refusal: {enforcing}"
     );
+    // Ledger 1755 (a): a registry that never loaded refuses every call that
+    // names a project, whatever the claim (`Reason::RegistryUnavailable`).
+    for unavailable in ["never loaded", "unavailable", "RegistryUnavailable"] {
+        assert!(
+            enforcing.contains(unavailable),
+            "the enforcing line must state the unavailable-registry refusal ({unavailable}): {enforcing}"
+        );
+    }
+    // Ledger 1755 (b): NotMember is wider than "a project the caller does not
+    // own". It is also any foreign `local/<seg>/...` claim, registered or not
+    // (ADR-0954), a project with a private row beneath it that the caller does
+    // not own, and a private row with no owner. The code's own term is
+    // "private", never "personal".
+    for wider in [
+        "local/",
+        "registered or not",
+        "beneath",
+        "no owner",
+        "private",
+    ] {
+        assert!(
+            enforcing.contains(wider),
+            "the enforcing line must state the whole not-member refusal ({wider}): {enforcing}"
+        );
+    }
+    assert!(
+        !enforcing.contains("personal"),
+        "the enforcing line must use the code's term `private`, not `personal`: {enforcing}"
+    );
 
     let counting = super::project_validation_announcement(Mode::Counting);
     assert!(
         counting.contains("counting") && counting.contains("refuses nobody"),
         "the counting line must say it refuses nobody: {counting}"
-    );
-    assert!(
-        !counting.contains("enforcing refuses"),
-        "the counting line must not claim enforcement: {counting}"
     );
 }

@@ -9,7 +9,7 @@
 //! **EXPECTED DELAYS ARE LITERALS** (ADR-0599, [`super`]'s rule): a schedule
 //! asserted through the function under test agrees with itself.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -57,9 +57,36 @@ fn once_loaded_every_retry_waits_the_whole_poll() {
     }
 }
 
+/// Make the log callsites of `report` safe to share between parallel tests.
+///
+/// **ROOT CAUSE OF LEDGER 1752.** `tracing` decides once per callsite whether
+/// anybody listens. While NO dispatcher exists, a callsite is judged from the
+/// registering thread's own (empty) default and cached. Registering the first
+/// dispatcher rebuilds that cache, but a callsite that a parallel test is
+/// registering at that instant is missed by the rebuild and stays "never".
+/// The only `set_default` in this test binary is in
+/// `the_logged_retry_secs_is_the_real_delay_before_the_next_load`, so it was
+/// the first dispatcher, it raced the sibling tests that also reach `report`,
+/// and the `("WARN", 60)` event was dropped about a third of the time.
+///
+/// A process-wide dispatcher installed ONCE, before any test thread registers
+/// those callsites, removes the race: every callsite is then judged against a
+/// dispatcher that listens, and the per-test `set_default` only chooses where
+/// the events go. Every test that reaches `report` calls this first.
+fn listen_for_logs() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let sink = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::set_global_default(sink).expect("no other global subscriber");
+    });
+}
+
 /// Run [`drive`] against a scripted loader and return the instant of each call,
 /// relative to the first.
 async fn call_times(script: Vec<bool>, registry: Registry) -> Vec<u64> {
+    listen_for_logs();
     let calls = Arc::new(Mutex::new(Vec::<Instant>::new()));
     let script = Arc::new(Mutex::new(script.into_iter()));
     let recorded = Arc::clone(&calls);
@@ -147,6 +174,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
 /// test here stays green.
 #[tokio::test(start_paused = true)]
 async fn the_logged_retry_secs_is_the_real_delay_before_the_next_load() {
+    listen_for_logs();
     let captured = Captured::default();
     let subscriber = tracing_subscriber::fmt()
         .json()
