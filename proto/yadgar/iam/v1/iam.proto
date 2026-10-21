@@ -99,6 +99,17 @@ message ResolveCredentialResponse {
   // published so that a consumer checking both is harder to get wrong than one
   // checking neither — but the empty `user_id` is the check that carries the
   // refusal, and this one does not replace it.
+  //
+  // A LIVE ANSWER NEVER OUTLIVES THE CREDENTIAL (ADR-0972 (3)). When
+  // yadgar.iamdb.v1.ResolveCredentialResponse.expires_at is present, `iam` sets
+  // this to min(300, expires_at - now), with a FLOOR OF 1. The floor exists
+  // because zero is the refusal signal above: a credential seconds from expiry
+  // must not be cached as a refusal. When `expires_at` is absent (a credential
+  // minted before ADR-0972 (3), which is not backfilled, an IssueCredential
+  // mint with expires_in_seconds 0, or an `iam-db` too old to return it), `iam`
+  // keeps 300. The gateway caches for min(its own TTL,
+  // this value). An `iam` built before ADR-0972 (3) sends 300 for every live
+  // answer, which is today's behaviour.
   int64 valid_for_seconds = 3;
 
   // D73's admin flag. The gateway needs it on every request: it gates the
@@ -156,6 +167,15 @@ message ResolveCredentialResponse {
 // Called by the GATEWAY, on behalf of `yadgar login` — never by an agent. This
 // is the one sign-in a person ever performs (D72); the token it returns is what
 // the client stores and attaches from then on.
+//
+// A LOGIN THAT LOST THE EPOCH RACE ANSWERS EXACTLY AS A WRONG PASSWORD
+// (ADR-0972 (4)). `iam` reads the hash and the credential epoch together, then
+// mints with yadgar.iamdb.v1.CreateCredentialRequest.expected_credential_epoch.
+// If a password-setting redemption, RevokeAllCredentials or SetPassword bumped
+// the epoch in between, the mint answers FAILED_PRECONDITION and nothing is
+// minted. `iam` maps that to the same code and message as a wrong password,
+// inside the same response floor, so the race opens no oracle. The person
+// logs in again with the password that now stands.
 message LoginRequest {
   string username = 1;
   // Never logged, never stored, and never echoed. Compared against an Argon2id
@@ -177,6 +197,18 @@ message LoginResponse {
   // Shown once. The store holds only a hash (D72).
   string token = 1;
   string credential_id = 2;
+
+  // When the credential this call minted stops resolving (ADR-0972 (3)).
+  // `iam` sets it to the mint time plus CREDENTIAL_LIFETIME_SECONDS, the same
+  // value it writes to the store, so the client can store it, show it in
+  // `whoami`, and explain a 401 after it as an expiry rather than guess.
+  //
+  // THERE IS NO "NEVER EXPIRES" VALUE (ADR-0972 (3)). An `iam` that implements
+  // ADR-0972 (3) always sets this. ABSENT MEANS AN `iam` TOO OLD TO SET IT,
+  // and NOT a credential that lives forever: a client reads absent as
+  // "expiry unknown", stores nothing, and keeps today's 401 handling. An old
+  // client ignores the field.
+  optional google.protobuf.Timestamp expires_at = 3;
 }
 
 // ---- Enrolment (D73): an admin creates the account, the PERSON sets the
@@ -266,8 +298,8 @@ message EnrolmentToken {
 // has `Login`'s enumeration problem in a sharper form, and it takes the same two
 // precautions:
 //
-//   - ONE FAILURE, NOT THREE. Unknown, already spent and expired are all
-//     UNAUTHENTICATED with one message. The server tells them apart and records
+//   - ONE FAILURE, NOT THREE. Unknown, already spent, expired and voided
+//     (ADR-0972 (5)) are all UNAUTHENTICATED with one message. The server tells them apart and records
 //     which (yadgar.iamdb.v1.RedeemOutcome); the caller cannot.
 //   - CONSTANT WORK. An unknown secret must not answer before a valid one has
 //     paid for its Argon2id hashing, or the response time restores exactly the
@@ -279,6 +311,18 @@ message EnrolmentToken {
 //     says the secret was good: an oracle cleaner than timing, and one that
 //     constant work does not touch. Either this order, or UNAUTHENTICATED for
 //     every failure. Constant work closes timing, not status codes.
+//
+// THE MINT CAN LOSE THE EPOCH RACE AFTER THE REDEMPTION COMMITTED (ADR-0972
+// (4)). `iam` mints the redemption's credential under the epoch
+// yadgar.iamdb.v1.RedeemEnrolmentResponse.credential_epoch returned. If a
+// second reset or a RevokeAllCredentials bumped the epoch in between, the
+// mint answers FAILED_PRECONDITION. By then the secret is spent and the
+// password is set, so the answer must not say spent or expired, and must not
+// be the single refusal above, which sends the person for a new enrolment
+// they do not need. `iam` answers FAILED_PRECONDITION with a fixed message:
+// "your password is set, but the account changed before a credential could be
+// issued; run `yaadgaar login`". It is answered inside the same floor, and it
+// is no oracle: only a caller who presented a valid secret reaches it.
 //
 // RETRY-SAFE WITHIN ONE PROCESS, BECAUSE OF `idempotency` BELOW. Redemption
 // spends the secret and mints the credential, so a lost RESPONSE leaves the
@@ -344,7 +388,9 @@ message EnrolmentToken {
 //
 // THE RESIDUAL, STATED RATHER THAN LEFT TO BE NOTICED: a lost response leaves
 // one credential nobody holds. THIS RPC ASKS FOR NO EXPIRY — there is no field
-// here to ask with — so it stands until it is withdrawn. It is enumerable
+// here to ask with. An `iam` that implements ADR-0972 (3) gives it the
+// configured CREDENTIAL_LIFETIME_SECONDS; one built before that minted it with
+// none, so it stood until it was withdrawn. It is enumerable
 // through ListCredentials and withdrawable through RevokeCredential; which
 // principal may call either is service policy rather than contract shape, and
 // ListCredentials says where that is decided. THAT RPC EXISTS BECAUSE OF THIS
@@ -462,6 +508,15 @@ message RedeemEnrolmentResponse {
   // the caller had to know it to call. This is not the hot path: it happens
   // once per person.
   string username = 3;
+
+  // When the credential this call minted stops resolving (ADR-0972 (3)).
+  // Exactly LoginResponse.expires_at: set by an `iam` that implements ADR-0972
+  // (3) to the mint time plus CREDENTIAL_LIFETIME_SECONDS, and absent only from
+  // an `iam` too old to set it — which a client reads as "expiry unknown",
+  // never as "no expiry". A RETRY mints a fresh credential (see `idempotency`
+  // on the request), so a retry's value is that new credential's expiry, not
+  // the first attempt's.
+  optional google.protobuf.Timestamp expires_at = 4;
 }
 
 // Everything below is administrative (D72): minting is GitOps or CLI, never an
@@ -500,6 +555,31 @@ message RevokeCredentialRequest {
   // service cannot verify it and MUST NOT authorise on it. The rule is stated
   // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
   yadgar.common.v1.UnverifiedActor unverified_actor = 3;
+
+  // The user the credential must belong to (ADR-0972 (2)). REQUIRED: an `iam`
+  // that implements ADR-0972 (2) refuses an empty value with INVALID_ARGUMENT
+  // before any upstream call, relays it to
+  // yadgar.iamdb.v1.RevokeCredentialRequest.user_id, and publishes
+  // CREDENTIAL_REVOKED for this user.
+  //
+  // A CREDENTIAL THAT DOES NOT BELONG TO THIS USER IS NOT_FOUND, AND NOTHING
+  // IS WRITTEN — the same answer as an unknown id, so the call cannot be used
+  // to learn whose a credential is. A credential of this user that is already
+  // revoked answers OK and changes nothing.
+  //
+  // This is an OWNERSHIP check, not authorisation: the caller names a user and
+  // a credential, and the store refuses a pair that does not match. Who may
+  // revoke is still the gateway's policy (an attested administrator only,
+  // ADR-0972 (2)).
+  //
+  // MIXED VERSIONS. An `iam` built before ADR-0972 (2) ignores this field
+  // and sends no `user_id` to `iam-db`. Against an `iam-db` that implements
+  // ADR-0972 (2) that call is refused with INVALID_ARGUMENT: it FAILS CLOSED,
+  // on an admin-only verb, and never revokes the wrong credential. Against an
+  // older `iam-db` it is the id-only revoke of today. A new `iam` against an
+  // `iam-db` that does not yet read the field also gets the id-only revoke:
+  // ownership holds only once `iam-db` implements it.
+  string user_id = 4;
 }
 message RevokeCredentialResponse {}
 
@@ -531,6 +611,8 @@ message RevokeCredentialResponse {}
 // IT DOES NOT CHANGE THE PASSWORD AND DOES NOT STOP LOGIN. The person can log
 // in again afterwards and mint a new credential; this verb contains the tokens
 // that exist now and nothing more. A leaked password is a different threat.
+// It DOES bump the user's credential epoch (ADR-0972 (4)), so a Login that
+// verified the password BEFORE this commit cannot mint a credential after it.
 //
 // `iam` PUBLISHES CREDENTIAL_REVOKED AFTER THE COMMIT WHATEVER `revoked` IS
 // (ADR-0945). A failed publish does not fail the call, and the gateway
@@ -561,6 +643,19 @@ message RevokeAllCredentialsResponse {
   // them. See the request's comment: `revoked = 0` on a retry does not mean no
   // token was revoked.
   uint32 revoked = 1;
+
+  // The number of the user's live enrolments THE DELIVERY voided (ADR-0972
+  // (5)), relayed unchanged from
+  // yadgar.iamdb.v1.RevokeAllCredentialsResponse.voided_enrolments. Revoke-all
+  // voids every enrolment of the user that is neither spent nor already
+  // voided, an outstanding bootstrap enrolment included, so a leaked
+  // unredeemed enrolment cannot re-open the account.
+  //
+  // COUNTED LIKE `revoked`, AND READ LIKE IT: a redelivery reports only what
+  // it changed, usually 0. Zero is a success. An `iam` or `iam-db` built
+  // before ADR-0972 (5) reports 0 because it voids nothing, so ZERO DOES NOT
+  // PROVE NO ENROLMENT WAS LIVE. DO NOT BRANCH ON IT.
+  uint32 voided_enrolments = 2;
 }
 
 // A credential as the person holding it sees one: enough to tell two apart and
@@ -578,8 +673,11 @@ message Credential {
   // which is why `created_at` is here.
   string label = 2;
   google.protobuf.Timestamp created_at = 3;
-  // Absent means no expiry, which is what a redemption mints: its request has
-  // no field to ask for one.
+  // When the credential stops resolving. A Login or redemption credential
+  // minted by an `iam` that implements ADR-0972 (3) always carries one: the
+  // mint time plus CREDENTIAL_LIFETIME_SECONDS. ABSENT MEANS A ROW MINTED
+  // BEFORE THAT, which is not backfilled (ADR-0972 (3)), or an IssueCredential
+  // mint with expires_in_seconds 0. Either way it does not expire.
   optional google.protobuf.Timestamp expires_at = 4;
 }
 
@@ -588,10 +686,10 @@ message Credential {
 // exists; without it that credential is reachable only by someone with direct
 // access to the database.
 //
-// WHO MAY CALL IT — the owner, an admin, or both — is service policy rather
-// than contract shape, exactly as it is for RevokeCredential beside it. The
-// gateway is the one place identity is attested (ADR-0488), so the gateway is
-// where that is decided.
+// WHO MAY CALL IT is service policy rather than contract shape, exactly as it
+// is for RevokeCredential beside it. The gateway is the one place identity is
+// attested (ADR-0488), so the gateway is where that is decided. ADR-0972 (2)
+// decided it: an attested administrator only, with no owner self-service.
 //
 // NEVER THE TOKEN AND NEVER ITS HASH. IssueCredentialResponse states the rule
 // this obeys: a credential store able to hand back its own tokens is a
@@ -1085,6 +1183,20 @@ message RemoveTeamMemberRequest {
 message RemoveTeamMemberResponse {}
 
 // Holds no store. Reaches its data ONLY over IamDbService (D4).
+//
+// ONE CALLER, ON EVERY RPC (ADR-0972 (1)). An `iam` that implements ADR-0972
+// (1) admits a call only when the peer's verified client certificate has the
+// common name `gateway-caller`, the gateway's leaf. Any other name, and no
+// name at all (a listener with client authentication off, or no client
+// certificate), is refused with PERMISSION_DENIED before any upstream call.
+// That includes ResolveCredential, Login and RedeemEnrolment. An `iam` built
+// before ADR-0972 (1) checks no name, and NetworkPolicy is then the only
+// control.
+//
+// THIS IS TRANSPORT IDENTITY, NOT THE ACTOR. It says which SERVICE dialled,
+// and nothing about which person the gateway acts for. The "WHO MAY CALL IT is
+// the gateway's policy" paragraphs above stay true: `unverified_actor` is
+// still audit-only, and the gateway still decides who may use each verb.
 service IamService {
   rpc ResolveCredential(ResolveCredentialRequest) returns (ResolveCredentialResponse);
   rpc Login(LoginRequest) returns (LoginResponse);

@@ -153,6 +153,20 @@ fn the_bootstrap_token_never_revokes_credentials() {
     );
 }
 
+/// ADR-0972 (2): listing and revoking one credential are for an attested
+/// administrator only. Both flag values, for the reason the test above gives.
+#[test]
+fn the_bootstrap_token_never_lists_or_revokes_one_credential() {
+    for verb in [Verb::ListCredentials, Verb::RevokeCredential] {
+        for flag in [true, false] {
+            assert!(
+                !verb.accepts_bootstrap(flag),
+                "the bootstrap token must never reach {verb:?}"
+            );
+        }
+    }
+}
+
 /// §6, and the row §9 names: assert ABSENCE, not an empty string.
 #[test]
 fn the_bootstrap_path_stamps_no_actor_at_all() {

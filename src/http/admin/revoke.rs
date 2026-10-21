@@ -147,7 +147,14 @@ pub(in crate::http) async fn admin_revoke_credentials(
 
     // `revoked` counts the rows THIS delivery changed (iam.proto): a retry may
     // answer 0 after an earlier delivery revoked everything.
-    let rendered = json!({ "user_id": user_id, "revoked": resp.revoked }).to_string();
+    // `voided_enrolments` is counted the same way (ADR-0972 (5)), and an `iam`
+    // built before that ADR always answers 0: zero proves nothing.
+    let rendered = json!({
+        "user_id": user_id,
+        "revoked": resp.revoked,
+        "voided_enrolments": resp.voided_enrolments,
+    })
+    .to_string();
     call.finish(Outcome {
         status: "OK",
         encoded_bytes: Some(rendered.len() as u64),

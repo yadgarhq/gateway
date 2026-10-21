@@ -3044,6 +3044,10 @@ mod archived;
 /// refusals that need no answering `iam`.
 mod revoke;
 
+/// `/admin/list-credentials` and `/admin/revoke-credential` (ADR-0972 (2)):
+/// the refusals that need no answering `iam`.
+mod credentials;
+
 /// `PROJECT_NOT_MEMBER` through the router: every tool, the 403, and one
 /// answer for every non-owner (`plans/project-membership.md` car P3).
 mod not_member;

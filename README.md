@@ -35,14 +35,14 @@ cutoff.
 
 Consequences here:
 
-|                   |                                                                                                                                                                                                                                                                              |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                                                                                                                                                      |
-| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login`, `POST /auth/enrol`, `GET /auth/whoami` and the four `POST /admin/*` verbs are the non-MCP paths. **An administrative verb is never an MCP tool** (ADR-0492). |
-| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                                                                                                                                                         |
-| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`.                                                                                                                                |
-| `resultType`      | Required on every result. This server only returns `complete`.                                                                                                                                                                                                               |
-| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                                                                                                                                      |
+|                   |                                                                                                                                                                                                                                                                             |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Statelessness     | No session is minted or echoed. Any replica serves any request; no affinity, which is what D47 assumed.                                                                                                                                                                     |
+| One MCP endpoint  | `POST /`. GET and DELETE get `405` — there is no stream in this revision for a GET to open. `POST /auth/login`, `POST /auth/enrol`, `GET /auth/whoami` and the six `POST /admin/*` verbs are the non-MCP paths. **An administrative verb is never an MCP tool** (ADR-0492). |
+| `server/discover` | Implemented, because the spec says servers MUST. It replaces the handshake a stateless protocol has nowhere to keep.                                                                                                                                                        |
+| Three headers     | `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` mirror the body's `_meta` and are cross-checked. Disagreement is `-32020 HeaderMismatch`.                                                                                                                               |
+| `resultType`      | Required on every result. This server only returns `complete`.                                                                                                                                                                                                              |
+| Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                                                                                                                                     |
 
 ## Identity
 
@@ -218,7 +218,7 @@ secret and is refused. See `## Risk` on the pull request that added this, and
 No rate limit and no audit record, exactly as `/auth/login` — and this endpoint
 does Argon2id work for anyone who can reach the port.
 
-### `POST /admin/create-user`, `POST /admin/issue-enrolment`, `POST /admin/set-user-admin`, `POST /admin/revoke-credentials`
+### `POST /admin/create-user`, `POST /admin/issue-enrolment`, `POST /admin/set-user-admin`, `POST /admin/revoke-credentials`, `POST /admin/list-credentials`, `POST /admin/revoke-credential`
 
 ADR-0492's administrative surface (D73, ledger 638). **These are never MCP
 tools**: no name of theirs is in `tools::SERVED`, so `tools/call` cannot dispatch
@@ -229,9 +229,11 @@ to one and `tools/list` cannot advertise one.
 | `/admin/create-user`        | `external_id`, `display_name`, optional `is_admin`            | `{"user_id": ...}`                                                                       |
 | `/admin/issue-enrolment`    | `user_id`, optional `revoke_existing_credentials` (a boolean) | `{"token": ..., "enrolment_id": ..., "revoke_existing_credentials": <bool, as applied>}` |
 | `/admin/set-user-admin`     | `user_id`, `is_admin` (a required boolean)                    | `{"user_id": ..., "is_admin": ...}`                                                      |
-| `/admin/revoke-credentials` | `user_id` (the only accepted key)                             | `{"user_id": ..., "revoked": <rows this request changed>}`                               |
+| `/admin/revoke-credentials` | `user_id` (the only accepted key)                             | `{"user_id": ..., "revoked": <rows changed>, "voided_enrolments": <enrolments voided>}`  |
+| `/admin/list-credentials`   | `user_id`, optional `page_token` (the only accepted keys)     | `{"credentials": [{"id", "label", "created_at", "expires_at"?}], "next_page_token"}`     |
+| `/admin/revoke-credential`  | `user_id`, `credential_id` (the only accepted keys)           | `{"user_id": ..., "credential_id": ...}`                                                 |
 
-The `user_id` `/admin/create-user` returns is the one the other three take.
+The `user_id` `/admin/create-user` returns is the one the other routes take.
 
 **Two authority mechanisms, and neither works alone.**
 
@@ -273,8 +275,23 @@ cache. A user `iam` does not hold is `404`. `iam` publishes the cache eviction
 after its commit, so a revoked token stops resolving at once; a missed publish
 leaves it resolving for at most `YADGAR_CREDENTIAL_TTL_SECONDS`. `revoked` counts
 the rows this request changed, so a retry can answer `0` after an earlier
-delivery revoked everything. Revocation does not change the password or stop
-the person logging in again.
+delivery revoked everything. `voided_enrolments` counts the user's live
+enrolments this request voided (ADR-0972 (5)), counted the same way; an `iam`
+built before that ADR answers `0`, so zero proves nothing. Revocation does not
+change the password or stop the person logging in again.
+
+**`/admin/list-credentials` and `/admin/revoke-credential` find and withdraw one
+credential** (ADR-0972 (2)), such as the orphan a lost login or redemption
+response leaves. Only an attested administrator may call them: the bootstrap
+token gets `403` and there is no owner self-service. Bodies are strict, and
+`user_id` must be canonical, as on `/admin/revoke-credentials`. The list omits
+revoked rows and includes expired ones. It never carries a token or a hash.
+Times are RFC 3339, and a row minted before credentials expired has no
+`expires_at` key. `revoke-credential` revokes only a credential of the named
+user: an unknown id and another user's id both answer
+`404 {"error":"no such credential for this user"}`. An administrator may revoke
+their own credential. Every other `iam` refusal answers the opaque `503`
+(ADR-0927); an unknown user gets an empty list, not a `404`.
 
 **An absent or empty bootstrap Secret DISABLES the bootstrap path**, answering
 `503 {"error":"the bootstrap token is not configured"}` — never a comparison

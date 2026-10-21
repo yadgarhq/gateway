@@ -512,7 +512,10 @@ macro_rules! stub_iam_service {
                         .expect("the broker is still running");
                 }
                 Ok(tonic::Response::new(
-                    yadgar_gateway::pb::yadgar::iam::v1::RevokeAllCredentialsResponse { revoked: 2 },
+                    yadgar_gateway::pb::yadgar::iam::v1::RevokeAllCredentialsResponse {
+                        revoked: 2,
+                        voided_enrolments: 0,
+                    },
                 ))
             }
 
