@@ -74,8 +74,8 @@ const AUTH_ENROL: &str = "auth/enrol";
 /// same for both and splitting it would halve every count.
 const AUTH_MODULE: &str = "auth";
 
-/// The four administrative endpoints' labels (ADR-0492, D73, ledger 638,
-/// ADR-0945).
+/// The six administrative endpoints' labels (ADR-0492, D73, ledger 638,
+/// ADR-0945, ADR-0972 (2)).
 ///
 /// PATHS rather than MCP methods, for [`AUTH_LOGIN`]'s reason — that is what they
 /// are — and `&'static` and closed for D67's.
@@ -89,6 +89,8 @@ const ADMIN_CREATE_USER: &str = "admin/create-user";
 const ADMIN_ISSUE_ENROLMENT: &str = "admin/issue-enrolment";
 const ADMIN_SET_USER_ADMIN: &str = "admin/set-user-admin";
 const ADMIN_REVOKE_CREDENTIALS: &str = "admin/revoke-credentials";
+const ADMIN_LIST_CREDENTIALS: &str = "admin/list-credentials";
+const ADMIN_REVOKE_CREDENTIAL: &str = "admin/revoke-credential";
 
 /// Where a caller presents D73's bootstrap token.
 ///

@@ -154,6 +154,10 @@ enum RevokeAnswer {
 /// echo that hardcoded either is visible.
 const REVOKED_COUNT: u32 = 3;
 
+/// The void count the stub's `RevokeAllCredentials` answers (ADR-0972 (5)).
+/// Different from [`REVOKED_COUNT`], so an echo that swapped the two is visible.
+const VOIDED_COUNT: u32 = 2;
+
 /// Write the stub's whole `IamService` impl: five real methods and nine refusals.
 ///
 /// **THE MACRO EMITS `#[tonic::async_trait]` ITSELF, and it has to.** That
@@ -267,6 +271,7 @@ macro_rules! admin_iam_service {
                 match self.revoke.clone() {
                     RevokeAnswer::Count => Ok(tonic::Response::new(RevokeAllCredentialsResponse {
                         revoked: REVOKED_COUNT,
+                        voided_enrolments: VOIDED_COUNT,
                     })),
                     RevokeAnswer::Refuse(status) => Err(status),
                     RevokeAnswer::Hang => std::future::pending().await,
@@ -1361,8 +1366,12 @@ async fn revoke_answers_the_user_id_and_the_count() {
     let answer: Value = serde_json::from_str(&body).expect("a JSON body");
     assert_eq!(
         answer,
-        serde_json::json!({ "user_id": OTHER_ID, "revoked": REVOKED_COUNT }),
-        "the 200 echoes user_id and the revoked count iam answered"
+        serde_json::json!({
+            "user_id": OTHER_ID,
+            "revoked": REVOKED_COUNT,
+            "voided_enrolments": VOIDED_COUNT,
+        }),
+        "the 200 echoes user_id, the revoked count and the void count iam answered"
     );
 }
 

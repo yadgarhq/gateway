@@ -1,7 +1,9 @@
-//! The four administrative endpoints (ADR-0492, D73, ADR-0945).
+//! The six administrative endpoints (ADR-0492, D73, ADR-0945, ADR-0972 (2)).
 //!
 //! Split out of [`super`] for the file-size ceiling; the fourth,
-//! `revoke-credentials`, lives in [`revoke`] for the same reason. WHO is allowed to reach
+//! `revoke-credentials`, lives in [`revoke`] for the same reason, and the
+//! fifth and sixth, `list-credentials` and `revoke-credential`, in
+//! [`credentials`]. WHO is allowed to reach
 //! them is [`super::authority`]'s, and the split is deliberate in that
 //! direction: these handlers do the work, and none of them decides the
 //! authorization.
@@ -11,6 +13,7 @@ use super::dispatch::*;
 use super::gate::*;
 use super::*;
 
+pub(in crate::http) mod credentials;
 pub(in crate::http) mod revoke;
 
 /// This module's routes. See [`super::dispatch::routes`] for why each set is
@@ -48,6 +51,16 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route(
             "/admin/revoke-credentials",
             post(revoke::admin_revoke_credentials).fallback(method_not_allowed),
+        )
+        // ADR-0972 (2). Above the layer and out of `tools::SERVED`, like the
+        // four above them.
+        .route(
+            "/admin/list-credentials",
+            post(credentials::admin_list_credentials).fallback(method_not_allowed),
+        )
+        .route(
+            "/admin/revoke-credential",
+            post(credentials::admin_revoke_credential).fallback(method_not_allowed),
         )
 }
 
