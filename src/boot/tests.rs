@@ -242,3 +242,33 @@ fn enforcing_with_trusted_headers_refuses_to_boot_naming_both_settings() {
         "enforcing with iam attestation boots"
     );
 }
+
+/// LEDGER 1747: the boot line that names the project-validation mode must say
+/// what THAT mode does. v0.12.21 logged "`counting` refuses nobody" under
+/// `enforcing` too, which reads as a gateway that refuses nothing.
+#[test]
+fn the_project_validation_boot_line_is_true_of_the_mode_it_names() {
+    use yadgar_gateway::project::Mode;
+
+    let enforcing = super::project_validation_announcement(Mode::Enforcing);
+    for counting_claim in ["refuses nobody", "only counts", "`counting`"] {
+        assert!(
+            !enforcing.contains(counting_claim),
+            "the enforcing line must not claim counting semantics ({counting_claim}): {enforcing}"
+        );
+    }
+    assert!(
+        enforcing.contains("enforcing") && enforcing.contains("refuses"),
+        "the enforcing line must say it refuses: {enforcing}"
+    );
+
+    let counting = super::project_validation_announcement(Mode::Counting);
+    assert!(
+        counting.contains("counting") && counting.contains("refuses nobody"),
+        "the counting line must say it refuses nobody: {counting}"
+    );
+    assert!(
+        !counting.contains("enforcing refuses"),
+        "the counting line must not claim enforcement: {counting}"
+    );
+}

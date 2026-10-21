@@ -372,3 +372,23 @@ pub fn refuse_unverifiable_enforcement(
         _ => Ok(()),
     }
 }
+
+/// The boot line that names the project-validation mode, true of THAT mode.
+///
+/// Ledger 1747: v0.12.21 logged "`counting` refuses nobody" whatever the mode,
+/// so an ENFORCING gateway announced itself as one that refuses nothing. Each
+/// arm now states what its own mode does (`plans/project-validation.md`).
+pub fn project_validation_announcement(mode: yadgar_gateway::project::Mode) -> &'static str {
+    match mode {
+        yadgar_gateway::project::Mode::Counting => {
+            "project validation is configured in `counting` mode: it resolves, classifies and \
+             counts each claimed workspace, refuses nobody, and stamps nothing \
+             (plans/project-validation.md)"
+        }
+        yadgar_gateway::project::Mode::Enforcing => {
+            "project validation is configured in `enforcing` mode: it refuses every call whose \
+             claimed workspace the registry does not accept, and stamps the registered path in \
+             place of the claim (plans/project-validation.md)"
+        }
+    }
+}
