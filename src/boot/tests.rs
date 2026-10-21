@@ -261,6 +261,20 @@ fn the_project_validation_boot_line_is_true_of_the_mode_it_names() {
         enforcing.contains("enforcing") && enforcing.contains("refuses"),
         "the enforcing line must say it refuses: {enforcing}"
     );
+    // ADR-0941: an archived project refuses WRITES and still serves READS, so
+    // a line that only said "refuses every call the registry does not accept"
+    // would overstate it. Pin both halves of the nuance.
+    for archived_nuance in ["archived", "writes", "reads"] {
+        assert!(
+            enforcing.contains(archived_nuance),
+            "the enforcing line must state the archived write/read split ({archived_nuance}): {enforcing}"
+        );
+    }
+    // ADR-0947: a private project the caller does not own is refused for both.
+    assert!(
+        enforcing.contains("does not own"),
+        "the enforcing line must state the not-member refusal: {enforcing}"
+    );
 
     let counting = super::project_validation_announcement(Mode::Counting);
     assert!(
