@@ -148,8 +148,11 @@ on it would be wrong with no error anywhere.
 ### `POST /auth/login`
 
 One of two unauthenticated paths (D75). `yaadgaar login` posts
-`{"username", "password", "label"}` and reads `{"token"}` back; the gateway
-translates that to `iam.Login` and drops `credential_id`, which nothing reads.
+`{"username", "password", "label"}` and reads `{"token", "expires_at"}` back; the
+gateway translates that to `iam.Login` and drops `credential_id`, which nothing
+reads. `expires_at` is when the credential stops resolving, in RFC 3339
+(ADR-0972 (3)). An `iam` too old to set it sends none, and then the key is
+absent: that means "expiry unknown", never "no expiry".
 
 **Two statuses, and that is the security property.** `UNAUTHENTICATED` is `401`;
 **every** other gRPC code is one opaque `503` with a constant body.
@@ -184,7 +187,8 @@ here; D74's buckets key on a user and a login has none yet.
 The other unauthenticated path (D73). An admin creates the account and hands over
 an enrolment token; the PERSON chooses their own password here, so the admin never
 learns it. `yaadgaar` posts `{"secret", "password", "label"}` and reads
-`{"token", "username"}` back.
+`{"token", "username", "expires_at"}` back. `expires_at` follows the
+`/auth/login` rule above.
 
 `username` is returned and `credential_id` is dropped. The contract returns the
 username because a person enrolling on their first machine would otherwise have to
@@ -208,6 +212,16 @@ password-policy refusal arrives without the secret having been checked; it is al
 what a replayed idempotency key with a different password returns, and that check
 runs only once the store has confirmed the secret was good. One code, both sides of
 the lookup, nothing to tell them apart — `login`'s problem exactly.
+
+**One code is carved out: `FAILED_PRECONDITION` is
+``409 {"error":"your password is set, but the account changed before a credential could be issued; run `yaadgaar login`"}``**
+(ADR-0977, a narrow exception to ADR-0927; ADR-0972 (4)). `iam` answers it only after the redemption committed: the secret
+is spent, the password is set, and the credential mint lost the epoch race to a
+concurrent reset or revoke-all. The opaque `503` would invite a retry with a spent
+secret, whose `401` sends the person for an enrolment they do not need. Only a
+caller who presented a valid secret can reach this answer, so it is no oracle.
+`http::opaque_status` itself is unchanged; the carve-out lives in
+`http::enrol_answer`, and `/auth/login` keeps `FAILED_PRECONDITION` opaque.
 
 The idempotency key is **minted per inbound request**, which makes this gateway's
 own retry to `iam` safe and does **not** deduplicate a client's retry: a client

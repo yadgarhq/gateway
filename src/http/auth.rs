@@ -170,10 +170,11 @@ pub(super) async fn login(
         }
     };
 
-    // ONLY `token`. `LoginResponse.credential_id` is dropped: the client's
-    // `LoginResponse` has one field, and a value nothing reads is a value that
-    // only widens what a successful response discloses.
-    let rendered = json!({ "token": resp.token }).to_string();
+    // `token` AND `expires_at`. `LoginResponse.credential_id` is dropped: a
+    // value nothing reads is a value that only widens what a successful
+    // response discloses. `expires_at` is read: the client stores it and
+    // explains a 401 after it (ADR-0972 (3)).
+    let rendered = with_expiry(json!({ "token": resp.token }), resp.expires_at).to_string();
     call.finish(Outcome {
         status: "OK",
         encoded_bytes: Some(rendered.len() as u64),
@@ -351,10 +352,12 @@ pub(super) async fn enrol(
             // more than usual, because the person on the other end has one
             // enrolment token and no way to diagnose it themselves.
             tracing::warn!(code = ?e.code(), message = e.message(), "enrolment refused or failed");
-            call.fail(if e.code() == tonic::Code::Unauthenticated {
-                "UNAUTHENTICATED"
-            } else {
-                "UNAVAILABLE"
+            call.fail(match e.code() {
+                tonic::Code::Unauthenticated => "UNAUTHENTICATED",
+                // The redemption committed and the mint lost the epoch race
+                // (ADR-0972 (4)); see `enrol_answer`.
+                tonic::Code::FailedPrecondition => "FAILED_PRECONDITION",
+                _ => "UNAVAILABLE",
             });
             return enrol_failure(e.code());
         }
@@ -370,7 +373,11 @@ pub(super) async fn enrol(
         }
     };
 
-    let rendered = json!({ "token": resp.token, "username": resp.username }).to_string();
+    let rendered = with_expiry(
+        json!({ "token": resp.token, "username": resp.username }),
+        resp.expires_at,
+    )
+    .to_string();
     call.finish(Outcome {
         status: "OK",
         encoded_bytes: Some(rendered.len() as u64),
@@ -382,4 +389,17 @@ pub(super) async fn enrol(
         ..Default::default()
     });
     text(StatusCode::OK, &rendered)
+}
+
+/// `body` with the credential's `expires_at` in RFC 3339, when `iam` sent one
+/// (ADR-0972 (3)).
+///
+/// ABSENT IS AN ABSENT KEY, never `null` and never a sentinel: `iam.proto`
+/// says an absent value means an `iam` too old to set it, so "expiry unknown",
+/// and not a credential that lives forever.
+fn with_expiry(mut body: Value, expires_at: Option<prost_types::Timestamp>) -> Value {
+    if let (Some(at), Value::Object(fields)) = (expires_at, &mut body) {
+        fields.insert("expires_at".into(), Value::String(at.to_string()));
+    }
+    body
 }
