@@ -215,7 +215,7 @@ the lookup, nothing to tell them apart — `login`'s problem exactly.
 
 **One code is carved out: `FAILED_PRECONDITION` is
 ``409 {"error":"your password is set, but the account changed before a credential could be issued; run `yaadgaar login`"}``**
-(ADR-0972 (4)). `iam` answers it only after the redemption committed: the secret
+(ADR-0977, a narrow exception to ADR-0927; ADR-0972 (4)). `iam` answers it only after the redemption committed: the secret
 is spent, the password is set, and the credential mint lost the epoch race to a
 concurrent reset or revoke-all. The opaque `503` would invite a retry with a spent
 secret, whose `401` sends the person for an enrolment they do not need. Only a
