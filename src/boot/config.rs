@@ -380,6 +380,8 @@ pub fn refuse_unverifiable_enforcement(
 /// arm now states what its own mode does (`plans/project-validation.md`). The
 /// enforcing arm follows [`yadgar_gateway::project::Reason`]: every class
 /// refuses reads and writes alike except `Archived`, which refuses writes only.
+/// `RegistryUnavailable` covers every call that names a project, and `NotMember`
+/// covers more than a project the caller does not own (`project/member.rs`).
 pub fn project_validation_announcement(mode: yadgar_gateway::project::Mode) -> &'static str {
     match mode {
         yadgar_gateway::project::Mode::Counting => {
@@ -390,9 +392,15 @@ pub fn project_validation_announcement(mode: yadgar_gateway::project::Mode) -> &
         yadgar_gateway::project::Mode::Enforcing => {
             "project validation is configured in `enforcing` mode: it refuses every call whose \
              claimed workspace is invalid or does not resolve against the registry, refuses \
-             every call to a personal project the caller does not own, refuses writes to an \
-             archived project but still serves its reads, and stamps the registered path in \
-             place of the claim (plans/project-validation.md, ADR-0941, ADR-0947)"
+             every call that names a project while the registry has not yet loaded \
+             (RegistryUnavailable), refuses every call that claims a `local/<account>/...` \
+             project of another account, registered or not, refuses every call to a private \
+             project the caller does not own, including one with no owner, refuses every call \
+             to a project, the caller's own private project included, that has a private \
+             project beneath it the caller does not own, treats a caller whose user id has \
+             no account segment as foreign to every `local/` claim, refuses writes to an archived project but still \
+             serves its reads, and stamps the registered path in place of the claim \
+             (plans/project-validation.md, ADR-0674, ADR-0941, ADR-0947, ADR-0954)"
         }
     }
 }

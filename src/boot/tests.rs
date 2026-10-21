@@ -275,14 +275,50 @@ fn the_project_validation_boot_line_is_true_of_the_mode_it_names() {
         enforcing.contains("does not own"),
         "the enforcing line must state the not-member refusal: {enforcing}"
     );
+    // Ledger 1755 (a): a registry that has not yet loaded refuses every call
+    // that names a project, whatever the claim (`Reason::RegistryUnavailable`).
+    for not_loaded in ["not yet loaded", "RegistryUnavailable"] {
+        assert!(
+            enforcing.contains(not_loaded),
+            "the enforcing line must state the not-yet-loaded refusal ({not_loaded}): {enforcing}"
+        );
+    }
+    // ...and ONLY before the first load: after one, an outage keeps serving the
+    // stale set (ADR-0674), so the line must not claim a refusal during an
+    // outage. The lower-case word may appear only inside the token.
+    for outage_claim in ["unavailable", "outage", "never loaded"] {
+        assert!(
+            !enforcing.contains(outage_claim),
+            "the enforcing line must not claim a refusal after a load ({outage_claim}): {enforcing}"
+        );
+    }
+    // Ledger 1755 (b): NotMember is wider than "a project the caller does not
+    // own". It is also any foreign `local/<seg>/...` claim, registered or not
+    // (ADR-0954), a project with a private row beneath it that the caller does
+    // not own, and a private row with no owner. The code's own term is
+    // "private", never "personal".
+    for wider in [
+        "local/",
+        "registered or not",
+        "beneath",
+        "no owner",
+        "private",
+        "own private project",
+        "no account segment",
+    ] {
+        assert!(
+            enforcing.contains(wider),
+            "the enforcing line must state the whole not-member refusal ({wider}): {enforcing}"
+        );
+    }
+    assert!(
+        !enforcing.contains("personal"),
+        "the enforcing line must use the code's term `private`, not `personal`: {enforcing}"
+    );
 
     let counting = super::project_validation_announcement(Mode::Counting);
     assert!(
         counting.contains("counting") && counting.contains("refuses nobody"),
         "the counting line must say it refuses nobody: {counting}"
-    );
-    assert!(
-        !counting.contains("enforcing refuses"),
-        "the counting line must not claim enforcement: {counting}"
     );
 }
