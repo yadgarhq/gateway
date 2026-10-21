@@ -24,9 +24,6 @@ use super::super::*;
 use super::revoke::is_canonical_user_id;
 use crate::pb::yadgar::iam::v1::{Credential, ListCredentialsRequest, RevokeCredentialRequest};
 
-/// The fixed 400 body for an `iam` INVALID_ARGUMENT. Never `iam`'s own words.
-const MALFORMED: &str = r#"{"error":"iam refused the request as malformed"}"#;
-
 /// A strict JSON object: every key in `allowed`, or the 400's message.
 fn strict<'a>(
     body: &'a Value,
@@ -95,23 +92,28 @@ fn bad_body(call: Call, message: &str) -> Response {
     )
 }
 
-/// An `iam` refusal on these two routes. NOT_FOUND is a 404 with `not_found`
-/// as its fixed body, INVALID_ARGUMENT a 400 with [`MALFORMED`]; everything
-/// else is `admin_failure`'s, as on every sibling route.
-fn refused(
-    call: Call,
-    endpoint: &'static str,
-    e: tonic::Status,
-    not_found: &'static str,
-) -> Response {
-    let (status, label, body) = match e.code() {
-        tonic::Code::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND", not_found),
-        tonic::Code::InvalidArgument => (StatusCode::BAD_REQUEST, "INVALID_ARGUMENT", MALFORMED),
-        _ => return admin_failure(call, endpoint, e),
-    };
-    tracing::warn!(code = ?e.code(), message = e.message(), endpoint, "iam refused a credential route");
-    call.fail(label);
-    text(status, body)
+/// An `iam` refusal on revoke-credential.
+///
+/// NOT_FOUND IS 404, as on revoke-credentials (ADR-0945) and as plan §2
+/// extends it here. EVERY OTHER CODE IS `admin_failure`'s opaque answer,
+/// INVALID_ARGUMENT included: ADR-0927 keeps upstream refusals at 503, and
+/// only this route's NOT_FOUND has a later ruling. The 400s this gateway
+/// answers itself are request-only and are not this.
+fn revoke_refused(call: Call, e: tonic::Status) -> Response {
+    if e.code() != tonic::Code::NotFound {
+        return admin_failure(call, ADMIN_REVOKE_CREDENTIAL, e);
+    }
+    tracing::warn!(
+        endpoint = ADMIN_REVOKE_CREDENTIAL,
+        "revoke-credential named no credential of this user"
+    );
+    call.fail("NOT_FOUND");
+    // ONE BODY for an unknown id and another user's id: `iam-db` answers
+    // NOT_FOUND for both, so the route cannot tell whose a credential is.
+    text(
+        StatusCode::NOT_FOUND,
+        r#"{"error":"no such credential for this user"}"#,
+    )
 }
 
 /// One listed row. ONLY the four projected fields: `iam` sends no token and
@@ -189,14 +191,9 @@ pub(in crate::http) async fn admin_list_credentials(
     });
     let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
         Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(e)) => {
-            return refused(
-                call,
-                ADMIN_LIST_CREDENTIALS,
-                e,
-                r#"{"error":"no such user"}"#,
-            )
-        }
+        // EVERY REFUSAL IS OPAQUE HERE (ADR-0927). `iam-db` answers an unknown
+        // user with an empty page, not NOT_FOUND, so there is no 404 to map.
+        Ok(Err(e)) => return admin_failure(call, ADMIN_LIST_CREDENTIALS, e),
         Err(_elapsed) => return admin_timeout(call, ADMIN_LIST_CREDENTIALS),
     };
 
@@ -277,16 +274,7 @@ pub(in crate::http) async fn admin_revoke_credential(
     });
     match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
         Ok(Ok(_)) => {}
-        // ONE BODY for an unknown id and another user's id: `iam-db` answers
-        // NOT_FOUND for both, so the route cannot tell whose a credential is.
-        Ok(Err(e)) => {
-            return refused(
-                call,
-                ADMIN_REVOKE_CREDENTIAL,
-                e,
-                r#"{"error":"no such credential for this user"}"#,
-            )
-        }
+        Ok(Err(e)) => return revoke_refused(call, e),
         Err(_elapsed) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIAL),
     }
 

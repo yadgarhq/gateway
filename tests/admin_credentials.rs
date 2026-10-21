@@ -91,6 +91,9 @@ fn rows() -> Vec<Credential> {
     ]
 }
 
+/// `admin_failure`'s body for every opaque upstream refusal.
+const UNAVAILABLE: &str = r#"{"error":"the administrative service is unavailable"}"#;
+
 const NEXT_PAGE: &str = "yadgar:credential:0192f3c1-8a4e-7c2d-9b11-000000000012";
 
 macro_rules! credential_iam_service {
@@ -403,24 +406,15 @@ async fn list_credentials_refuses_a_bad_body_before_iam() {
 }
 
 #[tokio::test]
-async fn list_credentials_maps_not_found_and_invalid_argument() {
-    let cases = [
-        (
-            tonic::Status::not_found("no iam_user row"),
-            StatusCode::NOT_FOUND,
-            r#"{"error":"no such user"}"#,
-        ),
-        (
-            tonic::Status::invalid_argument("`page_token` is malformed"),
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"iam refused the request as malformed"}"#,
-        ),
-    ];
-    for (refusal, want_status, want_body) in cases {
+async fn every_list_refusal_from_iam_is_opaque() {
+    for refusal in [
+        tonic::Status::not_found("no iam_user row"),
+        tonic::Status::invalid_argument("`page_token` is malformed"),
+    ] {
         let (state, _log) = gateway(true, Answer::Refuse(refusal)).await;
         let (status, body) = post(state, LIST, &list_body(OTHER_ID), &as_admin()).await;
-        assert_eq!(status, want_status);
-        assert_eq!(body, want_body, "a fixed body, never iam's own words");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "ADR-0927");
+        assert_eq!(body, UNAVAILABLE, "a fixed body, never iam's own words");
     }
 }
 
@@ -496,7 +490,7 @@ async fn a_credential_of_another_user_is_a_404() {
 }
 
 #[tokio::test]
-async fn revoke_credential_maps_invalid_argument_to_400() {
+async fn revoke_credential_keeps_invalid_argument_opaque() {
     let (state, _log) = gateway(
         true,
         Answer::Refuse(tonic::Status::invalid_argument("bad id")),
@@ -509,8 +503,12 @@ async fn revoke_credential_maps_invalid_argument_to_400() {
         &as_admin(),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body, r#"{"error":"iam refused the request as malformed"}"#);
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "only NOT_FOUND has a ruling past ADR-0927 on this route"
+    );
+    assert_eq!(body, UNAVAILABLE);
 }
 
 #[tokio::test]

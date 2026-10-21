@@ -290,8 +290,8 @@ Times are RFC 3339, and a row minted before credentials expired has no
 `expires_at` key. `revoke-credential` revokes only a credential of the named
 user: an unknown id and another user's id both answer
 `404 {"error":"no such credential for this user"}`. An administrator may revoke
-their own credential. An `iam` `INVALID_ARGUMENT` answers
-`400 {"error":"iam refused the request as malformed"}` on both routes.
+their own credential. Every other `iam` refusal answers the opaque `503`
+(ADR-0927); an unknown user gets an empty list, not a `404`.
 
 **An absent or empty bootstrap Secret DISABLES the bootstrap path**, answering
 `503 {"error":"the bootstrap token is not configured"}` — never a comparison
