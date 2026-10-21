@@ -1060,6 +1060,7 @@ async fn the_enrol_route_is_served() {
 async fn every_enrol_failure_is_opaque_in_body_and_headers() {
     let mut answers = std::collections::BTreeSet::new();
     let mut refusals = 0;
+    let mut password_set = 0;
 
     for code in ALL_CODES {
         let resp = enrol_failure(code);
@@ -1087,6 +1088,13 @@ async fn every_enrol_failure_is_opaque_in_body_and_headers() {
         if code == tonic::Code::Unauthenticated {
             refusals += 1;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
+        } else if code == tonic::Code::FailedPrecondition {
+            // THE ONE CARVE-OUT (ADR-0972 (4), plan §5.1): the redemption
+            // committed and only the mint lost the epoch race. Reachable only
+            // by a caller who presented a valid secret, so it is no oracle.
+            password_set += 1;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body, ENROL_PASSWORD_SET_BODY);
         } else {
             answers.insert((status.as_u16(), body.clone()));
         }
@@ -1109,6 +1117,10 @@ async fn every_enrol_failure_is_opaque_in_body_and_headers() {
     }
 
     assert_eq!(refusals, 1, "exactly one code is a refusal");
+    assert_eq!(
+        password_set, 1,
+        "exactly one code is the password-set answer"
+    );
     assert_eq!(
         answers.len(),
         1,
@@ -1145,6 +1157,14 @@ async fn every_enrol_failure_is_opaque_in_body_and_headers() {
 #[test]
 fn the_two_credential_endpoints_share_the_status_rule_and_not_the_words() {
     for code in ALL_CODES {
+        if code == tonic::Code::FailedPrecondition {
+            // ENROL'S ONE CARVE-OUT, and login does not share it: `iam` maps a
+            // login that lost the epoch race to the wrong-password refusal, so
+            // FAILED_PRECONDITION on login stays opaque.
+            assert_eq!(login_answer(code).0, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(enrol_answer(code).0, StatusCode::CONFLICT);
+            continue;
+        }
         assert_eq!(
             login_answer(code).0,
             enrol_answer(code).0,
@@ -1157,6 +1177,9 @@ fn the_two_credential_endpoints_share_the_status_rule_and_not_the_words() {
         );
     }
 }
+
+/// The fixed answer to a redemption whose mint lost the epoch race.
+const ENROL_PASSWORD_SET_BODY: &str = r#"{"error":"your password is set, but the account changed before a credential could be issued; run `yaadgaar login`"}"#;
 
 /// The rule itself, over every code: 401 for exactly one, one status for the rest.
 ///

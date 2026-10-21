@@ -141,7 +141,23 @@ pub(super) fn login_answer(code: tonic::Code) -> (StatusCode, &'static str) {
 /// unknown secret, a spent one and an expired one are one answer here, so the
 /// sentence names none of the three: any wording that fitted only one of them
 /// would be a hint about which it was.
+///
+/// **ONE CARVE-OUT: `FAILED_PRECONDITION` IS A 409 WITH A FIXED SENTENCE**
+/// (ADR-0972 (4), plan §5.1). `iam` answers it only when the redemption has
+/// COMMITTED — the secret is spent and the password is set — and the mint
+/// then lost the credential-epoch race. The opaque 503 would invite a retry
+/// with a spent secret, whose 401 sends the person for an enrolment they do not
+/// need. A 409, because the request was well formed and the account changed
+/// under it. It is no oracle: only a caller who presented a valid secret
+/// reaches it. ADR-0927's rule still holds for every other code, and
+/// [`opaque_status`] itself is unchanged.
 pub(super) fn enrol_answer(code: tonic::Code) -> (StatusCode, &'static str) {
+    if code == tonic::Code::FailedPrecondition {
+        return (
+            StatusCode::CONFLICT,
+            r#"{"error":"your password is set, but the account changed before a credential could be issued; run `yaadgaar login`"}"#,
+        );
+    }
     opaque_answer(
         code,
         r#"{"error":"this enrolment cannot be redeemed"}"#,
