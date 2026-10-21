@@ -19,7 +19,10 @@ use yadgar_gateway::source::TrustBoundary;
 mod config;
 mod wiring;
 
-pub use config::{http_configuration, identity, rate_limiting, refuse_unverifiable_enforcement};
+pub use config::{
+    http_configuration, identity, project_validation_announcement, rate_limiting,
+    refuse_unverifiable_enforcement,
+};
 pub use wiring::{serve, start_invalidation, wiring, Wiring};
 
 /// The JSON subscriber, and the default that keeps this process observable.

@@ -227,8 +227,8 @@ fn validation(project: Channel) -> Result<Arc<yadgar_gateway::project::Validator
     tracing::info!(
         ?mode,
         registry_poll_secs = poll.as_secs(),
-        "project validation is configured; `counting` refuses nobody and only counts \
-         (plans/project-validation.md)"
+        "{}",
+        crate::boot::project_validation_announcement(mode)
     );
     Ok(Arc::new(yadgar_gateway::project::Validator::new(
         yadgar_gateway::project::Registry::start(project.clone(), poll),

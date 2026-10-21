@@ -278,6 +278,15 @@ pub(in crate::http) async fn admin_revoke_credential(
         Err(_elapsed) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIAL),
     }
 
+    // THE RECEIPT ECHOES THE REQUEST, BECAUSE `iam` RETURNS NOTHING TO ECHO
+    // (ledger 1741). `yadgar.iam.v1.RevokeCredentialResponse` is an empty
+    // message in proto v1.21.0 (and in v1.21.1), so no id below is read from
+    // `iam`. What an OK attests, once `iam` AND `iam-db` both implement
+    // ADR-0972 (2), is the PAIR: a credential that is not this user's answers
+    // NOT_FOUND and writes nothing. Against an `iam-db` that does not read
+    // `user_id` yet, OK is the id-only revoke and attests no ownership (see
+    // the MIXED VERSIONS note on `RevokeCredentialRequest.user_id`). Echoing
+    // iam-attested ids needs a proto change to the response first.
     let rendered = json!({ "user_id": user_id, "credential_id": credential_id }).to_string();
     call.finish(Outcome {
         status: "OK",
