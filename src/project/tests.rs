@@ -544,6 +544,7 @@ fn the_unloaded_registry_reason_is_distinct_from_every_refusal_reason() {
 /// `Registry::start` and this test reds naming a missing series.
 #[test]
 fn the_never_loaded_gauge_is_published_before_the_first_load_attempt() {
+    retry::listen_for_logs();
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -899,6 +900,7 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
 /// (loads share an id).
 #[tokio::test]
 async fn each_registry_poll_sends_its_own_well_formed_request_id() {
+    retry::listen_for_logs();
     let request_ids = Arc::new(Mutex::new(Vec::new()));
     let served = Arc::clone(&request_ids);
     let incoming = tonic::transport::server::TcpIncoming::bind(

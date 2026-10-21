@@ -60,20 +60,23 @@ fn once_loaded_every_retry_waits_the_whole_poll() {
 /// Make the log callsites of `report` safe to share between parallel tests.
 ///
 /// **ROOT CAUSE OF LEDGER 1752.** `tracing` decides once per callsite whether
-/// anybody listens. While NO dispatcher exists, a callsite is judged from the
-/// registering thread's own (empty) default and cached. Registering the first
-/// dispatcher rebuilds that cache, but a callsite that a parallel test is
-/// registering at that instant is missed by the rebuild and stays "never".
+/// anybody listens. `register()` pushes the callsite onto the list first, then
+/// computes its interest. While only one dispatcher could exist, that
+/// computation asks the REGISTERING thread's default, and with none set the
+/// answer is "never". That answer can overwrite the rebuild a parallel
+/// `set_default` has just done, so the callsite stays "never".
 /// The only `set_default` in this test binary is in
 /// `the_logged_retry_secs_is_the_real_delay_before_the_next_load`, so it was
 /// the first dispatcher, it raced the sibling tests that also reach `report`,
 /// and the `("WARN", 60)` event was dropped about a third of the time.
 ///
-/// A process-wide dispatcher installed ONCE, before any test thread registers
-/// those callsites, removes the race: every callsite is then judged against a
-/// dispatcher that listens, and the per-test `set_default` only chooses where
-/// the events go. Every test that reaches `report` calls this first.
-fn listen_for_logs() {
+/// A process-wide dispatcher installed ONCE removes the race. `set_global_default`
+/// rebuilds nothing itself. The fix works because, once a global exists, the
+/// single-dispatcher computation falls back to it on a thread with no default,
+/// and its INFO filter enables WARN and ERROR. The per-test `set_default` then
+/// only chooses where the events go. Every test that reaches `report`, directly
+/// or through `Registry::start`, calls this first.
+pub(super) fn listen_for_logs() {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         let sink = tracing_subscriber::fmt()
