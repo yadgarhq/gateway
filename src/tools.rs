@@ -7,14 +7,15 @@
 use serde_json::{json, Value};
 use tonic::transport::Channel;
 
-use crate::pb::yadgar::common::v1::{Idempotency, Scope};
+use crate::pb::yadgar::common::v1::Scope;
 use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::{
-    read_task_request::Key, task_service_client::TaskServiceClient, CreateTaskRequest,
-    FindTasksRequest, FindTasksResponse, ReadTaskRequest,
+    read_task_request::Key, task_service_client::TaskServiceClient, ReadTaskRequest,
 };
 
 mod change;
+mod create;
+mod find;
 
 /// A tool's name, as a bounded value.
 ///
@@ -136,15 +137,7 @@ fn definition(name: &str) -> Value {
             "Create a task",
             "Create a task in the caller's project. \
              The id, number and version are assigned by the module.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "title": { "type": "string", "description": "Short summary of the task" },
-                    "body": { "type": "string", "description": "Full description" },
-                    "tags": { "type": "array", "items": { "type": "string" } },
-                },
-                "required": ["title"],
-            }),
+            create::schema(),
         ),
         READ_TASK => (
             "Read a task",
@@ -159,14 +152,12 @@ fn definition(name: &str) -> Value {
         ),
         FIND_TASKS => (
             "Find tasks",
-            "List tasks visible to the caller, newest first.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "page_size": { "type": "integer", "description": "Maximum results" },
-                    "page_token": { "type": "string", "description": "Continuation token" },
-                },
-            }),
+            "List tasks visible to the caller, oldest first (by id, a UUIDv7 \
+             timestamp; task-db runs 2 replicas, so ids are ordered to the \
+             millisecond across replicas, not strictly by number). \
+             Filter by status with `statuses`; ask for `fields: \"summary\"` to \
+             leave out bodies, tags and links.",
+            find::schema(),
         ),
         EDIT_TASK => (
             "Edit a task",
@@ -249,35 +240,6 @@ pub struct Output {
     pub rows: u32,
 }
 
-/// `page_size` exactly as the MCP caller sent it, with no second default
-/// (ledger 1281, ADR-0569). Absence and an explicit `0` both forward as `0`
-/// rather than this gateway's own `20` — a page size has exactly one source,
-/// `task-db`'s `DEFAULT_PAGE`, and a gateway-side default was a second one
-/// nobody could see drift from the first.
-///
-/// Split out for the same reason [`find_tasks_output`] is: there is no task
-/// service stub to fake, so the request this gateway BUILDS is what a test
-/// can pin, not what it sends.
-fn requested_page_size(args: &Value) -> i32 {
-    args.get("page_size").and_then(Value::as_i64).unwrap_or(0) as i32
-}
-
-/// Shape a `find_tasks` response, and count what it returned.
-///
-/// Split out so the count is testable without a task service behind it: `build.rs`
-/// generates the CLIENT half only, so there is no server stub to fake, and a row
-/// count that only a live upstream can exercise is a row count nothing pins.
-fn find_tasks_output(resp: FindTasksResponse) -> Output {
-    let rows = resp.tasks.len() as u32;
-    Output {
-        content: json!({
-            "tasks": resp.tasks.into_iter().map(|t| TaskView::from(Some(t))).collect::<Vec<_>>(),
-            "next_page_token": resp.next_page_token,
-        }),
-        rows,
-    }
-}
-
 /// A status as a client reads it: the enum's name, lowercased, prefix stripped.
 fn status_name(status: i32) -> String {
     TaskStatus::try_from(status)
@@ -321,36 +283,8 @@ pub async fn call(
 
     match name {
         CREATE_TASK => {
-            let title = args
-                .get("title")
-                .and_then(Value::as_str)
-                .ok_or_else(|| ToolError::Invalid("`title` is required".into()))?;
-            let resp = client
-                .create_task(CreateTaskRequest {
-                    idempotency: Some(Idempotency {
-                        key: crate::idempotency_key(),
-                    }),
-                    scope: Some(scope),
-                    title: title.to_string(),
-                    body: args
-                        .get("body")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    tags: args
-                        .get("tags")
-                        .and_then(Value::as_array)
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    links: Vec::new(),
-                })
-                .await?
-                .into_inner();
+            let request = create::request(scope, args, crate::idempotency_key)?;
+            let resp = client.create_task(request).await?.into_inner();
             let meta = resp.meta.unwrap_or_default();
             Ok(Output {
                 content: json!({ "id": meta.id, "number": resp.number, "version": meta.version }),
@@ -384,26 +318,15 @@ pub async fn call(
                 .await?
                 .into_inner();
             Ok(Output {
-                content: serde_json::to_value(TaskView::from(resp.task)).unwrap_or(Value::Null),
+                content: serde_json::to_value(TaskView::full(resp.task)).unwrap_or(Value::Null),
                 rows: 1,
             })
         }
 
         FIND_TASKS => {
-            let resp = client
-                .find_tasks(FindTasksRequest {
-                    scope: Some(scope),
-                    statuses: Vec::new(),
-                    page_size: requested_page_size(args),
-                    page_token: args
-                        .get("page_token")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .await?
-                .into_inner();
-            Ok(find_tasks_output(resp))
+            let (request, fields) = find::request(scope, args)?;
+            let resp = client.find_tasks(request).await?.into_inner();
+            Ok(find::output(resp, fields))
         }
 
         EDIT_TASK => change::edit(&mut client, scope, args).await,
@@ -419,30 +342,55 @@ pub async fn call(
 /// generated struct carries wire-level shapes — `Option` around every message,
 /// enums as `i32` — and serialising it directly would leak the transport into the
 /// public JSON and change whenever the proto's internal representation did.
+///
+/// `body`, `tags` and `links` are `None` only in the SUMMARY shape, and are then
+/// left out of the JSON rather than sent empty: an empty `body` would claim the
+/// task has none.
 #[derive(serde::Serialize)]
 pub struct TaskView {
     id: String,
     number: u32,
     title: String,
-    body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
     status: String,
     version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<String>>,
+    /// References to other records; a `legacy_ref` given at creation is here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    links: Option<Vec<String>>,
 }
 
-impl From<Option<crate::pb::yadgar::task::v1::Task>> for TaskView {
-    fn from(task: Option<crate::pb::yadgar::task::v1::Task>) -> Self {
+type ProtoTask = crate::pb::yadgar::task::v1::Task;
+
+impl TaskView {
+    /// Every field the response carries.
+    pub fn full(task: Option<ProtoTask>) -> Self {
         let task = task.unwrap_or_default();
         let meta = task.meta.unwrap_or_default();
         Self {
             id: meta.id,
             number: task.number,
             title: task.title,
-            body: task.body,
+            body: Some(task.body),
             // The enum's own name, lowercased and stripped of its prefix — a
             // number would make the payload unreadable and would silently change
             // meaning if the enum were ever reordered.
             status: status_name(task.status),
             version: meta.version,
+            tags: Some(task.tags),
+            links: Some(task.links),
+        }
+    }
+
+    /// The five fields a caller needs to choose a task, and nothing else.
+    pub fn summary(task: Option<ProtoTask>) -> Self {
+        Self {
+            body: None,
+            tags: None,
+            links: None,
+            ..Self::full(task)
         }
     }
 }

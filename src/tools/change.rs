@@ -26,7 +26,7 @@ pub(super) const TARGETS: [&str; 5] = ["open", "in_progress", "blocked", "done",
 ///
 /// Through [`TARGETS`] first, so the only spellings accepted are the ones the
 /// schema advertises — `from_str_name` alone would also take `unspecified`.
-fn target(name: &str) -> Option<TaskStatus> {
+pub(super) fn target(name: &str) -> Option<TaskStatus> {
     TARGETS
         .contains(&name)
         .then(|| TaskStatus::from_str_name(&format!("TASK_STATUS_{}", name.to_ascii_uppercase())))
@@ -51,7 +51,7 @@ fn target_task(args: &Value) -> Result<(String, u64), ToolError> {
 
 /// An argument that was SENT. JSON `null` counts as not sent, as it does for
 /// `create_task`: some clients fill every omitted optional argument with null.
-fn present<'a>(args: &'a Value, field: &str) -> Option<&'a Value> {
+pub(super) fn present<'a>(args: &'a Value, field: &str) -> Option<&'a Value> {
     args.get(field).filter(|v| !v.is_null())
 }
 
@@ -68,7 +68,7 @@ fn required_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> 
 /// is refused rather than read as absent, because for `edit_task` absent means
 /// "leave it". **Null is absent, never "clear"** — `""` is how a field is
 /// cleared, so a null can never wipe a field the caller did not mean to touch.
-fn optional_str<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, ToolError> {
+pub(super) fn optional_str<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>, ToolError> {
     present(args, field)
         .map(|v| {
             v.as_str()

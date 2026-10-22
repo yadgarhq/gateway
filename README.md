@@ -44,6 +44,36 @@ Consequences here:
 | `resultType`      | Required on every result. This server only returns `complete`.                                                                                                                                                                                                              |
 | Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                                                                                                                                     |
 
+### The task tools
+
+`tools/list` is the authority for every argument; `src/tools.rs` `definition`
+holds the schemas. Three behaviours a caller cannot read off a schema:
+
+- **`find_tasks` returns oldest first** (by id, a UUIDv7 timestamp; task-db
+  runs 2 replicas, so ids are ordered to the millisecond across replicas, not
+  strictly by number). `task-db` sorts `ORDER BY id`. `statuses` filters by
+  status; absent or `[]` means every status, and an unknown name is refused
+  rather than dropped. It takes at most 5 entries, and a repeated status counts
+  once. `fields: "summary"` returns `id`, `number`, `title`, `status` and
+  `version` only; the default `full` adds `body`, `tags` and `links`.
+- **`create_task` takes an optional `idempotency_key`.** The same key with the
+  same arguments returns the first call's task; the same key with different
+  arguments is refused (`task-db`, D9). The key is scoped to the caller and the
+  project. It is 1 to 255 printable ASCII characters with no spaces, the bound
+  of `task-db`'s `task_write.idem_key` column. Keys compare case-insensitively:
+  measured on MariaDB 11.8.8, `task_write` is `utf8mb4_uca1400_ai_ci`, so
+  `Key-A` and `key-a` are one key, while `-`, `_`, `.` and `:` are
+  significant. A replayed create returns the FIRST response's `version`, which
+  is stale if the task changed since; re-read the task before editing it.
+  Without a key, the gateway mints a fresh key per call, so a retry creates a
+  second task.
+- **`create_task` takes an optional `legacy_ref`**, stored verbatim (not
+  trimmed) as the task's only entry in `links` and returned there by
+  `read_task` and `find_tasks`. Pass a URN-shaped reference, e.g.
+  `urn:yadgar:ledger:yadgarhq/docs:1558`. That `links` entry is a
+  caller-supplied reference, not a parent link. It is 1 to 255 characters and
+  must contain a non-whitespace character. No tool edits links after creation.
+
 ## Identity
 
 `Scope` is constructed in **exactly one function**, `attest::scope`. Everything
