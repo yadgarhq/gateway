@@ -1,4 +1,5 @@
 use super::*;
+use crate::pb::yadgar::taskapi::v1::FindTasksResponse;
 
 /// The tool set, WRITTEN OUT HERE and never derived from the code under
 /// test. A test that read `SERVED` to check `SERVED` would agree with any
@@ -140,21 +141,24 @@ fn every_tool_declares_an_object_input_schema() {
 fn an_absent_page_size_forwards_zero_rather_than_a_compiled_in_default() {
     // MUTATION THIS CATCHES: `unwrap_or(20)` (or any other nonzero literal)
     // reappearing at the call site.
-    assert_eq!(requested_page_size(&json!({})), 0);
-    assert_eq!(requested_page_size(&json!({ "page_token": "next" })), 0);
+    assert_eq!(find::requested_page_size(&json!({})), 0);
+    assert_eq!(
+        find::requested_page_size(&json!({ "page_token": "next" })),
+        0
+    );
 }
 
 /// An explicit `0` is indistinguishable from absence, which is the point: both
 /// forward as `0` and `task-db` decides what that means.
 #[test]
 fn an_explicit_zero_page_size_forwards_as_zero() {
-    assert_eq!(requested_page_size(&json!({ "page_size": 0 })), 0);
+    assert_eq!(find::requested_page_size(&json!({ "page_size": 0 })), 0);
 }
 
 /// A caller-supplied page size still arrives unchanged.
 #[test]
 fn a_requested_page_size_forwards_unchanged() {
-    assert_eq!(requested_page_size(&json!({ "page_size": 7 })), 7);
+    assert_eq!(find::requested_page_size(&json!({ "page_size": 7 })), 7);
 }
 
 #[test]
@@ -165,13 +169,16 @@ fn find_tasks_reports_how_many_tasks_it_returned() {
     // cost and never how much it fetched.
     use crate::pb::yadgar::task::v1::Task;
 
-    let empty = find_tasks_output(FindTasksResponse::default());
+    let empty = find::output(FindTasksResponse::default(), find::Fields::Full);
     assert_eq!(empty.rows, 0);
 
-    let three = find_tasks_output(FindTasksResponse {
-        tasks: vec![Task::default(), Task::default(), Task::default()],
-        next_page_token: "next".into(),
-    });
+    let three = find::output(
+        FindTasksResponse {
+            tasks: vec![Task::default(), Task::default(), Task::default()],
+            next_page_token: "next".into(),
+        },
+        find::Fields::Full,
+    );
     assert_eq!(three.rows, 3, "the row count is the number of tasks");
     assert_eq!(
         three.content["tasks"].as_array().map(Vec::len),
@@ -418,4 +425,219 @@ async fn an_edit_whose_fields_are_all_null_has_nothing_to_edit() {
     )
     .await;
     assert!(msg.contains("nothing to edit"), "got {msg:?}");
+}
+
+// ---- ledger 1789: find_tasks status filter and summary shape -------------
+
+/// The status filter REACHES the request. It used to be hard-coded to an empty
+/// list, which `task-db` reads as every status, so a filter was impossible.
+#[test]
+fn find_tasks_forwards_the_statuses_the_caller_named() {
+    // MUTATION THIS CATCHES: `statuses: Vec::new()` coming back.
+    let (req, _) = find::request(
+        Scope::default(),
+        &json!({ "statuses": ["open", "blocked"] }),
+    )
+    .unwrap();
+    assert_eq!(
+        req.statuses,
+        vec![TaskStatus::Open as i32, TaskStatus::Blocked as i32]
+    );
+}
+
+/// Absent, null and `[]` all mean every status — `task-db`'s rule for an empty
+/// filter, forwarded rather than re-decided here.
+#[test]
+fn find_tasks_without_a_filter_sends_an_empty_one() {
+    for args in [
+        json!({}),
+        json!({ "statuses": null }),
+        json!({ "statuses": [] }),
+    ] {
+        let (req, fields) = find::request(Scope::default(), &args).unwrap();
+        assert!(req.statuses.is_empty(), "{args}");
+        assert_eq!(fields, find::Fields::Full, "{args}");
+    }
+}
+
+/// An unknown status is a refusal. Dropping it would turn `["opne"]` into an
+/// empty filter, which answers with EVERY status and looks like success.
+#[tokio::test]
+async fn find_tasks_refuses_a_status_it_does_not_know() {
+    for args in [
+        json!({ "statuses": ["opne"] }),
+        json!({ "statuses": ["open", "opne"] }),
+        json!({ "statuses": ["unspecified"] }),
+        json!({ "statuses": [1] }),
+        json!({ "statuses": "open" }),
+    ] {
+        assert!(
+            matches!(
+                refusal(FIND_TASKS, args.clone()).await,
+                ToolError::Invalid(_)
+            ),
+            "{args}"
+        );
+    }
+}
+
+#[test]
+fn the_find_schema_offers_the_statuses_and_both_shapes() {
+    let all = definitions();
+    let find = &all[2];
+    assert_eq!(find["name"], "find_tasks");
+    let props = &find["inputSchema"]["properties"];
+    assert_eq!(
+        props["statuses"]["items"]["enum"],
+        json!(["open", "in_progress", "blocked", "done", "dropped"])
+    );
+    assert_eq!(props["fields"]["enum"], json!(["full", "summary"]));
+}
+
+/// LEDGER 1609: the description said "newest first" while `task-db` sorts
+/// `ORDER BY id` over UUIDv7 ids — ascending, so oldest first.
+#[test]
+fn the_find_description_states_the_order_task_db_returns() {
+    let all = definitions();
+    let find = &all[2];
+    let text = find["description"].as_str().unwrap();
+    assert!(text.contains("oldest first"), "{text}");
+    assert!(!text.contains("newest first"), "{text}");
+}
+
+fn a_full_task() -> crate::pb::yadgar::task::v1::Task {
+    crate::pb::yadgar::task::v1::Task {
+        meta: Some(crate::pb::yadgar::common::v1::Meta {
+            id: "yadgar:task:1".into(),
+            version: 4,
+            ..Default::default()
+        }),
+        number: 7,
+        title: "t".into(),
+        body: "b".into(),
+        status: TaskStatus::Open as i32,
+        tags: vec!["ledger-1789".into()],
+        links: vec!["L1789".into()],
+    }
+}
+
+/// The summary is exactly the five fields a caller picks a task by.
+#[test]
+fn the_summary_shape_carries_no_body_tags_or_links() {
+    let out = find::output(
+        FindTasksResponse {
+            tasks: vec![a_full_task()],
+            next_page_token: String::new(),
+        },
+        find::Fields::Summary,
+    );
+    let row = out.content["tasks"][0].as_object().unwrap();
+    let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["id", "number", "status", "title", "version"]);
+    assert_eq!(out.rows, 1, "a summary fetched the same rows");
+}
+
+/// The full shape returns what the response proto carries: tags and links
+/// were in `Task` and dropped by the view.
+#[test]
+fn the_full_shape_returns_tags_and_links() {
+    let view = serde_json::to_value(TaskView::full(Some(a_full_task()))).unwrap();
+    assert_eq!(view["body"], "b");
+    assert_eq!(view["tags"], json!(["ledger-1789"]));
+    assert_eq!(view["links"], json!(["L1789"]));
+}
+
+#[tokio::test]
+async fn find_tasks_refuses_a_shape_it_does_not_know() {
+    for args in [json!({ "fields": "brief" }), json!({ "fields": false })] {
+        assert!(
+            matches!(
+                refusal(FIND_TASKS, args.clone()).await,
+                ToolError::Invalid(_)
+            ),
+            "{args}"
+        );
+    }
+}
+
+// ---- ledger 1789: create_task legacy_ref and caller idempotency key ------
+
+fn minted() -> String {
+    "minted".into()
+}
+
+#[test]
+fn create_task_stores_the_legacy_ref_as_its_link() {
+    // MUTATION THIS CATCHES: `links: Vec::new()` coming back.
+    let req = create::request(
+        Scope::default(),
+        &json!({ "title": "t", "legacy_ref": "L1789" }),
+        minted,
+    )
+    .unwrap();
+    assert_eq!(req.links, vec!["L1789".to_string()]);
+
+    let none = create::request(Scope::default(), &json!({ "title": "t" }), minted).unwrap();
+    assert!(none.links.is_empty());
+}
+
+/// The caller's key is forwarded VERBATIM; replay and refusal are `task-db`'s
+/// (D9), keyed on it. Absent, the gateway mints one as before.
+#[test]
+fn create_task_forwards_the_callers_idempotency_key() {
+    let req = create::request(
+        Scope::default(),
+        &json!({ "title": "t", "idempotency_key": "copy-L1789" }),
+        || panic!("a caller's key must not be replaced by a minted one"),
+    )
+    .unwrap();
+    assert_eq!(req.idempotency.unwrap().key, "copy-L1789");
+
+    let minted_req = create::request(Scope::default(), &json!({ "title": "t" }), minted).unwrap();
+    assert_eq!(minted_req.idempotency.unwrap().key, "minted");
+
+    let null_req = create::request(
+        Scope::default(),
+        &json!({ "title": "t", "idempotency_key": null }),
+        minted,
+    )
+    .unwrap();
+    assert_eq!(null_req.idempotency.unwrap().key, "minted");
+}
+
+/// An empty key would reach `task-db` as "does not participate" and dedupe
+/// nothing; an over-long one would fail in the `VARCHAR(255)` column.
+#[tokio::test]
+async fn create_task_refuses_a_key_or_ref_it_cannot_honour() {
+    for args in [
+        json!({ "title": "t", "idempotency_key": "" }),
+        json!({ "title": "t", "idempotency_key": "has space" }),
+        json!({ "title": "t", "idempotency_key": "x".repeat(256) }),
+        json!({ "title": "t", "idempotency_key": 7 }),
+        json!({ "title": "t", "legacy_ref": "" }),
+        json!({ "title": "t", "legacy_ref": "  " }),
+        json!({ "title": "t", "legacy_ref": 1789 }),
+    ] {
+        assert!(
+            matches!(
+                refusal(CREATE_TASK, args.clone()).await,
+                ToolError::Invalid(_)
+            ),
+            "{args}"
+        );
+    }
+    let longest = json!({ "title": "t", "idempotency_key": "x".repeat(255) });
+    assert!(create::request(Scope::default(), &longest, minted).is_ok());
+}
+
+#[test]
+fn the_create_schema_offers_the_legacy_ref_and_the_key() {
+    let all = definitions();
+    let create = &all[0];
+    assert_eq!(create["name"], "create_task");
+    let props = &create["inputSchema"]["properties"];
+    assert_eq!(props["legacy_ref"]["type"], "string");
+    assert_eq!(props["idempotency_key"]["maxLength"], 255);
+    assert_eq!(create["inputSchema"]["required"], json!(["title"]));
 }

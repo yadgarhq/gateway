@@ -44,6 +44,26 @@ Consequences here:
 | `resultType`      | Required on every result. This server only returns `complete`.                                                                                                                                                                                                              |
 | Origin            | Validated; an invalid one gets `403`. **This is not authentication** — it stops a browser page, not a client that sets its own headers.                                                                                                                                     |
 
+### The task tools
+
+`tools/list` is the authority for every argument; `src/tools.rs` `definition`
+holds the schemas. Three behaviours a caller cannot read off a schema:
+
+- **`find_tasks` returns oldest first**, in creation order. `task-db` sorts
+  `ORDER BY id`, and the id is a UUIDv7 URN. `statuses` filters by status;
+  absent or `[]` means every status, and an unknown name is refused rather than
+  dropped. `fields: "summary"` returns `id`, `number`, `title`, `status` and
+  `version` only; the default `full` adds `body`, `tags` and `links`.
+- **`create_task` takes an optional `idempotency_key`.** The same key with the
+  same arguments returns the first call's task; the same key with different
+  arguments is refused (`task-db`, D9). The key is scoped to the caller and the
+  project. It is 1 to 255 printable ASCII characters with no spaces, the bound
+  of `task-db`'s `task_write.idem_key` column. Without one, the gateway mints a
+  fresh key per call, so a retry creates a second task.
+- **`create_task` takes an optional `legacy_ref`**, stored verbatim as the
+  task's only entry in `links` and returned there by `read_task` and
+  `find_tasks`. No tool edits links after creation.
+
 ## Identity
 
 `Scope` is constructed in **exactly one function**, `attest::scope`. Everything

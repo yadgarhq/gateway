@@ -23,7 +23,7 @@ use super::{a_live_credential, post, rpc, send, state_resolving_to_with_task};
 use crate::http::AppState;
 use crate::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 use crate::pb::yadgar::common::v1::Meta;
-use crate::pb::yadgar::task::v1::TaskStatus;
+use crate::pb::yadgar::task::v1::{Task, TaskStatus};
 use crate::pb::yadgar::taskapi::v1::{
     task_service_server::{TaskService, TaskServiceServer},
     CreateTaskRequest, CreateTaskResponse, EditTaskRequest, EditTaskResponse, FindTasksRequest,
@@ -46,6 +46,8 @@ const FORGED_USER: &str = "mallory-forged-in-a-header";
 struct Seen {
     edits: Mutex<Vec<EditTaskRequest>>,
     transitions: Mutex<Vec<TransitionTaskRequest>>,
+    creates: Mutex<Vec<CreateTaskRequest>>,
+    finds: Mutex<Vec<FindTasksRequest>>,
     /// Every RPC that arrived, of any kind.
     hits: AtomicUsize,
 }
@@ -98,10 +100,14 @@ impl TaskService for FakeTask {
 
     async fn create_task(
         &self,
-        _: tonic::Request<CreateTaskRequest>,
+        request: tonic::Request<CreateTaskRequest>,
     ) -> Result<tonic::Response<CreateTaskResponse>, tonic::Status> {
         self.0.hits.fetch_add(1, Ordering::SeqCst);
-        Err(tonic::Status::unimplemented("not under test"))
+        self.0.creates.lock().unwrap().push(request.into_inner());
+        Ok(tonic::Response::new(CreateTaskResponse {
+            meta: returned_meta(),
+            number: 4_242,
+        }))
     }
 
     async fn read_task(
@@ -114,10 +120,22 @@ impl TaskService for FakeTask {
 
     async fn find_tasks(
         &self,
-        _: tonic::Request<FindTasksRequest>,
+        request: tonic::Request<FindTasksRequest>,
     ) -> Result<tonic::Response<FindTasksResponse>, tonic::Status> {
         self.0.hits.fetch_add(1, Ordering::SeqCst);
-        Err(tonic::Status::unimplemented("not under test"))
+        self.0.finds.lock().unwrap().push(request.into_inner());
+        Ok(tonic::Response::new(FindTasksResponse {
+            tasks: vec![Task {
+                meta: returned_meta(),
+                number: 4_242,
+                title: "returned title".into(),
+                body: "a body the summary must not carry".into(),
+                status: TaskStatus::Blocked as i32,
+                tags: vec!["ledger-1789".into()],
+                links: vec!["L1789".into()],
+            }],
+            next_page_token: String::new(),
+        }))
     }
 
     async fn remove_task(
@@ -432,4 +450,75 @@ async fn a_stale_version_is_a_tool_failure_not_a_protocol_error() {
             "{tool}: not a JSON-RPC error: {body}"
         );
     }
+}
+
+/// LEDGER 1789: the filter and the shape, end to end. The filter must ARRIVE at
+/// `task` — it was hard-coded empty — and the summary must leave the body out
+/// of what the caller receives.
+#[tokio::test]
+async fn find_tasks_reaches_task_with_the_filter_and_answers_in_summary() {
+    let (state, seen) = gateway().await;
+
+    let (status, body) = call(
+        state,
+        "find_tasks",
+        json!({ "statuses": ["blocked", "in_progress"], "fields": "summary" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let finds = seen.finds.lock().unwrap();
+    assert_eq!(finds.len(), 1, "exactly one FindTasks must arrive");
+    assert_eq!(
+        finds[0].statuses,
+        vec![TaskStatus::Blocked as i32, TaskStatus::InProgress as i32]
+    );
+    assert_eq!(
+        body["result"]["structuredContent"]["tasks"],
+        json!([{
+            "id": RETURNED_ID,
+            "number": 4_242,
+            "title": "returned title",
+            "status": "blocked",
+            "version": RETURNED_VERSION,
+        }])
+    );
+}
+
+/// LEDGER 1789: the caller's key and the legacy reference reach `task` as sent.
+/// Replay and refusal of a reused key are `task-db`'s (D9), keyed on this value.
+#[tokio::test]
+async fn create_task_reaches_task_with_the_callers_key_and_legacy_ref() {
+    let (state, seen) = gateway().await;
+
+    let (status, body) = call(
+        state,
+        "create_task",
+        json!({
+            "title": "L1789: sentinel",
+            "legacy_ref": "L1789",
+            "idempotency_key": "copy-L1789-sentinel",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let creates = seen.creates.lock().unwrap();
+    assert_eq!(creates.len(), 1, "exactly one CreateTask must arrive");
+    let req = &creates[0];
+    assert_eq!(req.links, vec!["L1789".to_string()]);
+    assert_eq!(
+        req.idempotency.as_ref().expect("a key").key,
+        "copy-L1789-sentinel"
+    );
+    assert_eq!(
+        req.scope.as_ref().expect("a scope").user_id,
+        "u-that-iam-resolved"
+    );
+    assert_eq!(
+        body["result"]["structuredContent"],
+        json!({ "id": RETURNED_ID, "number": 4_242, "version": RETURNED_VERSION })
+    );
 }
