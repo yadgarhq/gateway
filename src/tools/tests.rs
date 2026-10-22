@@ -492,6 +492,55 @@ fn the_find_schema_offers_the_statuses_and_both_shapes() {
         json!(["open", "in_progress", "blocked", "done", "dropped"])
     );
     assert_eq!(props["fields"]["enum"], json!(["full", "summary"]));
+    assert_eq!(props["fields"]["default"], "full");
+    assert_eq!(props["statuses"]["maxItems"], 5);
+}
+
+/// A repeated status is sent ONCE, first occurrence first: `task-db` builds
+/// one `?` per entry.
+#[test]
+fn find_tasks_sends_a_repeated_status_once() {
+    // MUTATION THIS CATCHES: the `out.contains` de-duplication removed.
+    let (req, _) = find::request(
+        Scope::default(),
+        &json!({ "statuses": ["blocked", "open", "blocked", "open"] }),
+    )
+    .unwrap();
+    assert_eq!(
+        req.statuses,
+        vec![TaskStatus::Blocked as i32, TaskStatus::Open as i32]
+    );
+}
+
+/// More entries than there are statuses is refused, even when every entry is
+/// a valid name — the array is bounded before any name is read.
+#[tokio::test]
+async fn find_tasks_refuses_more_statuses_than_there_are() {
+    // MUTATION THIS CATCHES: the `names.len() > TARGETS.len()` check removed
+    // (de-duplication would otherwise accept six `open`s as one).
+    let args = json!({ "statuses": vec!["open"; 6] });
+    let msg = refusal_message(FIND_TASKS, args).await;
+    assert!(msg.contains("at most 5"), "{msg}");
+    let five = json!({ "statuses": ["open", "in_progress", "blocked", "done", "dropped"] });
+    assert!(find::request(Scope::default(), &five).is_ok());
+}
+
+/// A refusal names the caller's value BOUNDED: a long string is cut, and a
+/// non-string is named by its JSON type, never echoed.
+#[tokio::test]
+async fn a_status_refusal_does_not_echo_an_unbounded_value() {
+    // MUTATION THIS CATCHES: the message formatting the raw `name` again.
+    let long = "z".repeat(1000);
+    let msg = refusal_message(FIND_TASKS, json!({ "statuses": [long] })).await;
+    assert!(msg.len() < 200, "{} bytes: {msg}", msg.len());
+    assert!(msg.contains(&"z".repeat(32)), "{msg}");
+
+    let object = json!({ "statuses": [{ "secret": "x".repeat(1000) }] });
+    let msg = refusal_message(FIND_TASKS, object).await;
+    assert!(
+        msg.contains("an object") && !msg.contains("secret"),
+        "{msg}"
+    );
 }
 
 /// LEDGER 1609: the description said "newest first" while `task-db` sorts
@@ -613,10 +662,18 @@ async fn create_task_refuses_a_key_or_ref_it_cannot_honour() {
     for args in [
         json!({ "title": "t", "idempotency_key": "" }),
         json!({ "title": "t", "idempotency_key": "has space" }),
+        // MUTATION THESE CATCH: the alphabet check narrowed to
+        // `key.contains(' ')` — a tab, an accent and a NUL all pass it.
+        json!({ "title": "t", "idempotency_key": "tab\tkey" }),
+        json!({ "title": "t", "idempotency_key": "é" }),
+        json!({ "title": "t", "idempotency_key": "\u{0}" }),
         json!({ "title": "t", "idempotency_key": "x".repeat(256) }),
         json!({ "title": "t", "idempotency_key": 7 }),
         json!({ "title": "t", "legacy_ref": "" }),
         json!({ "title": "t", "legacy_ref": "  " }),
+        json!({ "title": "t", "legacy_ref": "\t\n" }),
+        // MUTATION THIS CATCHES: the `LEGACY_REF_MAX` check removed.
+        json!({ "title": "t", "legacy_ref": "é".repeat(256) }),
         json!({ "title": "t", "legacy_ref": 1789 }),
     ] {
         assert!(
@@ -629,6 +686,14 @@ async fn create_task_refuses_a_key_or_ref_it_cannot_honour() {
     }
     let longest = json!({ "title": "t", "idempotency_key": "x".repeat(255) });
     assert!(create::request(Scope::default(), &longest, minted).is_ok());
+    // MUTATION THIS CATCHES: the bound counted in bytes (`.len()`), which
+    // refuses 255 two-byte characters the schema's `maxLength` allows.
+    let longest_ref = json!({ "title": "t", "legacy_ref": "é".repeat(255) });
+    assert!(create::request(Scope::default(), &longest_ref, minted).is_ok());
+    // VERBATIM: surrounding whitespace is kept, not trimmed.
+    let padded = json!({ "title": "t", "legacy_ref": " urn:x " });
+    let req = create::request(Scope::default(), &padded, minted).unwrap();
+    assert_eq!(req.links, vec![" urn:x ".to_string()]);
 }
 
 #[test]
@@ -638,6 +703,11 @@ fn the_create_schema_offers_the_legacy_ref_and_the_key() {
     assert_eq!(create["name"], "create_task");
     let props = &create["inputSchema"]["properties"];
     assert_eq!(props["legacy_ref"]["type"], "string");
+    assert_eq!(props["legacy_ref"]["minLength"], 1);
+    assert_eq!(props["legacy_ref"]["maxLength"], 255);
+    assert_eq!(props["legacy_ref"]["pattern"], "\\S");
+    assert_eq!(props["idempotency_key"]["minLength"], 1);
     assert_eq!(props["idempotency_key"]["maxLength"], 255);
+    assert_eq!(props["idempotency_key"]["pattern"], "^[!-~]+$");
     assert_eq!(create["inputSchema"]["required"], json!(["title"]));
 }

@@ -152,7 +152,9 @@ fn definition(name: &str) -> Value {
         ),
         FIND_TASKS => (
             "Find tasks",
-            "List tasks visible to the caller, oldest first (in creation order). \
+            "List tasks visible to the caller, oldest first (by id, a UUIDv7 \
+             timestamp; task-db runs 2 replicas, so ids are ordered to the \
+             millisecond across replicas, not strictly by number). \
              Filter by status with `statuses`; ask for `fields: \"summary\"` to \
              leave out bodies, tags and links.",
             find::schema(),

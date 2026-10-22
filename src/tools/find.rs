@@ -48,6 +48,11 @@ pub(super) fn requested_page_size(args: &Value) -> i32 {
 /// which `task-db` reads as every status. A typo would then answer with more
 /// rows than were asked for, and look like success. Absent, `null` and `[]`
 /// all mean "every status", which is `task-db`'s own rule for an empty filter.
+///
+/// **AT MOST [`TARGETS`]`.len()` ENTRIES, DE-DUPLICATED.** `task-db` builds one
+/// `?` placeholder per entry, so an array longer than the number of statuses
+/// is refused before any name is read, and a repeated name is sent once (first
+/// occurrence wins the order).
 fn statuses(args: &Value) -> Result<Vec<i32>, ToolError> {
     let Some(value) = present(args, "statuses") else {
         return Ok(Vec::new());
@@ -56,19 +61,45 @@ fn statuses(args: &Value) -> Result<Vec<i32>, ToolError> {
     let names = value
         .as_array()
         .ok_or_else(|| ToolError::Invalid(format!("`statuses` must be an array of: {allowed}")))?;
-    names
-        .iter()
-        .map(|name| {
-            name.as_str()
-                .and_then(target)
-                .map(|s| s as i32)
-                .ok_or_else(|| {
-                    ToolError::Invalid(format!(
-                        "unknown status {name} in `statuses`; use: {allowed}"
-                    ))
-                })
-        })
-        .collect()
+    if names.len() > TARGETS.len() {
+        return Err(ToolError::Invalid(format!(
+            "`statuses` takes at most {} entries, one per status: {allowed}",
+            TARGETS.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let status = name.as_str().and_then(target).ok_or_else(|| {
+            ToolError::Invalid(format!(
+                "unknown status {} in `statuses`; use: {allowed}",
+                shown(name)
+            ))
+        })? as i32;
+        if !out.contains(&status) {
+            out.push(status);
+        }
+    }
+    Ok(out)
+}
+
+/// How long a caller's string may be before a refusal shortens it.
+const SHOWN_MAX: usize = 32;
+
+/// A caller's value as a refusal names it: a string, quoted and cut to
+/// [`SHOWN_MAX`] characters; anything else, by its JSON type. A refusal never
+/// echoes an unbounded value back into the caller's context.
+fn shown(value: &Value) -> String {
+    match value {
+        Value::String(s) if s.chars().count() > SHOWN_MAX => {
+            format!("\"{}…\"", s.chars().take(SHOWN_MAX).collect::<String>())
+        }
+        Value::String(s) => format!("\"{s}\""),
+        Value::Null => "null".into(),
+        Value::Bool(_) => "a boolean".into(),
+        Value::Number(_) => "a number".into(),
+        Value::Array(_) => "an array".into(),
+        Value::Object(_) => "an object".into(),
+    }
 }
 
 /// The row shape. Absent or `null` is [`Fields::Full`].
@@ -126,7 +157,9 @@ pub(super) fn schema() -> Value {
             "statuses": {
                 "type": "array",
                 "items": { "type": "string", "enum": TARGETS },
-                "description": "Only tasks in one of these statuses; omit for every status",
+                "maxItems": TARGETS.len(),
+                "description": "Only tasks in one of these statuses; omit for every \
+                                status. A repeated status counts once",
             },
             "fields": {
                 "type": "string",

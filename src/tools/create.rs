@@ -24,10 +24,13 @@ pub(super) const IDEMPOTENCY_KEY_MAX: usize = 255;
 ///
 /// **PRINTABLE ASCII ONLY, NO SPACES.** The column's collation compares
 /// strings, not bytes; restricting the alphabet keeps accents, trailing blanks
-/// and control characters from making two different-looking keys one key. Case
-/// may still fold under that collation — a collision it causes is either a
-/// replay of the same payload or a refusal of a different one, never a wrong
-/// answer.
+/// and control characters from making two different-looking keys one key.
+///
+/// **KEYS COMPARE CASE-INSENSITIVELY.** Measured on MariaDB 11.8.8:
+/// `task_write` is `utf8mb4_uca1400_ai_ci`, so `Key-A` and `key-a` are one key,
+/// while `-`, `_`, `.` and `:` stay significant. A collision that causes is
+/// either a replay of the same payload or a refusal of a different one, never
+/// a wrong answer.
 fn idempotency_key(args: &Value, mint: impl FnOnce() -> String) -> Result<String, ToolError> {
     let Some(key) = optional_str(args, "idempotency_key")? else {
         return Ok(mint());
@@ -44,18 +47,32 @@ fn idempotency_key(args: &Value, mint: impl FnOnce() -> String) -> Result<String
     Ok(key.to_string())
 }
 
+/// The longest `legacy_ref` this gateway accepts, in characters (what JSON
+/// Schema's `maxLength` counts). `task-db` stores `links` as a `JSON` column
+/// with no length of its own, so this bound is the GATEWAY's, not the store's.
+pub(super) const LEGACY_REF_MAX: usize = 255;
+
 /// The legacy reference, stored as the task's only link.
 ///
 /// **VERBATIM.** `Task.links` is the proto's field for references to other
 /// records ("URNs — an ADR, a wiki page, a parent task"), and no decision names
-/// a URN scheme for a legacy ledger id — so this gateway invents no prefix. A
-/// reader gets back exactly the string the creator sent, in `links`.
+/// a URN scheme for a legacy ledger id — so this gateway invents no prefix and
+/// trims nothing. A caller should send a URN-shaped reference such as
+/// `urn:yadgar:ledger:yadgarhq/docs:1558`; a reader gets back exactly the
+/// string the creator sent, in `links`. It is a caller-supplied reference, not
+/// a parent link.
+///
+/// **BLANK IS REFUSED.** A value with no non-whitespace character is refused
+/// rather than stored, matching the schema's `pattern` `\S`.
 fn links(args: &Value) -> Result<Vec<String>, ToolError> {
     match optional_str(args, "legacy_ref")? {
         None => Ok(Vec::new()),
         Some(r) if r.trim().is_empty() => Err(ToolError::Invalid(
-            "`legacy_ref` must not be empty; omit it instead".into(),
+            "`legacy_ref` must contain a non-whitespace character; omit it instead".into(),
         )),
+        Some(r) if r.chars().count() > LEGACY_REF_MAX => Err(ToolError::Invalid(format!(
+            "`legacy_ref` must be at most {LEGACY_REF_MAX} characters"
+        ))),
         Some(r) => Ok(vec![r.to_string()]),
     }
 }
@@ -107,9 +124,14 @@ pub(super) fn schema() -> Value {
             "legacy_ref": {
                 "type": "string",
                 "minLength": 1,
+                "maxLength": LEGACY_REF_MAX,
+                "pattern": "\\S",
                 "description": "A reference to this task in another tracker, \
-                                e.g. a legacy ledger id. Stored verbatim as the \
-                                task's link; returned in `links`",
+                                URN-shaped, e.g. \
+                                urn:yadgar:ledger:yadgarhq/docs:1558. Stored \
+                                verbatim (not trimmed) as the task's only link \
+                                and returned in `links`. A caller-supplied \
+                                reference, not a parent link",
             },
             "idempotency_key": {
                 "type": "string",
@@ -119,8 +141,12 @@ pub(super) fn schema() -> Value {
                 "description": "Makes a retry safe: the same key with the same \
                                 arguments returns the first call's task; the same \
                                 key with different arguments is refused. Scoped \
-                                to the caller and project. Omit it and the \
-                                gateway uses a fresh key per call",
+                                to the caller and project. Keys compare \
+                                case-insensitively (`-`, `_`, `.` and `:` are \
+                                significant). A replay returns the first call's \
+                                version, which can be stale: re-read before \
+                                editing. Omit it and the gateway uses a fresh \
+                                key per call",
             },
         },
         "required": ["title"],
