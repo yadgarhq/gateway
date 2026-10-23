@@ -328,6 +328,26 @@ fn the_transition_schema_offers_exactly_the_statuses_a_task_can_move_to() {
     );
 }
 
+/// The store refuses a title over 128 code points (task-db migration 7), so
+/// both schemas that take a title advertise the same bound, in characters.
+/// MUTATION THIS CATCHES: `maxLength` dropped from either schema.
+#[test]
+fn the_create_and_edit_schemas_bound_the_title_at_128_characters() {
+    let catalogue = definitions();
+    for name in ["create_task", "edit_task"] {
+        let tool = catalogue
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"));
+        assert_eq!(
+            tool["inputSchema"]["properties"]["title"]["maxLength"], 128,
+            "{name} must bound `title` at 128"
+        );
+    }
+}
+
 #[test]
 fn the_edit_schema_requires_the_version_it_compares_against() {
     let catalogue = definitions();
