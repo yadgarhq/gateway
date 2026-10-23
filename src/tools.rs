@@ -156,18 +156,31 @@ fn definition(name: &str) -> Value {
              timestamp; task-db runs 2 replicas, so ids are ordered to the \
              millisecond across replicas, not strictly by number). \
              Filter by status with `statuses`; ask for `fields: \"summary\"` to \
-             leave out bodies, tags and links.",
+             leave out bodies, tags and links, or `fields: \"index\"` for \
+             number, status and title only. A listing reaches the caller's \
+             project and the projects below it, but edit_task and \
+             transition_task resolve a number in the caller's exact project \
+             only. So an index row from another project carries its \
+             `project_id`: to edit or move that task, use its id (from \
+             `fields: \"summary\"`), or work from that project.",
             find::schema(),
         ),
         EDIT_TASK => (
             "Edit a task",
-            "Change a task's title, body, or both. Only the fields sent are \
-             written; send at least one. Status is changed with transition_task, \
-             never here. Refused if the task's version is not expect_version.",
+            "Change a task's title, body, or both. Name the task by id or by \
+             number, not both. Only the fields sent are written; send at least \
+             one. Status is changed with transition_task, never here. Refused if \
+             the task's version is not expect_version, or if the body does not \
+             match expect_body_sha256.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
+                    "number": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Per-project task number, instead of id",
+                    },
                     "expect_version": {
                         "type": "integer",
                         "minimum": 0,
@@ -175,18 +188,32 @@ fn definition(name: &str) -> Value {
                     },
                     "title": { "type": "string", "description": "New short summary" },
                     "body": { "type": "string", "description": "New full description; empty clears it" },
+                    "expect_body_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "SHA-256 of the exact body bytes (sha256sum of the \
+                                        file you send); the edit is refused if the body \
+                                        that arrives does not match, so a cut-off body \
+                                        is never saved",
+                    },
                 },
-                "required": ["id", "expect_version"],
+                "required": ["expect_version"],
             }),
         ),
         TRANSITION_TASK => (
             "Transition a task",
-            "Move a task to another status. The module decides which moves are \
-             legal. Refused if the task's version is not expect_version.",
+            "Move a task to another status. Name the task by id or by number, \
+             not both. The module decides which moves are legal. Refused if the \
+             task's version is not expect_version.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
+                    "number": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Per-project task number, instead of id",
+                    },
                     "expect_version": {
                         "type": "integer",
                         "minimum": 0,
@@ -198,7 +225,7 @@ fn definition(name: &str) -> Value {
                         "description": "The status to move to",
                     },
                 },
-                "required": ["id", "expect_version", "to"],
+                "required": ["expect_version", "to"],
             }),
         ),
         // Unreachable for a member of `SERVED`, and deliberately not a panic.
@@ -324,9 +351,10 @@ pub async fn call(
         }
 
         FIND_TASKS => {
+            let scope_project = scope.project_id.clone();
             let (request, fields) = find::request(scope, args)?;
             let resp = client.find_tasks(request).await?.into_inner();
-            Ok(find::output(resp, fields))
+            Ok(find::output(resp, fields, &scope_project))
         }
 
         EDIT_TASK => change::edit(&mut client, scope, args).await,

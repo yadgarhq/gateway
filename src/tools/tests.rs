@@ -169,7 +169,7 @@ fn find_tasks_reports_how_many_tasks_it_returned() {
     // cost and never how much it fetched.
     use crate::pb::yadgar::task::v1::Task;
 
-    let empty = find::output(FindTasksResponse::default(), find::Fields::Full);
+    let empty = find::output(FindTasksResponse::default(), find::Fields::Full, "");
     assert_eq!(empty.rows, 0);
 
     let three = find::output(
@@ -178,6 +178,7 @@ fn find_tasks_reports_how_many_tasks_it_returned() {
             next_page_token: "next".into(),
         },
         find::Fields::Full,
+        "",
     );
     assert_eq!(three.rows, 3, "the row count is the number of tasks");
     assert_eq!(
@@ -323,12 +324,12 @@ fn the_transition_schema_offers_exactly_the_statuses_a_task_can_move_to() {
     );
     assert_eq!(
         transition["inputSchema"]["required"],
-        json!(["id", "expect_version", "to"])
+        json!(["expect_version", "to"])
     );
 }
 
 #[test]
-fn the_edit_schema_requires_the_id_and_the_version_it_compares_against() {
+fn the_edit_schema_requires_the_version_it_compares_against() {
     let catalogue = definitions();
     let edit = catalogue
         .as_array()
@@ -336,10 +337,7 @@ fn the_edit_schema_requires_the_id_and_the_version_it_compares_against() {
         .iter()
         .find(|t| t["name"] == "edit_task")
         .expect("edit_task is advertised");
-    assert_eq!(
-        edit["inputSchema"]["required"],
-        json!(["id", "expect_version"])
-    );
+    assert_eq!(edit["inputSchema"]["required"], json!(["expect_version"]));
     for field in ["title", "body"] {
         assert_eq!(edit["inputSchema"]["properties"][field]["type"], "string");
     }
@@ -362,7 +360,7 @@ async fn a_missing_field_and_a_mistyped_one_are_told_apart() {
         (
             "edit_task",
             json!({ "expect_version": 3, "title": "t" }),
-            "`id` is required",
+            "`id` or `number` is required",
         ),
         (
             "edit_task",
@@ -482,7 +480,7 @@ async fn find_tasks_refuses_a_status_it_does_not_know() {
 }
 
 #[test]
-fn the_find_schema_offers_the_statuses_and_both_shapes() {
+fn the_find_schema_offers_the_statuses_and_three_shapes() {
     let all = definitions();
     let find = &all[2];
     assert_eq!(find["name"], "find_tasks");
@@ -491,7 +489,7 @@ fn the_find_schema_offers_the_statuses_and_both_shapes() {
         props["statuses"]["items"]["enum"],
         json!(["open", "in_progress", "blocked", "done", "dropped"])
     );
-    assert_eq!(props["fields"]["enum"], json!(["full", "summary"]));
+    assert_eq!(props["fields"]["enum"], json!(["full", "summary", "index"]));
     assert_eq!(props["fields"]["default"], "full");
     assert_eq!(props["statuses"]["maxItems"], 5);
 }
@@ -579,6 +577,7 @@ fn the_summary_shape_carries_no_body_tags_or_links() {
             next_page_token: String::new(),
         },
         find::Fields::Summary,
+        "",
     );
     let row = out.content["tasks"][0].as_object().unwrap();
     let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
@@ -710,4 +709,124 @@ fn the_create_schema_offers_the_legacy_ref_and_the_key() {
     assert_eq!(props["idempotency_key"]["maxLength"], 255);
     assert_eq!(props["idempotency_key"]["pattern"], "^[!-~]+$");
     assert_eq!(create["inputSchema"]["required"], json!(["title"]));
+}
+
+// ---- yaadgaar #397: the index shape and number addressing ---------------
+
+/// The index is exactly number, status and title: no id, no version, no
+/// body. A key set asserted whole, so an extra field fails as surely as a
+/// missing one.
+#[test]
+fn the_index_shape_carries_only_number_status_and_title() {
+    let out = find::output(
+        FindTasksResponse {
+            tasks: vec![a_full_task()],
+            next_page_token: "page-2".into(),
+        },
+        find::Fields::Index,
+        "",
+    );
+    let row = out.content["tasks"][0].as_object().unwrap();
+    let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["number", "status", "title"]);
+    assert_eq!(row["number"], 7);
+    assert_eq!(row["status"], "open");
+    assert_eq!(row["title"], "t");
+    assert_eq!(out.content["next_page_token"], "page-2");
+    assert_eq!(out.rows, 1);
+}
+
+/// A listing reaches the scope's subtree, but `edit_task` and
+/// `transition_task` resolve a number in the caller's EXACT project. So an
+/// index row from a descendant project carries its `project_id`, and a row
+/// from the scope's own project does not: a bare number in an index row
+/// always means "this number, in the project you are working in".
+#[test]
+fn an_index_row_from_another_project_carries_its_project_id() {
+    use crate::pb::yadgar::common::v1::Meta;
+    use crate::pb::yadgar::task::v1::Task;
+
+    let in_project = |project: &str, number| Task {
+        meta: Some(Meta {
+            id: format!("yadgar:task:{number}"),
+            project_id: project.into(),
+            ..Default::default()
+        }),
+        number,
+        title: "t".into(),
+        status: TaskStatus::Open as i32,
+        ..Default::default()
+    };
+    let out = find::output(
+        FindTasksResponse {
+            tasks: vec![in_project("acme", 1), in_project("acme/a", 1)],
+            next_page_token: String::new(),
+        },
+        find::Fields::Index,
+        "acme",
+    );
+    let rows = out.content["tasks"].as_array().unwrap();
+
+    let own = rows[0].as_object().unwrap();
+    let mut keys: Vec<&str> = own.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["number", "status", "title"],
+        "same project: no project_id"
+    );
+
+    let descendant = rows[1].as_object().unwrap();
+    let mut keys: Vec<&str> = descendant.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["number", "project_id", "status", "title"]);
+    assert_eq!(descendant["project_id"], "acme/a");
+    assert_eq!(descendant["number"], 1);
+}
+
+#[test]
+fn the_find_schema_offers_the_index_shape() {
+    let all = definitions();
+    let find = &all[2];
+    assert_eq!(
+        find["inputSchema"]["properties"]["fields"]["enum"],
+        json!(["full", "summary", "index"])
+    );
+}
+
+/// `id` is no longer required: `number` names a task as well. What stays
+/// required is the version the compare-and-set checks.
+#[test]
+fn the_edit_and_transition_schemas_take_an_id_or_a_number() {
+    let catalogue = definitions();
+    let tool = |name: &str| {
+        catalogue
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    let edit = tool("edit_task");
+    assert_eq!(edit["inputSchema"]["required"], json!(["expect_version"]));
+    assert_eq!(
+        edit["inputSchema"]["properties"]["number"]["type"],
+        "integer"
+    );
+    assert_eq!(edit["inputSchema"]["properties"]["number"]["minimum"], 1);
+    assert_eq!(
+        edit["inputSchema"]["properties"]["expect_body_sha256"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    let transition = tool("transition_task");
+    assert_eq!(
+        transition["inputSchema"]["required"],
+        json!(["expect_version", "to"])
+    );
+    assert_eq!(
+        transition["inputSchema"]["properties"]["number"]["minimum"],
+        1
+    );
 }

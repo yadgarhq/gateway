@@ -28,6 +28,10 @@ message CreateTaskRequest {
   // The caller supplies content, never identity. `id`, `number`, `version` and
   // every Meta field are assigned by the module — a client that could set them
   // could collide with, or overwrite, a record it does not own (D42).
+  //
+  // At most 128 Unicode scalar values. A longer title is refused with
+  // INVALID_ARGUMENT once enforcement ships; the unit, its reasons and when it
+  // is enforced are on yadgar.task.v1.Task.title.
   string title = 3;
   string body = 4;
   repeated string tags = 5;
@@ -63,11 +67,54 @@ message FindTasksResponse {
 message EditTaskRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   yadgar.common.v1.Scope scope = 2;
+
+  // THE TASK IS NAMED BY EXACTLY ONE OF `id` OR `number`. Both, or neither, is
+  // refused with INVALID_ARGUMENT.
+  //
+  // `number` IS 0 WHEN ABSENT, and 0 is never a task: the per-project counter
+  // hands out 1 first. So the zero value cannot be mistaken for a task number,
+  // and no `optional` is needed to tell the two apart.
+  //
+  // THE TWO KEYS REACH DIFFERENT SETS, and that is deliberate. `id` is a global
+  // URN and reaches any task the caller's scope reaches, its project's subtree
+  // included. `number` is unique only within one project, so it resolves in the
+  // caller's EXACT project and never in a project above, beside or below it — a
+  // number that exists only in another project is NOT_FOUND, exactly as an
+  // unknown id is.
+  //
+  // WHY NOT A `oneof`, as ReadTaskRequest has. Moving the existing `id` into a
+  // oneof is a breaking change under `buf breaking`'s FILE rules (D15), so the
+  // rule is stated here and enforced by the logic service instead.
   string id = 3;
   uint64 expect_version = 4;
+  // At most 128 Unicode scalar values when the mask writes `title`. A longer
+  // title is refused with INVALID_ARGUMENT once enforcement ships; the unit,
+  // its reasons and when it is enforced are on yadgar.task.v1.Task.title.
   string title = 5;
   string body = 6;
   google.protobuf.FieldMask update_mask = 7;
+  uint32 number = 8;
+
+  // A GUARD AGAINST A BODY CUT OFF IN TRANSIT: the SHA-256 digest of the body
+  // the caller MEANT to send. When set, the edit is refused with
+  // INVALID_ARGUMENT unless SHA-256 over `body` equals it, so a body truncated
+  // between the caller and this service is refused rather than stored.
+  //
+  // THE DIGEST IS OVER THE EXACT UTF-8 BYTES OF `body`, with no normalisation:
+  // no trimming, no line-ending conversion, and a trailing newline counts.
+  //
+  // THE FIELD IS THE 32 RAW DIGEST BYTES, NOT A HEX STRING. Hex exists only on
+  // the gateway's MCP surface, which takes 64 lowercase hex characters and
+  // decodes them before it sends this field.
+  //
+  // EMPTY MEANS NO GUARD, which is what every caller that predates this field
+  // sends. Present, it must be exactly 32 bytes, or the edit is refused. It is
+  // refused as well when the mask does not write `body`: there is then no body
+  // to check, and a caller sending a digest believes there is.
+  //
+  // A MODEL CANNOT COMPUTE THIS IN ITS HEAD. A caller holds the body in a file
+  // and hashes that file (`sha256sum`), then sends the same file's content.
+  bytes expect_body_sha256 = 9;
 }
 message EditTaskResponse {
   yadgar.common.v1.Meta meta = 1;
@@ -82,9 +129,13 @@ message EditTaskResponse {
 message TransitionTaskRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   yadgar.common.v1.Scope scope = 2;
+  // Exactly one of `id` or `number`, with the same rules and the same reach as
+  // on EditTaskRequest: `number` is 0 when absent and resolves in the caller's
+  // exact project only.
   string id = 3;
   uint64 expect_version = 4;
   yadgar.task.v1.TaskStatus to = 5;
+  uint32 number = 6;
 }
 message TransitionTaskResponse {
   yadgar.common.v1.Meta meta = 1;

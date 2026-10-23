@@ -123,10 +123,17 @@ impl TaskService for FakeTask {
         request: tonic::Request<FindTasksRequest>,
     ) -> Result<tonic::Response<FindTasksResponse>, tonic::Status> {
         self.0.hits.fetch_add(1, Ordering::SeqCst);
-        self.0.finds.lock().unwrap().push(request.into_inner());
+        let request = request.into_inner();
+        // The task lives in the project the caller is scoped to, so an index
+        // row must carry no `project_id`.
+        let project_id = request.scope.as_ref().map(|s| s.project_id.clone());
+        self.0.finds.lock().unwrap().push(request);
         Ok(tonic::Response::new(FindTasksResponse {
             tasks: vec![Task {
-                meta: returned_meta(),
+                meta: returned_meta().map(|m| Meta {
+                    project_id: project_id.unwrap_or_default(),
+                    ..m
+                }),
                 number: 4_242,
                 title: "returned title".into(),
                 body: "a body the summary must not carry".into(),
@@ -486,6 +493,24 @@ async fn find_tasks_reaches_task_with_the_filter_and_answers_in_summary() {
     );
 }
 
+/// yaadgaar #397: the index shape compares each row's project with the
+/// ATTESTED scope's. A row from the caller's own project carries no
+/// `project_id`; if the scope's project did not reach the comparison, this
+/// same-project row would carry one.
+#[tokio::test]
+async fn find_tasks_in_index_shape_omits_the_callers_own_project() {
+    let (state, _) = gateway().await;
+
+    let (status, body) = call(state, "find_tasks", json!({ "fields": "index" })).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    assert_eq!(
+        body["result"]["structuredContent"]["tasks"],
+        json!([{ "number": 4_242, "title": "returned title", "status": "blocked" }])
+    );
+}
+
 /// LEDGER 1789: the caller's key and the legacy reference reach `task` as sent.
 /// Replay and refusal of a reused key are `task-db`'s (D9), keyed on this value.
 #[tokio::test]
@@ -521,4 +546,167 @@ async fn create_task_reaches_task_with_the_callers_key_and_legacy_ref() {
         body["result"]["structuredContent"],
         json!({ "id": RETURNED_ID, "number": 4_242, "version": RETURNED_VERSION })
     );
+}
+
+// ---- yaadgaar #397: edit and transition by number -----------------------
+
+/// A task named by its per-project number reaches `task` as a number with no
+/// id. `task` resolves it in the caller's exact project; the gateway forwards
+/// the attested scope unchanged, so it cannot widen that.
+#[tokio::test]
+async fn edit_and_transition_by_number_reach_task_as_a_number() {
+    let (state, seen) = gateway().await;
+
+    let (status, body) = call(
+        state.clone(),
+        "edit_task",
+        json!({ "number": 397, "expect_version": 41, "title": "sentinel by number e2" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+
+    let (status, body) = call(
+        state,
+        "transition_task",
+        json!({ "number": 397, "expect_version": 42, "to": "done" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+
+    let edits = seen.edits.lock().unwrap();
+    assert_eq!(edits[0].number, 397);
+    assert_eq!(edits[0].id, "", "a call by number sends no id");
+    assert_eq!(
+        edits[0].scope.as_ref().expect("a scope").project_id,
+        "acme/sentinel-project"
+    );
+    let transitions = seen.transitions.lock().unwrap();
+    assert_eq!(transitions[0].number, 397);
+    assert_eq!(transitions[0].id, "");
+}
+
+/// Both keys, neither key, and a number that is no task are the caller's
+/// mistakes, answered before any RPC.
+#[tokio::test]
+async fn an_ambiguous_or_absent_key_never_reaches_task() {
+    for (tool, args) in [
+        (
+            "edit_task",
+            json!({ "id": "yadgar:task:x", "number": 3, "expect_version": 1, "title": "t" }),
+        ),
+        ("edit_task", json!({ "expect_version": 1, "title": "t" })),
+        (
+            "edit_task",
+            json!({ "number": 0, "expect_version": 1, "title": "t" }),
+        ),
+        (
+            "edit_task",
+            json!({ "number": -4, "expect_version": 1, "title": "t" }),
+        ),
+        (
+            "transition_task",
+            json!({ "id": "yadgar:task:x", "number": 3, "expect_version": 1, "to": "done" }),
+        ),
+        (
+            "transition_task",
+            json!({ "expect_version": 1, "to": "done" }),
+        ),
+    ] {
+        let (state, seen) = gateway().await;
+        let (status, body) = call(state, tool, args.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{tool} {args}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{tool} {args}: {body}");
+        assert_eq!(seen.hits.load(Ordering::SeqCst), 0, "{tool} {args}");
+    }
+}
+
+// ---- yaadgaar #394: expect_body_sha256 ----------------------------------
+
+/// `printf 'the whole body\n' | sha256sum`, spelled as a literal (ADR-0573).
+const WHOLE_BODY: &str = "the whole body\n";
+const WHOLE_BODY_SHA256: &str = "3dd6ee3056c3a5d527d642ff3d19900286ad919bfbdccc6acb083ffde283f726";
+
+/// A matching digest is forwarded to `task` as its 32 raw bytes, so `task`
+/// checks it again for every caller that does not come through here.
+#[tokio::test]
+async fn a_body_matching_its_digest_reaches_task_with_the_digest() {
+    let (state, seen) = gateway().await;
+
+    let (status, body) = call(
+        state,
+        "edit_task",
+        json!({
+            "id": "yadgar:task:sentinel-sha",
+            "expect_version": 5,
+            "body": WHOLE_BODY,
+            "expect_body_sha256": WHOLE_BODY_SHA256,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let edits = seen.edits.lock().unwrap();
+    assert_eq!(edits[0].body, WHOLE_BODY);
+    assert_eq!(edits[0].expect_body_sha256.len(), 32);
+    assert_eq!(edits[0].expect_body_sha256[0], 0x3d);
+    assert_eq!(edits[0].expect_body_sha256[31], 0x26);
+}
+
+/// **THE CASE THE GUARD EXISTS FOR, CHECKED HERE AS WELL AS IN `task`.** A
+/// `task` older than the field ignores it, so without this check the cut body
+/// below would be stored during a rollout and reported as a success.
+#[tokio::test]
+async fn a_body_cut_off_before_its_digest_never_reaches_task() {
+    const MISMATCH: &str = "the body does not match `expect_body_sha256`; it may have been \
+                            cut off in transit, so nothing was written. Re-send the whole body";
+    const NOT_HEX: &str = "`expect_body_sha256` must be 64 lowercase hex characters";
+    const NO_BODY: &str = "`expect_body_sha256` was sent without a `body` to check";
+    // SHA-256 of the empty string. Sent with NO body, it matches the body an
+    // edit would get if a missing body were read as "", so only the
+    // missing-body check can refuse it.
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    for (args, refusal) in [
+        // Cut mid-word.
+        (
+            json!({ "id": "yadgar:task:x", "expect_version": 5, "body": "the whole bo",
+                    "expect_body_sha256": WHOLE_BODY_SHA256 }),
+            MISMATCH,
+        ),
+        // Lost only its trailing newline.
+        (
+            json!({ "id": "yadgar:task:x", "expect_version": 5, "body": "the whole body",
+                    "expect_body_sha256": WHOLE_BODY_SHA256 }),
+            MISMATCH,
+        ),
+        // Not 64 lowercase hex characters.
+        (
+            json!({ "id": "yadgar:task:x", "expect_version": 5, "body": WHOLE_BODY,
+                    "expect_body_sha256": WHOLE_BODY_SHA256.to_uppercase() }),
+            NOT_HEX,
+        ),
+        (
+            json!({ "id": "yadgar:task:x", "expect_version": 5, "body": WHOLE_BODY,
+                    "expect_body_sha256": &WHOLE_BODY_SHA256[..62] }),
+            NOT_HEX,
+        ),
+        // A digest with no body to check.
+        (
+            json!({ "id": "yadgar:task:x", "expect_version": 5, "title": "t",
+                    "expect_body_sha256": EMPTY_SHA256 }),
+            NO_BODY,
+        ),
+    ] {
+        let (state, seen) = gateway().await;
+        let (status, body) = call(state, "edit_task", args.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{args}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{args}: {body}");
+        assert_eq!(
+            body["result"]["content"][0]["text"], refusal,
+            "{args}: {body}"
+        );
+        assert_eq!(seen.hits.load(Ordering::SeqCst), 0, "{args}");
+    }
 }
