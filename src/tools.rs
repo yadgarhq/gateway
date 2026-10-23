@@ -186,7 +186,11 @@ fn definition(name: &str) -> Value {
                         "minimum": 0,
                         "description": "The version last read; the edit is refused if it moved",
                     },
-                    "title": { "type": "string", "description": "New short summary" },
+                    "title": {
+                        "type": "string",
+                        "maxLength": create::TITLE_MAX,
+                        "description": "New short summary",
+                    },
                     "body": { "type": "string", "description": "New full description; empty clears it" },
                     "expect_body_sha256": {
                         "type": "string",

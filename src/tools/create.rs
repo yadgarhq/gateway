@@ -47,6 +47,11 @@ fn idempotency_key(args: &Value, mint: impl FnOnce() -> String) -> Result<String
     Ok(key.to_string())
 }
 
+/// The longest task title the store accepts, in characters (what JSON Schema's
+/// `maxLength` counts). `task-db` enforces it with a CHECK (migration 7); the
+/// schemas advertise it so a caller learns the bound before the store refuses.
+pub(super) const TITLE_MAX: usize = 128;
+
 /// The longest `legacy_ref` this gateway accepts, in characters (what JSON
 /// Schema's `maxLength` counts). `task-db` stores `links` as a `JSON` column
 /// with no length of its own, so this bound is the GATEWAY's, not the store's.
@@ -118,7 +123,11 @@ pub(super) fn schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "title": { "type": "string", "description": "Short summary of the task" },
+            "title": {
+                "type": "string",
+                "maxLength": TITLE_MAX,
+                "description": "Short summary of the task",
+            },
             "body": { "type": "string", "description": "Full description" },
             "tags": { "type": "array", "items": { "type": "string" } },
             "legacy_ref": {
