@@ -20,6 +20,22 @@ message Task {
   // Semantic reference, same rationale as Adr.number.
   uint32 number = 16;
 
+  // A short, stable summary: AT MOST 128 UNICODE SCALAR VALUES (code points),
+  // counted on the string exactly as sent, with no trimming or normalisation.
+  //
+  // THE UNIT IS THE CODE POINT, NOT THE BYTE. It is what every layer that
+  // measures a title already counts: Rust `str::chars().count()`, MariaDB
+  // `CHAR_LENGTH` over a utf8mb4 column, and JSON Schema `maxLength`. A byte
+  // cap would give a Persian or CJK title a half or a third of the room an
+  // English one gets, for no storage reason: the column is utf8mb4
+  // `VARCHAR(512)`, which holds 512 characters, not 512 bytes.
+  //
+  // THE BOUND IS THE CONTRACT; ENFORCEMENT FOLLOWS IT. Once the titles already
+  // stored are shortened, `yadgar.taskapi.v1.TaskService` refuses a longer
+  // title with INVALID_ARGUMENT on CreateTask and on an EditTask whose mask
+  // writes `title`, and task-db refuses one with a CHECK constraint. Until both
+  // ship, a stored title CAN be longer, and a reader must not assume it is at
+  // most 128. A READ is never refused for a title's length.
   string title = 17;
   string body = 18;
   TaskStatus status = 19;

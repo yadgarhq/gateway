@@ -324,6 +324,11 @@ message EnrolmentToken {
 // issued; run `yaadgaar login`". It is answered inside the same floor, and it
 // is no oracle: only a caller who presented a valid secret reaches it.
 //
+// A REPLAYED REDEMPTION MINTS UNDER THE EPOCH ITS FIRST DELIVERY RECORDED
+// (ADR-0976), not the current one. A genuine lost-response retry with no bump
+// in between still mints. A retry after a later revoke-all, reset or password
+// set gets the same FAILED_PRECONDITION answer as above.
+//
 // RETRY-SAFE WITHIN ONE PROCESS, BECAUSE OF `idempotency` BELOW. Redemption
 // spends the secret and mints the credential, so a lost RESPONSE leaves the
 // person holding a password they chose, a spent secret, no credential, and NO
