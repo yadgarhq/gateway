@@ -189,7 +189,7 @@ fn definition(name: &str) -> Value {
                     "title": {
                         "type": "string",
                         "maxLength": create::TITLE_MAX,
-                        "description": "New short summary",
+                        "description": "Short summary of the task, at most 128 characters (Unicode code points); put detail in the body",
                     },
                     "body": { "type": "string", "description": "New full description; empty clears it" },
                     "expect_body_sha256": {
