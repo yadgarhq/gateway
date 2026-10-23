@@ -126,7 +126,7 @@ pub(super) fn schema() -> Value {
             "title": {
                 "type": "string",
                 "maxLength": TITLE_MAX,
-                "description": "Short summary of the task",
+                "description": "Short summary of the task, at most 128 characters (Unicode code points); put detail in the body",
             },
             "body": { "type": "string", "description": "Full description" },
             "tags": { "type": "array", "items": { "type": "string" } },

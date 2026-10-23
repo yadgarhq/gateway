@@ -348,6 +348,27 @@ fn the_create_and_edit_schemas_bound_the_title_at_128_characters() {
     }
 }
 
+/// ADR-0573: the description is literal text a caller reads, so assert it
+/// verbatim. It states the 128 bound the schema enforces.
+/// MUTATION THIS CATCHES: the description drifting from the `maxLength`.
+#[test]
+fn the_create_and_edit_schemas_describe_the_title_bound_in_words() {
+    let catalogue = definitions();
+    for name in ["create_task", "edit_task"] {
+        let tool = catalogue
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is advertised"));
+        assert_eq!(
+            tool["inputSchema"]["properties"]["title"]["description"],
+            "Short summary of the task, at most 128 characters (Unicode code points); put detail in the body",
+            "{name} must describe the `title` bound"
+        );
+    }
+}
+
 #[test]
 fn the_edit_schema_requires_the_version_it_compares_against() {
     let catalogue = definitions();
