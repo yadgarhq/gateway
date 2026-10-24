@@ -11,6 +11,21 @@ use super::gate::*;
 use super::*;
 use crate::upstream::CallError;
 
+/// The bootstrap verb rule's 403 (team access stage 3b, red 14).
+pub(super) const VERB_RULE_BODY: &str = r#"{"error":"the bootstrap token may only create an administrator, promote one, or issue an enrolment the enrolment predicate admits"}"#;
+
+/// The ONE 403 for every failed conjunct of the bootstrap enrolment predicate
+/// (ADR-0657), true in both modes of `IAM_ADMIN_FROM_TEAM`: ADR-0655's
+/// zero-credential predicate with derivation off, ADR-0966's declared-member
+/// predicate with it on. `chart`'s `kind-up.sh` reads it (team access stage 3a
+/// accepts this and the previous text).
+const ENROLMENT_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only enrol an administrator the enrolment predicate admits"}"#;
+
+/// The ONE 403 for every failed step of the bootstrap create-user predicate
+/// (team access §6, ADR-0657). Which step failed goes only to `iam-db`'s warn
+/// line and counter label, joined by the request id.
+const CREATE_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only create the declared first administrator, and only while no administrator exists"}"#;
+
 /// A refusal one administrative handler must return, with the D67 label it is
 /// recorded under.
 ///
@@ -66,7 +81,7 @@ pub(super) async fn authorise(
     state: &AppState,
     endpoint: &'static str,
     verb: Verb,
-    wants_admin: bool,
+    ask: Ask,
     headers: &HeaderMap,
     request_id: String,
 ) -> Result<Authority, Box<Refusal>> {
@@ -83,9 +98,7 @@ pub(super) async fn authorise(
                 ),
             ))
         }
-        Ok(Some(presented)) => {
-            return bootstrap_authority(state, endpoint, verb, wants_admin, presented)
-        }
+        Ok(Some(presented)) => return bootstrap_authority(state, endpoint, verb, ask, presented),
         Ok(None) => {}
     }
 
@@ -228,7 +241,7 @@ pub(super) fn bootstrap_authority(
     state: &AppState,
     endpoint: &'static str,
     verb: Verb,
-    wants_admin: bool,
+    ask: Ask,
     presented: &str,
 ) -> Result<Authority, Box<Refusal>> {
     // RULE 1 FIRST, AND FOR EVERY VERB. "An absent or empty bootstrap secret
@@ -259,7 +272,7 @@ pub(super) fn bootstrap_authority(
     // the secret being looked at, so it cannot be used as an oracle for it — and
     // more importantly, the exclusion cannot be reached by a comparison that
     // succeeded.
-    if !verb.accepts_bootstrap(wants_admin) {
+    if !verb.accepts_bootstrap(ask) {
         tracing::warn!(
             endpoint,
             "the bootstrap token was presented on a verb ADR-0492 does not grant it"
@@ -278,7 +291,13 @@ pub(super) fn bootstrap_authority(
                 // longer returned on `issue-enrolment` at all — the only refusals
                 // on that path now come from the predicate at `iam-db` and render
                 // through `admin_failure`.
-                r#"{"error":"the bootstrap token may only create an administrator, promote one, or enrol one who has never held a credential"}"#,
+                //
+                // **REWORDED AGAIN BY TEAM ACCESS STAGE 3b.** "Never held a
+                // credential" stopped being true under ADR-0966, whose
+                // break-glass arm admits a declared administrator whatever it
+                // holds. Stage 10 rewrites it once more, when "promote one"
+                // stops being true.
+                VERB_RULE_BODY,
             ),
         ));
     }
@@ -348,10 +367,20 @@ pub(super) fn bootstrap_authority(
 /// renders every administrative endpoint. An arm keyed on the CODE alone
 /// would answer a sentence about enrolment to a caller who was creating a user —
 /// the same overclaiming that made the exclusion message above false,
-/// re-introduced by the change that fixes it. `create-user` and `set-user-admin`
-/// keep the opaque catch-all they answer today, because nothing in ADR-0655 gives
-/// `iam` a new reason to refuse them and a body invented for a case that does not
-/// exist would be a widening by guess.
+/// re-introduced by the change that fixes it. `set-user-admin` keeps the opaque
+/// catch-all, because nothing gives `iam` a new reason to refuse it.
+///
+/// # `PERMISSION_DENIED` ON `create-user` IS 403 TOO (team access stage 3b)
+///
+/// `iam-db` evaluates the bootstrap create-user predicate (§6) inside the insert
+/// and refuses `PERMISSION_DENIED` when no `administrators` team exists, when an
+/// administrator already exists, or when the id is not declared. One constant
+/// body for all three (ADR-0657), distinct from the verb-rule 403.
+///
+/// **`ALREADY_EXISTS` AND `INVALID_ARGUMENT` STAY OPAQUE (ADR-0927).** A 409 on
+/// `create-user` would tell a caller that a user id or a username is taken, and
+/// a 400 that an identifier is malformed. No caller-visible status may reveal
+/// whether an identifier exists, so both keep the 503.
 ///
 /// Everything else is opaque, from a `tonic::Code` and a constant — never
 /// `e.to_string()` — for [`login_failure`]'s reason.
@@ -360,16 +389,19 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
     // the log rather than to the caller.
     tracing::warn!(code = ?e.code(), message = e.message(), endpoint, "an administrative RPC was refused or failed");
     let code = e.code();
-    // THE ENROLMENT PREDICATE'S REFUSAL, and only on the endpoint it can come
-    // from. Computed once so the label and the body cannot disagree about which
-    // case this is.
-    let enrolment_refusal =
-        code == tonic::Code::PermissionDenied && endpoint == ADMIN_ISSUE_ENROLMENT;
+    // A BOOTSTRAP PREDICATE'S REFUSAL (enrolment, or create-user since team
+    // access stage 3b), and only on the endpoint it can come from. Computed
+    // once so the label and the body cannot disagree about which case this is.
+    let predicate_refusal = match (code, endpoint) {
+        (tonic::Code::PermissionDenied, ADMIN_ISSUE_ENROLMENT) => Some(ENROLMENT_REFUSAL_BODY),
+        (tonic::Code::PermissionDenied, ADMIN_CREATE_USER) => Some(CREATE_REFUSAL_BODY),
+        _ => None,
+    };
     call.fail(if code == tonic::Code::Unauthenticated {
         "UNAUTHENTICATED"
     } else if code == tonic::Code::FailedPrecondition {
         "FAILED_PRECONDITION"
-    } else if enrolment_refusal {
+    } else if predicate_refusal.is_some() {
         // **AND NOT `UNAVAILABLE`.** D67's `outcome` label is what an operator
         // aggregates on, and recording a refusal as an unavailability would make
         // the one signal that says "the predicate held" read as an outage. Legal
@@ -380,15 +412,12 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
     } else {
         "UNAVAILABLE"
     });
-    if enrolment_refusal {
-        return text(
-            StatusCode::FORBIDDEN,
-            // ONE BODY FOR BOTH CONJUNCTS (ADR-0657). If a later edit finds
-            // itself wanting to name which conjunct failed, that is the oracle
-            // the ADR exists to refuse — the conjunct lives in `iam-db`'s log
-            // line and its closed-set counter label, reachable by request id.
-            r#"{"error":"the bootstrap token may only enrol an administrator who has never held a credential"}"#,
-        );
+    if let Some(body) = predicate_refusal {
+        // ONE BODY FOR EVERY CONJUNCT (ADR-0657). If a later edit finds itself
+        // wanting to name which conjunct failed, that is the oracle the ADR
+        // exists to refuse — the conjunct lives in `iam-db`'s log line and its
+        // closed-set counter label, reachable by request id.
+        return text(StatusCode::FORBIDDEN, body);
     }
     if code == tonic::Code::FailedPrecondition {
         return text(

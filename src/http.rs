@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
-use crate::admin::{Authority, Bootstrap, BootstrapToken, Verb};
+use crate::admin::{Ask, Authority, Bootstrap, BootstrapToken, Verb};
 use crate::attest::{self, Attestation, Claimed, Credentials};
 use crate::limit::{Bucket, Decision, Limiter};
 use crate::mcp::{self, codes, headers, meta_keys};

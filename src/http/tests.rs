@@ -781,10 +781,18 @@ fn admin_call() -> Call {
 /// - every other non-`UNAUTHENTICATED` code answers ONE identical
 ///   `(status, body)` pair, the generic "administrative service unavailable";
 /// - `UNAUTHENTICATED` alone answers 401 with the generic "refused" body.
+///
+/// **EXTENDED BY TEAM ACCESS STAGE 3b, red 5.** On `create-user`,
+/// `PERMISSION_DENIED` is the bootstrap create-user predicate's refusal and
+/// answers its own 403 (red 4). `ALREADY_EXISTS` and `INVALID_ARGUMENT` stay in
+/// the generic 503 bucket, asserted by name below: ADR-0927 rules that no
+/// caller-visible status may say whether an identifier exists or is well formed.
 #[tokio::test]
 async fn admin_failure_failed_precondition_gets_a_distinct_body() {
     let mut generic_answers = std::collections::BTreeSet::new();
     let mut precondition_answers = std::collections::BTreeSet::new();
+    let mut predicate_answers = std::collections::BTreeSet::new();
+    let mut generic_codes = std::collections::BTreeSet::new();
     let mut refusals = 0;
 
     for code in ALL_CODES {
@@ -819,12 +827,29 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
             assert_eq!(body, r#"{"error":"refused"}"#);
         } else if code == tonic::Code::FailedPrecondition {
             precondition_answers.insert((resp_status.as_u16(), body));
+        } else if code == tonic::Code::PermissionDenied {
+            predicate_answers.insert((resp_status.as_u16(), body));
         } else {
+            generic_codes.insert(code as i32);
             generic_answers.insert((resp_status.as_u16(), body));
         }
     }
 
     assert_eq!(refusals, 1, "exactly one code is a refusal");
+    assert_eq!(
+        predicate_answers.into_iter().collect::<Vec<_>>(),
+        vec![(
+            StatusCode::FORBIDDEN.as_u16(),
+            r#"{"error":"the bootstrap token may only create the declared first administrator, and only while no administrator exists"}"#.to_string()
+        )],
+        "red 4: PERMISSION_DENIED on create-user is the bootstrap predicate's one 403"
+    );
+    for code in [tonic::Code::AlreadyExists, tonic::Code::InvalidArgument] {
+        assert!(
+            generic_codes.contains(&(code as i32)),
+            "red 5: {code:?} on create-user must stay in the opaque 503 bucket (ADR-0927)"
+        );
+    }
     assert_eq!(
         generic_answers.len(),
         1,
@@ -2600,8 +2625,9 @@ fn an_accepted_bootstrap_token_is_counted_and_a_refused_one_is_not() {
     // never reached the comparison, and then this half would prove nothing about
     // the counter. The two bodies are what separate them: the pre-comparison
     // refusal says "the bootstrap token may only create an administrator, promote
-    // one, or enrol one who has never held a credential" (reworded by ADR-0655,
-    // which admitted the third verb and left the sentence overclaiming), and this
+    // one, or issue an enrolment the enrolment predicate admits" (reworded by
+    // ADR-0655, and again by team access stage 3b because ADR-0966 made "never
+    // held a credential" false), and this
     // one is the `Bootstrap::Refused` arm's own.
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
@@ -2703,8 +2729,8 @@ async fn a_bootstrap_request_never_falls_back_to_the_attested_path() {
     assert_eq!(
         answer.get("error"),
         Some(&json!(
-            "the bootstrap token may only create an administrator, promote one, or enrol one who \
-             has never held a credential"
+            "the bootstrap token may only create an administrator, promote one, or issue an \
+             enrolment the enrolment predicate admits"
         )),
         "and it must be the BOOTSTRAP verb gate that refused it, not the attested path's \
          non-administrator refusal — the two are both 403 and the body is what separates them"

@@ -83,7 +83,7 @@ pub(in crate::http) async fn admin_revoke_credentials(
         &state,
         ADMIN_REVOKE_CREDENTIALS,
         Verb::RevokeCredentials,
-        false,
+        Ask::flag(false),
         &headers,
         request_id.clone(),
     )
