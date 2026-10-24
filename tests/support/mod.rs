@@ -122,6 +122,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("IAM_REQUEST_TIMEOUT_SECONDS", "30"),
         ("PROJECT_REQUEST_TIMEOUT_SECONDS", "30"),
         ("LISTEN_HEADER_READ_TIMEOUT_SECS", "10"),
+        ("YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID", "0"),
     ]
 }
 

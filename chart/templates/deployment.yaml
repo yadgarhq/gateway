@@ -104,6 +104,13 @@
   at RENDER time: `helm upgrade` refuses and the pods already running are
   untouched. That is the same shape the four Secret mounts below already have.
 */}}
+{{/*
+  THE PRE-MINTED SWITCH (Max's ruling, 2026-10-24), guarded with the K-1 shape
+  the TLS switches use: `adminBootstrap: null` coalesces the whole block away,
+  so the schema's `required` has nothing to judge, and the `ternary` below
+  would render "0" for it.
+*/}}
+{{- if not (and (kindIs "map" .Values.adminBootstrap) (hasKey .Values.adminBootstrap "refusePreMintedUserId") (kindIs "bool" .Values.adminBootstrap.refusePreMintedUserId)) }}{{ fail "adminBootstrap.refusePreMintedUserId must be set to true or false; it renders YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID" }}{{ end }}
 {{- $bootstrapTokenSecret := .Values.adminBootstrap.tokenSecret -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -722,6 +729,10 @@ spec:
             - name: YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE
               value: /var/run/secrets/admin-bootstrap/token
             {{- end }}
+            # RENDERED UNCONDITIONALLY, as TASK_TLS_ENABLED is, so `false` is
+            # visible on the wire. Guarded at the top of this file.
+            - name: YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID
+              value: {{ ternary "1" "0" .Values.adminBootstrap.refusePreMintedUserId | quote }}
             - name: RUST_LOG
               value: "info"
             {{- if .Values.trustUnauthenticatedHeaders }}

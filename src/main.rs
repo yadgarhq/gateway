@@ -160,6 +160,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     watch_inputs.export_not_after();
 
     let (allowed_origins, trust, credential_limits, admin_limits) = boot::http_configuration()?;
+    // NO COMPILED-IN DEFAULT (ADR-0569): absent or not "1"/"0" refuses the boot.
+    let pre_minted_ids = yadgar_gateway::admin::PreMintedIds::from_env()?;
     log_trust_boundary(&trust);
 
     let state = Arc::new(AppState {
@@ -173,6 +175,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         credential_limits,
         admin_limits,
         bootstrap,
+        pre_minted_ids,
         tools_poll_interval,
         projects,
     });

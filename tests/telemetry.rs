@@ -82,6 +82,7 @@ fn state() -> Arc<AppState> {
         // DISABLED, which is the shipped default until the chart mounts the
         // Secret, and nothing here exercises the bootstrap path.
         bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881'S VALIDATOR, in the SHIPPED configuration: `Mode::Counting`

@@ -216,6 +216,9 @@ pub struct AppState {
     /// the bootstrap path and NOTHING else — see the type for why that is
     /// serve-and-disable rather than ADR-0569's refuse-to-start.
     pub bootstrap: BootstrapToken,
+    /// The fail-closed switch on the pre-minted `create-user` arm, from
+    /// `adminBootstrap.refusePreMintedUserId`. See [`crate::admin::PreMintedIds`].
+    pub pre_minted_ids: crate::admin::PreMintedIds,
     /// How often a client should re-poll `tools/list` for a changed catalogue,
     /// resolved from `gateway.yaml`'s `toolsPoll.intervalSeconds`
     /// (ADR-0569/0570). Read once at boot and held for the life of the

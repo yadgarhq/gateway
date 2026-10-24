@@ -21,11 +21,6 @@ pub(super) const VERB_RULE_BODY: &str = r#"{"error":"the bootstrap token may onl
 /// accepts this and the previous text).
 const ENROLMENT_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only enrol an administrator the enrolment predicate admits"}"#;
 
-/// The ONE 403 for every failed step of the bootstrap create-user predicate
-/// (team access §6, ADR-0657). Which step failed goes only to `iam-db`'s warn
-/// line and counter label, joined by the request id.
-const CREATE_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only create the declared first administrator, and only while no administrator exists"}"#;
-
 /// A refusal one administrative handler must return, with the D67 label it is
 /// recorded under.
 ///
@@ -65,6 +60,8 @@ impl Refusal {
 ///    Secret's own manifest states it in the same words. No comparison runs.
 /// 2. **Does the token reach this verb, at this value?** Refused BEFORE the
 ///    secret is compared, so an excluded verb is not even a comparison oracle.
+///    The pre-minted switch (`adminBootstrap.refusePreMintedUserId`) is judged
+///    here too, for the same reason.
 /// 3. **Does it match?** `BootstrapToken::check`, whose `None` arm returns above
 ///    rather than defaulting to `""` — §7.2's rule 2.
 ///
@@ -301,6 +298,23 @@ pub(super) fn bootstrap_authority(
             ),
         ));
     }
+    // THE PRE-MINTED SWITCH (Max's ruling (b), 2026-10-24), also BEFORE THE
+    // COMPARISON, so an engaged switch never counts an acceptance. A posture
+    // that does not depend on the id, so it names its knob, at the 503 the
+    // not-configured answer has.
+    if state.pre_minted_ids.refuses(verb, ask) {
+        tracing::warn!(
+            endpoint,
+            "a pre-minted user_id arrived and adminBootstrap.refusePreMintedUserId is engaged"
+        );
+        return Err(Refusal::new(
+            "FAILED_PRECONDITION",
+            text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::admin::SWITCHED_OFF_BODY,
+            ),
+        ));
+    }
     match state.bootstrap.check(presented) {
         Bootstrap::Accepted => {
             record_bootstrap_use(endpoint);
@@ -370,17 +384,16 @@ pub(super) fn bootstrap_authority(
 /// re-introduced by the change that fixes it. `set-user-admin` keeps the opaque
 /// catch-all, because nothing gives `iam` a new reason to refuse it.
 ///
-/// # `PERMISSION_DENIED` ON `create-user` IS 403 TOO (team access stage 3b)
+/// # `create-user` HAS NO ARM: EVERY REFUSAL THERE IS THE OPAQUE 503
 ///
-/// `iam-db` evaluates the bootstrap create-user predicate (§6) inside the insert
-/// and refuses `PERMISSION_DENIED` when no `administrators` team exists, when an
-/// administrator already exists, or when the id is not declared. One constant
-/// body for all three (ADR-0657), distinct from the verb-rule 403.
-///
-/// **`ALREADY_EXISTS` AND `INVALID_ARGUMENT` STAY OPAQUE (ADR-0927).** A 409 on
-/// `create-user` would tell a caller that a user id or a username is taken, and
-/// a 400 that an identifier is malformed. No caller-visible status may reveal
-/// whether an identifier exists, so both keep the 503.
+/// `iam-db`'s bootstrap create-user predicate (§6) refuses `PERMISSION_DENIED`
+/// (no `administrators` team, an administrator exists, the id is not
+/// declared); a taken id is `ALREADY_EXISTS`; a malformed one is
+/// `INVALID_ARGUMENT`. Max's ruling (a) of 2026-10-24: the bootstrap token must
+/// not tell a taken id from the other refusals. ONE answer, the opaque 503 of
+/// ADR-0927, because it also equals an outage and a malformed id, where a 403
+/// would still say "iam is up and judged a well-formed id". The label keeps
+/// `PERMISSION_DENIED` for the operator; the log has the code.
 ///
 /// Everything else is opaque, from a `tonic::Code` and a constant — never
 /// `e.to_string()` — for [`login_failure`]'s reason.
@@ -389,19 +402,20 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
     // the log rather than to the caller.
     tracing::warn!(code = ?e.code(), message = e.message(), endpoint, "an administrative RPC was refused or failed");
     let code = e.code();
-    // A BOOTSTRAP PREDICATE'S REFUSAL (enrolment, or create-user since team
-    // access stage 3b), and only on the endpoint it can come from. Computed
-    // once so the label and the body cannot disagree about which case this is.
+    // THE ENROLMENT PREDICATE'S REFUSAL, and only on the endpoint it can come
+    // from. Computed once so the label and the body cannot disagree about which
+    // case this is.
     let predicate_refusal = match (code, endpoint) {
         (tonic::Code::PermissionDenied, ADMIN_ISSUE_ENROLMENT) => Some(ENROLMENT_REFUSAL_BODY),
-        (tonic::Code::PermissionDenied, ADMIN_CREATE_USER) => Some(CREATE_REFUSAL_BODY),
         _ => None,
     };
+    let create_user_refusal =
+        code == tonic::Code::PermissionDenied && endpoint == ADMIN_CREATE_USER;
     call.fail(if code == tonic::Code::Unauthenticated {
         "UNAUTHENTICATED"
     } else if code == tonic::Code::FailedPrecondition {
         "FAILED_PRECONDITION"
-    } else if predicate_refusal.is_some() {
+    } else if predicate_refusal.is_some() || create_user_refusal {
         // **AND NOT `UNAVAILABLE`.** D67's `outcome` label is what an operator
         // aggregates on, and recording a refusal as an unavailability would make
         // the one signal that says "the predicate held" read as an outage. Legal

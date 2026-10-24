@@ -125,6 +125,7 @@ fn state_with_admin(
         // authority is judged, so a throttled request is a 429 either way — but a
         // test that could not tell the two apart would be measuring nothing.
         bootstrap: yadgar_gateway::admin::BootstrapToken::from_secret(BOOTSTRAP),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881'S VALIDATOR, in the SHIPPED configuration: `Mode::Counting`

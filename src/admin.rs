@@ -33,7 +33,11 @@
 //! [`crate::tools::SERVED`] and nothing here is dispatched by name.
 
 mod bootstrap;
+mod pre_minted;
 pub use bootstrap::{Bootstrap, BootstrapToken};
+pub use pre_minted::{
+    PreMintedIds, PreMintedIdsError, REFUSE_PRE_MINTED_USER_ID, SWITCHED_OFF_BODY,
+};
 
 use crate::pb::yadgar::common::v1::UnverifiedActor;
 

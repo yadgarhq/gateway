@@ -322,3 +322,59 @@ fn an_administrator_cannot_clear_their_own_flag() {
          this request before it could reach here"
     );
 }
+
+/// Ruling (b) (Max, 2026-10-24): the switch reads exactly `"1"` or `"0"`, and
+/// refuses absence and every other spelling (ADR-0569: no compiled-in default).
+#[test]
+fn the_pre_minted_switch_reads_one_or_zero_and_nothing_else() {
+    let read = |value: Option<&str>| {
+        PreMintedIds::from_lookup(|key| {
+            assert_eq!(key, REFUSE_PRE_MINTED_USER_ID);
+            value.map(str::to_string)
+        })
+    };
+    assert_eq!(read(Some("1")).ok(), Some(PreMintedIds::Refused));
+    assert_eq!(read(Some("0")).ok(), Some(PreMintedIds::Admitted));
+    assert!(matches!(read(None), Err(PreMintedIdsError::Absent)));
+    for other in ["", "true", "false", "yes", " 1", "1 ", "01"] {
+        let refusal = read(Some(other)).expect_err(other).to_string();
+        assert!(
+            refusal.contains(REFUSE_PRE_MINTED_USER_ID)
+                && refusal.contains("adminBootstrap.refusePreMintedUserId"),
+            "{other:?}: the refusal names the variable and the chart key: {refusal}"
+        );
+    }
+    let absent = read(None).expect_err("absent").to_string();
+    assert!(
+        absent.contains("adminBootstrap.refusePreMintedUserId"),
+        "{absent}"
+    );
+}
+
+/// Ruling (b): the engaged switch reaches the pre-minted `create-user` arm
+/// and no other request; the disengaged one reaches nothing.
+#[test]
+fn the_pre_minted_switch_reaches_only_the_pre_minted_arm() {
+    let pre_minted = Ask {
+        wants_admin: false,
+        pre_minted_id: true,
+    };
+    assert!(PreMintedIds::Refused.refuses(Verb::CreateUser, pre_minted));
+    assert!(!PreMintedIds::Admitted.refuses(Verb::CreateUser, pre_minted));
+    for verb in [
+        Verb::CreateUser,
+        Verb::IssueEnrolment,
+        Verb::SetUserAdmin,
+        Verb::RevokeCredentials,
+        Verb::ListCredentials,
+        Verb::RevokeCredential,
+    ] {
+        for wants_admin in [false, true] {
+            assert!(
+                !PreMintedIds::Refused.refuses(verb, Ask::flag(wants_admin)),
+                "{verb:?} without a pre-minted id is out of the switch's reach"
+            );
+            assert!(!PreMintedIds::Admitted.refuses(verb, Ask::flag(wants_admin)));
+        }
+    }
+}

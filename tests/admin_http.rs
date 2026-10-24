@@ -372,6 +372,9 @@ struct Refusals {
     create_user: Option<tonic::Status>,
     revoke: RevokeAnswer,
     create_answer: CreateAnswer,
+    /// NOT A REFUSAL OF THE STUB: the GATEWAY's own switch,
+    /// `adminBootstrap.refusePreMintedUserId`. `false` is the shipped value.
+    refuse_pre_minted: bool,
 }
 
 /// [`gateway`], with a stub `iam` that REFUSES the named verbs.
@@ -380,6 +383,7 @@ async fn gateway_with(
     refusals: Refusals,
 ) -> (Arc<AppState>, Arc<Log>) {
     let log = Arc::new(Log::default());
+    let refuse_pre_minted = refusals.refuse_pre_minted;
     let incoming =
         tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().expect("addr"))
             .expect("the stub binds");
@@ -438,6 +442,11 @@ async fn gateway_with(
         credential_limits: wide(),
         admin_limits: wide(),
         bootstrap: BootstrapToken::from_secret(BOOTSTRAP_SECRET),
+        pre_minted_ids: if refuse_pre_minted {
+            yadgar_gateway::admin::PreMintedIds::Refused
+        } else {
+            yadgar_gateway::admin::PreMintedIds::Admitted
+        },
         // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881'S VALIDATOR, in the SHIPPED configuration: `Mode::Counting`
@@ -1076,9 +1085,9 @@ async fn an_upstream_permission_denied_on_enrolment_is_one_403_with_one_body() {
 /// `Code::PermissionDenied` ALONE would answer the enrolment refusal to a
 /// caller who was creating a USER — a message about a verb the call was not.
 ///
-/// Since team access stage 3b, `create-user` HAS its own `PERMISSION_DENIED`
-/// arm, the bootstrap create-user predicate (§6), so this asserts that body:
-/// a 403 distinct from the enrolment one, with no upstream text.
+/// Since Max's ruling (a) of 2026-10-24, `create-user`'s `PERMISSION_DENIED`
+/// (the bootstrap create-user predicate, §6) is the opaque 503 again, with no
+/// upstream text.
 #[tokio::test]
 async fn the_enrolment_refusal_body_is_unreachable_from_create_user() {
     let (state, _log) = gateway_with(
@@ -1105,8 +1114,8 @@ async fn the_enrolment_refusal_body_is_unreachable_from_create_user() {
     assert!(!body.contains(UPSTREAM_SENTINEL), "got {body}");
     assert_eq!(
         (status, body.as_str()),
-        (StatusCode::FORBIDDEN, CREATE_REFUSAL_BODY),
-        "create-user's PERMISSION_DENIED is the bootstrap create-user predicate's one 403"
+        (StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_BODY),
+        "create-user's PERMISSION_DENIED is the opaque 503 (ruling (a))"
     );
 }
 
@@ -1493,10 +1502,6 @@ const PRE_MINTED: &str = "0192f3c1-8a4e-7c2d-9b11-5f0e7a3d8400";
 /// `ENROLMENT_REFUSAL_BODY`'s reason.
 const VERB_RULE_BODY: &str = r#"{"error":"the bootstrap token may only create an administrator, promote one, or issue an enrolment the enrolment predicate admits"}"#;
 
-/// The one 403 for every failed step of the bootstrap create-user predicate
-/// (red 4, ADR-0657).
-const CREATE_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only create the declared first administrator, and only while no administrator exists"}"#;
-
 /// What `iam`'s `refusal_for` sends for `PERMISSION_DENIED`: iam replaces every
 /// iam-db message with a fixed sentence per code (`iam/src/service.rs`).
 const IAM_PERMISSION_DENIED_SENTENCE: &str = "the iam-db call failed";
@@ -1511,6 +1516,9 @@ struct Seen {
     body: String,
     received: Vec<Received>,
     outcomes: Vec<String>,
+    /// Whether `yadgar_gateway_bootstrap_accepted_total` was registered at all:
+    /// it registers on the first acceptance only (see `admin::ACCEPTED`).
+    accepted: bool,
     logs: String,
 }
 
@@ -1565,9 +1573,11 @@ fn seen(
         })
     });
     let tool = path.trim_start_matches('/');
-    let outcomes = snapshotter
-        .snapshot()
-        .into_vec()
+    let snapshot = snapshotter.snapshot().into_vec();
+    let accepted = snapshot
+        .iter()
+        .any(|(key, _, _, _)| key.key().name() == yadgar_gateway::admin::ACCEPTED);
+    let outcomes = snapshot
         .iter()
         .filter(|(key, _, _, _)| key.key().name() == yadgar_telemetry::metrics::CALLS)
         .filter(|(key, _, _, _)| {
@@ -1589,6 +1599,7 @@ fn seen(
         body: value.to_string(),
         received,
         outcomes,
+        accepted,
         logs,
     }
 }
@@ -1796,12 +1807,13 @@ fn red_03_an_echo_mismatch_is_a_loud_502() {
     );
 }
 
-/// Red 4. iam's `PERMISSION_DENIED` on `create-user` (the bootstrap create-user
-/// predicate refused): ONE 403 whichever message iam sent, naming the
-/// predicate, distinct from the verb-rule 403, carrying no upstream text.
+/// Red 4, as Max's ruling (a) of 2026-10-24 changes it. iam's
+/// `PERMISSION_DENIED` on `create-user` (the bootstrap create-user predicate
+/// refused) is the opaque 503, byte-identical to `UNAVAILABLE`, whichever
+/// message iam sent. The D67 label still says `PERMISSION_DENIED`, for the
+/// operator: it is not visible to the caller.
 #[test]
-fn red_04_the_create_user_predicate_refusal_is_one_403() {
-    let mut bodies = std::collections::BTreeSet::new();
+fn red_04_the_create_user_predicate_refusal_is_the_opaque_503() {
     for message in [IAM_PERMISSION_DENIED_SENTENCE, UPSTREAM_SENTINEL] {
         let seen = seen(
             resolved(true),
@@ -1814,25 +1826,12 @@ fn red_04_the_create_user_predicate_refusal_is_one_403() {
             &bootstrap(),
         );
         assert_eq!(
-            seen.status,
-            StatusCode::FORBIDDEN,
-            "{message}: got {}",
-            seen.body
-        );
-        assert!(
-            !seen.body.contains(message),
-            "{message} leaked: {}",
-            seen.body
+            (seen.status, seen.body.as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_BODY),
+            "{message}: the predicate refusal is the opaque 503"
         );
         assert_eq!(seen.outcomes, vec!["PERMISSION_DENIED".to_string()]);
-        bodies.insert(seen.body);
     }
-    assert_eq!(
-        bodies.into_iter().collect::<Vec<_>>(),
-        vec![CREATE_REFUSAL_BODY.to_string()],
-        "one body, byte-identical whatever iam said (ADR-0657)"
-    );
-    assert_ne!(CREATE_REFUSAL_BODY, VERB_RULE_BODY);
 }
 
 /// Red 5, on the wire. `ALREADY_EXISTS` and `INVALID_ARGUMENT` keep the opaque
@@ -2097,4 +2096,196 @@ async fn red_14_the_verb_rule_body_is_the_rewritten_text() {
     );
     assert!(!body.contains("never held a credential"));
     assert!(!body.contains(UPSTREAM_SENTINEL));
+}
+
+// ---------------------------------------------------------------------------
+// Max's rulings of 2026-10-24 on gateway#139 (yaadgaar #426 item 8)
+// ---------------------------------------------------------------------------
+
+/// What the switch answers when engaged. A literal, for
+/// `ENROLMENT_REFUSAL_BODY`'s reason.
+const SWITCHED_OFF_BODY: &str = r#"{"error":"pre-minted user ids are switched off on this gateway (chart: adminBootstrap.refusePreMintedUserId)"}"#;
+
+/// One response as the caller receives it: status, every header, raw bytes.
+async fn post_raw(
+    state: Arc<AppState>,
+    path: &str,
+    body: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in extra {
+        req = req.header(*name, *value);
+    }
+    let req = req
+        .body(Body::from(body.to_string()))
+        .expect("the request builds");
+    let resp = router(state)
+        .oneshot(req)
+        .await
+        .expect("the router answers");
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.expect("a body");
+    (status, headers, bytes.to_vec())
+}
+
+/// Ruling (a). On bootstrap `create-user` with a pre-minted id, a TAKEN id
+/// (`ALREADY_EXISTS`), a refusal of the predicate (`PERMISSION_DENIED`: no
+/// `administrators` team, an administrator exists, or the id is not
+/// declared), a malformed id (`INVALID_ARGUMENT`) and an outage
+/// (`UNAVAILABLE`) are ONE answer: the same status, the same headers and the
+/// same bytes, whatever message iam sent. So the bootstrap token cannot tell a
+/// taken id from any other refusal, nor from an outage (ADR-0927).
+#[tokio::test]
+async fn ruling_a_every_bootstrap_create_user_refusal_is_one_answer() {
+    let mut answers = Vec::new();
+    for code in [
+        tonic::Code::AlreadyExists,
+        tonic::Code::PermissionDenied,
+        tonic::Code::InvalidArgument,
+        tonic::Code::Unavailable,
+    ] {
+        for message in [IAM_PERMISSION_DENIED_SENTENCE, UPSTREAM_SENTINEL] {
+            let (state, log) = gateway_with(
+                resolved(true),
+                Refusals {
+                    create_user: Some(tonic::Status::new(code, message)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let answer = post_raw(
+                state,
+                "/admin/create-user",
+                &create_body(PRE_MINTED),
+                &bootstrap(),
+            )
+            .await;
+            assert_eq!(log.drain().len(), 1, "{code:?}: iam was asked once");
+            answers.push((code, message, answer));
+        }
+    }
+    let (_, _, first) = &answers[0];
+    for (code, message, answer) in &answers {
+        assert_eq!(
+            answer, first,
+            "{code:?} ({message}) must be byte-equal to ALREADY_EXISTS: status, headers and body"
+        );
+    }
+    assert_eq!(first.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        String::from_utf8_lossy(&first.2),
+        UNAVAILABLE_BODY,
+        "the one answer is the opaque 503"
+    );
+}
+
+/// Ruling (b), engaged. The pre-minted arm is refused with the switch's own
+/// 503, BEFORE the token is compared: nothing reaches iam, the acceptance
+/// counter does not register, and a wrong token gets the same answer as the
+/// right one.
+#[test]
+fn ruling_b_the_engaged_switch_refuses_the_pre_minted_arm_before_the_comparison() {
+    let engaged = || Refusals {
+        refuse_pre_minted: true,
+        ..Default::default()
+    };
+    for token in [BOOTSTRAP_SECRET, "not-the-bootstrap-token"] {
+        let seen = seen(
+            resolved(true),
+            engaged(),
+            "/admin/create-user",
+            &create_body(PRE_MINTED),
+            &[(BOOTSTRAP_HEADER, token)],
+        );
+        assert_eq!(
+            (seen.status, seen.body.as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, SWITCHED_OFF_BODY),
+            "{token}: the engaged switch answers its own 503"
+        );
+        assert!(seen.received.is_empty(), "{token}: zero upstream calls");
+        assert!(
+            !seen.accepted,
+            "{token}: the acceptance counter must not move"
+        );
+        assert_eq!(seen.outcomes, vec!["FAILED_PRECONDITION".to_string()]);
+    }
+}
+
+/// Ruling (b), engaged: only the pre-minted arm is in reach. The
+/// `is_admin: true` arm, the promotion and the enrolment still pass for the
+/// bootstrap token, and an attested administrator's `create-user` is untouched.
+#[tokio::test]
+async fn ruling_b_the_engaged_switch_leaves_every_other_arm_open() {
+    let bootstrap_arms = [
+        (
+            "/admin/create-user",
+            r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#.to_string(),
+        ),
+        (
+            "/admin/set-user-admin",
+            format!(r#"{{"user_id":"{OTHER_ID}","is_admin":true}}"#),
+        ),
+        (
+            "/admin/issue-enrolment",
+            format!(r#"{{"user_id":"{OTHER_ID}"}}"#),
+        ),
+    ];
+    for (path, body) in bootstrap_arms {
+        let (state, log) = gateway_with(
+            resolved(true),
+            Refusals {
+                refuse_pre_minted: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (status, answer) = post(state, path, &body, &bootstrap()).await;
+        assert_eq!(status, StatusCode::OK, "{path}: got {answer}");
+        assert_eq!(log.drain().len(), 1, "{path}: iam was asked once");
+    }
+    let (state, log) = gateway_with(
+        resolved(true),
+        Refusals {
+            refuse_pre_minted: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, answer) = post(
+        state,
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada"}"#,
+        &as_admin(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "attested create-user: got {answer}");
+    assert_eq!(log.drain().len(), 1);
+}
+
+/// Ruling (b), not engaged (the shipped value): the pre-minted arm is open,
+/// as before the switch existed.
+#[tokio::test]
+async fn ruling_b_the_disengaged_switch_admits_the_pre_minted_arm() {
+    let (state, log) = gateway_with(
+        resolved(true),
+        Refusals {
+            refuse_pre_minted: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, answer) = post(
+        state,
+        "/admin/create-user",
+        &create_body(PRE_MINTED),
+        &bootstrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {answer}");
+    assert_eq!(log.drain().len(), 1);
 }

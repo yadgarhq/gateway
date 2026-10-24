@@ -88,6 +88,7 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         // `state_bootstrapped` is what the tests about a CONFIGURED token reach
         // for.
         bootstrap: crate::admin::BootstrapToken::disabled(),
+        pre_minted_ids: crate::admin::PreMintedIds::Admitted,
         // THE SHIPPED VALUE, and not the one the poll-interval test asserts
         // against — `tools_list_reports_the_gateways_chosen_poll_interval`
         // overrides this field on its own state rather than reusing this
@@ -782,16 +783,16 @@ fn admin_call() -> Call {
 ///   `(status, body)` pair, the generic "administrative service unavailable";
 /// - `UNAUTHENTICATED` alone answers 401 with the generic "refused" body.
 ///
-/// **EXTENDED BY TEAM ACCESS STAGE 3b, red 5.** On `create-user`,
-/// `PERMISSION_DENIED` is the bootstrap create-user predicate's refusal and
-/// answers its own 403 (red 4). `ALREADY_EXISTS` and `INVALID_ARGUMENT` stay in
+/// **EXTENDED BY TEAM ACCESS STAGE 3b, red 5, AND BY MAX'S RULING (a) OF
+/// 2026-10-24.** On `create-user`, `PERMISSION_DENIED` (the bootstrap
+/// create-user predicate), `ALREADY_EXISTS` and `INVALID_ARGUMENT` are all in
 /// the generic 503 bucket, asserted by name below: ADR-0927 rules that no
-/// caller-visible status may say whether an identifier exists or is well formed.
+/// caller-visible status may say whether an identifier exists or is well
+/// formed, and the ruling that a taken id answers as every other refusal does.
 #[tokio::test]
 async fn admin_failure_failed_precondition_gets_a_distinct_body() {
     let mut generic_answers = std::collections::BTreeSet::new();
     let mut precondition_answers = std::collections::BTreeSet::new();
-    let mut predicate_answers = std::collections::BTreeSet::new();
     let mut generic_codes = std::collections::BTreeSet::new();
     let mut refusals = 0;
 
@@ -827,8 +828,6 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
             assert_eq!(body, r#"{"error":"refused"}"#);
         } else if code == tonic::Code::FailedPrecondition {
             precondition_answers.insert((resp_status.as_u16(), body));
-        } else if code == tonic::Code::PermissionDenied {
-            predicate_answers.insert((resp_status.as_u16(), body));
         } else {
             generic_codes.insert(code as i32);
             generic_answers.insert((resp_status.as_u16(), body));
@@ -836,18 +835,14 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
     }
 
     assert_eq!(refusals, 1, "exactly one code is a refusal");
-    assert_eq!(
-        predicate_answers.into_iter().collect::<Vec<_>>(),
-        vec![(
-            StatusCode::FORBIDDEN.as_u16(),
-            r#"{"error":"the bootstrap token may only create the declared first administrator, and only while no administrator exists"}"#.to_string()
-        )],
-        "red 4: PERMISSION_DENIED on create-user is the bootstrap predicate's one 403"
-    );
-    for code in [tonic::Code::AlreadyExists, tonic::Code::InvalidArgument] {
+    for code in [
+        tonic::Code::AlreadyExists,
+        tonic::Code::InvalidArgument,
+        tonic::Code::PermissionDenied,
+    ] {
         assert!(
             generic_codes.contains(&(code as i32)),
-            "red 5: {code:?} on create-user must stay in the opaque 503 bucket (ADR-0927)"
+            "red 5, ruling (a): {code:?} on create-user must be in the opaque 503 bucket (ADR-0927)"
         );
     }
     assert_eq!(
@@ -1645,6 +1640,7 @@ fn state_with_upstreams(iam: Channel, task: Channel, ttl: std::time::Duration) -
         credential_limits: unlimited_credentials(),
         admin_limits: unlimited_credentials(),
         bootstrap: crate::admin::BootstrapToken::disabled(),
+        pre_minted_ids: crate::admin::PreMintedIds::Admitted,
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881, AND IT IS THE SHIPPED CONFIGURATION. `Mode::Counting`
         // records which terminal state each claim reached and serves the call
