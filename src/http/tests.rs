@@ -88,6 +88,7 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         // `state_bootstrapped` is what the tests about a CONFIGURED token reach
         // for.
         bootstrap: crate::admin::BootstrapToken::disabled(),
+        pre_minted_ids: crate::admin::PreMintedIds::Admitted,
         // THE SHIPPED VALUE, and not the one the poll-interval test asserts
         // against — `tools_list_reports_the_gateways_chosen_poll_interval`
         // overrides this field on its own state rather than reusing this
@@ -781,10 +782,17 @@ fn admin_call() -> Call {
 /// - every other non-`UNAUTHENTICATED` code answers ONE identical
 ///   `(status, body)` pair, the generic "administrative service unavailable";
 /// - `UNAUTHENTICATED` alone answers 401 with the generic "refused" body.
+///
+/// **EXTENDED BY TEAM ACCESS STAGE 3b, red 5, AND BY MAX'S RULING (a) OF
+/// 2026-10-24.** On `create-user`, `PERMISSION_DENIED` (the bootstrap
+/// create-user predicate), `ALREADY_EXISTS` and `INVALID_ARGUMENT` are all in
+/// the generic 503 bucket, asserted by name below: ADR-0927 rules that no
+/// caller-visible status may say whether an identifier exists or is well
+/// formed, and the ruling that a taken id answers as every other refusal does.
 #[tokio::test]
 async fn admin_failure_failed_precondition_gets_a_distinct_body() {
     let mut generic_answers = std::collections::BTreeSet::new();
-    let mut precondition_answers = std::collections::BTreeSet::new();
+    let mut generic_codes = std::collections::BTreeSet::new();
     let mut refusals = 0;
 
     for code in ALL_CODES {
@@ -817,19 +825,29 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
             refusals += 1;
             assert_eq!(resp_status, StatusCode::UNAUTHORIZED);
             assert_eq!(body, r#"{"error":"refused"}"#);
-        } else if code == tonic::Code::FailedPrecondition {
-            precondition_answers.insert((resp_status.as_u16(), body));
         } else {
+            generic_codes.insert(code as i32);
             generic_answers.insert((resp_status.as_u16(), body));
         }
     }
 
     assert_eq!(refusals, 1, "exactly one code is a refusal");
+    for code in [
+        tonic::Code::AlreadyExists,
+        tonic::Code::InvalidArgument,
+        tonic::Code::PermissionDenied,
+        tonic::Code::FailedPrecondition,
+    ] {
+        assert!(
+            generic_codes.contains(&(code as i32)),
+            "red 5, ruling (a): {code:?} on create-user must be in the opaque 503 bucket (ADR-0927)"
+        );
+    }
     assert_eq!(
         generic_answers.len(),
         1,
-        "every non-refusal, non-FAILED_PRECONDITION code must answer one identical status AND \
-         body; got {generic_answers:?}"
+        "every non-refusal code must answer one identical status AND body on create-user; got \
+         {generic_answers:?}"
     );
     assert_eq!(
         generic_answers.into_iter().next().expect("one answer"),
@@ -838,23 +856,81 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
             r#"{"error":"the administrative service is unavailable"}"#.to_string()
         )
     );
+}
 
+/// What `admin_failure` answers `FAILED_PRECONDITION` with on `endpoint`
+/// (yaadgaar #202, ledger 1738).
+async fn failed_precondition_on(endpoint: &'static str) -> (u16, String) {
+    let status = tonic::Status::failed_precondition("an upstream message that must not leak");
+    let resp = admin_failure(admin_call(), endpoint, status);
+    let code = resp.status().as_u16();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    (code, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+const OPAQUE_ADMIN_BODY: &str = r#"{"error":"the administrative service is unavailable"}"#;
+
+/// yaadgaar #202: the enrolment sentence belongs to `issue-enrolment` alone,
+/// where iam's only `FAILED_PRECONDITION` is an unset `ENROLMENT_GATEWAY`.
+#[tokio::test]
+async fn failed_precondition_on_issue_enrolment_names_enrolment() {
     assert_eq!(
-        precondition_answers.len(),
-        1,
-        "FAILED_PRECONDITION must answer one fixed status AND body; got {precondition_answers:?}"
+        failed_precondition_on(ADMIN_ISSUE_ENROLMENT).await,
+        (
+            503,
+            r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#.to_string()
+        )
     );
-    let (precondition_status, precondition_body) =
-        precondition_answers.into_iter().next().expect("one answer");
+}
+
+/// yaadgaar #202 and Max's ruling (a): on `create-user` it is the opaque 503.
+/// iam refuses a well-formed pre-minted id `FAILED_PRECONDITION` while
+/// `IAM_ADMIN_FROM_TEAM` is false, and a malformed one `INVALID_ARGUMENT`, so a
+/// distinct body here would tell the bootstrap token which ids are well formed.
+#[tokio::test]
+async fn failed_precondition_on_create_user_is_the_opaque_503() {
     assert_eq!(
-        precondition_status,
-        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-        "FAILED_PRECONDITION's distinct body is not a distinct STATUS — opaque_status gives it \
-         the same 503 as every other non-UNAUTHENTICATED code"
+        failed_precondition_on(ADMIN_CREATE_USER).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
     );
+}
+
+/// yaadgaar #202: iam's only `FAILED_PRECONDITION` on `SetUserAdmin` is the
+/// verb's retirement while `IAM_ADMIN_FROM_TEAM` is true (ADR-0962), before the
+/// store is asked, so that is the sentence. It does not depend on the target.
+#[tokio::test]
+async fn failed_precondition_on_set_user_admin_names_the_retirement() {
     assert_eq!(
-        precondition_body,
-        r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#
+        failed_precondition_on(ADMIN_SET_USER_ADMIN).await,
+        (503, SET_USER_ADMIN_RETIRED_BODY.to_string())
+    );
+}
+
+/// yaadgaar #202: iam has no `FAILED_PRECONDITION` on these verbs, so no
+/// specific sentence is true and the answer is the opaque one.
+#[tokio::test]
+async fn failed_precondition_on_revoke_credentials_is_the_opaque_503() {
+    assert_eq!(
+        failed_precondition_on(ADMIN_REVOKE_CREDENTIALS).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
+    );
+}
+
+#[tokio::test]
+async fn failed_precondition_on_list_credentials_is_the_opaque_503() {
+    assert_eq!(
+        failed_precondition_on(ADMIN_LIST_CREDENTIALS).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
+    );
+}
+
+#[tokio::test]
+async fn failed_precondition_on_revoke_credential_is_the_opaque_503() {
+    assert_eq!(
+        failed_precondition_on(ADMIN_REVOKE_CREDENTIAL).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
     );
 }
 
@@ -1620,6 +1696,7 @@ fn state_with_upstreams(iam: Channel, task: Channel, ttl: std::time::Duration) -
         credential_limits: unlimited_credentials(),
         admin_limits: unlimited_credentials(),
         bootstrap: crate::admin::BootstrapToken::disabled(),
+        pre_minted_ids: crate::admin::PreMintedIds::Admitted,
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881, AND IT IS THE SHIPPED CONFIGURATION. `Mode::Counting`
         // records which terminal state each claim reached and serves the call
@@ -2600,8 +2677,9 @@ fn an_accepted_bootstrap_token_is_counted_and_a_refused_one_is_not() {
     // never reached the comparison, and then this half would prove nothing about
     // the counter. The two bodies are what separate them: the pre-comparison
     // refusal says "the bootstrap token may only create an administrator, promote
-    // one, or enrol one who has never held a credential" (reworded by ADR-0655,
-    // which admitted the third verb and left the sentence overclaiming), and this
+    // one, or issue an enrolment the enrolment predicate admits" (reworded by
+    // ADR-0655, and again by team access stage 3b because ADR-0966 made "never
+    // held a credential" false), and this
     // one is the `Bootstrap::Refused` arm's own.
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
@@ -2703,8 +2781,8 @@ async fn a_bootstrap_request_never_falls_back_to_the_attested_path() {
     assert_eq!(
         answer.get("error"),
         Some(&json!(
-            "the bootstrap token may only create an administrator, promote one, or enrol one who \
-             has never held a credential"
+            "the bootstrap token may only create an administrator, promote one, or issue an \
+             enrolment the enrolment predicate admits"
         )),
         "and it must be the BOOTSTRAP verb gate that refused it, not the attested path's \
          non-administrator refusal — the two are both 403 and the body is what separates them"

@@ -222,6 +222,28 @@ fn an_absent_or_invalid_edge_header_read_timeout_refuses_boot_naming_the_chart_k
     }
 }
 
+/// The fail-closed switch on the pre-minted `create-user` arm (Max's ruling
+/// (b), 2026-10-24) has no compiled-in default (ADR-0569): absent, and every
+/// value other than "1" or "0", refuses the boot naming the variable and its
+/// chart key.
+#[test]
+fn an_absent_or_invalid_pre_minted_switch_refuses_boot_naming_the_chart_key() {
+    const VAR: &str = "YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID";
+    for value in [None, Some("true"), Some("")] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != VAR);
+        if let Some(value) = value {
+            vars.push((VAR, value));
+        }
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(VAR) && line.contains("adminBootstrap.refusePreMintedUserId"),
+            "the refusal for {value:?} must name both the variable and its chart key: {line}"
+        );
+    }
+}
+
 /// `TcpListener::bind` is the one call in `boot::serve` that was still a bare
 /// `?` after the Display cut-over: `io::Error`'s Display is informative about
 /// WHY ("Address already in use (os error 98)") but, unlike every other

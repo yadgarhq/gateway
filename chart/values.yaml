@@ -1050,6 +1050,20 @@ adminBootstrap:
   # `required` in the template, so naming a Secret and clearing this fails at
   # RENDER time rather than at boot.
   tokenSecretKey: token
+  # THE FAIL-CLOSED SWITCH ON THE PRE-MINTED `user_id` ARM of /admin/create-user
+  # (team access stage 3b; Max's ruling, 2026-10-24), rendered as
+  # YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID. `false` keeps that arm open, as
+  # before this switch. `true` refuses it with
+  # `503 {"error":"pre-minted user ids are switched off on this gateway ..."}`
+  # before the token is compared; the `is_admin: true` arm, the promotion and
+  # the enrolment are not affected. Engage it while the iam and iam-db that
+  # implement pre-minted ids are not live behind this gateway.
+  #
+  # A SWITCH BESIDE THE NAME, and not the "enabled flag beside a name" the
+  # comment above rejects: it narrows one arm, and it cannot disagree with
+  # `tokenSecret`. REQUIRED, with no binary default (ADR-0569): the schema types
+  # it boolean, and the template refuses `adminBootstrap: null`.
+  refusePreMintedUserId: false
 
 preStopSleepSeconds: 5
 

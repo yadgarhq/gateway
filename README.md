@@ -283,14 +283,14 @@ ADR-0492's administrative surface (D73, ledger 638). **These are never MCP
 tools**: no name of theirs is in `tools::SERVED`, so `tools/call` cannot dispatch
 to one and `tools/list` cannot advertise one.
 
-| path                        | body                                                          | answers                                                                                  |
-| --------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `/admin/create-user`        | `external_id`, `display_name`, optional `is_admin`            | `{"user_id": ...}`                                                                       |
-| `/admin/issue-enrolment`    | `user_id`, optional `revoke_existing_credentials` (a boolean) | `{"token": ..., "enrolment_id": ..., "revoke_existing_credentials": <bool, as applied>}` |
-| `/admin/set-user-admin`     | `user_id`, `is_admin` (a required boolean)                    | `{"user_id": ..., "is_admin": ...}`                                                      |
-| `/admin/revoke-credentials` | `user_id` (the only accepted key)                             | `{"user_id": ..., "revoked": <rows changed>, "voided_enrolments": <enrolments voided>}`  |
-| `/admin/list-credentials`   | `user_id`, optional `page_token` (the only accepted keys)     | `{"credentials": [{"id", "label", "created_at", "expires_at"?}], "next_page_token"}`     |
-| `/admin/revoke-credential`  | `user_id`, `credential_id` (the only accepted keys)           | `{"user_id": ..., "credential_id": ...}`                                                 |
+| path                        | body                                                                                    | answers                                                                                  |
+| --------------------------- | --------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `/admin/create-user`        | `external_id`, `display_name`, optional `is_admin`, optional `user_id` (bootstrap only) | `{"user_id": ...}`                                                                       |
+| `/admin/issue-enrolment`    | `user_id`, optional `revoke_existing_credentials` (a boolean)                           | `{"token": ..., "enrolment_id": ..., "revoke_existing_credentials": <bool, as applied>}` |
+| `/admin/set-user-admin`     | `user_id`, `is_admin` (a required boolean)                                              | `{"user_id": ..., "is_admin": ...}`                                                      |
+| `/admin/revoke-credentials` | `user_id` (the only accepted key)                                                       | `{"user_id": ..., "revoked": <rows changed>, "voided_enrolments": <enrolments voided>}`  |
+| `/admin/list-credentials`   | `user_id`, optional `page_token` (the only accepted keys)                               | `{"credentials": [{"id", "label", "created_at", "expires_at"?}], "next_page_token"}`     |
+| `/admin/revoke-credential`  | `user_id`, `credential_id` (the only accepted keys)                                     | `{"user_id": ..., "credential_id": ...}`                                                 |
 
 The `user_id` `/admin/create-user` returns is the one the other routes take.
 
@@ -302,20 +302,32 @@ The `user_id` `/admin/create-user` returns is the one the other routes take.
   `x-yadgar-project` is required, exactly as on `tools/call`.
 - **D73's bootstrap token**, presented in `X-Yadgar-Bootstrap-Token`. It reaches
   **three things — create an administrator, promote one, or issue an
-  enrolment** — so `/admin/create-user` only with `is_admin: true`,
-  `/admin/set-user-admin` only when setting it to `true`, and
-  `/admin/issue-enrolment` only for an administrator holding zero credentials
-  (ADR-0655, as amended by ADR-0656). That last predicate is enforced inside
-  `iam-db`'s write, never at this gateway. A request carrying the header is
+  enrolment** — so `/admin/create-user` only with `is_admin: true`, or with a
+  `user_id` and `is_admin` absent or false (the pre-minted first administrator,
+  flow F2 of `plans/team-access.md`, ADR-1011), `/admin/set-user-admin` only
+  when setting it to `true`, and `/admin/issue-enrolment` only for an
+  administrator the enrolment predicate admits (ADR-0655 and ADR-0656 with
+  `IAM_ADMIN_FROM_TEAM` off; ADR-0966's declared-member predicate with it on).
+  Those predicates are enforced inside `iam-db`'s write, never at this gateway.
+  The `user_id` of `/admin/create-user` is the bare uuid as declared; the
+  gateway sends `yadgar:user:<value>` without judging its format, answers an
+  attested administrator who sends it with the opaque `503`, and answers `502`
+  ("iam predates pre-minted user ids") when iam's answer names a different id.
+  Every upstream refusal of a bootstrap `create-user` (a taken id, a refusal of
+  the create-user predicate, a malformed id) is the opaque `503`, byte-equal to
+  an outage (ADR-0927; Max's ruling, 2026-10-24).
+  `adminBootstrap.refusePreMintedUserId: true` refuses the pre-minted arm with
+  `503 {"error":"pre-minted user ids are switched off on this gateway ..."}`
+  before the token is compared. A request carrying the header is
   judged by these rules alone and never falls back to the attested path.
 
 **`revoke_existing_credentials: true` makes a re-enrolment a containing reset**
 (ADR-0943): when the enrolment is redeemed, every credential the user held is
 revoked in the same `iam-db` transaction that replaces the password. Absent, a
 reset replaces the password and existing credentials keep working. Only an
-attested administrator may set it; the bootstrap path answers
-`403 {"error":"the bootstrap token may not revoke existing credentials"}` before
-`iam` is called. `iam` publishes the cache eviction on redemption, so a revoked
+attested administrator may set it, and so may the bootstrap path (ADR-0966,
+ADR-1014): with `IAM_ADMIN_FROM_TEAM` off, `iam-db` refuses the instruction
+beside the bootstrap demand, which answers the opaque `503`. `iam` publishes the cache eviction on redemption, so a revoked
 token stops resolving at once; a missed publish leaves it resolving from a
 replica's cache for at most `YADGAR_CREDENTIAL_TTL_SECONDS`.
 The `200` echoes `revoke_existing_credentials` as applied. Unknown JSON keys are
@@ -441,6 +453,7 @@ so it never spends login's budget.
 | `YADGAR_ADMIN_RATE_LIMIT`                                                                          | required — from `adminLimits.attributed`                                                                                                             | `<rate>:<burst>` for the four `/admin/*` verbs, per ATTRIBUTABLE client address. A THIRD bucket rather than a share of login's, and each verb keys its own within it                                                                                                                              |
 | `YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT`                                                             | required — from `adminLimits.unattributed`                                                                                                           | the same, per OBSERVED HOP                                                                                                                                                                                                                                                                        |
 | `YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE`                                                                | unset (an argued ADR-0569 exception)                                                                                                                 | a FILE holding D73's bootstrap token. **Unset DISABLES the bootstrap path** and serves everything else; set-but-unreadable EXITS at boot. Watched (ADR-0523): rotating the Secret restarts the pod                                                                                                |
+| `YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID`                                                           | required — from `adminBootstrap.refusePreMintedUserId`, exactly `1` or `0`, no default (ADR-0569)                                                    | `1` refuses the pre-minted `user_id` arm of bootstrap `/admin/create-user` with a `503` before the token is compared; `0` (shipped) admits it                                                                                                                                                     |
 | `RUST_LOG`                                                                                         | chart renders `info`; the binary also falls back to `info` (an argued ADR-0569 exception)                                                            | a default, because an unset `RUST_LOG` enables nothing at all                                                                                                                                                                                                                                     |
 | `TASK_TLS_CLIENT_CERT_FILE` / `TASK_TLS_CLIENT_KEY_FILE`                                           | unset                                                                                                                                                | the certificate this gateway PRESENTS to `task`, and its key — mutual TLS (ADR-0516). Off by default even when `TASK_TLS_ENABLED` is `1`. Both or neither: half an identity EXITS at boot naming the variable                                                                                     |
 | `IAM_TLS_CLIENT_CERT_FILE` / `IAM_TLS_CLIENT_KEY_FILE`                                             | unset                                                                                                                                                | the same for the `iam` hop. The chart points both prefixes at ONE mounted leaf; the prefixes exist so one hop can be cut over before the other                                                                                                                                                    |

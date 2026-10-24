@@ -1315,6 +1315,7 @@ fn revoking_gateway(iam: Channel) -> Arc<yadgar_gateway::http::AppState> {
         credential_limits: wide(),
         admin_limits: wide(),
         bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         tools_poll_interval: Duration::from_secs(600),
         projects: Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),

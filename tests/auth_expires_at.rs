@@ -165,6 +165,7 @@ async fn gateway(answer: Answer) -> Arc<AppState> {
         credential_limits: wide(),
         admin_limits: wide(),
         bootstrap: BootstrapToken::disabled(),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         tools_poll_interval: Duration::from_secs(600),
         projects: Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),
