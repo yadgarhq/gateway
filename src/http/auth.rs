@@ -9,6 +9,7 @@ use super::answer::*;
 use super::dispatch::*;
 use super::gate::*;
 use super::*;
+use crate::upstream::CallError;
 
 /// This module's routes. See [`super::dispatch::routes`] for why each set is
 /// registered beside its own handlers.
@@ -116,10 +117,10 @@ pub(super) async fn login(
     }
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.login(LoginRequest {
+    let request = LoginRequest {
         username: username.to_string(),
         password: password.to_string(),
         // OPTIONAL here, though `yaadgaar` always sends it. It only names the
@@ -131,7 +132,7 @@ pub(super) async fn login(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-    });
+    };
     // A DEADLINE, because this is the first surface reachable with no credential.
     // An `iam` that accepts the connection and then stalls would otherwise hold
     // the request — and the connection under it — open for as long as it liked,
@@ -142,9 +143,9 @@ pub(super) async fn login(
     // Generous rather than tight: Argon2id verification is deliberately expensive
     // (~50ms in `iam`, and it runs even for an unknown username), so a budget
     // sized for a healthy RPC would turn load into refusals.
-    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(e)) => {
+    let resp = match state.iam_rpc(request, |r| client.login(r)).await {
+        Ok(r) => r.into_inner(),
+        Err(CallError::Answered(e)) => {
             // THE ONLY PLACE THE REAL CODE IS WRITTEN DOWN, and it goes to the
             // log rather than to the caller. Without this an operator watching a
             // login outage sees an opaque 503 and no reason for it.
@@ -157,7 +158,7 @@ pub(super) async fn login(
             // `e.code()`, never `e`. See this function's doc comment.
             return login_failure(e.code());
         }
-        Err(_elapsed) => {
+        Err(CallError::Expired) => {
             tracing::warn!(
                 timeout_ms = AUTH_DEADLINE.as_millis(),
                 "login timed out waiting for iam"
@@ -316,10 +317,10 @@ pub(super) async fn enrol(
     };
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.redeem_enrolment(RedeemEnrolmentRequest {
+    let request = RedeemEnrolmentRequest {
         secret: secret.to_string(),
         password: password.to_string(),
         // OPTIONAL, exactly as on `login`: it only names the machine so a person
@@ -339,13 +340,13 @@ pub(super) async fn enrol(
         idempotency: Some(Idempotency {
             key: crate::idempotency_key(),
         }),
-    });
+    };
     // A DEADLINE, for the reason on `login`'s: this is reachable with no
     // credential, so a stalled `iam` would otherwise let an unauthenticated caller
     // hold as many requests open as it liked.
-    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(e)) => {
+    let resp = match state.iam_rpc(request, |r| client.redeem_enrolment(r)).await {
+        Ok(r) => r.into_inner(),
+        Err(CallError::Answered(e)) => {
             // THE ONLY PLACE THE REAL CODE IS WRITTEN DOWN, and it goes to the
             // log. Without it, an operator watching an enrolment fail sees an
             // opaque status and no reason for it — and here the reason matters
@@ -361,7 +362,7 @@ pub(super) async fn enrol(
             });
             return enrol_failure(e.code());
         }
-        Err(_elapsed) => {
+        Err(CallError::Expired) => {
             tracing::warn!(
                 timeout_ms = AUTH_DEADLINE.as_millis(),
                 "enrolment timed out waiting for iam"

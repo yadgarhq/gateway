@@ -48,8 +48,6 @@
 
 use std::fmt;
 
-use tonic::transport::Channel;
-
 mod account;
 mod classify;
 mod grants;
@@ -303,11 +301,11 @@ pub struct Validator {
     /// contractually the fallback, and the loaded set answers every
     /// classification without it. One dial happens per ANSWERED refusal, to
     /// fetch what the remediation names — which in counting mode is never.
-    project: Channel,
+    project: crate::upstream::ProjectUpstream,
 }
 
 impl Validator {
-    pub fn new(registry: Registry, mode: Mode, project: Channel) -> Self {
+    pub fn new(registry: Registry, mode: Mode, project: crate::upstream::ProjectUpstream) -> Self {
         Self {
             registry,
             mode,

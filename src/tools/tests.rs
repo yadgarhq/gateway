@@ -1,5 +1,6 @@
 use super::*;
 use crate::pb::yadgar::taskapi::v1::FindTasksResponse;
+use std::time::Duration;
 
 /// The tool set, WRITTEN OUT HERE and never derived from the code under
 /// test. A test that read `SERVED` to check `SERVED` would agree with any
@@ -927,5 +928,82 @@ fn every_tool_description_fits_the_client_cap() {
         let text = tool["description"].as_str().unwrap();
         let n = text.encode_utf16().count();
         assert!(n <= 2048, "{}: {n} UTF-16 code units", tool["name"]);
+    }
+}
+
+/// ADR-1019 on the `task` path: every task RPC STATES its deadline.
+///
+/// The deadline is the chart's `task.requestTimeoutSeconds` (here `BOUND`),
+/// built once at the top of [`call`], and each RPC is sent with
+/// `grpc-timeout` = that deadline's remaining time less
+/// [`yadgar_dial::DEADLINE_MARGIN`]. Without the header `task` would be bounded
+/// only by its own ceilings and would keep working on a call this gateway had
+/// already answered.
+///
+/// A real HTTP/2 server that never answers, unlike `tests/task_deadline.rs`'s
+/// silent socket: that one never completes the handshake, so no header is ever
+/// sent to be read. The answer is the one #361's wrapper gave: the
+/// `DEADLINE_EXCEEDED` upstream error, in the gateway's own words.
+#[tokio::test]
+async fn every_task_rpc_states_its_deadline_and_answers_its_timeout() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::upstream::hang;
+
+    const BOUND: Duration = Duration::from_secs(1);
+    for (name, rpc, args) in [
+        ("create_task", "CreateTask", json!({ "title": "t" })),
+        ("read_task", "ReadTask", json!({ "number": 1 })),
+        ("find_tasks", "FindTasks", json!({})),
+        (
+            "edit_task",
+            "EditTask",
+            json!({ "id": "yadgar:task:x", "expect_version": 1, "title": "t" }),
+        ),
+        (
+            "transition_task",
+            "TransitionTask",
+            json!({ "id": "yadgar:task:x", "expect_version": 1, "to": "done" }),
+        ),
+    ] {
+        let seen = Arc::new(hang::Seen::default());
+        let task = TaskUpstream::new(hang::serve(hang::Task(Arc::clone(&seen))).await, BOUND);
+        let started = Instant::now();
+        let outcome = call(&task, Scope::default(), name, &args).await;
+        let took = started.elapsed();
+        assert!(
+            took < BOUND + Duration::from_millis(500),
+            "{name} took {took:?}"
+        );
+        match outcome {
+            Err(ToolError::Upstream(s)) => {
+                assert_eq!(s.code(), tonic::Code::DeadlineExceeded, "{name}: {s}");
+                assert_eq!(
+                    s.message(),
+                    "task did not answer within 1s",
+                    "{name}: the gateway's own words for its own timeout"
+                );
+            }
+            Err(e) => panic!("{name}: expected an upstream deadline, got {e:?}"),
+            Ok(_) => panic!("{name} cannot succeed against a task that never answers"),
+        }
+        let arrivals = seen.arrivals();
+        assert_eq!(
+            arrivals.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(),
+            [format!("/yadgar.taskapi.v1.TaskService/{rpc}")],
+            "{name}: exactly one RPC reaches task"
+        );
+        let stated = arrivals[0]
+            .timeout
+            .unwrap_or_else(|| panic!("{name} must carry grpc-timeout (ADR-1019)"));
+        assert!(
+            stated <= BOUND - yadgar_dial::DEADLINE_MARGIN,
+            "{name} stated {stated:?}"
+        );
+        assert!(
+            stated >= BOUND - Duration::from_millis(500),
+            "{name} stated {stated:?}, far below its {BOUND:?} deadline"
+        );
     }
 }

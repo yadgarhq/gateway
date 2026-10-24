@@ -25,7 +25,6 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use tonic::transport::Channel;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
@@ -182,7 +181,7 @@ pub struct AppState {
     /// caller wrote. A second channel for the resolving half would have been a
     /// second address for one service, which is the confusion the deleted
     /// `YADGAR_IAM_ADDR` was.
-    pub iam: Channel,
+    pub iam: crate::upstream::IamUpstream,
     /// What `iam` last said about each token this replica has seen (D72,
     /// ADR-0491). Held here for the same reason the limiter is: it is process
     /// state, and one built per request would cache nothing.

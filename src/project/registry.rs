@@ -32,8 +32,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use tonic::transport::Channel;
-
 use crate::pb::yadgar::project::v1::{ProjectStatus, RegisteredPath};
 
 use super::classify::{is_private_class, Match, Registered};
@@ -356,7 +354,7 @@ impl Registry {
     /// that converts one absent dependency into a total front-door outage — no
     /// login, no health — and a pod stuck in startup is one D68's autoscaler
     /// cannot help. The degraded window is observable instead, through [`LOADED`].
-    pub fn start(project: Channel, poll: Duration) -> Self {
+    pub fn start(project: crate::upstream::ProjectUpstream, poll: Duration) -> Self {
         // BEFORE THE FIRST DIAL AND BEFORE ANYTHING CAN FAIL. See [`LOADED`]: a
         // gauge that appeared only on success, or only on the loop's first
         // tick, would make a replica that has never loaded indistinguishable
@@ -393,7 +391,7 @@ impl Registry {
 /// Each arm is its own function, and not only for the complexity gate: what to do
 /// with a set that loaded and what to say about one that did not are different
 /// decisions, and the second one turns on a state the first one changes.
-async fn run(project: Channel, poll: Duration, registry: Registry) {
+async fn run(project: crate::upstream::ProjectUpstream, poll: Duration, registry: Registry) {
     let loader = move || {
         let project = project.clone();
         async move { load(&project).await }

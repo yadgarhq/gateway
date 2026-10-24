@@ -490,7 +490,7 @@ async fn an_enforced_refusal_hands_project_the_id_on_the_calls_own_record() {
     state.projects = Arc::new(crate::project::Validator::new(
         crate::project::Registry::loaded_with(["yadgarhq".to_string()]),
         crate::project::Mode::Enforcing,
-        project,
+        crate::upstream::Upstream::new(project, std::time::Duration::from_secs(30)),
     ));
 
     let body = json!({
