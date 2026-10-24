@@ -245,3 +245,38 @@ fn enforcing_with_trusted_headers_refuses_boot_naming_both_settings() {
         );
     }
 }
+
+/// TEAM ACCESS RED 14, through the real binary: `orgGrants: enforcing` under
+/// `mode: counting` refuses to start, naming both. The unit test proves the
+/// function; this proves `main` passes it the knob it read.
+#[test]
+fn red_14_org_grants_enforcing_under_counting_mode_refuses_boot_naming_both() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "YADGAR_PROJECT_VALIDATION_ORG_GRANTS");
+    vars.push(("YADGAR_PROJECT_VALIDATION_ORG_GRANTS", "enforcing"));
+    let (status, stderr) = run_to_exit(&vars);
+    let line = refusal_line(status, &stderr);
+    for named in [
+        "YADGAR_PROJECT_VALIDATION_ORG_GRANTS",
+        "YADGAR_PROJECT_VALIDATION_MODE",
+    ] {
+        assert!(
+            line.contains(named),
+            "the refusal must name {named}: {line}"
+        );
+    }
+}
+
+/// The knob has no compiled-in default (ADR-0569): absent, the boot refuses
+/// naming it.
+#[test]
+fn an_absent_org_grants_knob_refuses_boot_naming_it() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "YADGAR_PROJECT_VALIDATION_ORG_GRANTS");
+    let (status, stderr) = run_to_exit(&vars);
+    let line = refusal_line(status, &stderr);
+    assert!(
+        line.contains("YADGAR_PROJECT_VALIDATION_ORG_GRANTS"),
+        "the refusal must name the knob: {line}"
+    );
+}

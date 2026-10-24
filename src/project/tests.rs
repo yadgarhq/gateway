@@ -308,7 +308,7 @@ fn checked_by(
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(claimed, access, user, "a-request-id")
+                .check(claimed, access, user, &[], "a-request-id")
                 .await
         })
     });
@@ -668,13 +668,19 @@ fn the_org_remediation_is_composed_from_data_and_degrades_without_it() {
         Reason::UnregisteredOrg,
         Some("yadgarhq"),
         Some("yadgarhq/estate"),
+        OrgGrants::Counting,
     );
     assert!(
         composed.contains("yadgarhq/estate"),
         "the remediation names the repository whose PR flow governs the namespace: {composed}"
     );
 
-    let degraded = remediate::sentence(Reason::UnregisteredOrg, Some("yadgarhq"), None);
+    let degraded = remediate::sentence(
+        Reason::UnregisteredOrg,
+        Some("yadgarhq"),
+        None,
+        OrgGrants::Counting,
+    );
     assert!(
         degraded.contains("yadgarhq") && degraded.contains("could not be reached"),
         "without the datum the refusal stands and only the prose degrades: {degraded}"
@@ -973,8 +979,13 @@ fn answered(
 #[tokio::test]
 async fn the_served_source_repo_reaches_the_composed_remediation() {
     let project = stub_project(answered("yadgarhq", "yadgarhq/estate")).await;
-    let denied =
-        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
+    let denied = remediate::compose(
+        &project,
+        Refusal::under_anchor("yadgarhq"),
+        "a-request-id",
+        OrgGrants::Counting,
+    )
+    .await;
 
     assert_eq!(
         denied.reason.token(),
@@ -1010,8 +1021,13 @@ async fn the_served_source_repo_reaches_the_composed_remediation() {
 #[tokio::test]
 async fn an_empty_served_source_repo_degrades_instead_of_interpolating_nothing() {
     let project = stub_project(answered("yadgarhq", "")).await;
-    let denied =
-        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
+    let denied = remediate::compose(
+        &project,
+        Refusal::under_anchor("yadgarhq"),
+        "a-request-id",
+        OrgGrants::Counting,
+    )
+    .await;
 
     assert!(
         denied
@@ -1042,8 +1058,13 @@ async fn an_empty_served_source_repo_degrades_instead_of_interpolating_nothing()
 #[tokio::test]
 async fn an_empty_served_resolved_path_falls_back_to_the_walked_anchor() {
     let project = stub_project(answered("", "")).await;
-    let denied =
-        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
+    let denied = remediate::compose(
+        &project,
+        Refusal::under_anchor("yadgarhq"),
+        "a-request-id",
+        OrgGrants::Counting,
+    )
+    .await;
 
     assert!(
         denied
@@ -1069,6 +1090,7 @@ async fn an_enforced_refusal_dials_resolve_project_carrying_the_request_id() {
             "yadgarhq/gateway",
             Access::Write,
             "a-user",
+            &[],
             "the-id-on-this-call",
         )
         .await;
@@ -1101,6 +1123,7 @@ fn row(path: &str, status: ProjectStatus, aliases: &[&str]) -> RegisteredPath {
         status: status as i32,
         aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
         owner_user_id: String::new(),
+        grants: Vec::new(),
     }
 }
 
@@ -1380,6 +1403,10 @@ fn the_archived_refusal_does_not_echo_the_callers_value() {
 /// Membership (`plans/project-membership.md` car P3): who may reach a resolved
 /// project, and the gauge that says whether a load carried its owners.
 mod member;
+
+/// Team grants on org rows (`plans/team-access.md` stage 8): reds 1-17 that
+/// `check` alone decides.
+mod grants;
 
 /// The first load retries on a short doubling schedule, then settles on the
 /// poll (ledger 1668).

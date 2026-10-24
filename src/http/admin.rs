@@ -172,6 +172,9 @@ pub(super) async fn admin_create_user(
         // `admin::Authority::actor` — an empty actor would reach `iam-db`'s
         // `<unattributed>` by the wrong route and hide a dropped id.
         unverified_actor: authority.actor(),
+        // PROTO v1.24.0's F2 field (ADR-0963 (5)). Empty means "mint one",
+        // today's behaviour; team access stage 3b owns the arm that sets it.
+        user_id: String::new(),
     });
     let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
         Ok(Ok(r)) => r.into_inner(),

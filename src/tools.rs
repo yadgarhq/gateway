@@ -30,6 +30,12 @@ pub const READ_TASK: &str = "read_task";
 pub const FIND_TASKS: &str = "find_tasks";
 pub const EDIT_TASK: &str = "edit_task";
 pub const TRANSITION_TASK: &str = "transition_task";
+/// The per-user project listing (ADR-0963 (8), `plans/team-access.md` §8).
+/// THE ONE TOOL EXEMPT FROM `X-Yadgar-Project`: it names no project, so it is
+/// attested without a workspace and never reaches the project validator. It
+/// is served by the gateway itself from the loaded registry, so it never
+/// reaches [`call`] either — see `http::listing`.
+pub const LIST_PROJECTS: &str = "list_projects";
 
 /// EVERY tool this gateway serves, stated ONCE.
 ///
@@ -53,12 +59,13 @@ pub const TRANSITION_TASK: &str = "transition_task";
 /// `assets/rules.md` list the served tool names. Adding, removing or renaming a
 /// member here changes what those rules must say — change them in the same
 /// release, or a rename recreates ledger 1543.
-pub const SERVED: [&str; 5] = [
+pub const SERVED: [&str; 6] = [
     CREATE_TASK,
     READ_TASK,
     FIND_TASKS,
     EDIT_TASK,
     TRANSITION_TASK,
+    LIST_PROJECTS,
 ];
 
 /// Whether `name` is a tool this gateway serves.
@@ -110,6 +117,9 @@ pub fn module_for(name: &str) -> Option<&'static str> {
     }
     match name {
         CREATE_TASK | READ_TASK | FIND_TASKS | EDIT_TASK | TRANSITION_TASK => Some("task"),
+        // Its own D74 bucket, so listing never spends `task`'s; an unconfigured
+        // `project.read` pair takes the configured fallback (`Limits::effective`).
+        LIST_PROJECTS => Some("project"),
         _ => None,
     }
 }
@@ -209,6 +219,7 @@ fn definition(name: &str) -> Value {
                 "required": ["expect_version", "to"],
             }),
         ),
+        LIST_PROJECTS => list_definition(),
         // Unreachable for a member of `SERVED`, and deliberately not a panic.
         _ => ("", "", Value::Null),
     };
@@ -218,6 +229,30 @@ fn definition(name: &str) -> Value {
         "description": description,
         "inputSchema": input_schema,
     })
+}
+
+/// `list_projects`' catalogue entry, split out of [`definition`] for the
+/// function-size ceiling.
+fn list_definition() -> (&'static str, &'static str, Value) {
+    (
+        "List your projects",
+        "List the projects you may reach: every organisation project one of \
+         your teams is granted, with `access` read or readWrite, and your own \
+         private projects, with `access` owner. Each entry carries `path`, \
+         `status` (active or archived) and `kind` (root, project or private). \
+         Needs no x-yadgar-project header. Takes no arguments except \
+         `page_token`, the `next_page_token` of the previous page.",
+        json!({
+            "type": "object",
+            "properties": {
+                "page_token": {
+                    "type": "string",
+                    "description": "The next_page_token a previous call answered",
+                },
+            },
+            "additionalProperties": false,
+        }),
+    )
 }
 
 #[derive(Debug, thiserror::Error)]

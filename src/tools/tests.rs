@@ -5,12 +5,16 @@ use crate::pb::yadgar::taskapi::v1::FindTasksResponse;
 /// test. A test that read `SERVED` to check `SERVED` would agree with any
 /// value it was given, including one an administrative verb had been added
 /// to — which is the whole failure ADR-0492 is defended against.
-const EXPECTED: [&str; 5] = [
+///
+/// `list_projects` is team access stage 8's deliberate addition (ADR-0963
+/// (8)): a read of the caller's own reach, not an administrative verb.
+const EXPECTED: [&str; 6] = [
     "create_task",
     "read_task",
     "find_tasks",
     "edit_task",
     "transition_task",
+    "list_projects",
 ];
 
 fn sorted(names: &[&str]) -> Vec<String> {
@@ -20,7 +24,7 @@ fn sorted(names: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn the_served_set_is_exactly_the_five_task_tools() {
+fn the_served_set_is_exactly_the_five_task_tools_and_list_projects() {
     // DIRECTION 1, AND THE GATE THE OTHER THREE REST ON. `label_for`,
     // `module_for`, `definitions` and `call` all consult `SERVED` before
     // they do anything else, so this is the one place a fourth tool can be

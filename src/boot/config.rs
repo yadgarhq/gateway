@@ -358,7 +358,35 @@ pub fn http_configuration() -> Result<
 pub fn refuse_unverifiable_enforcement(
     attestation: &Attestation,
     mode: yadgar_gateway::project::Mode,
+    org_grants: yadgar_gateway::project::OrgGrants,
 ) -> Result<(), String> {
+    use yadgar_gateway::project::{Mode, OrgGrants};
+    if org_grants == OrgGrants::Enforcing {
+        if mode == Mode::Counting {
+            return Err(
+                "YADGAR_PROJECT_VALIDATION_ORG_GRANTS is \"enforcing\" (chart: \
+                 projectValidation.orgGrants) while YADGAR_PROJECT_VALIDATION_MODE is \
+                 \"counting\" (chart: projectValidation.mode). The team-grant rule is narrower \
+                 than the registration rule, and no order enforces the narrower one first \
+                 (plans/team-access.md §5), so this gateway refuses to start. Set \
+                 projectValidation.mode to \"enforcing\" first, or keep orgGrants at \
+                 \"counting\"."
+                    .to_string(),
+            );
+        }
+        if matches!(attestation, Attestation::TrustedHeaders) {
+            return Err(
+                "YADGAR_PROJECT_VALIDATION_ORG_GRANTS is \"enforcing\" (chart: \
+                 projectValidation.orgGrants) while YADGAR_TRUST_UNAUTHENTICATED_HEADERS=1 \
+                 (chart: trustUnauthenticatedHeaders). A trusted-header caller carries no \
+                 teams, so every organisation project would refuse every call, and the \
+                 identity it would be refused for is one the caller wrote. This gateway \
+                 refuses to start. Attest identity through iam, or keep orgGrants at \
+                 \"counting\"."
+                    .to_string(),
+            );
+        }
+    }
     match (attestation, mode) {
         (Attestation::TrustedHeaders, yadgar_gateway::project::Mode::Enforcing) => Err(
             "YADGAR_PROJECT_VALIDATION_MODE is \"enforcing\" (chart: projectValidation.mode) \
@@ -370,6 +398,24 @@ pub fn refuse_unverifiable_enforcement(
                 .to_string(),
         ),
         _ => Ok(()),
+    }
+}
+
+/// The boot line that names the `orgGrants` knob, true of THAT value
+/// (ledger 1747's rule, applied to the second knob).
+pub fn org_grants_announcement(org_grants: yadgar_gateway::project::OrgGrants) -> &'static str {
+    match org_grants {
+        yadgar_gateway::project::OrgGrants::Counting => {
+            "organisation-project team grants are configured in `counting`: a call whose \
+             teams hold no grant, or only a read grant for a write, is counted on \
+             yadgar_gateway_project_grant_shadow_total and served (plans/team-access.md §5)"
+        }
+        yadgar_gateway::project::OrgGrants::Enforcing => {
+            "organisation-project team grants are configured in `enforcing`: a call whose \
+             teams hold no grant on the project or an ancestor is refused PROJECT_NOT_MEMBER, \
+             and a write under only a read grant is refused PROJECT_READ_ONLY \
+             (plans/team-access.md §3, ADR-0962, ADR-0963)"
+        }
     }
 }
 

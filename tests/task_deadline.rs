@@ -83,11 +83,17 @@ async fn every_task_tool_returns_within_the_bound_when_task_never_answers() {
 
 /// A sixth task RPC added to `SERVED` without a case above, and so without the
 /// `bounded` wrap check, turns this red.
+///
+/// The TASK tools only: `list_projects` (team access stage 8) is served from
+/// the loaded registry and dials no task RPC, so it has nothing to bound.
 #[test]
 fn the_tools_exercised_are_exactly_the_served_task_tools() {
     let mut exercised = EXERCISED.to_vec();
     exercised.sort_unstable();
-    let mut served = yadgar_gateway::tools::SERVED.to_vec();
+    let mut served: Vec<&str> = yadgar_gateway::tools::SERVED
+        .into_iter()
+        .filter(|name| yadgar_gateway::tools::module_for(name) == Some("task"))
+        .collect();
     served.sort_unstable();
     assert_eq!(exercised, served);
 }

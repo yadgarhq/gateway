@@ -247,7 +247,9 @@ projectValidation:
   # `yadgar_gateway_project_refusal_total{reason}` and the call is served exactly
   # as it was before this gateway could resolve anything. `enforcing` answers
   # those refusals — 400 with the reason token for the caller classes, 403 for
-  # PROJECT_NOT_MEMBER (a personal project the caller does not own), 503 for a
+  # PROJECT_NOT_MEMBER (a personal project the caller does not own; an org
+  # project no team of the caller's holds a grant on only under orgGrants:
+  # enforcing, below), 503 for a
   # registry that has never loaded (ADR-0674). `enforcing` refuses to boot with
   # trustUnauthenticatedHeaders, whose caller-named identity no owner check can
   # verify.
@@ -262,6 +264,18 @@ projectValidation:
   # leg is what stops a gateway with no traffic reading identically to one whose
   # canonicalisation is perfect.
   mode: counting
+  # `counting` or `enforcing`: the TEAM-GRANT rule on organisation projects
+  # (ADR-0962, ADR-0963 (4), plans/team-access.md §5), separate from `mode`.
+  #
+  # **`counting` SERVES EVERY CALL EXACTLY AS TODAY.** A call whose teams hold no
+  # grant on the project or an ancestor (or only a read grant, for a write)
+  # increments `yadgar_gateway_project_grant_shadow_total{verdict}` (`no_grant`,
+  # `read_only`) and is served as if every org project admitted everyone.
+  # `enforcing` refuses those calls 403 PROJECT_NOT_MEMBER / PROJECT_READ_ONLY.
+  # `enforcing` refuses to boot while `mode` is `counting`, and with
+  # trustUnauthenticatedHeaders (no teams). Flip only after the stage 11 window
+  # in plans/team-access.md reads zero shadow increments.
+  orgGrants: counting
   # How often the registered set is loaded: the retry after a failure and the
   # refresh after a success. A newly registered project becomes resolvable within
   # this interval, and an unreachable `project` is asked again at it.

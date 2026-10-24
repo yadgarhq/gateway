@@ -41,6 +41,7 @@ fn state_owning(mode: Mode) -> std::sync::Arc<crate::http::AppState> {
         status: status as i32,
         aliases: Vec::new(),
         owner_user_id: id(owner),
+        grants: Vec::new(),
     });
     let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
     std::sync::Arc::get_mut(&mut state)

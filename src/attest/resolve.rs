@@ -63,6 +63,7 @@ pub async fn attest(
             &attested.scope.project_id,
             access,
             &attested.scope.user_id,
+            &attested.scope.team_ids,
             &attested.scope.request_id,
         )
         .await
@@ -93,6 +94,31 @@ pub async fn attest(
 /// caller to enforce. Only the workspace half is dropped. Task and MCP routes
 /// keep calling [`attest`].
 pub async fn attest_admin(
+    how: &Attestation,
+    iam: &Channel,
+    cache: &Credentials,
+    credential: Option<&str>,
+    claimed: Claimed<'_>,
+    request_id: String,
+) -> Result<Attested, AttestError> {
+    let claimed = Claimed {
+        project_id: Some(""),
+        ..claimed
+    };
+    attested(how, iam, cache, credential, claimed, request_id).await
+}
+
+/// Attest a caller to `list_projects`, the one MCP tool that names no project
+/// (ADR-0963 (8), `plans/team-access.md` §8).
+///
+/// **THE SAME SHAPE AS [`attest_admin`], AND A SEPARATE FUNCTION ON PURPOSE.**
+/// No workspace is required, checked or carried: the scope's `project_id` is
+/// EMPTY whatever the request sent, and [`crate::project::Validator::check`] is
+/// not called — so the listing moves neither project counter, and a missing
+/// `X-Yadgar-Project` is not `MissingWorkspace` here. The credential is still
+/// resolved through `iam`, a dead one is still refused, and `team_ids` come
+/// from the response only, which is what the listing reads.
+pub async fn attest_unscoped(
     how: &Attestation,
     iam: &Channel,
     cache: &Credentials,

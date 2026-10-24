@@ -151,7 +151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // phase 1 and the validation mode `boot::wiring` read. Enforcing with a
     // caller-written identity enforces nothing, so it does not boot
     // (`plans/project-membership.md` car P3).
-    boot::refuse_unverifiable_enforcement(&attestation, projects.mode())?;
+    boot::refuse_unverifiable_enforcement(&attestation, projects.mode(), projects.org_grants())?;
 
     // AFTER THE EXPORTER, NEVER BEFORE IT. A value recorded before there is a
     // recorder is a value nobody ever sees. This process serves no certificate,

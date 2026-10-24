@@ -341,7 +341,7 @@ fn project_answer(denied: &crate::project::Denied) -> AttestAnswer {
             codes::INTERNAL_ERROR,
             "UNAVAILABLE",
         ),
-        Reason::NotMember => (
+        Reason::NotMember | Reason::ReadOnly => (
             StatusCode::FORBIDDEN,
             codes::INVALID_REQUEST,
             "PERMISSION_DENIED",
