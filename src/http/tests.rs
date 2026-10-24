@@ -792,7 +792,6 @@ fn admin_call() -> Call {
 #[tokio::test]
 async fn admin_failure_failed_precondition_gets_a_distinct_body() {
     let mut generic_answers = std::collections::BTreeSet::new();
-    let mut precondition_answers = std::collections::BTreeSet::new();
     let mut generic_codes = std::collections::BTreeSet::new();
     let mut refusals = 0;
 
@@ -826,8 +825,6 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
             refusals += 1;
             assert_eq!(resp_status, StatusCode::UNAUTHORIZED);
             assert_eq!(body, r#"{"error":"refused"}"#);
-        } else if code == tonic::Code::FailedPrecondition {
-            precondition_answers.insert((resp_status.as_u16(), body));
         } else {
             generic_codes.insert(code as i32);
             generic_answers.insert((resp_status.as_u16(), body));
@@ -839,6 +836,7 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
         tonic::Code::AlreadyExists,
         tonic::Code::InvalidArgument,
         tonic::Code::PermissionDenied,
+        tonic::Code::FailedPrecondition,
     ] {
         assert!(
             generic_codes.contains(&(code as i32)),
@@ -848,8 +846,8 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
     assert_eq!(
         generic_answers.len(),
         1,
-        "every non-refusal, non-FAILED_PRECONDITION code must answer one identical status AND \
-         body; got {generic_answers:?}"
+        "every non-refusal code must answer one identical status AND body on create-user; got \
+         {generic_answers:?}"
     );
     assert_eq!(
         generic_answers.into_iter().next().expect("one answer"),
@@ -858,23 +856,81 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
             r#"{"error":"the administrative service is unavailable"}"#.to_string()
         )
     );
+}
 
+/// What `admin_failure` answers `FAILED_PRECONDITION` with on `endpoint`
+/// (yaadgaar #202, ledger 1738).
+async fn failed_precondition_on(endpoint: &'static str) -> (u16, String) {
+    let status = tonic::Status::failed_precondition("an upstream message that must not leak");
+    let resp = admin_failure(admin_call(), endpoint, status);
+    let code = resp.status().as_u16();
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read the body");
+    (code, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+const OPAQUE_ADMIN_BODY: &str = r#"{"error":"the administrative service is unavailable"}"#;
+
+/// yaadgaar #202: the enrolment sentence belongs to `issue-enrolment` alone,
+/// where iam's only `FAILED_PRECONDITION` is an unset `ENROLMENT_GATEWAY`.
+#[tokio::test]
+async fn failed_precondition_on_issue_enrolment_names_enrolment() {
     assert_eq!(
-        precondition_answers.len(),
-        1,
-        "FAILED_PRECONDITION must answer one fixed status AND body; got {precondition_answers:?}"
+        failed_precondition_on(ADMIN_ISSUE_ENROLMENT).await,
+        (
+            503,
+            r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#.to_string()
+        )
     );
-    let (precondition_status, precondition_body) =
-        precondition_answers.into_iter().next().expect("one answer");
+}
+
+/// yaadgaar #202 and Max's ruling (a): on `create-user` it is the opaque 503.
+/// iam refuses a well-formed pre-minted id `FAILED_PRECONDITION` while
+/// `IAM_ADMIN_FROM_TEAM` is false, and a malformed one `INVALID_ARGUMENT`, so a
+/// distinct body here would tell the bootstrap token which ids are well formed.
+#[tokio::test]
+async fn failed_precondition_on_create_user_is_the_opaque_503() {
     assert_eq!(
-        precondition_status,
-        StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-        "FAILED_PRECONDITION's distinct body is not a distinct STATUS — opaque_status gives it \
-         the same 503 as every other non-UNAUTHENTICATED code"
+        failed_precondition_on(ADMIN_CREATE_USER).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
     );
+}
+
+/// yaadgaar #202: iam's only `FAILED_PRECONDITION` on `SetUserAdmin` is the
+/// verb's retirement while `IAM_ADMIN_FROM_TEAM` is true (ADR-0962), before the
+/// store is asked, so that is the sentence. It does not depend on the target.
+#[tokio::test]
+async fn failed_precondition_on_set_user_admin_names_the_retirement() {
     assert_eq!(
-        precondition_body,
-        r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#
+        failed_precondition_on(ADMIN_SET_USER_ADMIN).await,
+        (503, SET_USER_ADMIN_RETIRED_BODY.to_string())
+    );
+}
+
+/// yaadgaar #202: iam has no `FAILED_PRECONDITION` on these verbs, so no
+/// specific sentence is true and the answer is the opaque one.
+#[tokio::test]
+async fn failed_precondition_on_revoke_credentials_is_the_opaque_503() {
+    assert_eq!(
+        failed_precondition_on(ADMIN_REVOKE_CREDENTIALS).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
+    );
+}
+
+#[tokio::test]
+async fn failed_precondition_on_list_credentials_is_the_opaque_503() {
+    assert_eq!(
+        failed_precondition_on(ADMIN_LIST_CREDENTIALS).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
+    );
+}
+
+#[tokio::test]
+async fn failed_precondition_on_revoke_credential_is_the_opaque_503() {
+    assert_eq!(
+        failed_precondition_on(ADMIN_REVOKE_CREDENTIAL).await,
+        (503, OPAQUE_ADMIN_BODY.to_string())
     );
 }
 

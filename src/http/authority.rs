@@ -21,6 +21,10 @@ pub(super) const VERB_RULE_BODY: &str = r#"{"error":"the bootstrap token may onl
 /// accepts this and the previous text).
 const ENROLMENT_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only enrol an administrator the enrolment predicate admits"}"#;
 
+/// `set-user-admin`'s `FAILED_PRECONDITION` body (yaadgaar #202): iam's only
+/// one there is the verb's retirement (ADR-0962), independent of the target.
+pub(super) const SET_USER_ADMIN_RETIRED_BODY: &str = r#"{"error":"set-user-admin is retired on this deployment: admin is membership of the declared administrators team (ADR-0962), so declare the user there"}"#;
+
 /// A refusal one administrative handler must return, with the D67 label it is
 /// recorded under.
 ///
@@ -343,7 +347,9 @@ pub(super) fn bootstrap_authority(
 
 /// What an administrative caller is told when `iam` refuses or fails.
 ///
-/// **`FAILED_PRECONDITION` GETS ITS OWN BODY (§2), AND NOT ITS OWN STATUS.**
+/// **`FAILED_PRECONDITION` GETS ITS OWN BODY (§2) ON `issue-enrolment` AND
+/// `set-user-admin` ONLY, AND NEVER ITS OWN STATUS** (yaadgaar #202; the rest
+/// get the opaque body).
 /// `iam`'s `EnrolmentConfig::from_env` takes an argued exception to ADR-0569
 /// (`iam/src/service.rs:490`): an absent `ENROLMENT_GATEWAY` leaves the process
 /// SERVING and makes `IssueEnrolment` refuse with `FAILED_PRECONDITION` naming
@@ -433,11 +439,19 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
         // closed-set counter label, reachable by request id.
         return text(StatusCode::FORBIDDEN, body);
     }
-    if code == tonic::Code::FailedPrecondition {
-        return text(
-            opaque_status(code),
+    // PER ROUTE (yaadgaar #202): a sentence TRUE of iam's only such refusal on
+    // that verb. `create-user` gets the opaque body, or the bootstrap token
+    // could tell a well-formed id from a malformed one (ruling (a)); the
+    // credential verbs have no such refusal in iam.
+    let precondition_body = match endpoint {
+        ADMIN_ISSUE_ENROLMENT => Some(
             r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#,
-        );
+        ),
+        ADMIN_SET_USER_ADMIN => Some(SET_USER_ADMIN_RETIRED_BODY),
+        _ => None,
+    };
+    if let (tonic::Code::FailedPrecondition, Some(body)) = (code, precondition_body) {
+        return text(opaque_status(code), body);
     }
     let (status, body) = opaque_answer(
         code,

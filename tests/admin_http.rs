@@ -1835,9 +1835,9 @@ fn red_04_the_create_user_predicate_refusal_is_the_opaque_503() {
 }
 
 /// Red 5, on the wire. `ALREADY_EXISTS` and `INVALID_ARGUMENT` keep the opaque
-/// 503 (ADR-0927: a 409 would say an id or a name is taken);
-/// `FAILED_PRECONDITION` keeps its existing distinct body. No upstream text in
-/// any body. The unit-level loop is
+/// 503 (ADR-0927: a 409 would say an id or a name is taken), and so does
+/// `FAILED_PRECONDITION` (yaadgaar #202: the enrolment sentence was false
+/// here). No upstream text in any body. The unit-level loop is
 /// `admin_failure_failed_precondition_gets_a_distinct_body` in
 /// `src/http/tests.rs`.
 #[tokio::test]
@@ -1845,10 +1845,7 @@ async fn red_05_upstream_codes_on_create_user_stay_opaque() {
     for (code, expected) in [
         (tonic::Code::AlreadyExists, UNAVAILABLE_BODY),
         (tonic::Code::InvalidArgument, UNAVAILABLE_BODY),
-        (
-            tonic::Code::FailedPrecondition,
-            r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#,
-        ),
+        (tonic::Code::FailedPrecondition, UNAVAILABLE_BODY),
     ] {
         let (state, _log) = gateway_with(
             resolved(true),
@@ -2136,8 +2133,9 @@ async fn post_raw(
 /// Ruling (a). On bootstrap `create-user` with a pre-minted id, a TAKEN id
 /// (`ALREADY_EXISTS`), a refusal of the predicate (`PERMISSION_DENIED`: no
 /// `administrators` team, an administrator exists, or the id is not
-/// declared), a malformed id (`INVALID_ARGUMENT`) and an outage
-/// (`UNAVAILABLE`) are ONE answer: the same status, the same headers and the
+/// declared), a malformed id (`INVALID_ARGUMENT`), iam's refusal of a
+/// well-formed id while `IAM_ADMIN_FROM_TEAM` is false (`FAILED_PRECONDITION`)
+/// and an outage (`UNAVAILABLE`) are ONE answer: the same status, the same headers and the
 /// same bytes, whatever message iam sent. So the bootstrap token cannot tell a
 /// taken id from any other refusal, nor from an outage (ADR-0927).
 #[tokio::test]
@@ -2147,6 +2145,7 @@ async fn ruling_a_every_bootstrap_create_user_refusal_is_one_answer() {
         tonic::Code::AlreadyExists,
         tonic::Code::PermissionDenied,
         tonic::Code::InvalidArgument,
+        tonic::Code::FailedPrecondition,
         tonic::Code::Unavailable,
     ] {
         for message in [IAM_PERMISSION_DENIED_SENTENCE, UPSTREAM_SENTINEL] {
