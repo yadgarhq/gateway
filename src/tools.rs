@@ -4,8 +4,6 @@
 //! D67 rolls up per `tool`, and the number a person tunes is "what did
 //! `create_task` cost me" — so the label has to be the string the client sent.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use crate::pb::yadgar::common::v1::Scope;
@@ -13,7 +11,7 @@ use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::{
     read_task_request::Key, task_service_client::TaskServiceClient, ReadTaskRequest,
 };
-use crate::upstream::TaskUpstream;
+use crate::upstream::{CallError, TaskUpstream};
 
 mod change;
 mod create;
@@ -319,7 +317,9 @@ pub async fn call(
         return Err(ToolError::Unknown(name.to_string()));
     }
 
-    let limit = task.timeout();
+    // ONE DEADLINE FOR THE CALL, built before its own work (ADR-1019): the
+    // chart's `task.requestTimeoutSeconds`, which `bounded` also SENDS.
+    let deadline = yadgar_dial::Deadline::after(task.timeout());
     let mut client = TaskServiceClient::new(crate::upstream::request_id::carrying(
         task.channel(),
         &scope.request_id,
@@ -328,7 +328,7 @@ pub async fn call(
     match name {
         CREATE_TASK => {
             let request = create::request(scope, args, crate::idempotency_key)?;
-            let resp = bounded(limit, client.create_task(request))
+            let resp = bounded(task, deadline, request, |r| client.create_task(r))
                 .await?
                 .into_inner();
             let meta = resp.meta.unwrap_or_default();
@@ -356,15 +356,13 @@ pub async fn call(
                     return Err(ToolError::Invalid("`id` or `number` is required".into()))
                 }
             };
-            let resp = bounded(
-                limit,
-                client.read_task(ReadTaskRequest {
-                    scope: Some(scope),
-                    key: Some(key),
-                }),
-            )
-            .await?
-            .into_inner();
+            let request = ReadTaskRequest {
+                scope: Some(scope),
+                key: Some(key),
+            };
+            let resp = bounded(task, deadline, request, |r| client.read_task(r))
+                .await?
+                .into_inner();
             Ok(Output {
                 content: serde_json::to_value(TaskView::full(resp.task)).unwrap_or(Value::Null),
                 rows: 1,
@@ -374,35 +372,49 @@ pub async fn call(
         FIND_TASKS => {
             let scope_project = scope.project_id.clone();
             let (request, fields) = find::request(scope, args)?;
-            let resp = bounded(limit, client.find_tasks(request))
+            let resp = bounded(task, deadline, request, |r| client.find_tasks(r))
                 .await?
                 .into_inner();
             Ok(find::output(resp, fields, &scope_project))
         }
 
-        EDIT_TASK => change::edit(&mut client, limit, scope, args).await,
-        TRANSITION_TASK => change::transition(&mut client, limit, scope, args).await,
+        EDIT_TASK => change::edit(&mut client, task, deadline, scope, args).await,
+        TRANSITION_TASK => change::transition(&mut client, task, deadline, scope, args).await,
 
         other => Err(ToolError::Unknown(other.to_string())),
     }
 }
 
-/// Await one `task` RPC for at most `limit`.
+/// Send one `task` RPC under `deadline`, and await it for no longer.
 ///
-/// **EVERY `TaskServiceClient` call goes through this** (yaadgaar #361). A
-/// timeout is `DEADLINE_EXCEEDED`, the code the `iam` and `attest` deadlines
-/// already use, so it reaches the caller as the same class of failure.
-/// The message carries the bound and nothing from the peer.
-pub(super) async fn bounded<T>(
-    limit: Duration,
-    rpc: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
-) -> Result<tonic::Response<T>, ToolError> {
-    match tokio::time::timeout(limit, rpc).await {
-        Ok(result) => Ok(result?),
-        Err(_elapsed) => Err(ToolError::Upstream(tonic::Status::deadline_exceeded(
-            format!("task did not answer within {}s", limit.as_secs()),
-        ))),
-    }
+/// **EVERY `TaskServiceClient` call goes through this** (yaadgaar #361), and
+/// through [`TaskUpstream::call`] (ADR-1019): `task` is sent the deadline as
+/// `grpc-timeout`, so it and the hops behind it stop when this gateway does,
+/// and the wait for a ready endpoint is bounded by the same value.
+///
+/// A timeout is `DEADLINE_EXCEEDED`, the code the `iam` and `attest` deadlines
+/// already use, so it reaches the caller as the same class of failure. The
+/// gateway's OWN timeout carries the bound and nothing from the peer; a
+/// `DEADLINE_EXCEEDED` that `task` answered itself keeps its own words.
+pub(super) async fn bounded<M, T, F, Fut>(
+    task: &TaskUpstream,
+    deadline: yadgar_dial::Deadline,
+    request: M,
+    rpc: F,
+) -> Result<tonic::Response<T>, ToolError>
+where
+    F: FnOnce(tonic::Request<M>) -> Fut,
+    Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    task.call(deadline, request, rpc)
+        .await
+        .map_err(|e| match e {
+            CallError::Expired => ToolError::Upstream(tonic::Status::deadline_exceeded(format!(
+                "task did not answer within {}s",
+                task.timeout().as_secs()
+            ))),
+            CallError::Answered(status) => ToolError::Upstream(status),
+        })
 }
 
 /// The JSON shape of a task as a CLIENT sees it.

@@ -9,6 +9,7 @@
 use super::answer::*;
 use super::gate::*;
 use super::*;
+use crate::upstream::CallError;
 
 /// A refusal one administrative handler must return, with the D67 label it is
 /// recorded under.
@@ -401,6 +402,24 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
         r#"{"error":"the administrative service is unavailable"}"#,
     );
     text(status, body)
+}
+
+impl AppState {
+    /// One `iam` RPC under [`AUTH_DEADLINE`], the bound on login, enrolment
+    /// and every administrative verb.
+    ///
+    /// SENT AS WELL AS ENFORCED (ADR-1019): `iam` is told `grpc-timeout` =
+    /// AUTH_DEADLINE - 50 ms (its ceiling, >= 14 s, never binds below that), so
+    /// it stops hashing or writing when this gateway stops waiting.
+    /// [`CallError::Expired`] is the case each caller's elapsed-timer arm
+    /// answered, and it is answered the same way.
+    pub(super) async fn iam_rpc<M, T, F, Fut>(&self, request: M, rpc: F) -> Result<T, CallError>
+    where
+        F: FnOnce(tonic::Request<M>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+    {
+        self.iam.within(AUTH_DEADLINE, request, rpc).await
+    }
 }
 
 /// An `iam` that accepted the connection and then stalled.

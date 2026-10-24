@@ -384,7 +384,7 @@ async fn gateway_with(
             tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
             std::time::Duration::from_secs(1),
         ),
-        iam,
+        iam: yadgar_gateway::upstream::Upstream::new(iam, std::time::Duration::from_secs(30)),
         // SHORT, AND NOT ZERO. Each test builds its own gateway, so nothing here
         // depends on a cached answer — but a zero would disable the cache and
         // make this suite exercise a path the deployment does not run.
@@ -414,7 +414,10 @@ async fn gateway_with(
         projects: std::sync::Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),
             yadgar_gateway::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            yadgar_gateway::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     });
     (state, log)

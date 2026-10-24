@@ -23,6 +23,7 @@ use super::super::gate::*;
 use super::super::*;
 use super::revoke::is_canonical_user_id;
 use crate::pb::yadgar::iam::v1::{Credential, ListCredentialsRequest, RevokeCredentialRequest};
+use crate::upstream::CallError;
 
 /// A strict JSON object: every key in `allowed`, or the 400's message.
 fn strict<'a>(
@@ -179,22 +180,22 @@ pub(in crate::http) async fn admin_list_credentials(
     };
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.list_credentials(ListCredentialsRequest {
+    let request = ListCredentialsRequest {
         user_id,
         // 0 is `iam`'s default page size.
         page_size: 0,
         page_token,
         unverified_actor: authority.actor(),
-    });
-    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(r)) => r.into_inner(),
+    };
+    let resp = match state.iam_rpc(request, |r| client.list_credentials(r)).await {
+        Ok(r) => r.into_inner(),
         // EVERY REFUSAL IS OPAQUE HERE (ADR-0927). `iam-db` answers an unknown
         // user with an empty page, not NOT_FOUND, so there is no 404 to map.
-        Ok(Err(e)) => return admin_failure(call, ADMIN_LIST_CREDENTIALS, e),
-        Err(_elapsed) => return admin_timeout(call, ADMIN_LIST_CREDENTIALS),
+        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_LIST_CREDENTIALS, e),
+        Err(CallError::Expired) => return admin_timeout(call, ADMIN_LIST_CREDENTIALS),
     };
 
     let rows = u32::try_from(resp.credentials.len()).unwrap_or(u32::MAX);
@@ -261,21 +262,24 @@ pub(in crate::http) async fn admin_revoke_credential(
     };
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.revoke_credential(RevokeCredentialRequest {
+    let request = RevokeCredentialRequest {
         idempotency: Some(Idempotency {
             key: crate::idempotency_key(),
         }),
         credential_id: credential_id.clone(),
         unverified_actor: authority.actor(),
         user_id: user_id.clone(),
-    });
-    match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return revoke_refused(call, e),
-        Err(_elapsed) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIAL),
+    };
+    match state
+        .iam_rpc(request, |r| client.revoke_credential(r))
+        .await
+    {
+        Ok(_) => {}
+        Err(CallError::Answered(e)) => return revoke_refused(call, e),
+        Err(CallError::Expired) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIAL),
     }
 
     // THE RECEIPT ECHOES THE REQUEST, BECAUSE `iam` RETURNS NOTHING TO ECHO

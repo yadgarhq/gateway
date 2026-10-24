@@ -92,7 +92,10 @@ async fn golden_state(user: &str, teams: &[&str], mode: Mode) -> std::sync::Arc<
         Validator::new(
             Registry::loaded_from(golden_rows()),
             mode,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            crate::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )
         .with_org_grants(OrgGrants::Counting),
     );

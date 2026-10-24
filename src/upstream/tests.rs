@@ -575,3 +575,78 @@ async fn the_task_rpc_bound_is_the_timeout_dial_was_given() {
         .unwrap();
     assert_eq!(task.timeout(), bound);
 }
+
+/// ADR-1019: the CEILING is the channel's dialled timeout, and the gateway's
+/// own cut at it is [`CallError::Expired`].
+///
+/// Every other deadline test has the deadline bind first: task's deadline IS
+/// its ceiling, and iam's and project's are far below the 30 s ceiling. This one
+/// is the case where the ceiling binds, so a call site that passed the budget,
+/// or `Duration::MAX`, as the ceiling turns it red — and so does classifying
+/// the cut by the deadline's remaining time alone, which still has ~9 s left.
+#[tokio::test]
+async fn the_dialled_timeout_caps_the_stated_deadline_and_its_cut_is_expired() {
+    use std::sync::{Arc, Mutex};
+
+    use super::{CallError, Upstream};
+
+    const CEILING: Duration = Duration::from_millis(750);
+    let upstream = Upstream::new(
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        CEILING,
+    );
+    let stated = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&stated);
+    let outcome: Result<(), CallError> = upstream
+        .within(Duration::from_secs(10), (), |r: tonic::Request<()>| {
+            *seen.lock().unwrap() = Some(
+                yadgar_dial::Deadline::from_metadata(r.metadata())
+                    .remaining()
+                    .expect("the request carries grpc-timeout"),
+            );
+            std::future::pending()
+        })
+        .await;
+    let stated = stated.lock().unwrap().expect("the call ran");
+    assert!(
+        stated <= CEILING,
+        "stated {stated:?}; the dialled {CEILING:?} must cap it"
+    );
+    assert!(
+        stated >= CEILING - Duration::from_millis(100),
+        "stated {stated:?}"
+    );
+    assert!(
+        matches!(outcome, Err(CallError::Expired)),
+        "the gateway's own cut at its ceiling is Expired, got {outcome:?}"
+    );
+}
+
+/// A `DEADLINE_EXCEEDED` the UPSTREAM answers, well inside the deadline, is
+/// its own answer and keeps its words: `task` timing out on `task-db` is not
+/// this gateway timing out on `task`.
+#[tokio::test]
+async fn an_upstreams_own_deadline_exceeded_is_answered_not_expired() {
+    use super::{CallError, Upstream};
+
+    let upstream = Upstream::new(
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        Duration::from_secs(30),
+    );
+    let outcome: Result<(), CallError> = upstream
+        .within(
+            Duration::from_secs(10),
+            (),
+            |_r: tonic::Request<()>| async { Err(tonic::Status::deadline_exceeded("inner")) },
+        )
+        .await;
+    match outcome {
+        Err(CallError::Answered(s)) => {
+            assert_eq!(
+                (s.code(), s.message()),
+                (tonic::Code::DeadlineExceeded, "inner")
+            )
+        }
+        other => panic!("expected the upstream's own answer, got {other:?}"),
+    }
+}

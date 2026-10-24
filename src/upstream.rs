@@ -20,24 +20,30 @@ pub use tls::{TlsConfigError, UpstreamTls, IAM, PROJECT, TASK};
 
 mod tls;
 
-/// The `task` channel and the bound on one RPC over it.
+/// One upstream channel and the bound on one RPC over it.
 ///
-/// **THE BOUND TRAVELS WITH THE CHANNEL ON PURPOSE** (yaadgaar #361). `dial`'s
-/// request timeout starts when a request reaches a READY endpoint. Time spent
-/// waiting for one — a balancer with no ready endpoint, an HTTP/2 handshake that
-/// never completes against a peer that accepts and says nothing — is not under
-/// it. The caller wraps each RPC in `tokio::time::timeout(self.timeout())` so the
-/// whole wait is bounded by the chart's `task.requestTimeoutSeconds`, the same
-/// value `dial` gets. A separate field on the state would let the two drift.
+/// **THE BOUND TRAVELS WITH THE CHANNEL ON PURPOSE** (yaadgaar #361). The
+/// `timeout` is the request timeout the channel was dialled with — the chart's
+/// `<upstream>.requestTimeoutSeconds` — and it is the CEILING every outbound
+/// call stamps under (ADR-1019): each call runs through
+/// [`yadgar_dial::Deadline::call`], which sends `grpc-timeout` =
+/// min(ceiling, that call's remaining deadline - 50 ms) and drops the call at
+/// the same bound wherever it is waiting. `dial`'s own request timer starts only
+/// when a request reaches a READY endpoint, so the wait for one is bounded by
+/// `call` and not by `dial`. A separate field on the state would let the
+/// ceiling and the dialled value drift.
+///
+/// ONE type for all three upstreams, named three ways below, because the three
+/// carry the same pair for the same reason.
 ///
 /// No `From<Channel>` and no default: the value comes from the chart (ADR-0569).
 #[derive(Clone)]
-pub struct TaskUpstream {
+pub struct Upstream {
     channel: Channel,
     timeout: Duration,
 }
 
-impl TaskUpstream {
+impl Upstream {
     pub fn new(channel: Channel, timeout: Duration) -> Self {
         Self { channel, timeout }
     }
@@ -46,10 +52,86 @@ impl TaskUpstream {
         self.channel.clone()
     }
 
+    /// The request timeout the channel was dialled with: the ceiling for
+    /// [`yadgar_dial::Deadline::call`].
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    /// Run one RPC under a deadline `budget` from now. See [`Upstream::call`].
+    pub async fn within<M, T, F, Fut>(
+        &self,
+        budget: Duration,
+        request: M,
+        rpc: F,
+    ) -> Result<T, CallError>
+    where
+        F: FnOnce(tonic::Request<M>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+    {
+        self.call(yadgar_dial::Deadline::after(budget), request, rpc)
+            .await
+    }
+
+    /// Run one RPC under `deadline` (ADR-1019): send it with `grpc-timeout` =
+    /// min([`Upstream::timeout`], the deadline's remaining time - 50 ms), and
+    /// drop it at that bound wherever it waits.
+    ///
+    /// The gateway has no caller deadline to inherit, so `deadline` is the
+    /// bound the call site always had (`AUTH_DEADLINE`, `RESOLVE_DEADLINE`,
+    /// ...). It REPLACES the `tokio::time::timeout` each site wrapped its call
+    /// in: `Deadline::call` fires at min(ceiling, deadline - 50 ms), before
+    /// that timer could, and the sites now tell the two endings apart by
+    /// [`CallError`] instead.
+    pub async fn call<M, T, F, Fut>(
+        &self,
+        deadline: yadgar_dial::Deadline,
+        request: M,
+        rpc: F,
+    ) -> Result<T, CallError>
+    where
+        F: FnOnce(tonic::Request<M>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+    {
+        // THE GATEWAY'S OWN CUT, told apart from the upstream's answer by
+        // WHEN it came. `call` cuts at `bound` (or refuses to start when it is
+        // zero), so a `DEADLINE_EXCEEDED` at or past it is this gateway giving
+        // up; one earlier is the upstream's own, e.g. its inner hop timing out
+        // under the deadline it was sent, and keeps its words.
+        let bound = deadline.bound(self.timeout);
+        let started = std::time::Instant::now();
+        deadline
+            .call(self.timeout, tonic::Request::new(request), rpc)
+            .await
+            .map_err(|status| {
+                if status.code() == tonic::Code::DeadlineExceeded && started.elapsed() >= bound {
+                    CallError::Expired
+                } else {
+                    CallError::Answered(status)
+                }
+            })
+    }
 }
+
+/// How an [`Upstream::call`] failed.
+#[derive(Debug)]
+pub enum CallError {
+    /// The gateway's own deadline ran out: the case each call site answered
+    /// from its elapsed-timer arm, and still does.
+    Expired,
+    /// Any other failure, including a `DEADLINE_EXCEEDED` the upstream
+    /// answered itself.
+    Answered(tonic::Status),
+}
+
+/// The `task` upstream.
+pub type TaskUpstream = Upstream;
+
+/// The `iam` upstream.
+pub type IamUpstream = Upstream;
+
+/// The `project` upstream.
+pub type ProjectUpstream = Upstream;
 
 /// Connect to the `task` logic service, balancing across its replicas.
 ///
@@ -87,7 +169,7 @@ impl TaskUpstream {
 /// [`connect_iam`] has always cost one. A CONFIGURATION mistake still fails
 /// here — an unusable bundle, a missing client certificate, a host that is not a
 /// URI authority.
-/// [`connect_task`], with `timeout` ALSO kept as the bound on one RPC.
+/// [`connect_task`], with `timeout` ALSO kept as the ceiling on one RPC.
 ///
 /// The one value goes to `dial` and into the [`TaskUpstream`], so the two cannot
 /// differ. `tests` pin that.
@@ -253,6 +335,9 @@ pub fn request_timeout(
 
 /// D67's request id on every outbound request (ledger 1248).
 pub mod request_id;
+
+#[cfg(test)]
+pub(crate) mod hang;
 
 #[cfg(test)]
 mod tests;

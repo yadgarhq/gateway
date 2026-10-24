@@ -5,7 +5,7 @@
 //! the source is `iam`, and builds the [`super::Attested`] scope. The rules it
 //! applies are written down in [`super`]'s module comment.
 
-use tonic::transport::Channel;
+use crate::upstream::CallError;
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::limit::{kind_str, Bucket, ConfigError, Overrides};
@@ -43,7 +43,7 @@ use super::{AttestError, Attestation, Attested, Claimed, RESOLVE_DEADLINE};
 /// nobody asked for, inside a release whose whole claim is that it changes none.
 pub async fn attest(
     how: &Attestation,
-    iam: &Channel,
+    iam: &crate::upstream::IamUpstream,
     cache: &Credentials,
     projects: &crate::project::Validator,
     credential: Option<&str>,
@@ -95,7 +95,7 @@ pub async fn attest(
 /// keep calling [`attest`].
 pub async fn attest_admin(
     how: &Attestation,
-    iam: &Channel,
+    iam: &crate::upstream::IamUpstream,
     cache: &Credentials,
     credential: Option<&str>,
     claimed: Claimed<'_>,
@@ -120,7 +120,7 @@ pub async fn attest_admin(
 /// from the response only, which is what the listing reads.
 pub async fn attest_unscoped(
     how: &Attestation,
-    iam: &Channel,
+    iam: &crate::upstream::IamUpstream,
     cache: &Credentials,
     credential: Option<&str>,
     claimed: Claimed<'_>,
@@ -141,7 +141,7 @@ pub async fn attest_unscoped(
 /// two places can only be asserted, and a single site can be read.
 async fn attested(
     how: &Attestation,
-    iam: &Channel,
+    iam: &crate::upstream::IamUpstream,
     cache: &Credentials,
     credential: Option<&str>,
     claimed: Claimed<'_>,
@@ -186,14 +186,17 @@ async fn attested(
 
         Attestation::Iam => {
             let token = bearer(credential).ok_or(AttestError::MissingCredential)?;
+            // STARTED BEFORE THE CACHE (ADR-1019), so a miss's wait spends it,
+            // and SENT to `iam` as `grpc-timeout` = what is left - 50 ms.
+            let deadline = yadgar_dial::Deadline::after(RESOLVE_DEADLINE);
             // THROUGH THE CACHE, which is D72's "on a cache miss, never per
             // request". Everything below the closure runs on a MISS only.
             let resolved = resolve_through(cache, token, || async {
                 let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-                    iam.clone(),
+                    iam.channel(),
                     &request_id,
                 ));
-                let rpc = client.resolve_credential(ResolveCredentialRequest {
+                let request = ResolveCredentialRequest {
                     // As PRESENTED, never hashed here. The contract is explicit
                     // that hashing is `iam`'s job: a caller that hashed first would
                     // have to agree on the algorithm forever, and changing it would
@@ -202,17 +205,20 @@ async fn attested(
                     // same token and is unrelated to it — that one never leaves
                     // this process, so nothing has to agree about it.
                     token: token.to_string(),
-                });
-                match tokio::time::timeout(RESOLVE_DEADLINE, rpc).await {
-                    Ok(Ok(r)) => Ok(r.into_inner()),
+                };
+                let answer = iam.call(deadline, request, |r| client.resolve_credential(r));
+                match answer.await {
+                    Ok(r) => Ok(r.into_inner()),
                     // `e.code()` is kept and `e` is dropped. The message belongs in
                     // the log line `http` writes, not in an answer to a caller
                     // whose credential has just failed to resolve.
-                    Ok(Err(e)) => Err(AttestError::Upstream(e.code())),
+                    Err(CallError::Answered(e)) => Err(AttestError::Upstream(e.code())),
                     // Through the SAME variant as any other upstream problem, so a
                     // stall is not a third answer somebody has to remember to keep
                     // opaque.
-                    Err(_elapsed) => Err(AttestError::Upstream(tonic::Code::DeadlineExceeded)),
+                    Err(CallError::Expired) => {
+                        Err(AttestError::Upstream(tonic::Code::DeadlineExceeded))
+                    }
                 }
             })
             .await?;

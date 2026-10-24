@@ -220,7 +220,8 @@ const STATUS_KEYS: [&str; 2] = ["status", "to"];
 /// Dispatch `edit_task`.
 pub(super) async fn edit(
     client: &mut TaskServiceClient<crate::upstream::request_id::Carrying>,
-    limit: std::time::Duration,
+    task: &crate::upstream::TaskUpstream,
+    deadline: yadgar_dial::Deadline,
     scope: Scope,
     args: &Value,
 ) -> Result<Output, ToolError> {
@@ -264,25 +265,23 @@ pub(super) async fn edit(
         ));
     }
 
-    let resp = super::bounded(
-        limit,
-        client.edit_task(EditTaskRequest {
-            idempotency: Some(Idempotency {
-                key: crate::idempotency_key(),
-            }),
-            scope: Some(scope),
-            id,
-            expect_version,
-            title: title.unwrap_or_default().to_string(),
-            body: body.unwrap_or_default().to_string(),
-            update_mask: Some(prost_types::FieldMask { paths }),
-            number,
-            expect_body_sha256,
-            patch,
+    let request = EditTaskRequest {
+        idempotency: Some(Idempotency {
+            key: crate::idempotency_key(),
         }),
-    )
-    .await?
-    .into_inner();
+        scope: Some(scope),
+        id,
+        expect_version,
+        title: title.unwrap_or_default().to_string(),
+        body: body.unwrap_or_default().to_string(),
+        update_mask: Some(prost_types::FieldMask { paths }),
+        number,
+        expect_body_sha256,
+        patch,
+    };
+    let resp = super::bounded(task, deadline, request, |r| client.edit_task(r))
+        .await?
+        .into_inner();
     let meta = resp.meta.unwrap_or_default();
     Ok(Output {
         content: json!({ "id": meta.id, "version": meta.version }),
@@ -349,7 +348,8 @@ pub(super) fn edit_schema() -> Value {
 /// Dispatch `transition_task`.
 pub(super) async fn transition(
     client: &mut TaskServiceClient<crate::upstream::request_id::Carrying>,
-    limit: std::time::Duration,
+    task: &crate::upstream::TaskUpstream,
+    deadline: yadgar_dial::Deadline,
     scope: Scope,
     args: &Value,
 ) -> Result<Output, ToolError> {
@@ -357,21 +357,19 @@ pub(super) async fn transition(
     let to = target(required_str(args, "to")?)
         .ok_or_else(|| ToolError::Invalid(format!("`to` must be one of {}", TARGETS.join(", "))))?;
 
-    let resp = super::bounded(
-        limit,
-        client.transition_task(TransitionTaskRequest {
-            idempotency: Some(Idempotency {
-                key: crate::idempotency_key(),
-            }),
-            scope: Some(scope),
-            id,
-            expect_version,
-            to: to as i32,
-            number,
+    let request = TransitionTaskRequest {
+        idempotency: Some(Idempotency {
+            key: crate::idempotency_key(),
         }),
-    )
-    .await?
-    .into_inner();
+        scope: Some(scope),
+        id,
+        expect_version,
+        to: to as i32,
+        number,
+    };
+    let resp = super::bounded(task, deadline, request, |r| client.transition_task(r))
+        .await?
+        .into_inner();
     let meta = resp.meta.unwrap_or_default();
     Ok(Output {
         // `from` as `task` reported it. On a replay of an applied

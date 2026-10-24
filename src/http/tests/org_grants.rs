@@ -72,7 +72,10 @@ fn validating(state: &mut std::sync::Arc<AppState>, org_grants: OrgGrants) {
         Validator::new(
             Registry::loaded_from(rows()),
             Mode::Enforcing,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            crate::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )
         .with_org_grants(org_grants),
     );

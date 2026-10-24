@@ -37,11 +37,10 @@
 //! is made, for every string field of the answer, and its own comment says why it
 //! is one place.
 
-use tonic::transport::Channel;
-
 use crate::pb::yadgar::project::v1::{
     project_service_client::ProjectServiceClient, ProjectServiceResolveProjectRequest,
 };
+use crate::upstream::CallError;
 
 use super::{Denied, OrgGrants, Reason, Refusal};
 
@@ -51,12 +50,12 @@ use super::{Denied, OrgGrants, Reason, Refusal};
 /// runs while a caller waits for a 400 it is going to get either way, so a
 /// stalled `project` must cost one bounded wait rather than hold the answer
 /// open.
-const FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
+pub(super) const FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
 
 /// The answer for one classified refusal, dialling the fallback where the
 /// remediation needs data the loaded set does not hold.
 pub(super) async fn compose(
-    project: &Channel,
+    project: &crate::upstream::ProjectUpstream,
     refusal: Refusal,
     request_id: &str,
     org_grants: OrgGrants,
@@ -176,16 +175,24 @@ fn present(value: String) -> Option<String> {
 /// collation — plus the repository the remediation names. [`Resolved::absent`]
 /// means the tier could not be reached, and the caller above falls back to the
 /// anchor this gateway walked to.
-async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved {
+async fn resolve(
+    project: &crate::upstream::ProjectUpstream,
+    anchor: &str,
+    request_id: &str,
+) -> Resolved {
     let mut client = ProjectServiceClient::new(crate::upstream::request_id::carrying(
-        project.clone(),
+        project.channel(),
         request_id,
     ));
-    let rpc = client.resolve_project(ProjectServiceResolveProjectRequest {
+    let request = ProjectServiceResolveProjectRequest {
         candidate_path: anchor.to_string(),
-    });
-    match tokio::time::timeout(FALLBACK_DEADLINE, rpc).await {
-        Ok(Ok(answer)) => {
+    };
+    // Also SENT, as `grpc-timeout` = FALLBACK_DEADLINE - 50 ms (ADR-1019).
+    match project
+        .within(FALLBACK_DEADLINE, request, |r| client.resolve_project(r))
+        .await
+    {
+        Ok(answer) => {
             let answer = answer.into_inner();
             Resolved {
                 path: present(answer.resolved_path),
@@ -195,7 +202,7 @@ async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved 
         // BOTH FAILURES ARE THE SAME FAILURE HERE, and neither changes the
         // status the caller gets. The reason goes to the log, where an operator
         // can read it; the caller gets the 400 its request had already earned.
-        Ok(Err(e)) => {
+        Err(CallError::Answered(e)) => {
             tracing::warn!(
                 error = %e,
                 "the project registry could not be reached to name the repository this refusal \
@@ -203,7 +210,7 @@ async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved 
             );
             Resolved::absent()
         }
-        Err(_elapsed) => {
+        Err(CallError::Expired) => {
             tracing::warn!(
                 deadline_secs = FALLBACK_DEADLINE.as_secs(),
                 "the project registry did not answer within the fallback deadline; answering the \

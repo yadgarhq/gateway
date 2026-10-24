@@ -2,22 +2,23 @@
 //!
 //! Split out of [`super`] for the file-size ceiling, unchanged.
 
-use tonic::transport::Channel;
-
 use crate::pb::yadgar::project::v1::{
     project_service_client::ProjectServiceClient, ProjectServiceListProjectsRequest, RegisteredPath,
 };
+use crate::upstream::CallError;
 
 use super::PAGE_DEADLINE;
 
 /// One whole load: every page, until the token comes back empty.
-pub(super) async fn load(project: &Channel) -> Result<Vec<RegisteredPath>, tonic::Status> {
+pub(super) async fn load(
+    project: &crate::upstream::ProjectUpstream,
+) -> Result<Vec<RegisteredPath>, tonic::Status> {
     // ONE FRESH ID PER LOAD, minted here (D67). The poll has no inbound call whose
     // id it could inherit, so it is its own call; every page of one load shares
     // the id and the next load gets another. Sent so `project` and `project-db`
     // can join their records for it (ledger 1254).
     let mut client = ProjectServiceClient::new(crate::upstream::request_id::carrying(
-        project.clone(),
+        project.channel(),
         &crate::request_id(),
     ));
     let mut out = Vec::new();
@@ -31,10 +32,12 @@ pub(super) async fn load(project: &Channel) -> Result<Vec<RegisteredPath>, tonic
             page_size: 0,
             page_token: token.clone(),
         };
-        let rpc = client.list_projects(request);
-        let page = match tokio::time::timeout(PAGE_DEADLINE, rpc).await {
-            Ok(answer) => answer?.into_inner(),
-            Err(_elapsed) => {
+        // PER PAGE, as before; also SENT as `grpc-timeout` (ADR-1019).
+        let answer = project.within(PAGE_DEADLINE, request, |r| client.list_projects(r));
+        let page = match answer.await {
+            Ok(answer) => answer.into_inner(),
+            Err(CallError::Answered(e)) => return Err(e),
+            Err(CallError::Expired) => {
                 return Err(tonic::Status::deadline_exceeded(format!(
                     "ListProjects did not answer within {}s",
                     PAGE_DEADLINE.as_secs()

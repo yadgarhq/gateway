@@ -8,15 +8,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tonic::transport::Channel;
-
 use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 
 use yadgar_gateway::admin::BootstrapToken;
 use yadgar_gateway::http::{router, AppState};
 use yadgar_gateway::invalidate::Broker;
 use yadgar_gateway::rotate;
-use yadgar_gateway::upstream;
+use yadgar_gateway::upstream::{self, IamUpstream, ProjectUpstream, TaskUpstream, Upstream};
 
 use super::{bootstrap_path_message, bootstrap_token, env_required, refusal};
 
@@ -31,8 +29,8 @@ pub struct Wiring {
     /// `gateway.yaml`'s `toolsPoll.intervalSeconds` (ADR-0569/0570). Carried on
     /// [`AppState`](crate::http::AppState) rather than re-read per request.
     pub tools_poll_interval: std::time::Duration,
-    pub task: upstream::TaskUpstream,
-    pub iam: Channel,
+    pub task: TaskUpstream,
+    pub iam: IamUpstream,
     /// The registry, the validation mode, and the channel a refusal is composed
     /// over (ledger 881).
     ///
@@ -220,7 +218,7 @@ fn transports() -> Result<Transports, Boxed> {
 /// service, which is the confusion the deleted `YADGAR_IAM_ADDR` was — and a
 /// `tonic::transport::Channel` clone shares the connection rather than opening
 /// another.
-fn validation(project: Channel) -> Result<Arc<yadgar_gateway::project::Validator>, Boxed> {
+fn validation(project: ProjectUpstream) -> Result<Arc<yadgar_gateway::project::Validator>, Boxed> {
     let mode = yadgar_gateway::project::Mode::from_env().map_err(|e| e.to_string())?;
     let org_grants = yadgar_gateway::project::OrgGrants::from_env().map_err(|e| e.to_string())?;
     let poll = yadgar_gateway::project::poll_from_env().map_err(|e| e.to_string())?;
@@ -388,7 +386,7 @@ async fn upstreams(
     task_tls: Option<&upstream::UpstreamTls>,
     iam_tls: Option<&upstream::UpstreamTls>,
     project_tls: Option<&upstream::UpstreamTls>,
-) -> Result<(upstream::TaskUpstream, Channel, Channel), Boxed> {
+) -> Result<(TaskUpstream, IamUpstream, ProjectUpstream), Boxed> {
     let task_host = env_required("TASK_HOST")?;
     let task_port: u16 = env_required("TASK_PORT")?
         .parse()
@@ -493,5 +491,10 @@ async fn upstreams(
         request_timeout_secs = project_timeout.as_secs(),
         "project channel ready (connects on first use)"
     );
-    Ok((task, iam, project))
+    // Each keeps the value it was dialled with as its ceiling (ADR-1019).
+    Ok((
+        task,
+        Upstream::new(iam, iam_timeout),
+        Upstream::new(project, project_timeout),
+    ))
 }

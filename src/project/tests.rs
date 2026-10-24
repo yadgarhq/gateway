@@ -42,8 +42,11 @@ fn estate() -> Registry {
 /// reactor, so calling this outside `block_on` panics with "there is no reactor
 /// running" — which is how the first run of this file failed, before any
 /// assertion was reached.
-fn dead_channel() -> tonic::transport::Channel {
-    tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy()
+fn dead_channel() -> crate::upstream::ProjectUpstream {
+    crate::upstream::Upstream::new(
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        std::time::Duration::from_secs(30),
+    )
 }
 
 /// Classify one claim against `registry`, with no metrics and no dial.
@@ -810,14 +813,17 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
 /// Serve one `ResolveProject` answer, and return a channel pointed at it.
 async fn stub_project(
     answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
-) -> tonic::transport::Channel {
+) -> crate::upstream::ProjectUpstream {
     stub_project_recording(answer).await.0
 }
 
 /// The same stub, and the request ids its `ResolveProject` calls arrived with.
 async fn stub_project_recording(
     answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
-) -> (tonic::transport::Channel, Arc<Mutex<Vec<Option<String>>>>) {
+) -> (
+    crate::upstream::ProjectUpstream,
+    Arc<Mutex<Vec<Option<String>>>>,
+) {
     let request_ids = Arc::new(Mutex::new(Vec::new()));
     let served = Arc::clone(&request_ids);
     let incoming = tonic::transport::server::TcpIncoming::bind(
@@ -841,7 +847,10 @@ async fn stub_project_recording(
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("a URI")
         .connect_lazy();
-    (channel, request_ids)
+    (
+        crate::upstream::Upstream::new(channel, std::time::Duration::from_secs(30)),
+        request_ids,
+    )
 }
 
 /// A `ProjectService` that records the `x-yadgar-request-id` each `ListProjects`
@@ -930,7 +939,10 @@ async fn each_registry_poll_sends_its_own_well_formed_request_id() {
         .expect("a URI")
         .connect_lazy();
 
-    let _registry = Registry::start(channel, Duration::from_millis(20));
+    let _registry = Registry::start(
+        crate::upstream::Upstream::new(channel, std::time::Duration::from_secs(30)),
+        Duration::from_millis(20),
+    );
     for _ in 0..200 {
         if request_ids.lock().unwrap().len() >= 4 {
             break;
@@ -1399,6 +1411,9 @@ fn the_archived_refusal_does_not_echo_the_callers_value() {
     assert!(!denied.prose.contains("sentinel"), "{}", denied.prose);
     assert!(!denied.to_string().contains("sentinel"), "{denied}");
 }
+
+/// ADR-1019 on the `project` path: each call STATES its deadline.
+mod deadline;
 
 /// Membership (`plans/project-membership.md` car P3): who may reach a resolved
 /// project, and the gauge that says whether a load carried its owners.

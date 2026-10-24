@@ -9,8 +9,10 @@
 //! 2. the task dial's connect bound and TLS handshake bound;
 //! 3. the task request bound — the chart's `task.requestTimeoutSeconds`. Every
 //!    `task` RPC in `src/tools.rs` and `src/tools/change.rs` is wrapped in
-//!    `tools::bounded`, a `tokio::time::timeout` of that same value, so the wait
-//!    for a ready endpoint is bounded too (yaadgaar #361).
+//!    `tools::bounded`, which runs it through `yadgar_dial::Deadline::call`
+//!    under a deadline of that same value: the wait for a ready endpoint is
+//!    bounded too (yaadgaar #361), and `task` is sent it as `grpc-timeout`
+//!    less 50 ms (ADR-1019), so the sum below stays an upper bound.
 //!
 //! Steps 2 and 3 ADD only inside tonic 0.14.6's own timer: its `GrpcTimeout`
 //! starts in `call()`, after `Reconnect` has connected (and handshaken) in
@@ -34,11 +36,11 @@ use crate::attest::RESOLVE_DEADLINE;
 const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30); // ADR-0569-EXCEPTION(CC): mirrors yadgarhq/yadgar src/proxy.rs:72, a test oracle, not a knob.
 
 /// `yadgar-dial`'s connect bound plus its TLS handshake bound: 2 s each, one
-/// constant (`CONNECT_TIMEOUT`, dial v0.2.20 `src/lib.rs:304`, shared with the
-/// handshake bound in `TlsOptions::prepare`). Restated because v0.2.20 does
-/// not export it. FOLLOW-UP: once a dial release exports `CONNECT_TIMEOUT`
-/// (yadgarhq/dial#35, yaadgaar #365), import it and delete this restatement.
-const DIAL_CONNECT_AND_HANDSHAKE: Duration = Duration::from_secs(2 + 2); // ADR-0569-EXCEPTION(CC): mirrors dial v0.2.20 src/lib.rs:304 CONNECT_TIMEOUT x2, a test oracle, not a knob.
+/// constant (`CONNECT_TIMEOUT`, dial v0.2.25 `src/lib.rs:322`, shared with the
+/// handshake bound in `TlsOptions::prepare`). Restated, though v0.2.25 now
+/// exports it. FOLLOW-UP (yadgarhq/dial#35, yaadgaar #365): import
+/// `yadgar_dial::CONNECT_TIMEOUT` and delete this restatement.
+const DIAL_CONNECT_AND_HANDSHAKE: Duration = Duration::from_secs(2 + 2); // ADR-0569-EXCEPTION(CC): mirrors dial v0.2.25 src/lib.rs:322 CONNECT_TIMEOUT x2, a test oracle, not a knob.
 
 /// Headroom for what the sum does not count: the ingress hop, the gateway's
 /// own work around the calls, the client's scheduling.

@@ -9,6 +9,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Method, Request as HttpRequest, StatusCode};
 use serde_json::json;
+use tonic::transport::Channel;
 use tower::ServiceExt;
 
 // `http.rs` is a directory module now, so the items these tests drive live in
@@ -54,7 +55,10 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
             tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
             std::time::Duration::from_secs(1),
         ),
-        iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        iam: crate::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
         // ONE CACHE PER STATE, for the same reason there is one limiter per state:
         // a shared one would make what a test observes depend on which test ran
         // first, which is the failure the comment above describes.
@@ -99,7 +103,10 @@ fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<App
         projects: std::sync::Arc::new(crate::project::Validator::new(
             crate::project::Registry::never_loaded(),
             crate::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            crate::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     })
 }
@@ -1592,7 +1599,7 @@ fn state_with_upstreams(iam: Channel, task: Channel, ttl: std::time::Duration) -
     Arc::new(AppState {
         attestation: Attestation::Iam,
         task: crate::upstream::TaskUpstream::new(task, std::time::Duration::from_secs(1)),
-        iam,
+        iam: crate::upstream::Upstream::new(iam, std::time::Duration::from_secs(30)),
         credentials: crate::attest::Credentials::new(ttl),
         // GENEROUS, unlike the shared `state_with` above, and it is load-bearing.
         // Valkey is unreachable here so D74 falls back to its local floor of
@@ -1623,7 +1630,10 @@ fn state_with_upstreams(iam: Channel, task: Channel, ttl: std::time::Duration) -
         projects: std::sync::Arc::new(crate::project::Validator::new(
             crate::project::Registry::never_loaded(),
             crate::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            crate::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     })
 }
@@ -2833,7 +2843,10 @@ fn state_validating(mode: crate::project::Mode) -> Arc<AppState> {
         .projects = Arc::new(crate::project::Validator::new(
         crate::project::Registry::loaded_with(SEEDED.iter().map(|p| (*p).to_string())),
         mode,
-        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        crate::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
     ));
     state
 }
@@ -3022,7 +3035,10 @@ fn with_no_registry_an_enforcing_gateway_answers_an_availability_failure() {
             .projects = Arc::new(crate::project::Validator::new(
             crate::project::Registry::never_loaded(),
             crate::project::Mode::Enforcing,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            crate::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         ));
         let body = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -3060,6 +3076,10 @@ mod task_tools;
 /// The ledger 1284 ordering between the client's bound and the gateway's
 /// own waits, pinned against the chart's `task` maximum.
 mod request_deadlines;
+
+/// ADR-1019: every `iam` call states its deadline as `grpc-timeout`, and a
+/// stalled `iam` still gets the answer it always got.
+mod deadline;
 
 /// What each upstream is handed as D67's join key (ledger 1248).
 mod request_id;

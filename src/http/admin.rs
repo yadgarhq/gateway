@@ -12,6 +12,7 @@ use super::authority::*;
 use super::dispatch::*;
 use super::gate::*;
 use super::*;
+use crate::upstream::CallError;
 
 pub(in crate::http) mod credentials;
 pub(in crate::http) mod revoke;
@@ -155,10 +156,10 @@ pub(super) async fn admin_create_user(
     };
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.create_user(CreateUserRequest {
+    let request = CreateUserRequest {
         // MINTED HERE, PER INBOUND REQUEST, and it buys what `enrol`'s buys and
         // no more: this gateway's own retry to `iam` is safe; a CLIENT's retry is
         // a second inbound request and a second key. See `crate::idempotency_key`.
@@ -175,11 +176,11 @@ pub(super) async fn admin_create_user(
         // PROTO v1.24.0's F2 field (ADR-0963 (5)). Empty means "mint one",
         // today's behaviour; team access stage 3b owns the arm that sets it.
         user_id: String::new(),
-    });
-    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(e)) => return admin_failure(call, ADMIN_CREATE_USER, e),
-        Err(_elapsed) => return admin_timeout(call, ADMIN_CREATE_USER),
+    };
+    let resp = match state.iam_rpc(request, |r| client.create_user(r)).await {
+        Ok(r) => r.into_inner(),
+        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_CREATE_USER, e),
+        Err(CallError::Expired) => return admin_timeout(call, ADMIN_CREATE_USER),
     };
 
     let rendered = json!({ "user_id": resp.meta.map(|m| m.id).unwrap_or_default() }).to_string();
@@ -293,10 +294,10 @@ pub(super) async fn admin_issue_enrolment(
     }
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.issue_enrolment(IssueEnrolmentRequest {
+    let request = IssueEnrolmentRequest {
         // SENT, AND NOT SUPPRESSED. `iam-db` discards this key today (ledger 668)
         // and step 1's sensor exists to say so out loud on the day a caller
         // starts sending one. Sending an EMPTY key to keep the sensor quiet would
@@ -314,11 +315,11 @@ pub(super) async fn admin_issue_enrolment(
         require_zero_credential_admin: authority.demands_zero_credential_admin(),
         // FROM THE BODY, unlike the demand: see `revoke_instruction` (ADR-0943).
         revoke_existing_credentials: revoke,
-    });
-    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(r)) => r.into_inner(),
-        Ok(Err(e)) => return admin_failure(call, ADMIN_ISSUE_ENROLMENT, e),
-        Err(_elapsed) => return admin_timeout(call, ADMIN_ISSUE_ENROLMENT),
+    };
+    let resp = match state.iam_rpc(request, |r| client.issue_enrolment(r)).await {
+        Ok(r) => r.into_inner(),
+        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_ISSUE_ENROLMENT, e),
+        Err(CallError::Expired) => return admin_timeout(call, ADMIN_ISSUE_ENROLMENT),
     };
 
     let rendered = json!({
@@ -425,21 +426,21 @@ pub(super) async fn admin_set_user_admin(
     }
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.set_user_admin(SetUserAdminRequest {
+    let request = SetUserAdminRequest {
         idempotency: Some(Idempotency {
             key: crate::idempotency_key(),
         }),
         user_id: user_id.to_string(),
         is_admin,
         unverified_actor: authority.actor(),
-    });
-    match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return admin_failure(call, ADMIN_SET_USER_ADMIN, e),
-        Err(_elapsed) => return admin_timeout(call, ADMIN_SET_USER_ADMIN),
+    };
+    match state.iam_rpc(request, |r| client.set_user_admin(r)).await {
+        Ok(_) => {}
+        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_SET_USER_ADMIN, e),
+        Err(CallError::Expired) => return admin_timeout(call, ADMIN_SET_USER_ADMIN),
     }
 
     let rendered = json!({ "user_id": user_id, "is_admin": is_admin }).to_string();

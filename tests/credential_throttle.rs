@@ -96,7 +96,10 @@ fn state_with_admin(
         // on to `iam` and comes back 503; a request that is throttled never gets
         // there and comes back 429. The two are therefore distinguishable by
         // status alone, with no stub server to keep in step.
-        iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        iam: yadgar_gateway::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
         credentials: Credentials::new(Duration::from_secs(30)),
         limiter: Limiter::new(
             // Nothing listens on port 1, so every call degrades onto the local
@@ -133,7 +136,10 @@ fn state_with_admin(
         projects: std::sync::Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),
             yadgar_gateway::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            yadgar_gateway::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     })
 }
