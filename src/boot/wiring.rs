@@ -223,6 +223,7 @@ fn transports() -> Result<Transports, Boxed> {
 /// another.
 fn validation(project: Channel) -> Result<Arc<yadgar_gateway::project::Validator>, Boxed> {
     let mode = yadgar_gateway::project::Mode::from_env().map_err(|e| e.to_string())?;
+    let org_grants = yadgar_gateway::project::OrgGrants::from_env().map_err(|e| e.to_string())?;
     let poll = yadgar_gateway::project::poll_from_env().map_err(|e| e.to_string())?;
     tracing::info!(
         ?mode,
@@ -230,11 +231,14 @@ fn validation(project: Channel) -> Result<Arc<yadgar_gateway::project::Validator
         "{}",
         crate::boot::project_validation_announcement(mode)
     );
-    Ok(Arc::new(yadgar_gateway::project::Validator::new(
-        yadgar_gateway::project::Registry::start(project.clone(), poll),
-        mode,
-        project,
-    )))
+    tracing::info!(
+        ?org_grants,
+        "{}",
+        crate::boot::org_grants_announcement(org_grants)
+    );
+    let registry = yadgar_gateway::project::Registry::start(project.clone(), poll);
+    let validator = yadgar_gateway::project::Validator::new(registry, mode, project);
+    Ok(Arc::new(validator.with_org_grants(org_grants)))
 }
 
 /// PHASE 5. Start consuming D72's invalidation.

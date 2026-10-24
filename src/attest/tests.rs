@@ -1099,6 +1099,7 @@ fn stamping(mode: crate::project::Mode) -> crate::project::Validator {
             status: ProjectStatus::Active as i32,
             aliases: alias.into_iter().map(str::to_string).collect(),
             owner_user_id: String::new(),
+            grants: Vec::new(),
         }
     });
     crate::project::Validator::new(

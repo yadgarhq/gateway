@@ -20,8 +20,8 @@ mod config;
 mod wiring;
 
 pub use config::{
-    http_configuration, identity, project_validation_announcement, rate_limiting,
-    refuse_unverifiable_enforcement,
+    http_configuration, identity, org_grants_announcement, project_validation_announcement,
+    rate_limiting, refuse_unverifiable_enforcement,
 };
 pub use wiring::{serve, start_invalidation, wiring, Wiring};
 

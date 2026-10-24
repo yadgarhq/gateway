@@ -34,16 +34,17 @@ use std::time::Duration;
 
 use tonic::transport::Channel;
 
-use crate::pb::yadgar::project::v1::{
-    project_service_client::ProjectServiceClient, ProjectServiceListProjectsRequest, ProjectStatus,
-    RegisteredPath,
-};
+use crate::pb::yadgar::project::v1::{ProjectStatus, RegisteredPath};
 
 use super::classify::{is_private_class, Match, Registered};
+use super::grants::{GrantIndex, Level, ORG_ROWS_WITHOUT_EFFECTIVE_GRANT};
+use super::listing::{list, Listed, Row};
 use super::member::PrivateIndex;
 
 mod fold;
+mod load;
 use fold::merge;
+use load::load;
 
 /// Whether this replica has EVER loaded the registry: `1` after the first
 /// successful load, `0` before it.
@@ -72,7 +73,7 @@ pub const PRIVATE_WITHOUT_OWNER: &str = "yadgar_gateway_project_registry_private
 /// credential lookup, sized for an upstream that is SLOW rather than one that is
 /// expensive, and nothing about a deployment changes what a stalled page should
 /// cost a background task.
-const PAGE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
+pub(super) const PAGE_DEADLINE: Duration = Duration::from_secs(5); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
 
 /// Every registered path and alias, folded for comparison.
 ///
@@ -112,6 +113,10 @@ pub struct Loaded {
     /// opens (`plans/project-membership.md` §5 step 3).
     private_rows: usize,
     private_rows_without_owner: usize,
+    /// Every org row's own grants, for the effective level (ADR-0962).
+    grants: GrantIndex,
+    /// Every loaded ROW, for `list_projects` (§8) and the grant gauge.
+    rows: Vec<Row>,
 }
 
 /// The stored owner of one loaded row: `RegisteredPath.owner_user_id`
@@ -146,6 +151,17 @@ impl Loaded {
     /// The set from rows whose owners are stated beside them, as
     /// [`owner_of`] read them.
     fn from_owned(rows: impl IntoIterator<Item = (String, RegisteredPath)>) -> Self {
+        let rows: Vec<(String, RegisteredPath)> = rows.into_iter().collect();
+        let grants = GrantIndex::build(rows.iter().map(|(_, row)| row));
+        let listed: Vec<Row> = rows
+            .iter()
+            .map(|(owner, row)| Row {
+                path: row.path.clone(),
+                archived: is_archived(row.status),
+                owner: owner.clone(),
+                private: is_private_class(&row.path),
+            })
+            .collect();
         let mut private_rows = 0;
         let mut without_owner = 0;
         let mut matches = Vec::new();
@@ -182,6 +198,8 @@ impl Loaded {
             }
         }
         let mut loaded = Self::from_matches(matches);
+        loaded.grants = grants;
+        loaded.rows = listed;
         loaded.private_rows = private_rows;
         loaded.private_rows_without_owner += without_owner;
         loaded
@@ -197,6 +215,7 @@ impl Loaded {
                 status: ProjectStatus::Active as i32,
                 aliases: Vec::new(),
                 owner_user_id: String::new(),
+                grants: Vec::new(),
             };
             (String::new(), row)
         }))
@@ -235,7 +254,25 @@ impl Loaded {
             private,
             private_rows: 0,
             private_rows_without_owner: made_ownerless,
+            grants: GrantIndex::default(),
+            rows: Vec::new(),
         }
+    }
+
+    /// The caller's effective grant level on the org row at `path` (§3).
+    pub fn effective(&self, path: &str, team_ids: &[String]) -> Option<Level> {
+        self.grants.effective(path, team_ids)
+    }
+
+    /// Org rows that no team can reach: no own grant, none inherited.
+    pub fn org_rows_without_effective_grant(&self) -> usize {
+        let orphan = |r: &&Row| !r.private && !self.grants.any_effective(&r.path);
+        self.rows.iter().filter(orphan).count()
+    }
+
+    /// The rows this caller may reach, for `list_projects` (§8).
+    pub fn listing(&self, user_id: &str, team_ids: &[String]) -> Vec<Listed> {
+        list(&self.rows, &self.grants, user_id, team_ids)
     }
 
     /// Private rows in this load, for the load line.
@@ -370,6 +407,7 @@ pub(super) fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
     let count = loaded.len();
     let (private_rows, without_owner) =
         (loaded.private_rows(), loaded.private_rows_without_owner());
+    let ungranted = loaded.org_rows_without_effective_grant();
     let first = registry.loaded().is_none();
     registry.install(loaded);
     // AFTER THE SET IS INSTALLED, never before: a gauge saying the registry is
@@ -377,11 +415,13 @@ pub(super) fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
     // instrument disagrees with the service.
     metrics::gauge!(LOADED).set(1.0);
     metrics::gauge!(PRIVATE_WITHOUT_OWNER).set(without_owner as f64);
+    metrics::gauge!(ORG_ROWS_WITHOUT_EFFECTIVE_GRANT).set(ungranted as f64);
     if first {
         tracing::info!(
             paths = count,
             private_rows,
             private_rows_without_owner = without_owner,
+            org_rows_without_effective_grant = ungranted,
             "the project registry is loaded; claimed workspaces resolve against it"
         );
     } else {
@@ -389,6 +429,7 @@ pub(super) fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
             paths = count,
             private_rows,
             private_rows_without_owner = without_owner,
+            org_rows_without_effective_grant = ungranted,
             "the project registry was refreshed"
         );
     }
@@ -419,57 +460,5 @@ pub(super) fn report(registry: &Registry, e: &tonic::Status, retry: Duration) {
             "the project registry could not be refreshed; the previously loaded set stays in \
              force"
         );
-    }
-}
-
-/// One whole load: every page, until the token comes back empty.
-async fn load(project: &Channel) -> Result<Vec<RegisteredPath>, tonic::Status> {
-    // ONE FRESH ID PER LOAD, minted here (D67). The poll has no inbound call whose
-    // id it could inherit, so it is its own call; every page of one load shares
-    // the id and the next load gets another. Sent so `project` and `project-db`
-    // can join their records for it (ledger 1254).
-    let mut client = ProjectServiceClient::new(crate::upstream::request_id::carrying(
-        project.clone(),
-        &crate::request_id(),
-    ));
-    let mut out = Vec::new();
-    let mut token = String::new();
-    loop {
-        let request = ProjectServiceListProjectsRequest {
-            // NO NUMBER, because this caller has none to state. The page a
-            // caller can be given is derived from BYTES rather than declared as
-            // a count (D56), and inventing a size here would be inventing a
-            // configuration value nobody chose — see the field's own comment.
-            page_size: 0,
-            page_token: token.clone(),
-        };
-        let rpc = client.list_projects(request);
-        let page = match tokio::time::timeout(PAGE_DEADLINE, rpc).await {
-            Ok(answer) => answer?.into_inner(),
-            Err(_elapsed) => {
-                return Err(tonic::Status::deadline_exceeded(format!(
-                    "ListProjects did not answer within {}s",
-                    PAGE_DEADLINE.as_secs()
-                )))
-            }
-        };
-        // WHOLE ROWS, not their strings: an alias is only as archived as the
-        // row it names, and flattening here is what lost that (ADR-0941).
-        out.extend(page.paths);
-        if page.next_page_token.is_empty() {
-            return Ok(out);
-        }
-        // A TOKEN THAT DOES NOT MOVE ENDS THE LOAD, and it ends it as a
-        // FAILURE. The loop's termination otherwise depends on the server's
-        // good behaviour, and the failure mode is a background task allocating
-        // for ever against one unchanging page — which reads as a memory leak
-        // in this gateway rather than as a defect in the tier.
-        if page.next_page_token == token {
-            return Err(tonic::Status::internal(
-                "ListProjects returned the same next_page_token twice, so the load would not \
-                 terminate",
-            ));
-        }
-        token = page.next_page_token;
     }
 }

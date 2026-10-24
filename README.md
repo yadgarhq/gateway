@@ -74,6 +74,21 @@ holds the schemas. Three behaviours a caller cannot read off a schema:
   caller-supplied reference, not a parent link. It is 1 to 255 characters and
   must contain a non-whitespace character. No tool edits links after creation.
 
+### `list_projects`
+
+The one tool that needs no `x-yadgar-project` header (ADR-0963 (8)); a header
+sent anyway is ignored. It answers, from the registry this gateway has loaded
+and the caller's attest, every organisation project one of the caller's teams
+is granted (`access`: `read` or `readWrite`, inherited down the path tree) and
+the caller's own private projects (`access`: `owner`), each with `path`,
+`status` (`active` or `archived`) and `kind` (`root`, `project` or
+`private`). An ungranted organisation project and another user's private
+project are absent. It takes no argument but `page_token`; anything else is
+refused, so it cannot be asked about another user. Pages are bounded by bytes
+(D56): a `next_page_token` in the answer names the next page. It applies the
+grant rule whatever `projectValidation.orgGrants` says, and moves neither
+project counter.
+
 ## Identity
 
 `Scope` is constructed in **exactly one function**, `attest::scope`. Everything
@@ -399,6 +414,7 @@ so it never spends login's budget.
 | `PROJECT_HOST` / `PROJECT_PORT`                                                                    | required — from `project.host` / `project.port`                                                                                                      | the registry's logic tier: the set is LOADED from `ListProjects`, and the refusal path dials `ResolveProject`. Absent or unreachable does NOT fail the boot (ADR-0674)                                                                                                                            |
 | `TASK_REQUEST_TIMEOUT_SECONDS` / `IAM_REQUEST_TIMEOUT_SECONDS` / `PROJECT_REQUEST_TIMEOUT_SECONDS` | required — from `task.requestTimeoutSeconds` (`16`, schema max `18`), `iam.requestTimeoutSeconds` / `project.requestTimeoutSeconds` (`30`, max `59`) | the per-request bound `yadgar-dial` applies on that hop (ADR-0925 Q-C1). No compiled-in default; absent, non-numeric or outside `14..=59` EXITS at boot (ADR-0569). `task`'s lower cap keeps the ledger 1284 ordering under the client's 30 s                                                     |
 | `YADGAR_PROJECT_VALIDATION_MODE`                                                                   | required — from `projectValidation.mode`, shipped as `counting`                                                                                      | `counting` resolves, classifies and COUNTS, and refuses nobody. `enforcing` answers the refusals. No compiled-in default; an absent or misspelled value EXITS at boot (ADR-0569)                                                                                                                  |
+| `YADGAR_PROJECT_VALIDATION_ORG_GRANTS`                                                             | required — from `projectValidation.orgGrants`, shipped as `counting`                                                                                 | `counting` counts org-project team-grant misses on `yadgar_gateway_project_grant_shadow_total` and serves them; `enforcing` refuses them. No compiled-in default; absent or misspelled EXITS at boot (ADR-0569), and `enforcing` EXITS while the mode is `counting` or headers are trusted        |
 | `YADGAR_PROJECT_REGISTRY_POLL_SECONDS`                                                             | required — from `projectValidation.registryPollSeconds`                                                                                              | how often the registered set is loaded — the retry after a failure and the refresh after a success. Absent, empty, non-numeric or `0` EXITS at boot (ADR-0569)                                                                                                                                    |
 | `PROJECT_TLS_CLIENT_CERT_FILE` / `PROJECT_TLS_CLIENT_KEY_FILE`                                     | unset                                                                                                                                                | the same as the two hops above, for the registry hop. Three prefixes so the three can be cut over one at a time                                                                                                                                                                                   |
 | `YADGAR_TRUST_UNAUTHENTICATED_HEADERS`                                                             | unset                                                                                                                                                | `1` trusts caller identity — development only. Unset resolves the bearer token against `iam`                                                                                                                                                                                                      |
@@ -449,15 +465,30 @@ deeper than any registered row. The outcome is counted and the call then proceed
 exactly as it did before — including the `project_id` it is stamped with. Nothing
 about the answer changes until `projectValidation.mode` says `enforcing`.
 
-| terminal state                  | condition                                                                         | what `enforcing` answers                                   |
-| ------------------------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `MISSING_WORKSPACE`             | no `x-yadgar-project` at all — shipped in ledger 739 and unchanged here           | `400`, `INVALID_ARGUMENT`                                  |
-| `PROJECT_INVALID`               | the value is not a project path; refused BEFORE resolution, and never echoed back | `400`, the grammar stated                                  |
-| `PROJECT_UNREGISTERED_ORG`      | the nearest registered ancestor is a single-segment namespace ANCHOR (ADR-0673)   | `400`, "open a PR against `<source_repo>`"                 |
-| `PROJECT_UNREGISTERED_PERSONAL` | a `local/` path with no registered ancestor (ADR-0605)                            | `400`, write a marker file and use the project-create tool |
-| `PROJECT_UNRESOLVABLE`          | no registered ancestor at all, and not under `local/`                             | `400`, **no remediation** — ask a human                    |
-| `PROJECT_REGISTRY_UNAVAILABLE`  | the registry has NEVER loaded, so no claim can be checked (ADR-0674)              | `503`, and a reason distinct from all four above           |
-| `PROJECT_ARCHIVED`              | the claim RESOLVES to an archived project and the tool WRITES (ADR-0941)          | `400`; a read of the same project is served                |
+| terminal state                  | condition                                                                                                                                  | what `enforcing` answers                                   |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------- |
+| `MISSING_WORKSPACE`             | no `x-yadgar-project` at all — shipped in ledger 739 and unchanged here                                                                    | `400`, `INVALID_ARGUMENT`                                  |
+| `PROJECT_INVALID`               | the value is not a project path; refused BEFORE resolution, and never echoed back                                                          | `400`, the grammar stated                                  |
+| `PROJECT_UNREGISTERED_ORG`      | the nearest registered ancestor is a single-segment namespace ANCHOR (ADR-0673)                                                            | `400`, "open a PR against `<source_repo>`"                 |
+| `PROJECT_UNREGISTERED_PERSONAL` | a `local/` path with no registered ancestor (ADR-0605)                                                                                     | `400`, write a marker file and use the project-create tool |
+| `PROJECT_UNRESOLVABLE`          | no registered ancestor at all, and not under `local/`                                                                                      | `400`, **no remediation** — ask a human                    |
+| `PROJECT_REGISTRY_UNAVAILABLE`  | the registry has NEVER loaded, so no claim can be checked (ADR-0674)                                                                       | `503`, and a reason distinct from all four above           |
+| `PROJECT_ARCHIVED`              | the claim RESOLVES to an archived project and the tool WRITES (ADR-0941)                                                                   | `400`; a read of the same project is served                |
+| `PROJECT_NOT_MEMBER`            | a private project the caller does not own, or (under `orgGrants: enforcing`) an organisation project none of the caller's teams is granted | `403`, `PERMISSION_DENIED`; one body for every non-member  |
+| `PROJECT_READ_ONLY`             | under `orgGrants: enforcing`, a WRITE to an organisation project the caller's teams may only read (ADR-0963 (3))                           | `403`, `PERMISSION_DENIED`; reads are served               |
+
+**Team grants on organisation projects** (ADR-0962, `plans/team-access.md`) have
+their own knob, `projectValidation.orgGrants`, shipped as `counting`. A grant
+names a team, is `read` or `readWrite`, and covers its row and every row beneath
+it; the caller's teams come from `iam` only, so a trusted-header caller has none.
+On an org row the order is grant, then level, then archived, so a caller with no
+grant learns nothing about archive state. Under `counting` a miss increments
+`yadgar_gateway_project_grant_shadow_total{verdict}` (`no_grant` or `read_only`)
+and the call is judged exactly as before; under `enforcing` it is refused
+`PROJECT_NOT_MEMBER` or `PROJECT_READ_ONLY`. `enforcing` refuses to boot while
+`projectValidation.mode` is `counting`, and with trusted headers. The gauge
+`yadgar_gateway_project_registry_org_rows_without_effective_grant` counts org
+rows no team can reach, so a dropped grant relay is loud.
 
 An archived project refuses WRITES and still answers READS (ADR-0941): archive
 keeps history, so `find_tasks` and `read_task` resolve as usual, and

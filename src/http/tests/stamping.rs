@@ -48,6 +48,7 @@ fn state_stamping(mode: Mode) -> std::sync::Arc<crate::http::AppState> {
         status: ProjectStatus::Active as i32,
         aliases: Vec::new(),
         owner_user_id: String::new(),
+        grants: Vec::new(),
     });
     let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
     std::sync::Arc::get_mut(&mut state)

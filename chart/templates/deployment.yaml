@@ -460,6 +460,13 @@ spec:
             # the registry is seeded refuses essentially every call.
             - name: YADGAR_PROJECT_VALIDATION_MODE
               value: {{ .Values.projectValidation.mode | quote }}
+            # The team-grant rule on organisation projects (plans/team-access.md
+            # §5), its own knob beside the mode above. `counting` serves every
+            # call as today and counts the misses on
+            # `yadgar_gateway_project_grant_shadow_total`; the binary refuses to
+            # boot on `enforcing` while the mode above is `counting`.
+            - name: YADGAR_PROJECT_VALIDATION_ORG_GRANTS
+              value: {{ .Values.projectValidation.orgGrants | quote }}
             # How often the registered set is re-loaded: the retry after a failed
             # load and the refresh after a successful one. It bounds how long a
             # newly registered project stays unresolvable — which matters while

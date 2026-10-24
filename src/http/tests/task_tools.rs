@@ -219,7 +219,7 @@ fn sorted(paths: &[String]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn tools_list_advertises_the_five_task_tools() {
+async fn tools_list_advertises_the_five_task_tools_and_list_projects() {
     let (status, body) = rpc("tools/list", Some(1)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut names: Vec<&str> = body["result"]["tools"]
@@ -235,6 +235,7 @@ async fn tools_list_advertises_the_five_task_tools() {
             "create_task",
             "edit_task",
             "find_tasks",
+            "list_projects",
             "read_task",
             "transition_task"
         ]

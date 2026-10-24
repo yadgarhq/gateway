@@ -83,6 +83,14 @@ message Project {
   // Former paths that still resolve here. A rename is an alias, never a rewrite
   // of every record carrying the old path (D53).
   repeated string aliases = 20;
+
+  // THIS ROW'S OWN TEAM GRANTS (ADR-0962, ADR-0963 (1), plans/team-access.md
+  // §4). Written only by `SyncProjects` from the GitOps declaration, and
+  // relayed by `project` into `RegisteredPath.grants`. NOT INHERITED: a grant
+  // on an ancestor is not repeated here, and a reader computes inheritance from
+  // the whole loaded set. EMPTY ON EVERY PRIVATE (`local/...`) ROW, which no
+  // grant can name. A `project-db` that predates grants leaves it empty.
+  repeated DeclaredGrant grants = 21;
 }
 
 message RegisterProjectRequest {
@@ -241,6 +249,45 @@ message DeclaredProject {
   // `ck_project_class` gives an org row a `source_repo` and never an owner.
   // Same canonical form as `RegisterProjectRequest.source_repo`.
   string source_repo = 3;
+
+  // THE TEAMS THIS ROW ADMITS, AND AT WHAT LEVEL (ADR-0962, ADR-0963 (1)).
+  // Grants name teams, never users. A grant on a row covers every row beneath
+  // it, archived rows included, so most projects declare none and inherit from
+  // their root. EMPTY MEANS "INHERIT ONLY", never "everyone".
+  //
+  // The store REPLACES this row's grant set with this list on every sync, and
+  // deletes the grants of a row it archives. Refused `INVALID_ARGUMENT`, naming
+  // the path, and nothing written: a `GRANT_LEVEL_UNSPECIFIED` level, a
+  // malformed `team_id`, or one team named twice on one row.
+  //
+  // A `project-db` or `project` that predates this field DROPS IT SILENTLY
+  // (proto3). `SyncProjectsResponse.grants_declared` is the echo that makes the
+  // drop loud: a seeder that sent N grants and reads back 0 exits non-zero.
+  repeated DeclaredGrant grants = 4;
+}
+
+// How much a team grant admits (ADR-0962: "a grant is either read or
+// read-write"). A write under `GRANT_LEVEL_READ` is refused
+// `PROJECT_READ_ONLY` once the gateway enforces grants (ADR-0963 (3)).
+enum GrantLevel {
+  // REFUSED ON INPUT AND NEVER STORED. A grant with no level is a malformed
+  // declaration, not a read grant: reading the zero value as the narrower
+  // level would turn a dropped field into a silent downgrade.
+  GRANT_LEVEL_UNSPECIFIED = 0;
+  GRANT_LEVEL_READ = 1;
+  GRANT_LEVEL_READ_WRITE = 2;
+}
+
+// One team's grant on one row. Used by the declaration (`DeclaredProject`),
+// by the stored row (`Project.grants`) and by the load (`RegisteredPath`).
+message DeclaredGrant {
+  // "yadgar:team:<name>", where <name> matches `^[a-z][a-z0-9-]{0,62}$`. The id
+  // is DETERMINISTIC from the declared team name, so the grant and the team
+  // (written to `iam` by `SyncTeams`) never exchange a minted id. A grant
+  // naming a team `iam` does not hold matches nobody, because no caller's
+  // `Scope.team_ids` carries it: a missing half fails closed.
+  string team_id = 1;
+  GrantLevel level = 2;
 }
 
 // THE WHOLE DECLARATION, in one request (ADR-0936). Not a per-row write: the
@@ -302,6 +349,15 @@ message SyncProjectsRequest {
   // `FAILED_PRECONDITION` AND NOT `INVALID_ARGUMENT`, because the request is
   // well-formed: whether it trips depends on what the store holds.
   bool allow_mass_archive = 4;
+
+  // THE MASS-REVOKE GUARD (ADR-0963 (6)). False by default, and false is the
+  // guard ON. With this false, a sync that would DELETE STRICTLY MORE THAN HALF
+  // of the grant rows stored when the sync takes its lock is refused
+  // `FAILED_PRECONDITION`, naming both counts and this field, and writes
+  // nothing. Exactly half is admitted. A level change is an update, not a
+  // delete. A cold install has zero stored grants and never trips it. The rows
+  // guard above and this one are independent: either can refuse a sync.
+  bool allow_mass_revoke = 5;
 }
 
 // What the sync did, counted per row. Every declared row lands in exactly one
@@ -322,6 +378,25 @@ message SyncProjectsResponse {
   uint32 reactivated = 4;
   // Declared, `ACTIVE`, and identical: no write, no version change.
   uint32 unchanged = 5;
+
+  // THE GRANT COUNTS (ADR-0963 (1)). A grant change does NOT change the row's
+  // `version` and does not move the row between the five counts above.
+  //
+  // `grants_declared` is the number of grants the store PARSED from the
+  // request, an echo rather than an outcome. A store or a relay that predates
+  // grants answers 0 here whatever was sent, which is how the seeder detects a
+  // silently dropped field.
+  uint32 grants_declared = 6;
+  // A (row, team) pair declared and not stored.
+  uint32 grants_inserted = 7;
+  // A stored pair not declared, including every grant of a row this sync
+  // archived. Counted against `allow_mass_revoke`. A level change on a kept
+  // pair is not counted here.
+  uint32 grants_deleted = 8;
+  // A stored pair declared with the same level. A pair whose level changed is
+  // rewritten and counted in neither this nor `grants_inserted`; it is
+  // `grants_declared - grants_inserted - grants_unchanged`.
+  uint32 grants_unchanged = 9;
 }
 
 // Registration is administrative — GitOps or CLI, like configuration (D43).
@@ -476,6 +551,20 @@ message RegisteredPath {
   // `gateway-caller`. Any other workload is refused before the relay, so only
   // the gateway, of `ProjectService`'s callers, receives the owner ids.
   string owner_user_id = 4;
+
+  // THIS ROW'S OWN TEAM GRANTS, NOT ITS EFFECTIVE ONES (ADR-0962,
+  // plans/team-access.md §3). The gateway computes inheritance from the whole
+  // loaded set: a row's effective grants are its own plus those of every row
+  // whose path is a segment-wise proper prefix of its canonical path. Shipping
+  // effective grants would repeat each root grant on every row and hide which
+  // row declared it.
+  //
+  // EMPTY IS NORMAL on an org row that inherits from its root. A reader MUST
+  // IGNORE any grant on a private (`local/...`) row: none can be declared, so
+  // one arriving is a store defect, and private rows stay owner-only
+  // (ADR-0952). A `project` that predates this field sends none, and a gateway
+  // enforcing grants then denies every org row (fail closed).
+  repeated DeclaredGrant grants = 5;
 }
 
 // The registry LOAD: every registered path, so a caller answers "what does this
@@ -651,6 +740,9 @@ message ProjectServiceSyncProjectsRequest {
   // Relayed unchanged: the STORE applies the guard, because only the store
   // knows how many org-class rows are active under the sync's lock.
   bool allow_mass_archive = 4;
+  // The mass-revoke guard; see `SyncProjectsRequest.allow_mass_revoke`.
+  // Relayed unchanged, for the same reason.
+  bool allow_mass_revoke = 5;
 }
 // The store's counts, relayed unchanged; see `SyncProjectsResponse`.
 message ProjectServiceSyncProjectsResponse {
@@ -659,6 +751,10 @@ message ProjectServiceSyncProjectsResponse {
   uint32 archived = 3;
   uint32 reactivated = 4;
   uint32 unchanged = 5;
+  uint32 grants_declared = 6;
+  uint32 grants_inserted = 7;
+  uint32 grants_deleted = 8;
+  uint32 grants_unchanged = 9;
 }
 
 // The registry's PUBLIC API — what the gateway calls (D4). Holds no store, and

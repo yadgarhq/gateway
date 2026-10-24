@@ -113,6 +113,7 @@ auth_iam_service! {
     set_user_admin(SetUserAdminRequest) -> SetUserAdminResponse;
     set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
+    sync_teams(SyncTeamsRequest) -> SyncTeamsResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
     set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
 }

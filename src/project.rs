@@ -52,7 +52,10 @@ use tonic::transport::Channel;
 
 mod account;
 mod classify;
+mod grants;
+mod listing;
 mod member;
+mod mode;
 mod poll;
 mod registry;
 mod remediate;
@@ -60,6 +63,12 @@ mod retry;
 
 pub use account::{account_segment, is_canonical_user_id};
 pub use classify::{classify, is_well_formed, Match, Outcome, Registered};
+pub use grants::{
+    Level, OrgGrants, OrgGrantsError, Shadow, GRANT_SHADOW, ORG_GRANTS,
+    ORG_ROWS_WITHOUT_EFFECTIVE_GRANT,
+};
+pub use listing::Listed;
+pub use mode::{Mode, ModeError, MODE};
 pub use poll::{poll_from_env, poll_from_lookup, RetryError, POLL};
 pub use registry::{Loaded, Registry, LOADED, PRIVATE_WITHOUT_OWNER};
 
@@ -154,10 +163,23 @@ pub enum Reason {
     ///
     /// **ONE ANSWER FOR EVERY NON-OWNER.** Decided before [`Self::Archived`] on a
     /// private row (Max's ruling E), so a non-owner learns nothing about the
-    /// row's status, and the same 403 answers a read and a write. Org rows admit
-    /// every attested user and never reach this class (ruling 3). See
+    /// row's status, and the same 403 answers a read and a write. See
     /// [`member`] for the subtree rule and why a missing owner fails closed.
+    ///
+    /// **ALSO AN ORG ROW NO TEAM OF THE CALLER'S IS GRANTED (ADR-0962)**, under
+    /// `orgGrants: enforcing` — decided before archived, so the same body
+    /// answers an org non-member and a private non-owner (ADR-0963 (2)).
     NotMember,
+
+    /// The claim RESOLVED to an ORG row on which the caller's teams hold only
+    /// a `read` grant, and the call writes (ADR-0963 (3)).
+    ///
+    /// Decided after the grant step and before [`Self::Archived`]: a caller
+    /// with no grant at all is [`Self::NotMember`], and a read-only member is
+    /// told about the level before the archive state. Counted here only under
+    /// `orgGrants: enforcing`; under `counting` the same call moves
+    /// [`GRANT_SHADOW`]`{verdict="read_only"}` and is served.
+    ReadOnly,
 }
 
 impl Reason {
@@ -174,6 +196,7 @@ impl Reason {
             Self::RegistryUnavailable => "PROJECT_REGISTRY_UNAVAILABLE",
             Self::Archived => "PROJECT_ARCHIVED",
             Self::NotMember => "PROJECT_NOT_MEMBER",
+            Self::ReadOnly => "PROJECT_READ_ONLY",
         }
     }
 }
@@ -263,82 +286,6 @@ pub struct Stamp {
     pub exact: bool,
 }
 
-/// Whether a classified refusal is answered or only counted.
-///
-/// **NO COMPILED-IN DEFAULT (ADR-0569).** An absent or unrecognised value
-/// refuses the boot naming the variable, because the two values differ by
-/// whether the estate's calls are served — and a mode nobody chose, applied as
-/// if somebody had, is exactly what that rule exists to delete. The flip to
-/// [`Self::Enforcing`] is a one-line change to this gateway's own deployment,
-/// revertable by the same line, gated on the two counters above.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Mode {
-    /// Resolve, classify, count — and serve the call anyway. The shipped value.
-    #[default]
-    Counting,
-    /// Answer the refusal. Reachable only by naming it (stage 5).
-    Enforcing,
-}
-
-/// The environment variable that chooses the mode.
-pub const MODE: &str = "YADGAR_PROJECT_VALIDATION_MODE";
-
-impl Mode {
-    /// Resolve the mode from this process's environment.
-    ///
-    /// # Errors
-    ///
-    /// See [`Self::from_lookup`], which this is: no fallback, and no parameter a
-    /// fallback could sit in (ADR-0569).
-    pub fn from_env() -> Result<Self, ModeError> {
-        Self::from_lookup(|key| std::env::var(key).ok())
-    }
-
-    /// Resolve the mode from an injected lookup.
-    ///
-    /// **A SEAM, for `Attestation::from_lookup`'s reason**: environment
-    /// variables are process-global, so a test that set one would steer every
-    /// other test in the same binary — and the decision this one makes is
-    /// whether the estate's calls are refused.
-    ///
-    /// # Errors
-    ///
-    /// An absent value, and any value that is not one of the two names.
-    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ModeError> {
-        match lookup(MODE).as_deref().map(str::trim) {
-            None => Err(ModeError::Absent),
-            Some("counting") => Ok(Self::Counting),
-            Some("enforcing") => Ok(Self::Enforcing),
-            // THE VALUE IS ECHOED HERE and nowhere a caller can read it: this
-            // is a boot refusal naming a deployment's own mistake, on the
-            // operator's terminal, and a typo an operator cannot see is a
-            // refusal they cannot fix.
-            Some(other) => Err(ModeError::Unknown(other.to_string())),
-        }
-    }
-}
-
-/// A mode this deployment did not state, or stated in a word this binary does
-/// not know.
-#[derive(Debug, thiserror::Error)]
-pub enum ModeError {
-    #[error(
-        "{MODE} is not set. It chooses whether a claimed workspace that resolves to nothing is \
-         REFUSED or merely counted, and there is no compiled-in default (ADR-0569) because the \
-         two answers differ by whether this estate's calls are served. Set it to \"counting\" \
-         — the value every deployment ships until the flip gate in \
-         plans/project-validation.md is read — or to \"enforcing\"."
-    )]
-    Absent,
-
-    #[error(
-        "{MODE} is {0:?}, which is neither \"counting\" nor \"enforcing\". A value outside the \
-         two names is refused rather than read as the safer one: a deployment that meant to \
-         enforce and misspelled it would otherwise enforce nothing, silently, for ever."
-    )]
-    Unknown(String),
-}
-
 /// The registry, the mode, and the channel a refusal is composed over.
 ///
 /// Held on [`crate::http::AppState`] for the reason the credential cache is:
@@ -347,6 +294,8 @@ pub enum ModeError {
 pub struct Validator {
     registry: Registry,
     mode: Mode,
+    /// Whether an org-row grant miss is refused or only shadow-counted.
+    org_grants: OrgGrants,
     /// The `project` logic tier, for the FALLBACK rpc only.
     ///
     /// **NOT the hot path, and this channel carries no per-request traffic at
@@ -362,12 +311,30 @@ impl Validator {
         Self {
             registry,
             mode,
+            org_grants: OrgGrants::default(),
             project,
         }
     }
 
+    /// This validator with the `orgGrants` knob set (ADR-0963 (4)). Without
+    /// it a validator judges as the shipped chart does: `counting`.
+    #[must_use]
+    pub fn with_org_grants(self, org_grants: OrgGrants) -> Self {
+        Self { org_grants, ..self }
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    pub fn org_grants(&self) -> OrgGrants {
+        self.org_grants
+    }
+
+    /// The rows the caller may reach (`list_projects`, §8), or `None` while
+    /// the registry has never loaded.
+    pub fn listing(&self, user_id: &str, team_ids: &[String]) -> Option<Vec<Listed>> {
+        Some(self.registry.loaded()?.listing(user_id, team_ids))
     }
 
     /// Resolve one claimed workspace, count the outcome, and refuse only if
@@ -390,6 +357,9 @@ impl Validator {
     /// `user_id` is the attested caller, compared with a private row's stored
     /// owner — see [`member`].
     ///
+    /// `team_ids` are the attested caller's teams, from iam only, matched
+    /// against an org row's effective grants (ADR-0962) — see [`grants`].
+    ///
     /// `request_id` is the call's D67 id, carried to `project` if a refusal
     /// dials it (ledger 1248).
     pub async fn check(
@@ -397,9 +367,10 @@ impl Validator {
         claimed: &str,
         access: Access,
         user_id: &str,
+        team_ids: &[String],
         request_id: &str,
     ) -> Result<(), Denied> {
-        let resolved = self.resolve(claimed, access, user_id, request_id);
+        let resolved = self.resolve(claimed, access, user_id, team_ids, request_id);
         resolved.await.map(drop)
     }
 
@@ -409,6 +380,7 @@ impl Validator {
         claimed: &str,
         access: Access,
         user_id: &str,
+        team_ids: &[String],
         request_id: &str,
     ) -> Result<Option<Stamp>, Denied> {
         let Some(loaded) = self.registry.loaded() else {
@@ -452,7 +424,8 @@ impl Validator {
         };
         // A REFUSAL IS NOT A RESOLUTION, so a membership or archived refusal
         // moves the refusal series ONLY: exactly one series per call, as above.
-        match member::verdict(loaded.as_ref(), &landed, access, user_id) {
+        let org = || self.org_gate(loaded.as_ref(), &landed, access, team_ids);
+        match member::verdict(loaded.as_ref(), &landed, access, user_id, org) {
             member::Verdict::Refuse(reason) => self.decide(Refusal::bare(reason), request_id).await,
             member::Verdict::Resolution { exact } => {
                 metrics::counter!(
@@ -461,6 +434,36 @@ impl Validator {
                 )
                 .increment(1);
                 Ok((self.mode == Mode::Enforcing).then_some(Stamp { path, exact }))
+            }
+        }
+    }
+
+    /// The grant step on an ORG row (§3 steps 1-2), as this knob judges it.
+    ///
+    /// Under `enforcing` the miss is a refusal reason. Under `counting` it is
+    /// one [`GRANT_SHADOW`] increment and no reason, so the call goes on to be
+    /// judged as org-is-everyone judges it — an archived write still counts
+    /// `PROJECT_ARCHIVED` (red 17).
+    fn org_gate(
+        &self,
+        loaded: &Loaded,
+        landed: &member::Landed<'_>,
+        access: Access,
+        team_ids: &[String],
+    ) -> Option<Reason> {
+        let shadow = match loaded.effective(landed.path, team_ids) {
+            None => Shadow::NoGrant,
+            Some(Level::Read) if access == Access::Write => Shadow::ReadOnly,
+            Some(_) => return None,
+        };
+        match self.org_grants {
+            OrgGrants::Enforcing => Some(match shadow {
+                Shadow::NoGrant => Reason::NotMember,
+                Shadow::ReadOnly => Reason::ReadOnly,
+            }),
+            OrgGrants::Counting => {
+                metrics::counter!(GRANT_SHADOW, "verdict" => shadow.token()).increment(1);
+                None
             }
         }
     }
@@ -487,7 +490,7 @@ impl Validator {
             return Ok(None);
         }
 
-        Err(remediate::compose(&self.project, refusal, request_id).await)
+        Err(remediate::compose(&self.project, refusal, request_id, self.org_grants).await)
     }
 }
 

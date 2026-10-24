@@ -303,6 +303,7 @@ admin_iam_service! {
     list_credentials(ListCredentialsRequest) -> ListCredentialsResponse;
     set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
+    sync_teams(SyncTeamsRequest) -> SyncTeamsResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
     set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
 }

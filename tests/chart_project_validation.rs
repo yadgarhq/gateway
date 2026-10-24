@@ -97,6 +97,28 @@ fn the_chart_ships_the_counting_mode_and_refuses_nobody() {
     );
 }
 
+/// **THE SHIPPED `orgGrants` IS `counting`, WHICH SERVES EVERY CALL AS TODAY**
+/// (team access stage 8, ADR-0963 (4)). Reddening here is the intended
+/// behaviour of the deliberate flip (stage 12), after the stage 11 window
+/// reads zero on `yadgar_gateway_project_grant_shadow_total`; anything else
+/// that moves this value is the flip arriving as a side effect.
+///
+/// THROUGH THE BINARY'S OWN PARSE as well, so the rendered word is one the
+/// binary accepts — an unknown word refuses the boot (ADR-0569).
+#[test]
+fn the_chart_ships_org_grants_counting_and_the_binary_accepts_it() {
+    let rendered = nested_scalar("projectValidation", "orgGrants");
+    assert_eq!(
+        rendered, "counting",
+        "the chart's orgGrants moved; `enforcing` refuses every caller whose teams hold no grant"
+    );
+    assert_eq!(
+        yadgar_gateway::project::OrgGrants::from_lookup(|_| Some(rendered.clone()))
+            .expect("the chart's orgGrants must be one this binary accepts"),
+        yadgar_gateway::project::OrgGrants::Counting
+    );
+}
+
 /// The cadence is a whole number of seconds greater than zero, which is what the
 /// binary will accept.
 ///

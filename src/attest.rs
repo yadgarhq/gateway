@@ -90,7 +90,7 @@ mod cache;
 mod resolve;
 
 pub use cache::{Credentials, CACHE};
-pub use resolve::{attest, attest_admin};
+pub use resolve::{attest, attest_admin, attest_unscoped};
 
 /// The environment variable is named for WHAT IT DOES, not for where it runs.
 ///

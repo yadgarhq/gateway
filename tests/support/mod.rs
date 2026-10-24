@@ -109,6 +109,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("YADGAR_ADMIN_RATE_LIMIT", "20:5"),
         ("YADGAR_ADMIN_UNATTRIBUTED_RATE_LIMIT", "10:2"),
         ("YADGAR_PROJECT_VALIDATION_MODE", "counting"),
+        ("YADGAR_PROJECT_VALIDATION_ORG_GRANTS", "counting"),
         ("YADGAR_PROJECT_REGISTRY_POLL_SECONDS", "30"),
         ("LISTEN", "127.0.0.1:0"),
         ("TASK_TLS_ENABLED", "0"),

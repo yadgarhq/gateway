@@ -1509,6 +1509,7 @@ stub_iam_service! {
     set_user_admin(SetUserAdminRequest) -> SetUserAdminResponse;
     set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
+    sync_teams(SyncTeamsRequest) -> SyncTeamsResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
     set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
     revoke_all_credentials(RevokeAllCredentialsRequest) -> RevokeAllCredentialsResponse;
@@ -3077,6 +3078,14 @@ mod credentials;
 /// `PROJECT_NOT_MEMBER` through the router: every tool, the 403, and one
 /// answer for every non-owner (`plans/project-membership.md` car P3).
 mod not_member;
+
+/// Team grants through the router (`plans/team-access.md` stage 8): attested
+/// teams reach the check, the two 403s, and `list_projects`.
+mod org_grants;
+
+/// `orgGrants: counting` answers every pre-existing call byte for byte as
+/// `origin/main` did (golden capture), `list_projects` aside.
+mod org_grants_off;
 
 /// ADR-0954 through the router: another account's `local/` segment answers
 /// the same bytes whether its paths are registered or not (ledger 1651).
