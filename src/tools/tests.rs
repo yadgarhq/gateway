@@ -877,3 +877,51 @@ fn the_edit_and_transition_schemas_take_an_id_or_a_number() {
         1
     );
 }
+
+/// Patch mode on the catalogue (ADR-1008): an object of three required
+/// fields, and a description that says the match is literal and counted.
+#[test]
+fn the_edit_schema_offers_a_literal_patch() {
+    let all = definitions();
+    let edit = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "edit_task")
+        .cloned()
+        .unwrap();
+    let patch = &edit["inputSchema"]["properties"]["patch"];
+    assert_eq!(patch["type"], "object");
+    assert_eq!(patch["required"], json!(["old", "new", "expect_count"]));
+    assert_eq!(patch["properties"]["old"]["minLength"], 1);
+    assert_eq!(patch["properties"]["expect_count"]["minimum"], 1);
+    assert_eq!(patch["additionalProperties"], false);
+    let digest = edit["inputSchema"]["properties"]["expect_body_sha256"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        digest.contains("pre-edit"),
+        "patch mode missing from: {digest}"
+    );
+    let text = edit["description"].as_str().unwrap();
+    for needle in ["patch", "literal", "expect_count", "pre-edit"] {
+        assert!(text.contains(needle), "{needle:?} missing from: {text}");
+    }
+}
+
+/// THE DESCRIPTION CAP, as a FLOOR for older clients. Claude Code 2.1.84
+/// began cutting an MCP tool description at 2048 characters; 2.1.280 added
+/// the `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` override; 2.1.295 allows 16384
+/// for descriptions loaded through tool search; 2.1.296 raised the default to
+/// 4096. A description within 2048 reaches every one of those clients whole.
+/// Counted in UTF-16 code units, the unit a JavaScript client's length
+/// measures. The cap is spelled as a literal here, not read from the code
+/// under test.
+#[test]
+fn every_tool_description_fits_the_client_cap() {
+    for tool in definitions().as_array().unwrap() {
+        let text = tool["description"].as_str().unwrap();
+        let n = text.encode_utf16().count();
+        assert!(n <= 2048, "{}: {n} UTF-16 code units", tool["name"]);
+    }
+}
