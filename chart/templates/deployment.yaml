@@ -302,6 +302,15 @@ spec:
               value: "0.0.0.0:8080"
             - name: METRICS_LISTEN
               value: "0.0.0.0:9090"
+            # THE LISTENER'S PROTOCOL LIMIT (ADR-1006), from `server.limits`.
+            # No compiled-in default (ADR-0569); the schema holds the range, and
+            # `required` names the key when an overlay nulls the whole block.
+            # `$limits` is guarded so that case reaches `required` rather than a
+            # raw nil-pointer error. `| int64` because helm hands a values-file
+            # number over as a float64.
+            {{- $limits := (and (kindIs "map" .Values.server) (kindIs "map" .Values.server.limits) .Values.server.limits) | default dict }}
+            - name: LISTEN_HEADER_READ_TIMEOUT_SECS
+              value: {{ required "server.limits.headerReadTimeoutSeconds is required (ADR-1006): the binary refuses to boot without LISTEN_HEADER_READ_TIMEOUT_SECS" $limits.headerReadTimeoutSeconds | int64 | quote }}
             - name: TASK_HOST
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
