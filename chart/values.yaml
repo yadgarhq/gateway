@@ -27,15 +27,18 @@ task:
   # `task` that is connected and never replies. The binary has no default
   # (ADR-0569) and refuses a value outside yadgar-dial's 14..=59.
   #
-  # 16, CAPPED AT 18 IN THE SCHEMA — BELOW THE CRATE'S 59, deliberately. A
-  # `task` call (src/tools.rs) has NO tokio timeout around it, so this bound is
-  # the gateway's only limit on the wait. The yadgar client gives up on a round
-  # trip at 30 s (yadgarhq/yadgar src/proxy.rs:68, ADR-0925 Q-C4). A
-  # tools/call first attests on a cache miss (RESOLVE_DEADLINE 5 s), then dials
-  # task: connect 2 s + TLS handshake 2 s (dial CONNECT_TIMEOUT), which run
-  # BEFORE this bound starts. Ledger 1284 / ADR-0928 keep the sum strictly
-  # below the client's: 5 + 4 + 18 + 2 s margin = 29 < 30. AUTH_DEADLINE is not
-  # on this path; login and admin never call task.
+  # 16, CAPPED AT 18 IN THE SCHEMA — BELOW THE CRATE'S 59, deliberately. Every
+  # `task` call (src/tools.rs, src/tools/change.rs) is wrapped in
+  # `tokio::time::timeout` of this same value (`tools::bounded`), so it also
+  # covers the wait for a ready endpoint, the connect and the TLS handshake. The
+  # yadgar client gives up on a round trip at 30 s (yadgarhq/yadgar
+  # src/proxy.rs:72, ADR-0925 Q-C4). A tools/call first attests on a cache miss
+  # (RESOLVE_DEADLINE 5 s), then calls task. dial's connect 2 s + TLS handshake
+  # 2 s (CONNECT_TIMEOUT) run inside dial's own inner timer, which starts after
+  # them, but the outer wrapper cuts the whole call at this value. The sum below
+  # therefore over-counts, which is the safe side. Ledger 1284 / ADR-0928 keep
+  # it strictly below the client's: 5 + 4 + 18 + 2 s margin = 29 < 30.
+  # AUTH_DEADLINE is not on this path; login and admin never call task.
   # src/http/tests/request_deadlines.rs pins that sum against the schema max.
   #
   # WHY 16 AND NOT 15 (ledger 1522 plan): dial's floor is 14 s, so a chain that

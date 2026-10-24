@@ -209,7 +209,10 @@ async fn gateway(is_admin: bool, answer: Answer) -> (Arc<AppState>, Log) {
     };
     let state = Arc::new(AppState {
         attestation: Attestation::Iam,
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task: yadgar_gateway::upstream::TaskUpstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(1),
+        ),
         iam,
         credentials: Credentials::new(Duration::from_secs(30)),
         limiter: Limiter::new(

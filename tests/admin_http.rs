@@ -379,7 +379,10 @@ async fn gateway_with(
     };
     let state = Arc::new(AppState {
         attestation: Attestation::Iam,
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task: yadgar_gateway::upstream::TaskUpstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(1),
+        ),
         iam,
         // SHORT, AND NOT ZERO. Each test builds its own gateway, so nothing here
         // depends on a cached answer — but a zero would disable the cache and

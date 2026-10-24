@@ -320,7 +320,7 @@ pub(super) async fn tools_call(
     let resolution = attested
         .exact
         .map(|exact| (scope.project_id.clone(), exact));
-    let outcome = tools::call(state.task.clone(), scope, name, &args).await;
+    let outcome = tools::call(&state.task, scope, name, &args).await;
     let (status, rows, payload) = shape(id, outcome);
     let claimed = header(headers, "x-yadgar-project").unwrap_or_default();
     let payload = with_resolution(payload, claimed, resolution);

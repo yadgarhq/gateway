@@ -281,15 +281,8 @@ fn settings_with_identity(ca: &TempPem, certificate: &Path, key: &Path) -> Upstr
 /// `Unimplemented`, which is all that is needed: the question each test asks is
 /// whether a request reached the server at all.
 async fn serve(p: &Pki) -> u16 {
-    let addrs = resolve().await;
-    let first = TcpListener::bind(addrs[0]).await.unwrap();
-    let port = first.local_addr().unwrap().port();
-    spawn_tls_server(first, p);
-
-    for addr in &addrs[1..] {
-        let listener = TcpListener::bind(SocketAddr::new(addr.ip(), port))
-            .await
-            .expect("the same free port on a second address of the same name");
+    let (port, listeners) = bind_all().await;
+    for listener in listeners {
         spawn_tls_server(listener, p);
     }
 
@@ -307,15 +300,8 @@ async fn serve(p: &Pki) -> u16 {
 /// identity `UpstreamTls::options` attached, or only configure one that was
 /// never read off the struct.
 async fn serve_requiring_client_auth(p: &Pki, client_ca: &str) -> u16 {
-    let addrs = resolve().await;
-    let first = TcpListener::bind(addrs[0]).await.unwrap();
-    let port = first.local_addr().unwrap().port();
-    spawn_tls_server_requiring_client_auth(first, p, client_ca);
-
-    for addr in &addrs[1..] {
-        let listener = TcpListener::bind(SocketAddr::new(addr.ip(), port))
-            .await
-            .expect("the same free port on a second address of the same name");
+    let (port, listeners) = bind_all().await;
+    for listener in listeners {
         spawn_tls_server_requiring_client_auth(listener, p, client_ca);
     }
 
@@ -326,19 +312,46 @@ async fn serve_requiring_client_auth(p: &Pki, client_ca: &str) -> u16 {
 /// Serve gRPC in CLEARTEXT, for the case that has to keep working untouched —
 /// and for the case that must STOP working once TLS is on.
 async fn serve_cleartext() -> u16 {
-    let addrs = resolve().await;
-    let first = TcpListener::bind(addrs[0]).await.unwrap();
-    let port = first.local_addr().unwrap().port();
-    spawn_cleartext_server(first);
-    for addr in &addrs[1..] {
-        let listener = TcpListener::bind(SocketAddr::new(addr.ip(), port))
-            .await
-            .unwrap();
+    let (port, listeners) = bind_all().await;
+    for listener in listeners {
         spawn_cleartext_server(listener);
     }
     ready(port).await;
     port
 }
+
+/// Bind ONE listener per address `SERVED_NAME` resolves to, all on the SAME
+/// port, and return the port with the listeners. Nothing is bound twice and
+/// nothing is re-bound after a listener is handed to a server.
+///
+/// **THIS WAS THE FLAKE (yaadgaar #374).** The OS picks a free port for the
+/// first address, and that says nothing about the same port on the second
+/// address (`localhost` is `127.0.0.1` and `::1`). A parallel test, or another
+/// process, can hold it there, and the old code panicked with `AddrInUse`. The
+/// whole set is now retried on a fresh port; the listeners of a failed attempt
+/// are dropped before the next one.
+async fn bind_all() -> (u16, Vec<TcpListener>) {
+    let addrs = resolve().await;
+    for _ in 0..BIND_ATTEMPTS {
+        let first = TcpListener::bind(addrs[0]).await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        let mut listeners = vec![first];
+        for addr in &addrs[1..] {
+            match TcpListener::bind(SocketAddr::new(addr.ip(), port)).await {
+                Ok(listener) => listeners.push(listener),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => break,
+                Err(e) => panic!("binding {addr} on port {port}: {e}"),
+            }
+        }
+        if listeners.len() == addrs.len() {
+            return (port, listeners);
+        }
+    }
+    panic!("no port was free on every address of {SERVED_NAME} in {BIND_ATTEMPTS} attempts");
+}
+
+/// How many fresh ports [`bind_all`] tries before it gives up.
+const BIND_ATTEMPTS: usize = 50;
 
 async fn resolve() -> Vec<SocketAddr> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((SERVED_NAME, 0))
@@ -428,9 +441,15 @@ async fn request(mut channel: Channel) -> Result<(), String> {
         .body(tonic::body::Body::empty())
         .unwrap();
 
-    std::future::poll_fn(|cx| channel.poll_ready(cx))
-        .await
-        .map_err(|e| format!("{e}"))?;
+    // BOUNDED: a lazy channel can sit in `Pending` for ever when nothing is
+    // there to dial (yaadgaar #374), and the test would then hang rather than fail.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        std::future::poll_fn(|cx| channel.poll_ready(cx)),
+    )
+    .await
+    .map_err(|_| "the channel was never ready".to_string())?
+    .map_err(|e| format!("{e}"))?;
     match tokio::time::timeout(Duration::from_secs(10), channel.call(req)).await {
         Err(_) => Err("the request timed out".to_string()),
         Ok(Ok(_)) => Ok(()),

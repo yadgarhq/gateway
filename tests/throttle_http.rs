@@ -102,7 +102,10 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // that the token WAS spent before the upstream was touched at all — D74
         // enforces at the gateway precisely so a refused call costs `task`
         // nothing.
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task: yadgar_gateway::upstream::TaskUpstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(1),
+        ),
         // Never reached. /auth/login IS bounded now, but by its own bucket keyed
         // on a source address (task 497) rather than by D74's `(user, module,
         // kind)` one — and nothing in this file posts to it. This comment used to

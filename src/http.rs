@@ -172,7 +172,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024; // ADR-0569-EXCEPTION(CB): a contract
 
 pub struct AppState {
     pub attestation: Attestation,
-    pub task: Channel,
+    pub task: crate::upstream::TaskUpstream,
     /// The `iam` logic service. ONE channel, and it now carries both halves of
     /// the credential lifecycle: `/auth/login` and `/auth/enrol` ISSUE a token
     /// through it, and `attest` RESOLVES one through it on every `tools/call`.
