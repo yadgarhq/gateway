@@ -13,7 +13,7 @@ use super::{status_name, Output, ToolError};
 use crate::pb::yadgar::common::v1::{Idempotency, Scope};
 use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::{
-    task_service_client::TaskServiceClient, EditTaskRequest, TransitionTaskRequest,
+    task_service_client::TaskServiceClient, BodyPatch, EditTaskRequest, TransitionTaskRequest,
 };
 
 /// The statuses a transition may name, in the spelling [`super::TaskView`] emits.
@@ -87,13 +87,20 @@ fn target_task(args: &Value) -> Result<(String, u32, u64), ToolError> {
 /// Spelled as 64 lowercase hex characters, which is what `sha256sum` prints;
 /// sent upstream as the 32 bytes they encode. The digest is over the exact
 /// UTF-8 bytes of `body`: no trimming, and a trailing newline counts.
-fn body_digest(args: &Value, body: Option<&str>) -> Result<Vec<u8>, ToolError> {
+///
+/// **IN PATCH MODE THE DIGEST IS FORWARDED UNCHECKED** (ADR-1008). It is then
+/// over the PRE-edit body, which only `task` reads, so only `task` can compare
+/// it. A `task` that predates patch mode refuses the whole call on its mask.
+fn body_digest(args: &Value, body: Option<&str>, patching: bool) -> Result<Vec<u8>, ToolError> {
     let Some(hex) = optional_str(args, "expect_body_sha256")? else {
         return Ok(Vec::new());
     };
     let digest = decode_sha256_hex(hex).ok_or_else(|| {
         ToolError::Invalid("`expect_body_sha256` must be 64 lowercase hex characters".into())
     })?;
+    if patching {
+        return Ok(digest);
+    }
     let body = body.ok_or_else(|| {
         ToolError::Invalid("`expect_body_sha256` was sent without a `body` to check".into())
     })?;
@@ -105,6 +112,58 @@ fn body_digest(args: &Value, body: Option<&str>) -> Result<Vec<u8>, ToolError> {
         ));
     }
     Ok(digest)
+}
+
+/// The `patch` argument, as the proto's `BodyPatch` (ADR-1008).
+///
+/// **SHAPE ONLY.** Each field must be present with its type, and
+/// `expect_count` must fit 1..=u32::MAX, so a value the proto cannot carry is
+/// refused rather than truncated. Whether `old` is empty, how long each side
+/// is and how often `old` occurs are `task`'s rules, applied in one place so
+/// that no caller path can disagree with another.
+fn body_patch(args: &Value) -> Result<Option<BodyPatch>, ToolError> {
+    let Some(patch) = present(args, "patch") else {
+        return Ok(None);
+    };
+    let Some(fields) = patch.as_object() else {
+        return Err(ToolError::Invalid(
+            "`patch` must be an object with `old`, `new` and `expect_count`".into(),
+        ));
+    };
+    // The schema says `additionalProperties: false`, and this holds the call
+    // to it: a misspelt or invented key (`regex`, `count`) is refused rather
+    // than ignored, so a caller never believes an option took effect.
+    if let Some(extra) = fields
+        .keys()
+        .find(|k| !["old", "new", "expect_count"].contains(&k.as_str()))
+    {
+        return Err(ToolError::Invalid(format!(
+            "`patch` takes only `old`, `new` and `expect_count`, not `{extra}`"
+        )));
+    }
+    let side = |field: &str| -> Result<String, ToolError> {
+        Ok(present(patch, field)
+            .ok_or_else(|| ToolError::Invalid(format!("`patch.{field}` is required")))?
+            .as_str()
+            .ok_or_else(|| ToolError::Invalid(format!("`patch.{field}` must be a string")))?
+            .to_string())
+    };
+    let old = side("old")?;
+    let new = side("new")?;
+    let expect_count = present(patch, "expect_count")
+        .and_then(Value::as_u64)
+        .filter(|n| (1..=u64::from(u32::MAX)).contains(n))
+        .ok_or_else(|| {
+            ToolError::Invalid(format!(
+                "`patch.expect_count` must be an integer from 1 to {}",
+                u32::MAX
+            ))
+        })? as u32;
+    Ok(Some(BodyPatch {
+        old,
+        new,
+        expect_count,
+    }))
 }
 
 /// 64 lowercase hex characters as 32 bytes, or `None`.
@@ -173,21 +232,35 @@ pub(super) async fn edit(
     let (id, number, expect_version) = target_task(args)?;
     let title = optional_str(args, "title")?;
     let body = optional_str(args, "body")?;
-    let expect_body_sha256 = body_digest(args, body)?;
+    let patch = body_patch(args)?;
+    if body.is_some() && patch.is_some() {
+        return Err(ToolError::Invalid(
+            "send `body` or `patch`, not both".into(),
+        ));
+    }
+    let expect_body_sha256 = body_digest(args, body, patch.is_some())?;
 
     // THE MASK IS WHAT THE CALLER SENT, by key presence. `task` reads an
     // EMPTY mask as "every editable field", so omitting it would write the
     // zero value of whatever the caller left out — blanking a body on a
     // title-only edit. An empty string that WAS sent is still written:
     // that is how a body is cleared.
-    let paths: Vec<String> = [("title", title), ("body", body)]
-        .into_iter()
-        .filter(|(_, v)| v.is_some())
-        .map(|(p, _)| p.to_string())
-        .collect();
+    //
+    // A PATCH IS NAMED `patch`, NEVER `body` (ADR-1008). `task` turns it into
+    // the body write; a `task` that predates the field refuses the path, so
+    // a rollout in which this gateway is newer cannot clear a body.
+    let paths: Vec<String> = [
+        ("title", title.is_some()),
+        ("body", body.is_some()),
+        ("patch", patch.is_some()),
+    ]
+    .into_iter()
+    .filter(|(_, sent)| *sent)
+    .map(|(p, _)| p.to_string())
+    .collect();
     if paths.is_empty() {
         return Err(ToolError::Invalid(
-            "send `title`, `body`, or both — there is nothing to edit".into(),
+            "send `title`, `body` or `patch` — there is nothing to edit".into(),
         ));
     }
 
@@ -205,6 +278,7 @@ pub(super) async fn edit(
             update_mask: Some(prost_types::FieldMask { paths }),
             number,
             expect_body_sha256,
+            patch,
         }),
     )
     .await?
@@ -213,6 +287,62 @@ pub(super) async fn edit(
     Ok(Output {
         content: json!({ "id": meta.id, "version": meta.version }),
         rows: 1,
+    })
+}
+
+/// The `edit_task` input schema. Here rather than in [`super::definition`],
+/// beside the dispatch that reads the same arguments.
+pub(super) fn edit_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
+            "number": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Per-project task number, instead of id",
+            },
+            "expect_version": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "The version last read; the edit is refused if it moved",
+            },
+            "title": {
+                "type": "string",
+                "maxLength": super::create::TITLE_MAX,
+                "description": "Short summary of the task, at most 128 characters (Unicode code points); put detail in the body",
+            },
+            "body": { "type": "string", "description": "New full description; empty clears it" },
+            "patch": {
+                "type": "object",
+                "description": "Literal replace inside the stored body, instead of `body`",
+                "properties": {
+                    "old": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Exact text to find; no regex, no normalisation",
+                    },
+                    "new": { "type": "string", "description": "Replacement; empty deletes" },
+                    "expect_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many times `old` occurs; refused otherwise",
+                    },
+                },
+                "required": ["old", "new", "expect_count"],
+                "additionalProperties": false,
+            },
+            "expect_body_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "SHA-256 of the exact body bytes (sha256sum of the \
+                                file you send); the edit is refused if the body \
+                                that arrives does not match, so a cut-off body \
+                                is never saved. With `patch`: SHA-256 of the \
+                                pre-edit body as read",
+            },
+        },
+        "required": ["expect_version"],
     })
 }
 

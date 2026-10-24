@@ -173,38 +173,13 @@ fn definition(name: &str) -> Value {
              number, not both. Only the fields sent are written; send at least \
              one. Status is changed with transition_task, never here. Refused if \
              the task's version is not expect_version, or if the body does not \
-             match expect_body_sha256.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
-                    "number": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Per-project task number, instead of id",
-                    },
-                    "expect_version": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "The version last read; the edit is refused if it moved",
-                    },
-                    "title": {
-                        "type": "string",
-                        "maxLength": create::TITLE_MAX,
-                        "description": "Short summary of the task, at most 128 characters (Unicode code points); put detail in the body",
-                    },
-                    "body": { "type": "string", "description": "New full description; empty clears it" },
-                    "expect_body_sha256": {
-                        "type": "string",
-                        "pattern": "^[0-9a-f]{64}$",
-                        "description": "SHA-256 of the exact body bytes (sha256sum of the \
-                                        file you send); the edit is refused if the body \
-                                        that arrives does not match, so a cut-off body \
-                                        is never saved",
-                    },
-                },
-                "required": ["expect_version"],
-            }),
+             match expect_body_sha256. To change part of a body, send `patch` \
+             instead of `body`: a literal (not regex) replace of every \
+             occurrence of `old` by `new`, refused unless `old` occurs exactly \
+             expect_count times (counted non-overlapping, left to right). With \
+             a patch, expect_body_sha256 is the hash of the pre-edit body as \
+             read. `old` and `new` are at most 65536 bytes each.",
+            change::edit_schema(),
         ),
         TRANSITION_TASK => (
             "Transition a task",
