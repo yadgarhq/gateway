@@ -124,7 +124,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     //
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure is
-    // logged and ignored: telemetry must never fail a call (D25), and that rule
+    // logged and ignored: telemetry must never fail a call (D67), and that rule
     // covers the metrics endpoint too.
     let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
         .parse()

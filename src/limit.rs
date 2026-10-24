@@ -182,7 +182,7 @@ pub(super) fn user_component(user_id: &str) -> String {
     let mut out = String::with_capacity(32);
     for byte in &digest[..16] {
         // Infallible into a String; the result is discarded rather than
-        // unwrapped so a formatting error could never fail a call (D25).
+        // unwrapped so a formatting error could never fail a call (D67).
         let _ = write!(out, "{byte:02x}");
     }
     out
