@@ -20,6 +20,37 @@ pub use tls::{TlsConfigError, UpstreamTls, IAM, PROJECT, TASK};
 
 mod tls;
 
+/// The `task` channel and the bound on one RPC over it.
+///
+/// **THE BOUND TRAVELS WITH THE CHANNEL ON PURPOSE** (yaadgaar #361). `dial`'s
+/// request timeout starts when a request reaches a READY endpoint. Time spent
+/// waiting for one — a balancer with no ready endpoint, an HTTP/2 handshake that
+/// never completes against a peer that accepts and says nothing — is not under
+/// it. The caller wraps each RPC in `tokio::time::timeout(self.timeout())` so the
+/// whole wait is bounded by the chart's `task.requestTimeoutSeconds`, the same
+/// value `dial` gets. A separate field on the state would let the two drift.
+///
+/// No `From<Channel>` and no default: the value comes from the chart (ADR-0569).
+#[derive(Clone)]
+pub struct TaskUpstream {
+    channel: Channel,
+    timeout: Duration,
+}
+
+impl TaskUpstream {
+    pub fn new(channel: Channel, timeout: Duration) -> Self {
+        Self { channel, timeout }
+    }
+
+    pub fn channel(&self) -> Channel {
+        self.channel.clone()
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
 /// Connect to the `task` logic service, balancing across its replicas.
 ///
 /// **This used to pin to a single pod, and fixing it took a change in two
@@ -56,6 +87,20 @@ mod tls;
 /// [`connect_iam`] has always cost one. A CONFIGURATION mistake still fails
 /// here — an unusable bundle, a missing client certificate, a host that is not a
 /// URI authority.
+/// [`connect_task`], with `timeout` ALSO kept as the bound on one RPC.
+///
+/// The one value goes to `dial` and into the [`TaskUpstream`], so the two cannot
+/// differ. `tests` pin that.
+pub async fn connect_task_bounded(
+    host: &str,
+    port: u16,
+    tls: Option<&UpstreamTls>,
+    timeout: Duration,
+) -> Result<TaskUpstream, yadgar_dial::BalanceError> {
+    let channel = connect_task(host, port, tls, timeout).await?;
+    Ok(TaskUpstream::new(channel, timeout))
+}
+
 pub async fn connect_task(
     host: &str,
     port: u16,

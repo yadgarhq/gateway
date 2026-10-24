@@ -1290,7 +1290,10 @@ fn revoking_gateway(iam: Channel) -> Arc<yadgar_gateway::http::AppState> {
     };
     Arc::new(yadgar_gateway::http::AppState {
         attestation: Attestation::Iam,
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task: yadgar_gateway::upstream::TaskUpstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(1),
+        ),
         iam,
         credentials: Credentials::new(TTL),
         limiter: yadgar_gateway::limit::Limiter::new(

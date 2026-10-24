@@ -1,19 +1,22 @@
 //! The ledger 1284 ordering, pinned: the client gives up AFTER the gateway does.
 //!
 //! The yadgar client bounds one gateway round trip at 30 s
-//! (`yadgarhq/yadgar` `src/proxy.rs:68`, `REQUEST_TIMEOUT`, ADR-0925 Q-C4).
+//! (`yadgarhq/yadgar` `src/proxy.rs:72`, `REQUEST_TIMEOUT`, ADR-0925 Q-C4).
 //!
 //! THE PATH SUMMED IS A `tools/call`, the one route that reaches `task`:
 //!
 //! 1. attestation on a credential-cache miss, bounded by [`RESOLVE_DEADLINE`];
 //! 2. the task dial's connect bound and TLS handshake bound;
-//! 3. the task request bound — the chart's `task.requestTimeoutSeconds`. The
-//!    `task` call in `src/tools.rs` has NO `tokio::time::timeout`, so this is
-//!    the only limit on that wait.
+//! 3. the task request bound — the chart's `task.requestTimeoutSeconds`. Every
+//!    `task` RPC in `src/tools.rs` and `src/tools/change.rs` is wrapped in
+//!    `tools::bounded`, a `tokio::time::timeout` of that same value, so the wait
+//!    for a ready endpoint is bounded too (yaadgaar #361).
 //!
-//! Steps 2 and 3 ADD rather than overlap: tonic 0.14.6's `GrpcTimeout` starts
-//! its timer in `call()`, after `Reconnect` has connected (and handshaken) in
-//! `poll_ready`. `AUTH_DEADLINE` is NOT on this path: login and admin never
+//! Steps 2 and 3 ADD only inside tonic 0.14.6's own timer: its `GrpcTimeout`
+//! starts in `call()`, after `Reconnect` has connected (and handshaken) in
+//! `poll_ready`. The outer `tools::bounded` wrapper covers both steps with ONE
+//! task bound, so the real worst case is lower than this sum, which is kept as
+//! the conservative figure. `AUTH_DEADLINE` is NOT on this path: login and admin never
 //! call `task`.
 //!
 //! If the sum reached the client's bound, the client would give up on an answer
@@ -26,14 +29,15 @@ use std::time::Duration;
 use crate::attest::RESOLVE_DEADLINE;
 
 /// The yadgar client's per-round-trip bound. Restated, not imported: it lives
-/// in another repository (`yadgarhq/yadgar` `src/proxy.rs:68`). A change there
+/// in another repository (`yadgarhq/yadgar` `src/proxy.rs:72`). A change there
 /// must be mirrored here, and this test then says whether the chart still fits.
-const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30); // ADR-0569-EXCEPTION(CC): mirrors yadgarhq/yadgar src/proxy.rs:68, a test oracle, not a knob.
+const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30); // ADR-0569-EXCEPTION(CC): mirrors yadgarhq/yadgar src/proxy.rs:72, a test oracle, not a knob.
 
 /// `yadgar-dial`'s connect bound plus its TLS handshake bound: 2 s each, one
 /// constant (`CONNECT_TIMEOUT`, dial v0.2.20 `src/lib.rs:304`, shared with the
 /// handshake bound in `TlsOptions::prepare`). Restated because v0.2.20 does
-/// not export it.
+/// not export it. FOLLOW-UP: once a dial release exports `CONNECT_TIMEOUT`
+/// (yadgarhq/dial#35, yaadgaar #365), import it and delete this restatement.
 const DIAL_CONNECT_AND_HANDSHAKE: Duration = Duration::from_secs(2 + 2); // ADR-0569-EXCEPTION(CC): mirrors dial v0.2.20 src/lib.rs:304 CONNECT_TIMEOUT x2, a test oracle, not a knob.
 
 /// Headroom for what the sum does not count: the ingress hop, the gateway's

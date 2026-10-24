@@ -161,6 +161,7 @@ const STATUS_KEYS: [&str; 2] = ["status", "to"];
 /// Dispatch `edit_task`.
 pub(super) async fn edit(
     client: &mut TaskServiceClient<crate::upstream::request_id::Carrying>,
+    limit: std::time::Duration,
     scope: Scope,
     args: &Value,
 ) -> Result<Output, ToolError> {
@@ -190,8 +191,9 @@ pub(super) async fn edit(
         ));
     }
 
-    let resp = client
-        .edit_task(EditTaskRequest {
+    let resp = super::bounded(
+        limit,
+        client.edit_task(EditTaskRequest {
             idempotency: Some(Idempotency {
                 key: crate::idempotency_key(),
             }),
@@ -203,9 +205,10 @@ pub(super) async fn edit(
             update_mask: Some(prost_types::FieldMask { paths }),
             number,
             expect_body_sha256,
-        })
-        .await?
-        .into_inner();
+        }),
+    )
+    .await?
+    .into_inner();
     let meta = resp.meta.unwrap_or_default();
     Ok(Output {
         content: json!({ "id": meta.id, "version": meta.version }),
@@ -216,6 +219,7 @@ pub(super) async fn edit(
 /// Dispatch `transition_task`.
 pub(super) async fn transition(
     client: &mut TaskServiceClient<crate::upstream::request_id::Carrying>,
+    limit: std::time::Duration,
     scope: Scope,
     args: &Value,
 ) -> Result<Output, ToolError> {
@@ -223,8 +227,9 @@ pub(super) async fn transition(
     let to = target(required_str(args, "to")?)
         .ok_or_else(|| ToolError::Invalid(format!("`to` must be one of {}", TARGETS.join(", "))))?;
 
-    let resp = client
-        .transition_task(TransitionTaskRequest {
+    let resp = super::bounded(
+        limit,
+        client.transition_task(TransitionTaskRequest {
             idempotency: Some(Idempotency {
                 key: crate::idempotency_key(),
             }),
@@ -233,9 +238,10 @@ pub(super) async fn transition(
             expect_version,
             to: to as i32,
             number,
-        })
-        .await?
-        .into_inner();
+        }),
+    )
+    .await?
+    .into_inner();
     let meta = resp.meta.unwrap_or_default();
     Ok(Output {
         // `from` as `task` reported it. On a replay of an applied

@@ -26,7 +26,10 @@ use yadgar_gateway::mcp::{headers, meta_keys, PROTOCOL_VERSION};
 fn state() -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::TrustedHeaders,
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task: yadgar_gateway::upstream::TaskUpstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(1),
+        ),
         // Never reached: nothing in this file posts to /auth/login.
         iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         // Never reached either: identity comes from a trusted header on this path,

@@ -4,14 +4,16 @@
 //! D67 rolls up per `tool`, and the number a person tunes is "what did
 //! `create_task` cost me" — so the label has to be the string the client sent.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
-use tonic::transport::Channel;
 
 use crate::pb::yadgar::common::v1::Scope;
 use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::{
     read_task_request::Key, task_service_client::TaskServiceClient, ReadTaskRequest,
 };
+use crate::upstream::TaskUpstream;
 
 mod change;
 mod create;
@@ -290,7 +292,7 @@ fn status_name(status: i32) -> String {
 /// response — measuring here would count the protobuf on the wrong side of the
 /// boundary, which is the mistake D67 was written to avoid.
 pub async fn call(
-    channel: Channel,
+    task: &TaskUpstream,
     scope: Scope,
     name: &str,
     args: &Value,
@@ -307,15 +309,18 @@ pub async fn call(
         return Err(ToolError::Unknown(name.to_string()));
     }
 
+    let limit = task.timeout();
     let mut client = TaskServiceClient::new(crate::upstream::request_id::carrying(
-        channel,
+        task.channel(),
         &scope.request_id,
     ));
 
     match name {
         CREATE_TASK => {
             let request = create::request(scope, args, crate::idempotency_key)?;
-            let resp = client.create_task(request).await?.into_inner();
+            let resp = bounded(limit, client.create_task(request))
+                .await?
+                .into_inner();
             let meta = resp.meta.unwrap_or_default();
             Ok(Output {
                 content: json!({ "id": meta.id, "number": resp.number, "version": meta.version }),
@@ -341,13 +346,15 @@ pub async fn call(
                     return Err(ToolError::Invalid("`id` or `number` is required".into()))
                 }
             };
-            let resp = client
-                .read_task(ReadTaskRequest {
+            let resp = bounded(
+                limit,
+                client.read_task(ReadTaskRequest {
                     scope: Some(scope),
                     key: Some(key),
-                })
-                .await?
-                .into_inner();
+                }),
+            )
+            .await?
+            .into_inner();
             Ok(Output {
                 content: serde_json::to_value(TaskView::full(resp.task)).unwrap_or(Value::Null),
                 rows: 1,
@@ -357,14 +364,34 @@ pub async fn call(
         FIND_TASKS => {
             let scope_project = scope.project_id.clone();
             let (request, fields) = find::request(scope, args)?;
-            let resp = client.find_tasks(request).await?.into_inner();
+            let resp = bounded(limit, client.find_tasks(request))
+                .await?
+                .into_inner();
             Ok(find::output(resp, fields, &scope_project))
         }
 
-        EDIT_TASK => change::edit(&mut client, scope, args).await,
-        TRANSITION_TASK => change::transition(&mut client, scope, args).await,
+        EDIT_TASK => change::edit(&mut client, limit, scope, args).await,
+        TRANSITION_TASK => change::transition(&mut client, limit, scope, args).await,
 
         other => Err(ToolError::Unknown(other.to_string())),
+    }
+}
+
+/// Await one `task` RPC for at most `limit`.
+///
+/// **EVERY `TaskServiceClient` call goes through this** (yaadgaar #361). A
+/// timeout is `DEADLINE_EXCEEDED`, the code the `iam` and `attest` deadlines
+/// already use, so it reaches the caller as the same class of failure.
+/// The message carries the bound and nothing from the peer.
+pub(super) async fn bounded<T>(
+    limit: Duration,
+    rpc: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+) -> Result<tonic::Response<T>, ToolError> {
+    match tokio::time::timeout(limit, rpc).await {
+        Ok(result) => Ok(result?),
+        Err(_elapsed) => Err(ToolError::Upstream(tonic::Status::deadline_exceeded(
+            format!("task did not answer within {}s", limit.as_secs()),
+        ))),
     }
 }
 

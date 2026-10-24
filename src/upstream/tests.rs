@@ -563,3 +563,15 @@ fn an_in_range_request_timeout_is_the_value_set() {
         assert!(request_timeout(TASK, lookup(&pairs)).is_err());
     }
 }
+
+/// yaadgaar #361: the bound on one RPC is the value `dial` was given. A 60 s
+/// sentinel cannot come from any default, so this fails if the wrapper takes
+/// another number.
+#[tokio::test]
+async fn the_task_rpc_bound_is_the_timeout_dial_was_given() {
+    let bound = Duration::from_secs(60);
+    let task = connect_task_bounded("localhost", 50051, None, bound)
+        .await
+        .unwrap();
+    assert_eq!(task.timeout(), bound);
+}

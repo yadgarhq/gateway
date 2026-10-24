@@ -71,12 +71,15 @@ async fn call_refuses_a_name_outside_the_served_set() {
     // "never a dispatch", so the assertion is correct either way — but it is
     // not evidence that the guard is what fired. See the note at the guard
     // sites.
-    let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+    let channel = TaskUpstream::new(
+        tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+        Duration::from_secs(16),
+    );
     // `match` rather than `expect_err`, because `Output` carries a
     // `serde_json::Value` and is not `Debug` — and adding a derive to
     // production code so a test can phrase itself more tidily is the wrong
     // trade.
-    let err = match call(channel, Scope::default(), "admin_create_user", &json!({})).await {
+    let err = match call(&channel, Scope::default(), "admin_create_user", &json!({})).await {
         Ok(_) => panic!("ADR-0492: an administrative verb must never dispatch"),
         Err(err) => err,
     };
@@ -254,8 +257,11 @@ fn the_three_writes_are_writes_and_the_two_reads_are_not() {
 /// touched; `connect_lazy` to a closed port turns a dispatch into an
 /// `Upstream` error, which the assertions below would reject.
 async fn refusal(name: &str, args: Value) -> ToolError {
-    let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
-    match call(channel, Scope::default(), name, &args).await {
+    let channel = TaskUpstream::new(
+        tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+        Duration::from_secs(16),
+    );
+    match call(&channel, Scope::default(), name, &args).await {
         Ok(_) => panic!("{name} with {args} must be refused"),
         Err(err) => err,
     }

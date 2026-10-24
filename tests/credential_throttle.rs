@@ -88,7 +88,10 @@ fn state_with_admin(
 ) -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::Iam,
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task: yadgar_gateway::upstream::TaskUpstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(1),
+        ),
         // UNREACHABLE, AND REACHED ON PURPOSE. A request that spends a token goes
         // on to `iam` and comes back 503; a request that is throttled never gets
         // there and comes back 429. The two are therefore distinguishable by

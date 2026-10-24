@@ -50,7 +50,10 @@ fn state(allowed_origins: Vec<String>) -> Arc<AppState> {
 fn state_with(attestation: Attestation, allowed_origins: Vec<String>) -> Arc<AppState> {
     Arc::new(AppState {
         attestation,
-        task: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        task: crate::upstream::TaskUpstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(1),
+        ),
         iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
         // ONE CACHE PER STATE, for the same reason there is one limiter per state:
         // a shared one would make what a test observes depend on which test ran
@@ -1587,7 +1590,7 @@ async fn state_resolving_to_with_task(
 fn state_with_upstreams(iam: Channel, task: Channel, ttl: std::time::Duration) -> Arc<AppState> {
     Arc::new(AppState {
         attestation: Attestation::Iam,
-        task,
+        task: crate::upstream::TaskUpstream::new(task, std::time::Duration::from_secs(1)),
         iam,
         credentials: crate::attest::Credentials::new(ttl),
         // GENEROUS, unlike the shared `state_with` above, and it is load-bearing.

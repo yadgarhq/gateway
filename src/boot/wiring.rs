@@ -32,7 +32,7 @@ pub struct Wiring {
     /// `gateway.yaml`'s `toolsPoll.intervalSeconds` (ADR-0569/0570). Carried on
     /// [`AppState`](crate::http::AppState) rather than re-read per request.
     pub tools_poll_interval: std::time::Duration,
-    pub task: Channel,
+    pub task: upstream::TaskUpstream,
     pub iam: Channel,
     /// The registry, the validation mode, and the channel a refusal is composed
     /// over (ledger 881).
@@ -387,7 +387,7 @@ async fn upstreams(
     task_tls: Option<&upstream::UpstreamTls>,
     iam_tls: Option<&upstream::UpstreamTls>,
     project_tls: Option<&upstream::UpstreamTls>,
-) -> Result<(Channel, Channel, Channel), Boxed> {
+) -> Result<(upstream::TaskUpstream, Channel, Channel), Boxed> {
     let task_host = env_required("TASK_HOST")?;
     let task_port: u16 = env_required("TASK_PORT")?
         .parse()
@@ -396,7 +396,7 @@ async fn upstreams(
     // No fallback: unset or outside 14..=59 refuses the boot naming the
     // variable and the chart key (ADR-0569), the class D69 says fails boot.
     let task_timeout = upstream::request_timeout(upstream::TASK, |n| std::env::var(n).ok())?;
-    let task = upstream::connect_task(&task_host, task_port, task_tls, task_timeout)
+    let task = upstream::connect_task_bounded(&task_host, task_port, task_tls, task_timeout)
         .await
         // Same reasoning: `BalanceError`'s messages are paragraphs explaining
         // that an empty bundle trusts nobody and that a missing one is not a
