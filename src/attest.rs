@@ -102,7 +102,7 @@ const TRUST_HEADERS: &str = "YADGAR_TRUST_UNAUTHENTICATED_HEADERS";
 ///
 /// **Much shorter than `/auth/login`'s, and the difference is which path it sits
 /// on.** A login happens once per person per machine and pays for Argon2id; this
-/// runs on EVERY `tools/call`, including `recall`, which D25 calls the
+/// runs on EVERY `tools/call`, including `recall`, which D67 (after D25) calls the
 /// latency-critical path. A stalled `iam` must cost one bounded wait rather than
 /// hold every request in the system open, so this is sized for a lookup that is
 /// slow rather than for one that is expensive.
