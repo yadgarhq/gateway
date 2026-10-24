@@ -4,14 +4,28 @@
 //!
 //! **THIS PROVES THE TWO STOP PATHS EXIT 0, NOT THAT ANYTHING DRAINS.** Both
 //! cases below send the signal, or rewrite the file, with no request in
-//! flight — there is nothing here for a drain to wait out. The drain itself,
-//! under load, with a real in-flight call, is `yadgar-lifecycle`'s own
-//! `tests/shutdown.rs`: "a real server on a real port", a real SIGTERM sent
-//! to that test's own process, asserting the serving future returned and the
-//! port stopped accepting. That file's own header is explicit that it is the
-//! one asserting the drain rather than only the registration. What is left
-//! for THIS file to hold is the wiring one layer up, which is repo-specific
-//! and which no library test can see.
+//! flight — there is nothing here for a drain to wait out. An aborted server
+//! still lets `main` return `Ok` and exit 0, so `stop.await; serving.abort();`
+//! in place of `drain_within` in `src/boot/wiring.rs` is invisible to them
+//! (`task` measured the same mutant against its copy of these two cases).
+//!
+//! **THE ESTATE'S IN-FLIGHT CANARY IS `task`'s, NOT THIS FILE AND NOT
+//! `yadgar-lifecycle`.** `task/tests/exit_chain.rs`'s
+//! `sigterm_lets_an_in_flight_call_finish` (task#87, yaadgaar #318) runs the
+//! `task` binary, holds a call in flight across a real SIGTERM, and asserts the
+//! caller gets its answer; the `serving.abort()` mutant reds it. It is the one
+//! in-flight canary, and it covers `task`'s tonic server only. `yadgar-lifecycle`'s
+//! `tests/shutdown.rs` holds no request in flight, so it does not hold the drain
+//! either, whatever this header used to say.
+//!
+//! **WHAT IS LEFT UNHELD HERE.** This gateway serves HTTP through its own loop,
+//! `yadgar_gateway::edge::serve`, not through tonic, so `task`'s canary does not
+//! see it. `tests/drain.rs` holds that loop's in-flight wait IN PROCESS: a call
+//! in flight at the stop gets its answer before the drain ends. No case runs
+//! THIS binary with a call in flight across SIGTERM, so the `serving.abort()`
+//! mutant in `src/boot/wiring.rs` still survives every suite here.
+//! What is left for THIS file to hold is the wiring one layer up, which is
+//! repo-specific and which no library test can see.
 //!
 //! The library tests prove the parts — `yadgar-lifecycle` that a signal resolves
 //! `shutdown()` and that a changed file resolves `rotate::watch`,

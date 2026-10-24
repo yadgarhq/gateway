@@ -22,6 +22,19 @@ description = "The bilingual edge: MCP over HTTP outward, gRPC inward (D16)."
 # another one.
 axum = "0.8"
 tower-http = { version = "0.7", features = ["limit"] }
+# THE EDGE'S OWN ACCEPT LOOP (`src/edge.rs`, yaadgaar #218, ADR-1006).
+# `axum::serve` sets no timer, so hyper drops its header-read timeout; naming
+# hyper and hyper-util here is what lets `edge::serve` build the connection
+# itself, with `TokioTimer` and the bound. Both are already in this tree under
+# axum and tonic, at the versions Cargo.lock pins, so the build gains nothing.
+# `tower-service` is the `Service` trait `Router::call` is reached through.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = [
+  "server-auto",
+  "server-graceful",
+  "tokio",
+] }
+tower-service = "0.3"
 
 # INWARD: gRPC to the module services. No sqlx and no yadgar-store here, for the
 # same reason a logic service has none (D4): the gateway reaches no module's

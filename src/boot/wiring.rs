@@ -3,7 +3,6 @@
 //! Each function is ONE CONTIGUOUS RUN of what `main` already did — see
 //! [`super`]. No dial, bind or listen is reordered.
 
-use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -304,6 +303,8 @@ pub async fn serve(
     let addr: SocketAddr = env_required("LISTEN")?
         .parse()
         .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
+    // ADR-1006's edge bound; absent or out of range refuses (ADR-0569).
+    let header_read_timeout = yadgar_gateway::edge::header_read_timeout(|n| std::env::var(n).ok())?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("LISTEN={addr} could not be bound: {}", refusal(&e)))?;
@@ -326,6 +327,7 @@ pub async fn serve(
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
         drain_budget_secs = DRAIN_BUDGET.as_secs(),
+        header_read_timeout_secs = header_read_timeout.as_secs(),
         "gateway listening"
     );
 
@@ -337,22 +339,17 @@ pub async fn serve(
     // process one budget after boot, on every boot — the defect `iam` shipped
     // and `yadgar-lifecycle`'s own `tests/drain.rs` keeps dead.
     let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
-    let serving = tokio::spawn(
-        axum::serve(
-            listener,
-            // `into_make_service_with_connect_info`, WHICH THIS CALL DID NOT
-            // HAVE. Without it nothing populates `ConnectInfo`, so the peer
-            // address is not extractable at all and every request resolves to
-            // `Source::Unknown` — an unthrottleable, unattributable request. It
-            // is the one line that makes the rest reachable in the shipped
-            // binary.
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
+    // `edge::serve`, NOT `axum::serve`, which set no timer (yaadgaar #218). It
+    // also attaches `ConnectInfo<SocketAddr>`: without it every request is
+    // `Source::Unknown`, unthrottleable and unattributable.
+    let serving = tokio::spawn(yadgar_gateway::edge::serve(
+        listener,
+        router(state),
+        header_read_timeout,
+        async {
             let _ = stop_requested.await;
-        })
-        .into_future(),
-    );
+        },
+    ));
 
     // TWO WAYS THIS PROCESS STOPS, and only one of them is a signal. The other
     // is a rotated TLS file (ADR-0523), which is why the drain below is bounded

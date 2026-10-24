@@ -200,6 +200,28 @@ fn an_unparsable_listen_names_the_variable() {
     );
 }
 
+/// The edge's header-read bound (ADR-1006, yaadgaar #218) is read in
+/// `boot::serve` beside `LISTEN`, so this needs the mount namespace too. It has
+/// no compiled-in default (ADR-0569): absent, non-numeric and out-of-range
+/// values each refuse the boot, naming the variable and its chart key.
+#[test]
+fn an_absent_or_invalid_edge_header_read_timeout_refuses_boot_naming_the_chart_key() {
+    const VAR: &str = "LISTEN_HEADER_READ_TIMEOUT_SECS";
+    for value in [None, Some("ten"), Some("0"), Some("61")] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != VAR);
+        if let Some(value) = value {
+            vars.push((VAR, value));
+        }
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(VAR) && line.contains("server.limits.headerReadTimeoutSeconds"),
+            "the refusal for {value:?} must name both the variable and its chart key: {line}"
+        );
+    }
+}
+
 /// `TcpListener::bind` is the one call in `boot::serve` that was still a bare
 /// `?` after the Display cut-over: `io::Error`'s Display is informative about
 /// WHY ("Address already in use (os error 98)") but, unlike every other

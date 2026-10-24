@@ -88,6 +88,8 @@ exec "$2""#;
 /// always required, so `VALKEY_TLS_ENABLED` is unconditionally required too.
 /// The three `*_REQUEST_TIMEOUT_SECONDS` carry the chart defaults (ADR-0925
 /// Q-C1): each is required with no binary default.
+/// `LISTEN_HEADER_READ_TIMEOUT_SECS` carries the chart default too (ADR-1006),
+/// for the same reason.
 pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
     vec![
         ("METRICS_LISTEN", "127.0.0.1:0"),
@@ -119,6 +121,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("TASK_REQUEST_TIMEOUT_SECONDS", "16"),
         ("IAM_REQUEST_TIMEOUT_SECONDS", "30"),
         ("PROJECT_REQUEST_TIMEOUT_SECONDS", "30"),
+        ("LISTEN_HEADER_READ_TIMEOUT_SECS", "10"),
     ]
 }
 

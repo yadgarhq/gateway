@@ -728,6 +728,26 @@ autoscaling:
 service:
   port: 8080
 
+# THE LISTENER'S PROTOCOL LIMITS (ADR-1006): this process's own HTTP listener,
+# not the ingress in front of it. The same `server.limits` block the gRPC
+# services' charts carry; this edge has one limit of its own (yaadgaar #218).
+server:
+  limits:
+    # LISTEN_HEADER_READ_TIMEOUT_SECS. How long a client may take to send a
+    # whole request head (request line and headers) before this gateway closes
+    # the connection. It bounds a slowloris client, which holds a socket open by
+    # sending its head a byte at a time, or not at all. D80 rules out leaning on
+    # an ingress for this, so the edge bounds itself.
+    #
+    # It applies to EVERY head on a connection, so it is also how long a
+    # kept-alive connection may sit idle between requests. An ingress that pools
+    # connections to this Service should close an idle one sooner than this, or
+    # it may reuse one at the moment it is closed.
+    #
+    # No binary default (ADR-0569); the binary and the schema both refuse a value
+    # outside 1..=60.
+    headerReadTimeoutSeconds: 10
+
 # Where this service attaches to the TLS edge (D71). The Gateway and its
 # certificate live in yadgarhq/deploy — shared edge infrastructure outlives any
 # one module — while the HTTPRoute lives in this chart, so the route and the
