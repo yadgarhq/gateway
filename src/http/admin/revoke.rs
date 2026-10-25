@@ -76,14 +76,13 @@ pub(in crate::http) async fn admin_revoke_credentials(
         tel(request_id.clone()),
     );
 
-    // AUTHORISE BEFORE THE BODY IS READ. The request carries no flag, so
-    // `wants_admin` is `false`, and `accepts_bootstrap` refuses this verb on
-    // either value.
+    // AUTHORISE BEFORE THE BODY IS READ. The request names no pre-minted id,
+    // and `accepts_bootstrap` refuses this verb whatever the `Ask`.
     let authority = match authorise(
         &state,
         ADMIN_REVOKE_CREDENTIALS,
         Verb::RevokeCredentials,
-        Ask::flag(false),
+        Ask::plain(),
         &headers,
         request_id.clone(),
     )
@@ -108,8 +107,7 @@ pub(in crate::http) async fn admin_revoke_credentials(
     };
 
     // THE SELF-TARGET REFUSAL, exact because `target` admitted only the
-    // canonical spelling. It keeps a structural last-administrator guard, as
-    // `is_self_demotion` does for `SetUserAdmin`.
+    // canonical spelling. It keeps a structural last-administrator guard.
     if authority == Authority::Administrator(user_id.clone()) {
         call.fail("PERMISSION_DENIED");
         return text(

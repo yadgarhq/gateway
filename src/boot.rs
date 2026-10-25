@@ -240,21 +240,23 @@ pub(crate) fn bootstrap_token() -> Result<(BootstrapToken, Option<PathBuf>), Str
 /// out of the log line so a test can pin the literal without booting a
 /// process (ledger 868, ADR-0599).
 ///
-/// **THREE VERBS, NOT TWO.** The ENABLED sentence used to end "and nothing
+/// **EVERY VERB IT REACHES, AND ONLY THOSE.** Two since team access stage 10
+/// retired `set-user-admin`. The ENABLED sentence used to end "and nothing
 /// else" after `admin::Verb::accepts_bootstrap`'s `IssueEnrolment` arm flipped
 /// from `false` to `true`, and nothing asserted the literal, so the false
 /// sentence shipped and stayed green. The reach is NOT unconditional: the
-/// enrolment half is narrowed by ADR-0655's zero-credential predicate, as
-/// amended by ADR-0656, and that predicate is enforced INSIDE `iam-db`'s
-/// write — never at this gateway. See `admin::Verb::accepts_bootstrap` for the
+/// create half is narrowed by `iam-db`'s bootstrap create-user predicate, and
+/// the enrolment half by the enrolment predicate (ADR-0655 as amended by
+/// ADR-0656 with `IAM_ADMIN_FROM_TEAM` off, ADR-0966 with it on). Both are
+/// enforced INSIDE `iam-db`'s write — never at this gateway. See `admin::Verb::accepts_bootstrap` for the
 /// argument.
 pub(crate) fn bootstrap_path_message(configured: bool) -> &'static str {
     if configured {
         "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
-         and it reaches creating an administrator, promoting one, and — under a \
-         predicate enforced inside iam-db's write, never at this gateway — issuing an \
-         enrolment for an administrator holding zero credentials (ADR-0492, ADR-0655, \
-         ADR-0656)"
+         and it reaches creating the declared first administrator by its pre-minted \
+         user id and — under a predicate enforced inside iam-db's write, never at this \
+         gateway — issuing an enrolment the enrolment predicate admits (ADR-0492, \
+         ADR-0655, ADR-0966, ADR-1011)"
     } else {
         "the administrative bootstrap path is DISABLED: no bootstrap token is configured, \
          so every request presenting one is refused naming the missing configuration. \

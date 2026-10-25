@@ -1,5 +1,42 @@
 # Migration notes
 
+## `/admin/set-user-admin` and the `is_admin` field of `create-user` are retired (team access stage 10)
+
+**Breaking.** `POST /admin/set-user-admin` answers `404`. A `create-user` body
+carrying `is_admin` (any value) answers `400` naming the field, with no
+upstream call. The bootstrap token reaches `create-user` only with a
+pre-minted `user_id` (flow F2). The verb-rule `403` now reads "the bootstrap
+token may only create the declared first administrator or issue an enrolment
+the enrolment predicate admits".
+
+- **Merging this is a deploy to kind-yadgar.** The merge cuts a gateway
+  release. The `parent` job of `yadgarhq/actions` `ci-release.yaml` then
+  writes the parent chart pin and cuts a chart release, with no human step
+  (ADR-0722). In `yadgarhq/argocd`, `AUTO_PIN_ENABLED=true` and
+  `AUTO_PIN_MERGE=true` make the bot open and merge the pin for that chart
+  release, and Argo CD syncs it to kind-yadgar. No one can "hold the pin by
+  hand" after the merge.
+- **Order (plans/team-access.md, stage 10 and stage 9b ordering 2).** Every
+  item below must hold BEFORE the merge:
+  1. argocd sets `IAM_ADMIN_FROM_TEAM=true`, and stage 10's kind-yadgar
+     gates 1-3 pass. Gates 1 and 2 call `POST /admin/set-user-admin`, which
+     this image removes, so they run against the current gateway.
+  2. Stage 10's ADR-0831 VM gates 1-7 pass on an install made by the ported
+     `kind-up.sh`.
+  3. A chart release that carries the ported `kind-up.sh` is strictly earlier
+     than the release this merge cuts. The port is in `yadgarhq/chart` from
+     `v0.47.3`, so this holds today. An older `kind-up.sh` sends `is_admin` in
+     both its `create-user` bodies and gets `400` from this image.
+- **To pause the deploy after the merge:** before the merge, open an issue in
+  `yadgarhq/argocd` with the label `auto-pin-hold`. Any open issue with that
+  label stops `auto-pin.yaml` at its first step (no pin PR) and stops
+  `auto-pin-merge.yaml` from merging one (`scripts/auto_pin.py`
+  `open_holds`). The automation never closes a hold: close it by hand to let
+  the pin through. A hold blocks every automatic pin, not only this one.
+- **Gate after deploy:** as Max, `POST /admin/set-user-admin` answers `404`.
+- **Rollback:** pin the previous gateway image. Setting
+  `IAM_ADMIN_FROM_TEAM=false` does not bring the route back.
+
 ## Each upstream's request timeout is a chart value (ADR-0925 Q-C1, ledger 1490)
 
 **The binary now requires `TASK_REQUEST_TIMEOUT_SECONDS`,
@@ -191,6 +228,11 @@ requested ruling (the admin exception) is where that belongs; until it is ruled,
 the flip has an unexamined circular dependency.
 
 ## The bootstrap token CAN now be mounted, and one value in `yadgarhq/argocd` turns it on (ADR-0492, ledger 638, step 7)
+
+**Superseded by team access stage 10 (see the top of this file).** Step 2
+below is history: `create-user` now refuses `is_admin` with `400`,
+`set-user-admin` answers `404`, and the bootstrap token creates only the
+declared first administrator by its pre-minted `user_id`.
 
 **This supersedes the "ships DISABLED" paragraph in the section below.** That
 section described the release that added the routes; this one describes the

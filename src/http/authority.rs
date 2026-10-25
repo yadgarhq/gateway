@@ -11,8 +11,9 @@ use super::gate::*;
 use super::*;
 use crate::upstream::CallError;
 
-/// The bootstrap verb rule's 403 (team access stage 3b, red 14).
-pub(super) const VERB_RULE_BODY: &str = r#"{"error":"the bootstrap token may only create an administrator, promote one, or issue an enrolment the enrolment predicate admits"}"#;
+/// The bootstrap verb rule's 403, rewritten by team access stage 10 when
+/// `set-user-admin` was retired and "promote one" stopped being true.
+pub(super) const VERB_RULE_BODY: &str = r#"{"error":"the bootstrap token may only create the declared first administrator or issue an enrolment the enrolment predicate admits"}"#;
 
 /// The ONE 403 for every failed conjunct of the bootstrap enrolment predicate
 /// (ADR-0657), true in both modes of `IAM_ADMIN_FROM_TEAM`: ADR-0655's
@@ -20,10 +21,6 @@ pub(super) const VERB_RULE_BODY: &str = r#"{"error":"the bootstrap token may onl
 /// predicate with it on. `chart`'s `kind-up.sh` reads it (team access stage 3a
 /// accepts this and the previous text).
 const ENROLMENT_REFUSAL_BODY: &str = r#"{"error":"the bootstrap token may only enrol an administrator the enrolment predicate admits"}"#;
-
-/// `set-user-admin`'s `FAILED_PRECONDITION` body (yaadgaar #202): iam's only
-/// one there is the verb's retirement (ADR-0962), independent of the target.
-pub(super) const SET_USER_ADMIN_RETIRED_BODY: &str = r#"{"error":"set-user-admin is retired on this deployment: admin is membership of the declared administrators team (ADR-0962), so declare the user there"}"#;
 
 /// A refusal one administrative handler must return, with the D67 label it is
 /// recorded under.
@@ -282,22 +279,17 @@ pub(super) fn bootstrap_authority(
             "PERMISSION_DENIED",
             text(
                 StatusCode::FORBIDDEN,
-                // **REWORDED BY ADR-0655, SAME CONSTANT, SAME TWO REMAINING
-                // ARMS.** The old sentence — "may only create an administrator or
-                // promote one" — became FALSE the moment `IssueEnrolment` was
-                // admitted, and it was still the right refusal for the two cases
-                // that keep producing it: a `create-user` whose `is_admin` is
-                // false or absent, and a `set-user-admin` demotion. So the text
-                // stops overclaiming rather than the refusal moving. It is no
-                // longer returned on `issue-enrolment` at all — the only refusals
-                // on that path now come from the predicate at `iam-db` and render
-                // through `admin_failure`.
-                //
-                // **REWORDED AGAIN BY TEAM ACCESS STAGE 3b.** "Never held a
-                // credential" stopped being true under ADR-0966, whose
-                // break-glass arm admits a declared administrator whatever it
-                // holds. Stage 10 rewrites it once more, when "promote one"
-                // stops being true.
+                // **REWORDED BY ADR-0655, AGAIN BY TEAM ACCESS STAGE 3b, AND
+                // AGAIN BY STAGE 10.** "May only create an administrator or
+                // promote one" became FALSE when `IssueEnrolment` was admitted.
+                // "Never held a credential" became false under ADR-0966's
+                // break-glass arm. "Promote one" became false when stage 10
+                // retired `set-user-admin`. Each time the text stopped
+                // overclaiming rather than the refusal moving. It is returned for
+                // a `create-user` without a `user_id` and for the three
+                // credential verbs; never on `issue-enrolment`, whose refusals
+                // come from the predicate at `iam-db` and render through
+                // `admin_failure`.
                 VERB_RULE_BODY,
             ),
         ));
@@ -347,9 +339,10 @@ pub(super) fn bootstrap_authority(
 
 /// What an administrative caller is told when `iam` refuses or fails.
 ///
-/// **`FAILED_PRECONDITION` GETS ITS OWN BODY (§2) ON `issue-enrolment` AND
-/// `set-user-admin` ONLY, AND NEVER ITS OWN STATUS** (yaadgaar #202; the rest
-/// get the opaque body).
+/// **`FAILED_PRECONDITION` GETS ITS OWN BODY (§2) ON `issue-enrolment` ONLY,
+/// AND NEVER ITS OWN STATUS** (yaadgaar #202; the rest get the opaque body).
+/// `set-user-admin` had the retirement body until team access stage 10 removed
+/// the route.
 /// `iam`'s `EnrolmentConfig::from_env` takes an argued exception to ADR-0569
 /// (`iam/src/service.rs:490`): an absent `ENROLMENT_GATEWAY` leaves the process
 /// SERVING and makes `IssueEnrolment` refuse with `FAILED_PRECONDITION` naming
@@ -387,8 +380,7 @@ pub(super) fn bootstrap_authority(
 /// renders every administrative endpoint. An arm keyed on the CODE alone
 /// would answer a sentence about enrolment to a caller who was creating a user —
 /// the same overclaiming that made the exclusion message above false,
-/// re-introduced by the change that fixes it. `set-user-admin` keeps the opaque
-/// catch-all, because nothing gives `iam` a new reason to refuse it.
+/// re-introduced by the change that fixes it.
 ///
 /// # `create-user` HAS NO ARM: EVERY REFUSAL THERE IS THE OPAQUE 503
 ///
@@ -447,7 +439,6 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
         ADMIN_ISSUE_ENROLMENT => Some(
             r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#,
         ),
-        ADMIN_SET_USER_ADMIN => Some(SET_USER_ADMIN_RETIRED_BODY),
         _ => None,
     };
     if let (tonic::Code::FailedPrecondition, Some(body)) = (code, precondition_body) {

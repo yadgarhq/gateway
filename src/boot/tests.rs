@@ -71,16 +71,17 @@ fn allow_empty_accepts_empty_but_still_refuses_absence() {
 /// `bootstrap_path_message`'s own return value on both sides, per ADR-0599.
 ///
 /// MUTATION: restore the old "and nothing else \n (ADR-0492)" wording in
-/// `bootstrap_path_message` and this goes red.
+/// `bootstrap_path_message` and this goes red. Team access stage 10 rewrote it
+/// again: "promoting one" stopped being true when `set-user-admin` was retired.
 #[test]
-fn the_enabled_message_names_all_three_verbs_and_the_predicate() {
+fn the_enabled_message_names_both_verbs_and_the_predicate() {
     assert_eq!(
         bootstrap_path_message(true),
         "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
-         and it reaches creating an administrator, promoting one, and — under a \
-         predicate enforced inside iam-db's write, never at this gateway — issuing an \
-         enrolment for an administrator holding zero credentials (ADR-0492, ADR-0655, \
-         ADR-0656)"
+         and it reaches creating the declared first administrator by its pre-minted \
+         user id and — under a predicate enforced inside iam-db's write, never at this \
+         gateway — issuing an enrolment the enrolment predicate admits (ADR-0492, \
+         ADR-0655, ADR-0966, ADR-1011)"
     );
 }
 

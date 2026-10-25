@@ -161,7 +161,7 @@ async fn an_admin_verb_states_auth_deadline_and_answers_its_timeout() {
     let (status, answer) = admin_post(
         state,
         "/admin/create-user",
-        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        r#"{"external_id":"ada","display_name":"Ada","user_id":"0192f3c1-8a4e-7c2d-9b11-5f0e7a3d8400"}"#,
         &[(BOOTSTRAP_HEADER_NAME, BOOTSTRAP_SECRET)],
     )
     .await;

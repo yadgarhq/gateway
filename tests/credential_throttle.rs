@@ -479,8 +479,10 @@ async fn admin(
         .status()
 }
 
-/// A body the bootstrap token is granted: create an ADMINISTRATOR.
-const CREATE_ADMIN: &str = r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#;
+/// A body the bootstrap token is granted: create the declared first
+/// ADMINISTRATOR by its pre-minted id (the only `create-user` arm since team
+/// access stage 10).
+const CREATE_ADMIN: &str = r#"{"external_id":"ada","display_name":"Ada","user_id":"0192f3c1-8a4e-7c2d-9b11-5f0e7a3d8400"}"#;
 
 #[tokio::test]
 async fn the_admin_surface_is_bounded_by_its_own_bucket_and_not_login_s() {
@@ -670,8 +672,8 @@ async fn each_admin_verb_has_its_own_throttle_key() {
     assert_ne!(
         admin(
             Arc::clone(&state),
-            "/admin/set-user-admin",
-            r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
+            "/admin/issue-enrolment",
+            r#"{"user_id":"yadgar:user:x"}"#,
             None,
             Some(&forwarded)
         )
@@ -690,18 +692,14 @@ async fn a_cross_origin_browser_request_is_refused_on_every_admin_path() {
     // bootstrap token creates an administrator, and the attacker never needs to
     // read the response to benefit."
     //
-    // ALL THREE PATHS, because the check is a per-handler call and the compiler
-    // cannot notice one is missing.
+    // EVERY PATH THAT READS ITS BODY FIRST, because the check is a per-handler
+    // call and the compiler cannot notice one is missing.
     let state = state_with_admin(TrustBoundary::Hops(1), wide(), wide());
     let forwarded = format!("203.0.113.1, {REAL_CLIENT}");
 
     for (path, body) in [
         ("/admin/create-user", CREATE_ADMIN),
         ("/admin/issue-enrolment", r#"{"user_id":"yadgar:user:x"}"#),
-        (
-            "/admin/set-user-admin",
-            r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
-        ),
     ] {
         assert_eq!(
             admin(
