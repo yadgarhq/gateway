@@ -162,7 +162,7 @@ pub(in crate::http) async fn admin_list_credentials(
         &state,
         ADMIN_LIST_CREDENTIALS,
         Verb::ListCredentials,
-        Ask::flag(false),
+        Ask::plain(),
         &headers,
         request_id.clone(),
     )
@@ -244,7 +244,7 @@ pub(in crate::http) async fn admin_revoke_credential(
         &state,
         ADMIN_REVOKE_CREDENTIAL,
         Verb::RevokeCredential,
-        Ask::flag(false),
+        Ask::plain(),
         &headers,
         request_id.clone(),
     )

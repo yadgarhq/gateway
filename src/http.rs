@@ -35,7 +35,7 @@ use crate::mcp::{self, codes, headers, meta_keys};
 use crate::pb::yadgar::common::v1::Idempotency;
 use crate::pb::yadgar::iam::v1::{
     iam_service_client::IamServiceClient, CreateUserRequest, IssueEnrolmentRequest, LoginRequest,
-    RedeemEnrolmentRequest, SetUserAdminRequest,
+    RedeemEnrolmentRequest,
 };
 use crate::source::{PeerAddr, Source, TrustBoundary};
 use crate::tools;
@@ -74,7 +74,7 @@ const AUTH_ENROL: &str = "auth/enrol";
 /// same for both and splitting it would halve every count.
 const AUTH_MODULE: &str = "auth";
 
-/// The six administrative endpoints' labels (ADR-0492, D73, ledger 638,
+/// The five administrative endpoints' labels (ADR-0492, D73, ledger 638,
 /// ADR-0945, ADR-0972 (2)).
 ///
 /// PATHS rather than MCP methods, for [`AUTH_LOGIN`]'s reason — that is what they
@@ -87,7 +87,6 @@ const AUTH_MODULE: &str = "auth";
 /// operator watching that budget could not tell the two apart.
 const ADMIN_CREATE_USER: &str = "admin/create-user";
 const ADMIN_ISSUE_ENROLMENT: &str = "admin/issue-enrolment";
-const ADMIN_SET_USER_ADMIN: &str = "admin/set-user-admin";
 const ADMIN_REVOKE_CREDENTIALS: &str = "admin/revoke-credentials";
 const ADMIN_LIST_CREDENTIALS: &str = "admin/list-credentials";
 const ADMIN_REVOKE_CREDENTIAL: &str = "admin/revoke-credential";

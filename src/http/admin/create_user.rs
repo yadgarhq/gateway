@@ -5,11 +5,12 @@
 //!
 //! 1. [`guard`] — the `Origin` check and this route's own throttle key.
 //! 2. [`fields`] — JSON SHAPE only: invalid JSON, a missing required field, a
-//!    non-string `user_id`. Never an identifier's format or existence
-//!    (ADR-0927), because this step runs before authorization and would answer
-//!    an unauthenticated caller.
-//! 3. [`authorise`] — an attested administrator, or the bootstrap token on one
-//!    of its two `create-user` arms (`Verb::accepts_bootstrap`).
+//!    non-string `user_id`, and the retired `is_admin` field (team access
+//!    stage 10). Never an identifier's format or existence (ADR-0927), because
+//!    this step runs before authorization and would answer an unauthenticated
+//!    caller.
+//! 3. [`authorise`] — an attested administrator, or the bootstrap token on its
+//!    one `create-user` arm, the pre-minted id (`Verb::accepts_bootstrap`).
 //! 4. The bootstrap-only rule of a pre-minted id
 //!    (`admin::refuses_pre_minted_id`): the opaque 503, no upstream call.
 //! 5. `iam.CreateUser`, bounded by [`AUTH_DEADLINE`].
@@ -30,14 +31,17 @@ const ECHO_MISMATCH_BODY: &str = r#"{"error":"iam predates pre-minted user ids: 
 /// The opaque answer, byte-identical to every upstream `UNAVAILABLE`.
 const UNAVAILABLE_BODY: &str = r#"{"error":"the administrative service is unavailable"}"#;
 
+/// The 400 for a body that carries `is_admin` (team access stage 10, §6
+/// "Retired"). Admin is membership of the declared `administrators` team
+/// (ADR-0962), so no caller sets the column any more. The field is refused
+/// whatever its value, `false` included, so a client that still sends it
+/// learns at once rather than meeting a default.
+const IS_ADMIN_RETIRED_BODY: &str = r#"{"error":"`is_admin` is retired: admin is membership of the declared administrators team (ADR-0962), so send create-user without it"}"#;
+
 /// One `create-user` body, judged for SHAPE only.
 struct Fields<'a> {
     external_id: &'a str,
     display_name: &'a str,
-    /// ABSENT MEANS FALSE, and false is an ordinary account. A bootstrap caller
-    /// who omits it and names no `user_id` is refused by `accepts_bootstrap`
-    /// rather than quietly creating one.
-    is_admin: bool,
     /// The bare pre-minted id, as declared (team access §6, flow F2). Any JSON
     /// string is accepted here, the empty one included: the format is `iam`'s
     /// to judge, after authorization.
@@ -52,6 +56,11 @@ fn fields(req: &Value) -> Result<Fields<'_>, &'static str> {
     ) else {
         return Err(r#"{"error":"`external_id` and `display_name` are required"}"#);
     };
+    // THE RETIRED FIELD, BY PRESENCE (stage 10). `null` and a non-boolean are
+    // refused too: any value would be a caller still asking for the column.
+    if req.get("is_admin").is_some() {
+        return Err(IS_ADMIN_RETIRED_BODY);
+    }
     // A NON-STRING `user_id` IS A SHAPE ERROR, `null` included, for
     // `revoke_instruction`'s reason: guessing what a caller meant is not a
     // kindness on the verb that creates administrators.
@@ -63,10 +72,6 @@ fn fields(req: &Value) -> Result<Fields<'_>, &'static str> {
     Ok(Fields {
         external_id,
         display_name,
-        is_admin: req
-            .get("is_admin")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
         user_id,
     })
 }
@@ -76,16 +81,16 @@ fn fields(req: &Value) -> Result<Fields<'_>, &'static str> {
 /// The FIRST of D73's administrative verbs and the one the bootstrap token
 /// exists for: the first administrator has to exist before anyone can log in.
 ///
-/// Body: `external_id` and `display_name` (both required), an optional
-/// `is_admin` which DEFAULTS TO FALSE, and an optional `user_id`: the bare
-/// lowercase uuidv7 the operator declared in GitOps as the first administrator
-/// (flow F2, ADR-0963 (5)). The gateway sends it upstream as
-/// `yadgar:user:<value>` with `is_admin` false; only the bootstrap token may
-/// send it.
+/// Body: `external_id` and `display_name` (both required), and an optional
+/// `user_id`: the bare lowercase uuidv7 the operator declared in GitOps as the
+/// first administrator (flow F2, ADR-0963 (5)). The gateway sends it upstream
+/// as `yadgar:user:<value>`; only the bootstrap token may send it. A body with
+/// `is_admin` is refused 400 (retired at team access stage 10), and every
+/// upstream request carries `is_admin: false`.
 ///
 /// Answers `{"user_id": ...}` from `CreateUserResponse.meta.id`. That is the same
 /// identifier space `ResolveCredential` returns and the same one
-/// `admin_issue_enrolment` and `admin_set_user_admin` consume — `iam-db`
+/// `admin_issue_enrolment` and the credential verbs consume — `iam-db`
 /// mints it as `yadgar:user:<uuidv7>` (or stores the pre-minted one) as
 /// `iam_user.id`, which is what `iam_credential.user_id` points at — so an
 /// administrator can drive the whole ceremony from what this returns.
@@ -130,7 +135,6 @@ pub(in crate::http) async fn admin_create_user(
     };
 
     let ask = Ask {
-        wants_admin: f.is_admin,
         pre_minted_id: f.user_id.is_some(),
     };
     let authority = match authorise(
@@ -180,7 +184,10 @@ pub(in crate::http) async fn admin_create_user(
         }),
         external_id: f.external_id.to_string(),
         display_name: f.display_name.to_string(),
-        is_admin: f.is_admin,
+        // ALWAYS FALSE (stage 10): the column is not set from here any more.
+        // With `IAM_ADMIN_FROM_TEAM` on, admin is the user's membership of
+        // `administrators`, which GitOps declares.
+        is_admin: false,
         user_id: sent.clone(),
         // ADR-0534's relay, and `None` on the bootstrap path. See
         // `admin::Authority::actor` — an empty actor would reach `iam-db`'s

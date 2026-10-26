@@ -56,8 +56,8 @@ impl PreMintedIds {
     }
 
     /// Whether this switch refuses a bootstrap request for `verb` with `ask`.
-    /// Only the pre-minted `create-user` arm is in its reach: the
-    /// `is_admin: true` arm, the promotion and the enrolment are not.
+    /// Only the pre-minted `create-user` arm is in its reach: the enrolment
+    /// is not.
     pub fn refuses(self, verb: Verb, ask: Ask) -> bool {
         self == Self::Refused && verb == Verb::CreateUser && ask.pre_minted_id
     }

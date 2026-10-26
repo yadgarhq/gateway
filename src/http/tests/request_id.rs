@@ -374,25 +374,20 @@ async fn enrol_hands_iam_the_id_on_its_own_record() {
     assert_all_carry(&arrivals, &["redeem_enrolment"], &id);
 }
 
-/// The four administrative verbs: the attestation AND the verb carry the SAME
+/// The administrative write verbs: the attestation AND the verb carry the SAME
 /// id, because both are one inbound request.
 #[tokio::test]
 async fn each_admin_verb_hands_iam_one_id_for_attestation_and_verb() {
     let verbs = [
         (
             "/admin/create-user",
-            r#"{"external_id":"ada","display_name":"Ada","is_admin":false}"#,
+            r#"{"external_id":"ada","display_name":"Ada"}"#,
             "create_user",
         ),
         (
             "/admin/issue-enrolment",
             r#"{"user_id":"yadgar:user:someone-else"}"#,
             "issue_enrolment",
-        ),
-        (
-            "/admin/set-user-admin",
-            r#"{"user_id":"yadgar:user:someone-else","is_admin":true}"#,
-            "set_user_admin",
         ),
         (
             "/admin/revoke-credentials",

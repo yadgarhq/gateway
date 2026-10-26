@@ -897,17 +897,6 @@ async fn failed_precondition_on_create_user_is_the_opaque_503() {
     );
 }
 
-/// yaadgaar #202: iam's only `FAILED_PRECONDITION` on `SetUserAdmin` is the
-/// verb's retirement while `IAM_ADMIN_FROM_TEAM` is true (ADR-0962), before the
-/// store is asked, so that is the sentence. It does not depend on the target.
-#[tokio::test]
-async fn failed_precondition_on_set_user_admin_names_the_retirement() {
-    assert_eq!(
-        failed_precondition_on(ADMIN_SET_USER_ADMIN).await,
-        (503, SET_USER_ADMIN_RETIRED_BODY.to_string())
-    );
-}
-
 /// yaadgaar #202: iam has no `FAILED_PRECONDITION` on these verbs, so no
 /// specific sentence is true and the answer is the opaque one.
 #[tokio::test]
@@ -2408,17 +2397,15 @@ async fn a_username_is_never_bounded_here() {
 // halves — an administrator admitted, an actor stamped — need an `iam` that
 // answers, and live in `tests/admin_http.rs`.
 
-/// The three administrative paths, with a body each verb accepts.
-const ADMIN_PATHS: [(&str, &str); 3] = [
+/// The administrative paths that read their body before authorising, with a
+/// body each verb accepts from the bootstrap token. `set-user-admin` was the
+/// third until team access stage 10 retired it.
+const ADMIN_PATHS: [(&str, &str); 2] = [
     (
         "/admin/create-user",
-        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        r#"{"external_id":"ada","display_name":"Ada","user_id":"u"}"#,
     ),
     ("/admin/issue-enrolment", r#"{"user_id":"yadgar:user:x"}"#),
-    (
-        "/admin/set-user-admin",
-        r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
-    ),
 ];
 
 /// POST to an administrative path against `state`, with optional headers.
@@ -2461,7 +2448,7 @@ async fn admin_post(
 #[tokio::test]
 async fn the_body_limit_covers_every_admin_route() {
     let huge = format!(
-        r#"{{"external_id":"{}","display_name":"a","user_id":"u","is_admin":true}}"#,
+        r#"{{"external_id":"{}","display_name":"a","user_id":"u"}}"#,
         "u".repeat(2_000_000)
     );
     for (path, _) in ADMIN_PATHS {
@@ -2563,41 +2550,22 @@ async fn bootstrap_post(path: &str, body: &str) -> (StatusCode, Value) {
 /// which is strictly stronger, because it asserts the DEMAND that travelled and
 /// not merely the status that came back.
 ///
-/// The two rows below SURVIVE UNCHANGED and are the must-not-break proofs: the
-/// token still cannot create an ordinary account, and still cannot demote.
+/// The row below is the must-not-break proof: the token still cannot create an
+/// ordinary account. (The demotion row went with `set-user-admin`, retired at
+/// team access stage 10.)
 #[tokio::test]
-async fn the_bootstrap_token_is_refused_an_ordinary_account_and_a_demotion() {
-    for (path, body, why) in [
-        (
-            "/admin/create-user",
-            r#"{"external_id":"ada","display_name":"Ada","is_admin":false}"#,
-            "an ORDINARY account is a power ADR-0492 never granted an unattributable credential",
-        ),
-        (
-            "/admin/set-user-admin",
-            r#"{"user_id":"yadgar:user:x","is_admin":false}"#,
-            "a demotion would let a shared secret remove every administrator in the deployment",
-        ),
-    ] {
-        let (status, answer) = bootstrap_post(path, body).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {why}. Got {answer}");
-    }
-}
-
-/// An OMITTED `is_admin` on `create-user` is an ordinary account, so the
-/// bootstrap token is refused it too.
-///
-/// The row the exclusion test above would miss: a caller who sends no flag at all
-/// rather than `false`. Reading absence as `true` would be the one default that
-/// hands a stranger an administrator.
-#[tokio::test]
-async fn the_bootstrap_token_is_refused_a_create_user_with_no_flag_at_all() {
-    let (status, _) = bootstrap_post(
+async fn the_bootstrap_token_is_refused_an_ordinary_account() {
+    let (status, answer) = bootstrap_post(
         "/admin/create-user",
         r#"{"external_id":"ada","display_name":"Ada"}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an ORDINARY account is a power ADR-0492 never granted an unattributable credential. \
+         Got {answer}"
+    );
 }
 
 /// A WRONG token on a granted verb is refused.
@@ -2606,7 +2574,7 @@ async fn a_wrong_bootstrap_token_is_refused_on_a_granted_verb() {
     let (status, _) = admin_post(
         state_bootstrapped(BOOTSTRAP_SECRET),
         "/admin/create-user",
-        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        r#"{"external_id":"ada","display_name":"Ada","user_id":"u"}"#,
         &[(BOOTSTRAP_HEADER_NAME, "not-the-token")],
     )
     .await;
@@ -2636,15 +2604,15 @@ async fn a_wrong_bootstrap_token_is_refused_on_a_granted_verb() {
 /// `Bootstrap::Accepted` arm. Nothing else in this repository reds.
 #[test]
 fn an_accepted_bootstrap_token_is_counted_and_a_refused_one_is_not() {
-    // The accepted half. `create-user` with `is_admin: true` is one of
-    // ADR-0492's two grants, so `authorise` reaches the `Bootstrap::Accepted`
-    // arm. This state's `iam` points at nothing, so the call fails AFTER the
+    // The accepted half. `create-user` with a pre-minted `user_id` is one of
+    // the bootstrap token's two grants, so `authorise` reaches the
+    // `Bootstrap::Accepted` arm. This state's `iam` points at nothing, so the call fails AFTER the
     // authorisation decision — which is the point rather than a limitation: the
     // counter records the DECISION, not the outcome of the work it authorised.
     let (accepted, status, answer) = count_bootstrap_acceptances(|| {
         bootstrap_post(
             "/admin/create-user",
-            r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+            r#"{"external_id":"ada","display_name":"Ada","user_id":"u"}"#,
         )
     });
     assert_ne!(
@@ -2663,7 +2631,7 @@ fn an_accepted_bootstrap_token_is_counted_and_a_refused_one_is_not() {
         admin_post(
             state_bootstrapped(BOOTSTRAP_SECRET),
             "/admin/create-user",
-            r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+            r#"{"external_id":"ada","display_name":"Ada","user_id":"u"}"#,
             &[(BOOTSTRAP_HEADER_NAME, "not-the-token")],
         )
         .await
@@ -2676,11 +2644,10 @@ fn an_accepted_bootstrap_token_is_counted_and_a_refused_one_is_not() {
     // the status alone would let the `== 0` below pass against a gateway that
     // never reached the comparison, and then this half would prove nothing about
     // the counter. The two bodies are what separate them: the pre-comparison
-    // refusal says "the bootstrap token may only create an administrator, promote
-    // one, or issue an enrolment the enrolment predicate admits" (reworded by
-    // ADR-0655, and again by team access stage 3b because ADR-0966 made "never
-    // held a credential" false), and this
-    // one is the `Bootstrap::Refused` arm's own.
+    // refusal says "the bootstrap token may only create the declared first
+    // administrator or issue an enrolment the enrolment predicate admits"
+    // (reworded by ADR-0655, by team access stage 3b, and by stage 10), and
+    // this one is the `Bootstrap::Refused` arm's own.
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
         answer.get("error"),
@@ -2746,12 +2713,11 @@ where
 /// which mechanism admitted a call would depend on which check happened to run
 /// first.
 ///
-/// **THE EXCLUDED VERB IS NOW A DEMOTION, AND THE BODY IS ASSERTED.** This test
-/// used to drive `/admin/issue-enrolment`, which ADR-0655 admits — an admitted
-/// verb reaches the closed-port `iam` and renders the opaque 503, so the verb had
-/// to change. `set-user-admin` with `is_admin: false` is still excluded from the
-/// bootstrap token (only the promotion half is granted) and is the natural
-/// replacement.
+/// **THE EXCLUDED REQUEST IS AN ORDINARY ACCOUNT, AND THE BODY IS ASSERTED.**
+/// This test used to drive `/admin/issue-enrolment`, which ADR-0655 admits, and
+/// then a `set-user-admin` demotion, which team access stage 10 retired with the
+/// route. A `create-user` without a `user_id` is still excluded from the
+/// bootstrap token and reads its body before authorising, as the demotion did.
 ///
 /// Asserting the STATUS alone would not have proved the property even before:
 /// this file attests through `TrustedHeaders`, where `is_admin` is `false` by
@@ -2762,8 +2728,8 @@ where
 async fn a_bootstrap_request_never_falls_back_to_the_attested_path() {
     let (status, answer) = admin_post(
         state_bootstrapped(BOOTSTRAP_SECRET),
-        "/admin/set-user-admin",
-        r#"{"user_id":"yadgar:user:x","is_admin":false}"#,
+        "/admin/create-user",
+        r#"{"external_id":"ada","display_name":"Ada"}"#,
         &[
             (BOOTSTRAP_HEADER_NAME, BOOTSTRAP_SECRET),
             ("x-yadgar-user", "ada"),
@@ -2781,7 +2747,7 @@ async fn a_bootstrap_request_never_falls_back_to_the_attested_path() {
     assert_eq!(
         answer.get("error"),
         Some(&json!(
-            "the bootstrap token may only create an administrator, promote one, or issue an \
+            "the bootstrap token may only create the declared first administrator or issue an \
              enrolment the enrolment predicate admits"
         )),
         "and it must be the BOOTSTRAP verb gate that refused it, not the attested path's \
@@ -2835,7 +2801,7 @@ async fn an_empty_bootstrap_token_against_no_secret_is_refused_by_the_disable_pa
     let (status, answer) = admin_post(
         state(Vec::new()),
         "/admin/create-user",
-        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        r#"{"external_id":"ada","display_name":"Ada","user_id":"u"}"#,
         &[(BOOTSTRAP_HEADER_NAME, "")],
     )
     .await;
@@ -2858,7 +2824,7 @@ async fn an_empty_bootstrap_token_against_a_configured_secret_is_refused() {
     let (status, answer) = admin_post(
         state_bootstrapped(BOOTSTRAP_SECRET),
         "/admin/create-user",
-        r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#,
+        r#"{"external_id":"ada","display_name":"Ada","user_id":"u"}"#,
         &[(BOOTSTRAP_HEADER_NAME, "")],
     )
     .await;
@@ -2877,27 +2843,6 @@ async fn an_unparseable_admin_body_is_a_400() {
     for (path, _) in ADMIN_PATHS {
         let (status, _) = admin_post(state(Vec::new()), path, "not json", &[]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
-    }
-}
-
-/// `is_admin` is REQUIRED on `set-user-admin`, and must be a real boolean.
-///
-/// An absent flag defaulting to `false` would make a malformed request a
-/// demotion, which is the wrong direction for the verb that removes
-/// administrators.
-#[tokio::test]
-async fn set_user_admin_requires_a_real_boolean_flag() {
-    for body in [
-        r#"{"user_id":"yadgar:user:x"}"#,
-        r#"{"user_id":"yadgar:user:x","is_admin":"false"}"#,
-        r#"{"user_id":"yadgar:user:x","is_admin":0}"#,
-    ] {
-        let (status, _) = admin_post(state(Vec::new()), "/admin/set-user-admin", body, &[]).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "guessing what {body} meant on the verb that removes administrators is not a kindness"
-        );
     }
 }
 
