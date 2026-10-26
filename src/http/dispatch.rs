@@ -252,6 +252,12 @@ pub(super) async fn tools_call(
     // Minted here, never read from the request (D67). See `crate::request_id`.
     let request_id = crate::request_id();
 
+    // ADR-0963 (8): the one tool that names no project; see `super::listing`.
+    if name == tools::LIST_PROJECTS {
+        let tool = (label, module);
+        return super::listing::list_projects(&state, id, params, headers, tool, request_id).await;
+    }
+
     // Read or write, decided ONCE: attestation needs it for ADR-0941 and the
     // limiter and the record below need it for D74 and D67.
     let kind = kind_of(name);

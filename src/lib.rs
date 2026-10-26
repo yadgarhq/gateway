@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod attest;
+pub mod edge;
 pub mod http;
 pub mod invalidate;
 pub mod limit;

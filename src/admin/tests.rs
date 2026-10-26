@@ -92,75 +92,116 @@ fn the_acceptance_counter_is_named_the_thing_an_operator_alerts_on() {
     assert_eq!(ACCEPTED, "yadgar_gateway_bootstrap_accepted_total");
 }
 
-/// ADR-0492's grant, and every excluded cell around it.
+/// The bootstrap token's grant since team access stage 10, and every
+/// excluded cell around it.
 ///
 /// **The exclusions are the contract; the inclusions are the feature.** A
 /// suite asserting only the `true` rows passes against a gateway that accepts
 /// the bootstrap token everywhere.
 ///
-/// **`IssueEnrolment` IS NOW ADMITTED, ON EVERY VALUE OF THE FLAG** (ADR-0655
-/// as amended by ADR-0656). Both `IssueEnrolment` rows below are therefore
-/// POSITIVE, and BOTH of them are load-bearing rather than one being a
-/// duplicate of the other: `admin_issue_enrolment` passes `wants_admin: false`
-/// because an enrolment request carries no `is_admin` field at all, so an arm
-/// written `Verb::IssueEnrolment => wants_admin` would refuse every real
-/// enrolment while the `(true)` row below still passed. The `(false)` row is
-/// what reds on that mutation.
+/// **`IssueEnrolment` IS ADMITTED WHATEVER THE `Ask`** (ADR-0655 as amended by
+/// ADR-0656, and ADR-0966's break-glass arm). Both of its rows are POSITIVE and
+/// both are load-bearing: `admin_issue_enrolment` passes `Ask::plain()`, so an
+/// arm gated on `pre_minted_id` would refuse every real enrolment while the
+/// `pre_minted_id: true` row still passed. The plain row is what reds on that
+/// mutation.
 #[test]
-fn the_bootstrap_token_reaches_create_an_admin_promote_one_and_enrol_one() {
+fn the_bootstrap_token_reaches_the_declared_first_administrator_and_enrolment() {
     assert!(
-        Verb::CreateUser.accepts_bootstrap(true),
-        "create an admin: ADR-0492's first grant"
+        Verb::CreateUser.accepts_bootstrap(Ask {
+            pre_minted_id: true
+        }),
+        "the F2 arm: the declared first administrator, by its pre-minted id"
     );
     assert!(
-        Verb::SetUserAdmin.accepts_bootstrap(true),
-        "promote to admin: ADR-0492's second grant"
-    );
-
-    assert!(
-        !Verb::CreateUser.accepts_bootstrap(false),
-        "an ORDINARY account is a power ADR-0492 never granted an unattributable credential"
+        !Verb::CreateUser.accepts_bootstrap(Ask::plain()),
+        "stage 10: without a pre-minted id the bootstrap token reaches no create-user arm; \
+         an ORDINARY account is a power ADR-0492 never granted an unattributable credential"
     );
     assert!(
-        !Verb::SetUserAdmin.accepts_bootstrap(false),
-        "demotion would let a shared secret remove every administrator in the deployment"
+        Verb::IssueEnrolment.accepts_bootstrap(Ask::plain()),
+        "ADR-0655's grant and ADR-0966's break-glass arm: the enrolment predicate at `iam-db` \
+         is what keeps that from being takeover"
     );
     assert!(
-        Verb::IssueEnrolment.accepts_bootstrap(true),
-        "ADR-0655's grant: the token may enrol the administrator it just created, because the \
-         zero-credential predicate at `iam-db` is what keeps that from being takeover"
-    );
-    assert!(
-        Verb::IssueEnrolment.accepts_bootstrap(false),
-        "and it is admitted on EVERY value of the flag, because an enrolment request carries no \
-         flag — the handler passes `false`, so a `wants_admin`-gated arm would refuse every real \
-         enrolment and this is the row that says so"
+        Verb::IssueEnrolment.accepts_bootstrap(Ask {
+            pre_minted_id: true
+        }),
+        "and it is admitted whatever the `Ask`"
     );
 }
 
-/// ADR-0945: the bootstrap token never reaches `RevokeCredentials`, on either
-/// value of the flag. A revoke request carries no flag; both values are
-/// asserted so that a `wants_admin`-gated arm cannot pass.
+/// The pre-minted id widens `CreateUser` only. On every other verb it changes
+/// nothing, so a handler that passed it by mistake could not open a verb.
+#[test]
+fn a_pre_minted_id_admits_no_other_verb() {
+    for verb in [
+        Verb::RevokeCredentials,
+        Verb::ListCredentials,
+        Verb::RevokeCredential,
+    ] {
+        assert!(
+            !verb.accepts_bootstrap(Ask {
+                pre_minted_id: true
+            }),
+            "{verb:?} must not be opened by a pre-minted id"
+        );
+    }
+}
+
+/// The bootstrap-only rule (§6): an ATTESTED administrator's `create-user`
+/// with a `user_id` is refused after authorization; the bootstrap path is not.
+#[test]
+fn red_06_a_pre_minted_id_is_bootstrap_only() {
+    assert!(
+        refuses_pre_minted_id(
+            &Authority::Administrator("yadgar:user:abc".to_string()),
+            true
+        ),
+        "an attested administrator never names the id of the user it creates"
+    );
+    assert!(!refuses_pre_minted_id(&Authority::Bootstrap, true));
+    assert!(
+        !refuses_pre_minted_id(
+            &Authority::Administrator("yadgar:user:abc".to_string()),
+            false
+        ),
+        "red 9: without a `user_id` the attested path is today's"
+    );
+    assert!(!refuses_pre_minted_id(&Authority::Bootstrap, false));
+}
+
+/// The bare uuid is sent upstream with the prefix, byte for byte, and the
+/// gateway does not judge its format (ADR-0927).
+#[test]
+fn the_pre_minted_id_is_prefixed_and_not_judged() {
+    assert_eq!(
+        upstream_user_id("0192f3c1-8a4e-7c2d-9b11-5f0e7a3d84c6"),
+        "yadgar:user:0192f3c1-8a4e-7c2d-9b11-5f0e7a3d84c6"
+    );
+    assert_eq!(upstream_user_id("NOT A UUID"), "yadgar:user:NOT A UUID");
+}
+
+/// ADR-0945: the bootstrap token never reaches `RevokeCredentials`, whatever
+/// the `Ask`. Both values are asserted so that an `ask`-gated arm cannot pass.
 #[test]
 fn the_bootstrap_token_never_revokes_credentials() {
-    assert!(
-        !Verb::RevokeCredentials.accepts_bootstrap(true),
-        "the bootstrap token must never revoke credentials"
-    );
-    assert!(
-        !Verb::RevokeCredentials.accepts_bootstrap(false),
-        "the bootstrap token must never revoke credentials, whatever the flag"
-    );
+    for pre_minted_id in [true, false] {
+        assert!(
+            !Verb::RevokeCredentials.accepts_bootstrap(Ask { pre_minted_id }),
+            "the bootstrap token must never revoke credentials"
+        );
+    }
 }
 
 /// ADR-0972 (2): listing and revoking one credential are for an attested
-/// administrator only. Both flag values, for the reason the test above gives.
+/// administrator only. Both values, for the reason the test above gives.
 #[test]
 fn the_bootstrap_token_never_lists_or_revokes_one_credential() {
     for verb in [Verb::ListCredentials, Verb::RevokeCredential] {
-        for flag in [true, false] {
+        for pre_minted_id in [true, false] {
             assert!(
-                !verb.accepts_bootstrap(flag),
+                !verb.accepts_bootstrap(Ask { pre_minted_id }),
                 "the bootstrap token must never reach {verb:?}"
             );
         }
@@ -200,18 +241,6 @@ fn only_the_bootstrap_path_demands_a_zero_credential_admin() {
 }
 
 #[test]
-fn only_an_attested_administrator_may_revoke_existing_credentials() {
-    assert!(
-        !Authority::Bootstrap.may_revoke_existing_credentials(),
-        "the bootstrap token never carries ADR-0943's revoke instruction"
-    );
-    assert!(
-        Authority::Administrator("yadgar:user:abc".to_string()).may_revoke_existing_credentials(),
-        "an attested administrator's re-enrolment is the reset ADR-0943 lets revoke"
-    );
-}
-
-#[test]
 fn an_administrator_stamps_their_resolved_id() {
     assert_eq!(
         Authority::Administrator("yadgar:user:abc".to_string()).actor(),
@@ -221,29 +250,54 @@ fn an_administrator_stamps_their_resolved_id() {
     );
 }
 
-/// D73's exclusion, and the three neighbouring cells that must NOT be refused.
+/// Ruling (b) (Max, 2026-10-24): the switch reads exactly `"1"` or `"0"`, and
+/// refuses absence and every other spelling (ADR-0569: no compiled-in default).
 #[test]
-fn an_administrator_cannot_clear_their_own_flag() {
-    let me = Authority::Administrator("yadgar:user:me".to_string());
+fn the_pre_minted_switch_reads_one_or_zero_and_nothing_else() {
+    let read = |value: Option<&str>| {
+        PreMintedIds::from_lookup(|key| {
+            assert_eq!(key, REFUSE_PRE_MINTED_USER_ID);
+            value.map(str::to_string)
+        })
+    };
+    assert_eq!(read(Some("1")).ok(), Some(PreMintedIds::Refused));
+    assert_eq!(read(Some("0")).ok(), Some(PreMintedIds::Admitted));
+    assert!(matches!(read(None), Err(PreMintedIdsError::Absent)));
+    for other in ["", "true", "false", "yes", " 1", "1 ", "01"] {
+        let refusal = read(Some(other)).expect_err(other).to_string();
+        assert!(
+            refusal.contains(REFUSE_PRE_MINTED_USER_ID)
+                && refusal.contains("adminBootstrap.refusePreMintedUserId"),
+            "{other:?}: the refusal names the variable and the chart key: {refusal}"
+        );
+    }
+    let absent = read(None).expect_err("absent").to_string();
+    assert!(
+        absent.contains("adminBootstrap.refusePreMintedUserId"),
+        "{absent}"
+    );
+}
 
-    assert!(
-        is_self_demotion(&me, "yadgar:user:me", false),
-        "D73 excludes admin self-demotion, and this boundary is the only one with a real \
-         identity to test it against"
-    );
-    assert!(
-        !is_self_demotion(&me, "yadgar:user:other", false),
-        "demoting SOMEBODY ELSE is the feature, and the demoter stays an administrator — \
-         which is what keeps the count above zero"
-    );
-    assert!(
-        !is_self_demotion(&me, "yadgar:user:me", true),
-        "D73 excludes DEMOTION; refusing a self-promotion would invent a rule the contract \
-         does not have"
-    );
-    assert!(
-        !is_self_demotion(&Authority::Bootstrap, "yadgar:user:me", false),
-        "there is no self on the bootstrap path — and `accepts_bootstrap` already refused \
-         this request before it could reach here"
-    );
+/// Ruling (b): the engaged switch reaches the pre-minted `create-user` arm
+/// and no other request; the disengaged one reaches nothing.
+#[test]
+fn the_pre_minted_switch_reaches_only_the_pre_minted_arm() {
+    let pre_minted = Ask {
+        pre_minted_id: true,
+    };
+    assert!(PreMintedIds::Refused.refuses(Verb::CreateUser, pre_minted));
+    assert!(!PreMintedIds::Admitted.refuses(Verb::CreateUser, pre_minted));
+    for verb in [
+        Verb::CreateUser,
+        Verb::IssueEnrolment,
+        Verb::RevokeCredentials,
+        Verb::ListCredentials,
+        Verb::RevokeCredential,
+    ] {
+        assert!(
+            !PreMintedIds::Refused.refuses(verb, Ask::plain()),
+            "{verb:?} without a pre-minted id is out of the switch's reach"
+        );
+        assert!(!PreMintedIds::Admitted.refuses(verb, Ask::plain()));
+    }
 }

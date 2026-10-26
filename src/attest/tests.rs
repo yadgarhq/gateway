@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
-use tonic::transport::Channel;
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
 use crate::pb::yadgar::common::v1::InheritedSetting;
@@ -30,8 +29,11 @@ fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> +
 ///
 /// `connect_lazy` needs a reactor in scope even though it dials nothing, so
 /// every caller is a `#[tokio::test]`.
-fn nowhere() -> Channel {
-    tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy()
+fn nowhere() -> crate::upstream::Upstream {
+    crate::upstream::Upstream::new(
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        std::time::Duration::from_secs(30),
+    )
 }
 
 /// A validator that refuses nobody, which is the shipped configuration.
@@ -1099,6 +1101,7 @@ fn stamping(mode: crate::project::Mode) -> crate::project::Validator {
             status: ProjectStatus::Active as i32,
             aliases: alias.into_iter().map(str::to_string).collect(),
             owner_user_id: String::new(),
+            grants: Vec::new(),
         }
     });
     crate::project::Validator::new(

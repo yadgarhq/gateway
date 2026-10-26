@@ -247,7 +247,9 @@ projectValidation:
   # `yadgar_gateway_project_refusal_total{reason}` and the call is served exactly
   # as it was before this gateway could resolve anything. `enforcing` answers
   # those refusals — 400 with the reason token for the caller classes, 403 for
-  # PROJECT_NOT_MEMBER (a personal project the caller does not own), 503 for a
+  # PROJECT_NOT_MEMBER (a personal project the caller does not own; an org
+  # project no team of the caller's holds a grant on only under orgGrants:
+  # enforcing, below), 503 for a
   # registry that has never loaded (ADR-0674). `enforcing` refuses to boot with
   # trustUnauthenticatedHeaders, whose caller-named identity no owner check can
   # verify.
@@ -262,6 +264,18 @@ projectValidation:
   # leg is what stops a gateway with no traffic reading identically to one whose
   # canonicalisation is perfect.
   mode: counting
+  # `counting` or `enforcing`: the TEAM-GRANT rule on organisation projects
+  # (ADR-0962, ADR-0963 (4), plans/team-access.md §5), separate from `mode`.
+  #
+  # **`counting` SERVES EVERY CALL EXACTLY AS TODAY.** A call whose teams hold no
+  # grant on the project or an ancestor (or only a read grant, for a write)
+  # increments `yadgar_gateway_project_grant_shadow_total{verdict}` (`no_grant`,
+  # `read_only`) and is served as if every org project admitted everyone.
+  # `enforcing` refuses those calls 403 PROJECT_NOT_MEMBER / PROJECT_READ_ONLY.
+  # `enforcing` refuses to boot while `mode` is `counting`, and with
+  # trustUnauthenticatedHeaders (no teams). Flip only after the stage 11 window
+  # in plans/team-access.md reads zero shadow increments.
+  orgGrants: counting
   # How often the registered set is loaded: the retry after a failure and the
   # refresh after a success. A newly registered project becomes resolvable within
   # this interval, and an unreachable `project` is asked again at it.
@@ -714,6 +728,26 @@ autoscaling:
 service:
   port: 8080
 
+# THE LISTENER'S PROTOCOL LIMITS (ADR-1006): this process's own HTTP listener,
+# not the ingress in front of it. The same `server.limits` block the gRPC
+# services' charts carry; this edge has one limit of its own (yaadgaar #218).
+server:
+  limits:
+    # LISTEN_HEADER_READ_TIMEOUT_SECS. How long a client may take to send a
+    # whole request head (request line and headers) before this gateway closes
+    # the connection. It bounds a slowloris client, which holds a socket open by
+    # sending its head a byte at a time, or not at all. D80 rules out leaning on
+    # an ingress for this, so the edge bounds itself.
+    #
+    # It applies to EVERY head on a connection, so it is also how long a
+    # kept-alive connection may sit idle between requests. An ingress that pools
+    # connections to this Service should close an idle one sooner than this, or
+    # it may reuse one at the moment it is closed.
+    #
+    # No binary default (ADR-0569); the binary and the schema both refuse a value
+    # outside 1..=60.
+    headerReadTimeoutSeconds: 10
+
 # Where this service attaches to the TLS edge (D71). The Gateway and its
 # certificate live in yadgarhq/deploy — shared edge infrastructure outlives any
 # one module — while the HTTPRoute lives in this chart, so the route and the
@@ -885,10 +919,11 @@ credentialLimits:
 # `lifecycle` block at all. The reasoning, and why an `exec` of /bin/sleep is
 # not an option on a distroless image, is in `templates/deployment.yaml`.
 
-# WHAT BOUNDS THE THREE ADMINISTRATIVE ENDPOINTS (ADR-0492, D73, ledger 638).
+# WHAT BOUNDS THE ADMINISTRATIVE ENDPOINTS (ADR-0492, D73, ledger 638).
 #
-# /admin/create-user, /admin/issue-enrolment and /admin/set-user-admin are
-# reached by an attested administrator OR by D73's bootstrap token, and they pass
+# /admin/create-user and /admin/issue-enrolment are reached by an attested
+# administrator OR by D73's bootstrap token (/admin/set-user-admin was the
+# third until team access stage 10 retired it), and they pass
 # the same guard /auth/login and /auth/enrol do — the Origin check and a
 # source-address bucket.
 #
@@ -906,7 +941,8 @@ credentialLimits:
 adminLimits:
   # PER CLIENT, and only reachable once sourceAddress.trustedProxyHops is set.
   # SIZED FOR A PERSON DOING ADMINISTRATIVE WORK, not for a script: six at once —
-  # enough to create a user, enrol them and promote them without waiting — and
+  # enough to create a user, enrol them and revoke a credential without
+  # waiting — and
   # then one every twenty seconds. Deliberately TIGHTER than
   # credentialLimits.attributed, because administrative work is rare and the
   # traffic this bucket exists to bound is a search for a 264-bit shared secret.
@@ -924,13 +960,14 @@ adminLimits:
 # D73'S BOOTSTRAP TOKEN — the credential that lets the FIRST administrator exist
 # before an administrator exists to create one (ADR-0492, ledger 638).
 #
-# It reaches three acts — create-an-administrator, promote-one, and (ADR-0655,
-# as amended by ADR-0656) issue-an-enrolment for an administrator holding zero
-# credentials — and it is checked at this gateway rather than inside `iam`: no
+# It reaches two acts since team access stage 10 — create-the-declared-first-
+# administrator by its pre-minted user id, and issue-an-enrolment the enrolment
+# predicate admits (ADR-0655 as amended by ADR-0656, and ADR-0966's break-glass
+# arm) — and it is checked at this gateway rather than inside `iam`: no
 # administrative RPC on that service carries a credential of any kind, because
 # a second authentication mechanism there would be a second place for it to be
-# wrong, holding the same secret twice. The zero-credential predicate on the
-# third act is enforced inside `iam-db`'s write, not here.
+# wrong, holding the same secret twice. The predicates on both acts are
+# enforced inside `iam-db`'s write, not here.
 #
 # ONE VALUE, NOT A BOOLEAN BESIDE A NAME. Naming the Secret IS the switch, the
 # same shape rateLimit.passwordSecret, nats.passwordSecret, task.tls.caSecret and
@@ -1016,6 +1053,19 @@ adminBootstrap:
   # `required` in the template, so naming a Secret and clearing this fails at
   # RENDER time rather than at boot.
   tokenSecretKey: token
+  # THE FAIL-CLOSED SWITCH ON THE PRE-MINTED `user_id` ARM of /admin/create-user
+  # (team access stage 3b; Max's ruling, 2026-10-24), rendered as
+  # YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID. `false` keeps that arm open, as
+  # before this switch. `true` refuses it with
+  # `503 {"error":"pre-minted user ids are switched off on this gateway ..."}`
+  # before the token is compared; the enrolment is not affected. Engage it while the iam and iam-db that
+  # implement pre-minted ids are not live behind this gateway.
+  #
+  # A SWITCH BESIDE THE NAME, and not the "enabled flag beside a name" the
+  # comment above rejects: it narrows one arm, and it cannot disagree with
+  # `tokenSecret`. REQUIRED, with no binary default (ADR-0569): the schema types
+  # it boolean, and the template refuses `adminBootstrap: null`.
+  refusePreMintedUserId: false
 
 preStopSleepSeconds: 5
 

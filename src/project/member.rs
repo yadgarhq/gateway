@@ -5,10 +5,13 @@
 //! WHICH row a claim lands on; this decides whether the CALLER may reach it, and
 //! [`super::Validator::check`] counts what this answers.
 //!
-//! **MEMBERSHIP IS DERIVED, NOT STORED.** An org row admits every attested user
-//! (Max's ruling 3: an org project is the whole organisation). A private
-//! (`local/…`) row admits exactly its stored owner, for reads AND writes
-//! (ruling A). Nothing else is consulted: no team, no grant table.
+//! **MEMBERSHIP IS DERIVED, NOT STORED.** A private (`local/…`) row admits
+//! exactly its stored owner, for reads AND writes (ruling A), and no grant is
+//! ever read for one (ADR-0962 ruling 7). An org row admits whoever its TEAM
+//! GRANTS admit (ADR-0962, replacing ruling 3's "every attested user"): that
+//! step is [`super::grants`]'s, asked by [`verdict`] through its `org` hook,
+//! and under `orgGrants: counting` it only counts, so an org row still admits
+//! every attested user until the flip.
 //!
 //! **THE CLASS IS THE PATH, NEVER "AN OWNER ARRIVED".** A private row whose
 //! owner loads empty — a `project` older than car P2, or a store defect — stays
@@ -93,14 +96,25 @@ pub(super) struct Landed<'a> {
 /// ownership comes first, for every `Access`, so a non-owner gets one answer
 /// whether the row is archived or not and learns nothing about its status;
 /// only the owner is then told that a write hits an archived row.
+///
+/// **ON AN ORG ROW THE GRANT STEP SITS BETWEEN THE TWO (ADR-0963 (2)).** `org`
+/// is asked only for an org row that passed the subtree rule, and only before
+/// the archived step, so a caller with no grant learns nothing about archive
+/// state. It answers the reason to refuse with, or `None` to go on.
 pub(super) fn verdict(
     registered: &impl Registered,
     landed: &Landed<'_>,
     access: Access,
     user_id: &str,
+    org: impl FnOnce() -> Option<Reason>,
 ) -> Verdict {
     if !is_member(registered, landed, user_id) {
         return Verdict::Refuse(Reason::NotMember);
+    }
+    if !is_private(landed) {
+        if let Some(reason) = org() {
+            return Verdict::Refuse(reason);
+        }
     }
     if landed.archived && access == Access::Write {
         return Verdict::Refuse(Reason::Archived);
@@ -117,12 +131,16 @@ pub(super) fn verdict(
 /// path, and nothing in this estate folds it.
 fn is_member(registered: &impl Registered, landed: &Landed<'_>, user_id: &str) -> bool {
     let owns = |owner: &str| !owner.is_empty() && owner == user_id;
-    let private = landed.private || is_private_class(landed.path);
-    (!private || owns(landed.owner))
+    (!is_private(landed) || owns(landed.owner))
         && registered
             .private_owners_beneath(landed.path)
             .into_iter()
             .all(owns)
+}
+
+/// Whether the landed row is private: by the row's class or the spelling's.
+fn is_private(landed: &Landed<'_>) -> bool {
+    landed.private || is_private_class(landed.path)
 }
 
 /// The private spellings of one load with their rows' owners, sorted by

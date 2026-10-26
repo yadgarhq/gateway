@@ -219,7 +219,7 @@ fn sorted(paths: &[String]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn tools_list_advertises_the_five_task_tools() {
+async fn tools_list_advertises_the_five_task_tools_and_list_projects() {
     let (status, body) = rpc("tools/list", Some(1)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut names: Vec<&str> = body["result"]["tools"]
@@ -235,6 +235,7 @@ async fn tools_list_advertises_the_five_task_tools() {
             "create_task",
             "edit_task",
             "find_tasks",
+            "list_projects",
             "read_task",
             "transition_task"
         ]
@@ -697,6 +698,142 @@ async fn a_body_cut_off_before_its_digest_never_reaches_task() {
             json!({ "id": "yadgar:task:x", "expect_version": 5, "title": "t",
                     "expect_body_sha256": EMPTY_SHA256 }),
             NO_BODY,
+        ),
+    ] {
+        let (state, seen) = gateway().await;
+        let (status, body) = call(state, "edit_task", args.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{args}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{args}: {body}");
+        assert_eq!(
+            body["result"]["content"][0]["text"], refusal,
+            "{args}: {body}"
+        );
+        assert_eq!(seen.hits.load(Ordering::SeqCst), 0, "{args}");
+    }
+}
+
+// ---- yaadgaar #399: patch mode (ADR-1008) --------------------------------
+
+/// A patch reaches `task` as the message, with `patch` named in the mask and
+/// NO `body` path: `task` computes the result, and a `task` older than the
+/// field refuses the `patch` path rather than writing a body.
+///
+/// The digest is FORWARDED UNCHECKED here: in patch mode it is over the
+/// pre-edit body, which only `task` reads. So a digest of a body this gateway
+/// never saw reaches `task` as its 32 bytes.
+#[tokio::test]
+async fn a_patch_reaches_task_as_a_patch_with_its_digest_unchecked() {
+    let (state, seen) = gateway().await;
+
+    let (status, body) = call(
+        state,
+        "edit_task",
+        json!({
+            "id": "yadgar:task:sentinel-patch",
+            "expect_version": 5,
+            "patch": { "old": "ledger", "new": "یادگار", "expect_count": 3 },
+            "expect_body_sha256": WHOLE_BODY_SHA256,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let edits = seen.edits.lock().unwrap();
+    let patch = edits[0].patch.clone().expect("the patch is forwarded");
+    assert_eq!(patch.old, "ledger");
+    assert_eq!(patch.new, "یادگار");
+    assert_eq!(patch.expect_count, 3);
+    assert_eq!(edits[0].body, "");
+    assert_eq!(
+        edits[0].update_mask.clone().unwrap().paths,
+        ["patch".to_string()]
+    );
+    // All 32 bytes, from the literal: a decoder that got any byte wrong fails.
+    let expected: Vec<u8> = (0..64)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&WHOLE_BODY_SHA256[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(edits[0].expect_body_sha256, expected);
+}
+
+/// A patch with a title names both, in the mask's usual order.
+#[tokio::test]
+async fn a_patch_with_a_title_names_both_in_the_mask() {
+    let (state, seen) = gateway().await;
+    let (_, body) = call(
+        state,
+        "edit_task",
+        json!({
+            "number": 7,
+            "expect_version": 5,
+            "title": "t",
+            "patch": { "old": "a", "new": "", "expect_count": 1 },
+        }),
+    )
+    .await;
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let edits = seen.edits.lock().unwrap();
+    assert_eq!(
+        sorted(&edits[0].update_mask.clone().unwrap().paths),
+        ["patch", "title"]
+    );
+}
+
+/// Shapes the gateway can refuse without `task`: `patch` with `body`, a
+/// patch missing a field or carrying the wrong type, and an `expect_count`
+/// outside 1..=u32::MAX. Size, emptiness of `old` and the count itself are
+/// `task`'s rules (ADR-1008: one place), so they are not checked here.
+#[tokio::test]
+async fn a_malformed_patch_never_reaches_task() {
+    const EXCLUSIVE: &str = "send `body` or `patch`, not both";
+    for (args, refusal) in [
+        (
+            json!({ "id": "x", "expect_version": 5, "body": "b",
+                    "patch": { "old": "a", "new": "b", "expect_count": 1 } }),
+            EXCLUSIVE,
+        ),
+        (
+            json!({ "id": "x", "expect_version": 5, "patch": "a->b" }),
+            "`patch` must be an object with `old`, `new` and `expect_count`",
+        ),
+        (
+            json!({ "id": "x", "expect_version": 5,
+                    "patch": { "new": "b", "expect_count": 1 } }),
+            "`patch.old` is required",
+        ),
+        (
+            json!({ "id": "x", "expect_version": 5,
+                    "patch": { "old": "a", "expect_count": 1 } }),
+            "`patch.new` is required",
+        ),
+        (
+            json!({ "id": "x", "expect_version": 5,
+                    "patch": { "old": 1, "new": "b", "expect_count": 1 } }),
+            "`patch.old` must be a string",
+        ),
+        (
+            json!({ "id": "x", "expect_version": 5,
+                    "patch": { "old": "a", "new": "b" } }),
+            "`patch.expect_count` must be an integer from 1 to 4294967295",
+        ),
+        (
+            json!({ "id": "x", "expect_version": 5,
+                    "patch": { "old": "a", "new": "b", "expect_count": 0 } }),
+            "`patch.expect_count` must be an integer from 1 to 4294967295",
+        ),
+        (
+            json!({ "id": "x", "expect_version": 5,
+                    "patch": { "old": "a", "new": "b", "expect_count": 4294967296u64 } }),
+            "`patch.expect_count` must be an integer from 1 to 4294967295",
+        ),
+        // A key the schema does not declare (`additionalProperties: false`):
+        // a misspelt `expect_count` must not be read as absent and silently
+        // replaced by another field's error, nor ignored.
+        (
+            json!({ "id": "x", "expect_version": 5,
+                    "patch": { "old": "a", "new": "b", "expect_count": 1, "regex": true } }),
+            "`patch` takes only `old`, `new` and `expect_count`, not `regex`",
         ),
     ] {
         let (state, seen) = gateway().await;

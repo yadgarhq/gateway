@@ -49,7 +49,7 @@ pub struct Stamp(Option<AsciiMetadataValue>);
 
 impl Stamp {
     /// **AN ID THAT CANNOT BE A HEADER IS DROPPED, NOT AN ERROR.** Telemetry
-    /// never fails a call (D25). The gateway mints every id as a UUIDv7, which
+    /// never fails a call (D67). The gateway mints every id as a UUIDv7, which
     /// is always a valid header value, so this arm is unreachable from
     /// [`crate::request_id`] and exists so that no other input can fail a call.
     fn new(request_id: &str) -> Self {

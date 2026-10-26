@@ -25,18 +25,17 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use tonic::transport::Channel;
 use yadgar_telemetry::observe::{Call, Outcome};
 use yadgar_telemetry::pb::yadgar::telemetry::v1::Kind;
 
-use crate::admin::{Authority, Bootstrap, BootstrapToken, Verb};
+use crate::admin::{Ask, Authority, Bootstrap, BootstrapToken, Verb};
 use crate::attest::{self, Attestation, Claimed, Credentials};
 use crate::limit::{Bucket, Decision, Limiter};
 use crate::mcp::{self, codes, headers, meta_keys};
 use crate::pb::yadgar::common::v1::Idempotency;
 use crate::pb::yadgar::iam::v1::{
     iam_service_client::IamServiceClient, CreateUserRequest, IssueEnrolmentRequest, LoginRequest,
-    RedeemEnrolmentRequest, SetUserAdminRequest,
+    RedeemEnrolmentRequest,
 };
 use crate::source::{PeerAddr, Source, TrustBoundary};
 use crate::tools;
@@ -48,6 +47,7 @@ mod authority;
 mod call;
 mod dispatch;
 mod gate;
+mod listing;
 mod whoami;
 
 pub use answer::{login_status, opaque_status};
@@ -74,7 +74,7 @@ const AUTH_ENROL: &str = "auth/enrol";
 /// same for both and splitting it would halve every count.
 const AUTH_MODULE: &str = "auth";
 
-/// The six administrative endpoints' labels (ADR-0492, D73, ledger 638,
+/// The five administrative endpoints' labels (ADR-0492, D73, ledger 638,
 /// ADR-0945, ADR-0972 (2)).
 ///
 /// PATHS rather than MCP methods, for [`AUTH_LOGIN`]'s reason — that is what they
@@ -87,7 +87,6 @@ const AUTH_MODULE: &str = "auth";
 /// operator watching that budget could not tell the two apart.
 const ADMIN_CREATE_USER: &str = "admin/create-user";
 const ADMIN_ISSUE_ENROLMENT: &str = "admin/issue-enrolment";
-const ADMIN_SET_USER_ADMIN: &str = "admin/set-user-admin";
 const ADMIN_REVOKE_CREDENTIALS: &str = "admin/revoke-credentials";
 const ADMIN_LIST_CREDENTIALS: &str = "admin/list-credentials";
 const ADMIN_REVOKE_CREDENTIAL: &str = "admin/revoke-credential";
@@ -181,7 +180,7 @@ pub struct AppState {
     /// caller wrote. A second channel for the resolving half would have been a
     /// second address for one service, which is the confusion the deleted
     /// `YADGAR_IAM_ADDR` was.
-    pub iam: Channel,
+    pub iam: crate::upstream::IamUpstream,
     /// What `iam` last said about each token this replica has seen (D72,
     /// ADR-0491). Held here for the same reason the limiter is: it is process
     /// state, and one built per request would cache nothing.
@@ -216,6 +215,9 @@ pub struct AppState {
     /// the bootstrap path and NOTHING else — see the type for why that is
     /// serve-and-disable rather than ADR-0569's refuse-to-start.
     pub bootstrap: BootstrapToken,
+    /// The fail-closed switch on the pre-minted `create-user` arm, from
+    /// `adminBootstrap.refusePreMintedUserId`. See [`crate::admin::PreMintedIds`].
+    pub pre_minted_ids: crate::admin::PreMintedIds,
     /// How often a client should re-poll `tools/list` for a changed catalogue,
     /// resolved from `gateway.yaml`'s `toolsPoll.intervalSeconds`
     /// (ADR-0569/0570). Read once at boot and held for the life of the

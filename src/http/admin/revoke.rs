@@ -20,6 +20,7 @@ use super::super::dispatch::*;
 use super::super::gate::*;
 use super::super::*;
 use crate::pb::yadgar::iam::v1::RevokeAllCredentialsRequest;
+use crate::upstream::CallError;
 
 /// The canonical-id check, shared with the project membership check
 /// (ADR-0954), which reads the same spelling to derive an account segment.
@@ -75,14 +76,13 @@ pub(in crate::http) async fn admin_revoke_credentials(
         tel(request_id.clone()),
     );
 
-    // AUTHORISE BEFORE THE BODY IS READ. The request carries no flag, so
-    // `wants_admin` is `false`, and `accepts_bootstrap` refuses this verb on
-    // either value.
+    // AUTHORISE BEFORE THE BODY IS READ. The request names no pre-minted id,
+    // and `accepts_bootstrap` refuses this verb whatever the `Ask`.
     let authority = match authorise(
         &state,
         ADMIN_REVOKE_CREDENTIALS,
         Verb::RevokeCredentials,
-        false,
+        Ask::plain(),
         &headers,
         request_id.clone(),
     )
@@ -107,8 +107,7 @@ pub(in crate::http) async fn admin_revoke_credentials(
     };
 
     // THE SELF-TARGET REFUSAL, exact because `target` admitted only the
-    // canonical spelling. It keeps a structural last-administrator guard, as
-    // `is_self_demotion` does for `SetUserAdmin`.
+    // canonical spelling. It keeps a structural last-administrator guard.
     if authority == Authority::Administrator(user_id.clone()) {
         call.fail("PERMISSION_DENIED");
         return text(
@@ -118,22 +117,25 @@ pub(in crate::http) async fn admin_revoke_credentials(
     }
 
     let mut client = IamServiceClient::new(crate::upstream::request_id::carrying(
-        state.iam.clone(),
+        state.iam.channel(),
         &request_id,
     ));
-    let rpc = client.revoke_all_credentials(RevokeAllCredentialsRequest {
+    let request = RevokeAllCredentialsRequest {
         idempotency: Some(Idempotency {
             key: crate::idempotency_key(),
         }),
         user_id: user_id.clone(),
         unverified_actor: authority.actor(),
-    });
-    let resp = match tokio::time::timeout(AUTH_DEADLINE, rpc).await {
-        Ok(Ok(r)) => r.into_inner(),
+    };
+    let resp = match state
+        .iam_rpc(request, |r| client.revoke_all_credentials(r))
+        .await
+    {
+        Ok(r) => r.into_inner(),
         // NOT_FOUND IS 404 HERE AND ONLY HERE (ADR-0945): `iam-db` holds no
         // `iam_user` row for this id. `admin_failure` keeps answering 503 for
         // the other routes.
-        Ok(Err(e)) if e.code() == tonic::Code::NotFound => {
+        Err(CallError::Answered(e)) if e.code() == tonic::Code::NotFound => {
             tracing::warn!(
                 endpoint = ADMIN_REVOKE_CREDENTIALS,
                 "revoke-credentials named no user"
@@ -141,8 +143,8 @@ pub(in crate::http) async fn admin_revoke_credentials(
             call.fail("NOT_FOUND");
             return text(StatusCode::NOT_FOUND, r#"{"error":"no such user"}"#);
         }
-        Ok(Err(e)) => return admin_failure(call, ADMIN_REVOKE_CREDENTIALS, e),
-        Err(_elapsed) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIALS),
+        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_REVOKE_CREDENTIALS, e),
+        Err(CallError::Expired) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIALS),
     };
 
     // `revoked` counts the rows THIS delivery changed (iam.proto): a retry may

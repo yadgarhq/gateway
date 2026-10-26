@@ -1,16 +1,21 @@
 use super::*;
 use crate::pb::yadgar::taskapi::v1::FindTasksResponse;
+use std::time::Duration;
 
 /// The tool set, WRITTEN OUT HERE and never derived from the code under
 /// test. A test that read `SERVED` to check `SERVED` would agree with any
 /// value it was given, including one an administrative verb had been added
 /// to — which is the whole failure ADR-0492 is defended against.
-const EXPECTED: [&str; 5] = [
+///
+/// `list_projects` is team access stage 8's deliberate addition (ADR-0963
+/// (8)): a read of the caller's own reach, not an administrative verb.
+const EXPECTED: [&str; 6] = [
     "create_task",
     "read_task",
     "find_tasks",
     "edit_task",
     "transition_task",
+    "list_projects",
 ];
 
 fn sorted(names: &[&str]) -> Vec<String> {
@@ -20,7 +25,7 @@ fn sorted(names: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn the_served_set_is_exactly_the_five_task_tools() {
+fn the_served_set_is_exactly_the_five_task_tools_and_list_projects() {
     // DIRECTION 1, AND THE GATE THE OTHER THREE REST ON. `label_for`,
     // `module_for`, `definitions` and `call` all consult `SERVED` before
     // they do anything else, so this is the one place a fourth tool can be
@@ -876,4 +881,129 @@ fn the_edit_and_transition_schemas_take_an_id_or_a_number() {
         transition["inputSchema"]["properties"]["number"]["minimum"],
         1
     );
+}
+
+/// Patch mode on the catalogue (ADR-1008): an object of three required
+/// fields, and a description that says the match is literal and counted.
+#[test]
+fn the_edit_schema_offers_a_literal_patch() {
+    let all = definitions();
+    let edit = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "edit_task")
+        .cloned()
+        .unwrap();
+    let patch = &edit["inputSchema"]["properties"]["patch"];
+    assert_eq!(patch["type"], "object");
+    assert_eq!(patch["required"], json!(["old", "new", "expect_count"]));
+    assert_eq!(patch["properties"]["old"]["minLength"], 1);
+    assert_eq!(patch["properties"]["expect_count"]["minimum"], 1);
+    assert_eq!(patch["additionalProperties"], false);
+    let digest = edit["inputSchema"]["properties"]["expect_body_sha256"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        digest.contains("pre-edit"),
+        "patch mode missing from: {digest}"
+    );
+    let text = edit["description"].as_str().unwrap();
+    for needle in ["patch", "literal", "expect_count", "pre-edit"] {
+        assert!(text.contains(needle), "{needle:?} missing from: {text}");
+    }
+}
+
+/// THE DESCRIPTION CAP, as a FLOOR for older clients. Claude Code 2.1.84
+/// began cutting an MCP tool description at 2048 characters; 2.1.280 added
+/// the `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` override; 2.1.295 allows 16384
+/// for descriptions loaded through tool search; 2.1.296 raised the default to
+/// 4096. A description within 2048 reaches every one of those clients whole.
+/// Counted in UTF-16 code units, the unit a JavaScript client's length
+/// measures. The cap is spelled as a literal here, not read from the code
+/// under test.
+#[test]
+fn every_tool_description_fits_the_client_cap() {
+    for tool in definitions().as_array().unwrap() {
+        let text = tool["description"].as_str().unwrap();
+        let n = text.encode_utf16().count();
+        assert!(n <= 2048, "{}: {n} UTF-16 code units", tool["name"]);
+    }
+}
+
+/// ADR-1019 on the `task` path: every task RPC STATES its deadline.
+///
+/// The deadline is the chart's `task.requestTimeoutSeconds` (here `BOUND`),
+/// built once at the top of [`call`], and each RPC is sent with
+/// `grpc-timeout` = that deadline's remaining time less
+/// [`yadgar_dial::DEADLINE_MARGIN`]. Without the header `task` would be bounded
+/// only by its own ceilings and would keep working on a call this gateway had
+/// already answered.
+///
+/// A real HTTP/2 server that never answers, unlike `tests/task_deadline.rs`'s
+/// silent socket: that one never completes the handshake, so no header is ever
+/// sent to be read. The answer is the one #361's wrapper gave: the
+/// `DEADLINE_EXCEEDED` upstream error, in the gateway's own words.
+#[tokio::test]
+async fn every_task_rpc_states_its_deadline_and_answers_its_timeout() {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::upstream::hang;
+
+    const BOUND: Duration = Duration::from_secs(1);
+    for (name, rpc, args) in [
+        ("create_task", "CreateTask", json!({ "title": "t" })),
+        ("read_task", "ReadTask", json!({ "number": 1 })),
+        ("find_tasks", "FindTasks", json!({})),
+        (
+            "edit_task",
+            "EditTask",
+            json!({ "id": "yadgar:task:x", "expect_version": 1, "title": "t" }),
+        ),
+        (
+            "transition_task",
+            "TransitionTask",
+            json!({ "id": "yadgar:task:x", "expect_version": 1, "to": "done" }),
+        ),
+    ] {
+        let seen = Arc::new(hang::Seen::default());
+        let task = TaskUpstream::new(hang::serve(hang::Task(Arc::clone(&seen))).await, BOUND);
+        let started = Instant::now();
+        let outcome = call(&task, Scope::default(), name, &args).await;
+        let took = started.elapsed();
+        assert!(
+            took < BOUND + Duration::from_millis(500),
+            "{name} took {took:?}"
+        );
+        match outcome {
+            Err(ToolError::Upstream(s)) => {
+                assert_eq!(s.code(), tonic::Code::DeadlineExceeded, "{name}: {s}");
+                assert_eq!(
+                    s.message(),
+                    "task did not answer within 1s",
+                    "{name}: the gateway's own words for its own timeout"
+                );
+            }
+            Err(e) => panic!("{name}: expected an upstream deadline, got {e:?}"),
+            Ok(_) => panic!("{name} cannot succeed against a task that never answers"),
+        }
+        let arrivals = seen.arrivals();
+        assert_eq!(
+            arrivals.iter().map(|a| a.path.as_str()).collect::<Vec<_>>(),
+            [format!("/yadgar.taskapi.v1.TaskService/{rpc}")],
+            "{name}: exactly one RPC reaches task"
+        );
+        let stated = arrivals[0]
+            .timeout
+            .unwrap_or_else(|| panic!("{name} must carry grpc-timeout (ADR-1019)"));
+        assert!(
+            stated <= BOUND - yadgar_dial::DEADLINE_MARGIN,
+            "{name} stated {stated:?}"
+        );
+        assert!(
+            stated >= BOUND - Duration::from_millis(500),
+            "{name} stated {stated:?}, far below its {BOUND:?} deadline"
+        );
+    }
 }

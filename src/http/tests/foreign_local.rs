@@ -24,6 +24,7 @@ fn state() -> std::sync::Arc<crate::http::AppState> {
         status: ProjectStatus::Active as i32,
         aliases: Vec::new(),
         owner_user_id: ALICE.to_string(),
+        grants: Vec::new(),
     }];
     let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
     std::sync::Arc::get_mut(&mut state)
@@ -31,7 +32,10 @@ fn state() -> std::sync::Arc<crate::http::AppState> {
         .projects = std::sync::Arc::new(Validator::new(
         Registry::loaded_from(rows),
         Mode::Enforcing,
-        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        crate::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
     ));
     state
 }

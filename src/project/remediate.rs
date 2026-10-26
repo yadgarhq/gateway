@@ -37,13 +37,12 @@
 //! is made, for every string field of the answer, and its own comment says why it
 //! is one place.
 
-use tonic::transport::Channel;
-
 use crate::pb::yadgar::project::v1::{
     project_service_client::ProjectServiceClient, ProjectServiceResolveProjectRequest,
 };
+use crate::upstream::CallError;
 
-use super::{Denied, Reason, Refusal};
+use super::{Denied, OrgGrants, Reason, Refusal};
 
 /// How long the fallback may take before the refusal is answered without it.
 ///
@@ -51,11 +50,16 @@ use super::{Denied, Reason, Refusal};
 /// runs while a caller waits for a 400 it is going to get either way, so a
 /// stalled `project` must cost one bounded wait rather than hold the answer
 /// open.
-const FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
+pub(super) const FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3); // ADR-0569-EXCEPTION(CC): a bound, not a knob — see the module's own argument.
 
 /// The answer for one classified refusal, dialling the fallback where the
 /// remediation needs data the loaded set does not hold.
-pub(super) async fn compose(project: &Channel, refusal: Refusal, request_id: &str) -> Denied {
+pub(super) async fn compose(
+    project: &crate::upstream::ProjectUpstream,
+    refusal: Refusal,
+    request_id: &str,
+    org_grants: OrgGrants,
+) -> Denied {
     let Some(anchor) = refusal.anchor.as_deref() else {
         // EVERY OTHER CLASS IS COMPOSED FROM THE REASON ALONE, so nothing is
         // dialled for it. A grammar failure, an unregistered private path and an
@@ -63,7 +67,7 @@ pub(super) async fn compose(project: &Channel, refusal: Refusal, request_id: &st
         // anything.
         return Denied {
             reason: refusal.reason,
-            prose: sentence(refusal.reason, None, None),
+            prose: sentence(refusal.reason, None, None, org_grants),
         };
     };
 
@@ -77,7 +81,42 @@ pub(super) async fn compose(project: &Channel, refusal: Refusal, request_id: &st
             // reached: the classification was already made from the loaded set.
             Some(resolved.path.as_deref().unwrap_or(anchor)),
             resolved.source_repo.as_deref(),
+            org_grants,
         ),
+    }
+}
+
+/// The [`Reason::NotMember`] sentence, by the `orgGrants` knob.
+///
+/// **UNDER `counting` IT IS THE SENTENCE THIS GATEWAY ANSWERED BEFORE TEAM
+/// GRANTS, BYTE FOR BYTE**, because under `counting` no org row is refused
+/// for a grant and every `PROJECT_NOT_MEMBER` is one the private rule made
+/// (ADR-0952): the shipped value changes no answer
+/// (`http::tests::org_grants_off`). It names neither the claim, the owner nor
+/// which shape it was.
+///
+/// **UNDER `enforcing` ONE SENTENCE ANSWERS EVERY SHAPE**: a personal project
+/// the caller does not own, a project with another account's personal project
+/// beneath it, and an organisation project none of the caller's teams is
+/// granted (ADR-0962). Byte-identical across all of them on purpose (team
+/// access red 2), so a non-member learns nothing about which shape it met or
+/// about the row's archive state (ADR-0963 (2)).
+fn not_member(org_grants: OrgGrants) -> &'static str {
+    match org_grants {
+        OrgGrants::Counting => {
+            "this call would reach a personal project that belongs to another account. A \
+             personal project, and everything beneath it, is reachable only by the account \
+             that registered it. Use your own local/<your-user-uuid>/... project, where \
+             <your-user-uuid> is your user id without its yadgar:user: prefix (ADR-0954)."
+        }
+        OrgGrants::Enforcing => {
+            "this call would reach a project your account may not reach. A personal project, \
+             and everything beneath it, is reachable only by the account that registered it: \
+             use your own local/<your-user-uuid>/... project, where <your-user-uuid> is your \
+             user id without its yadgar:user: prefix (ADR-0954). An organisation project is \
+             reachable only through a team grant declared in your organisation's GitOps \
+             repository (ADR-0962): ask an administrator."
+        }
     }
 }
 
@@ -136,16 +175,24 @@ fn present(value: String) -> Option<String> {
 /// collation — plus the repository the remediation names. [`Resolved::absent`]
 /// means the tier could not be reached, and the caller above falls back to the
 /// anchor this gateway walked to.
-async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved {
+async fn resolve(
+    project: &crate::upstream::ProjectUpstream,
+    anchor: &str,
+    request_id: &str,
+) -> Resolved {
     let mut client = ProjectServiceClient::new(crate::upstream::request_id::carrying(
-        project.clone(),
+        project.channel(),
         request_id,
     ));
-    let rpc = client.resolve_project(ProjectServiceResolveProjectRequest {
+    let request = ProjectServiceResolveProjectRequest {
         candidate_path: anchor.to_string(),
-    });
-    match tokio::time::timeout(FALLBACK_DEADLINE, rpc).await {
-        Ok(Ok(answer)) => {
+    };
+    // Also SENT, as `grpc-timeout` = FALLBACK_DEADLINE - 50 ms (ADR-1019).
+    match project
+        .within(FALLBACK_DEADLINE, request, |r| client.resolve_project(r))
+        .await
+    {
+        Ok(answer) => {
             let answer = answer.into_inner();
             Resolved {
                 path: present(answer.resolved_path),
@@ -155,7 +202,7 @@ async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved 
         // BOTH FAILURES ARE THE SAME FAILURE HERE, and neither changes the
         // status the caller gets. The reason goes to the log, where an operator
         // can read it; the caller gets the 400 its request had already earned.
-        Ok(Err(e)) => {
+        Err(CallError::Answered(e)) => {
             tracing::warn!(
                 error = %e,
                 "the project registry could not be reached to name the repository this refusal \
@@ -163,7 +210,7 @@ async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved 
             );
             Resolved::absent()
         }
-        Err(_elapsed) => {
+        Err(CallError::Expired) => {
             tracing::warn!(
                 deadline_secs = FALLBACK_DEADLINE.as_secs(),
                 "the project registry did not answer within the fallback deadline; answering the \
@@ -178,7 +225,12 @@ async fn resolve(project: &Channel, anchor: &str, request_id: &str) -> Resolved 
 ///
 /// Pure, and separate from the dial for that reason: both the composed and the
 /// degraded form of every class are then assertable without a server.
-pub(super) fn sentence(reason: Reason, anchor: Option<&str>, source_repo: Option<&str>) -> String {
+pub(super) fn sentence(
+    reason: Reason,
+    anchor: Option<&str>,
+    source_repo: Option<&str>,
+    org_grants: OrgGrants,
+) -> String {
     match reason {
         // THE GRAMMAR, AND NOT THE VALUE. See this module's header.
         Reason::Invalid => "the workspace named in x-yadgar-project is not a project path. A \
@@ -237,14 +289,17 @@ pub(super) fn sentence(reason: Reason, anchor: Option<&str>, source_repo: Option
                              different project, or the archived one reactivated."
             .to_string(),
 
-        // ONE SENTENCE FOR BOTH SHAPES: a personal project the caller does not
-        // own, and a project with another account's personal project beneath
-        // it. It names neither the claim, the owner nor which shape it was.
-        Reason::NotMember => "this call would reach a personal project that belongs to another \
-                              account. A personal project, and everything beneath it, is \
-                              reachable only by the account that registered it. Use your own \
-                              local/<your-user-uuid>/... project, where <your-user-uuid> is \
-                              your user id without its yadgar:user: prefix (ADR-0954)."
+        // ONE SENTENCE FOR EVERY SHAPE, chosen by the `orgGrants` knob; see
+        // [`not_member`].
+        Reason::NotMember => not_member(org_grants).to_string(),
+
+        // THE CALLER'S TEAMS MAY READ THIS PROJECT AND NOT WRITE IT (ADR-0963
+        // (3)). Names neither the claim, the row, nor which team granted what:
+        // the declaration is in GitOps, and that is where a change is made.
+        Reason::ReadOnly => "your teams hold a read grant on this project and no read-write \
+                             grant, so this call, which writes, is refused. Reads still \
+                             answer. Team grants are declared in your organisation's GitOps \
+                             repository (ADR-0962); ask an administrator for a read-write grant."
             .to_string(),
 
         // NOT ABOUT THE CALLER AT ALL (ADR-0674), and the sentence says so

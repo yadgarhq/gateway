@@ -1,31 +1,32 @@
 //! The administrative surface's decisions, apart from its plumbing (ADR-0492,
 //! D73, ledger 638).
 //!
-//! `http.rs` owns the six handlers — the routes, the bodies, the upstream
+//! `http.rs` owns the five handlers — the routes, the bodies, the upstream
 //! calls. **This module owns everything about them that can be got wrong without
 //! failing**, because every one of those decisions is a per-handler function call
 //! in a language whose compiler cannot notice one is missing. Put here, each is a
 //! total function over its inputs and each has a test that watches it refuse.
 //!
-//! Four decisions live here:
+//! Three decisions live here:
 //!
 //! 1. **[`BootstrapToken`]** — whether the shared secret this deployment holds
 //!    accepts a presented one, INCLUDING the two ways that question is not a
 //!    comparison at all (see the type).
 //! 2. **[`Verb::accepts_bootstrap`]** — which verbs the bootstrap token reaches,
-//!    under which condition. ADR-0492 grants it `CreateUser` and the promotion
-//!    half of `SetUserAdmin`; ADR-0655, as amended by ADR-0656, admits
-//!    `IssueEnrolment` too, narrowed by a zero-credential predicate enforced
-//!    inside `iam-db`'s write rather than here. `iam.proto:687-688` states the
-//!    two-verb half of this from `iam`'s side: "create an admin, or promote
-//!    one … IT IS CHECKED AT THE GATEWAY" — that sentence predates ADR-0655 and
-//!    is a `proto` repo carrier of the same stale claim, tracked separately.
-//!    ADR-0945's `RevokeCredentials` is never admitted, on any value, and
+//!    under which condition. Since team access stage 10 it reaches two: the
+//!    `user_id` arm of `CreateUser` (the declared first administrator, flow F2,
+//!    ADR-0963 (5), ADR-1011), narrowed by `iam-db`'s bootstrap create-user
+//!    predicate, and `IssueEnrolment` (ADR-0655 as amended by ADR-0656, and
+//!    ADR-0966's break-glass arm), narrowed by the enrolment predicate. Both
+//!    predicates are enforced inside `iam-db`'s write rather than here. Stage
+//!    10 retired ADR-0492's `is_admin: true` arm and `SetUserAdmin` with its
+//!    route: admin is membership of the declared `administrators` team
+//!    (ADR-0962). `iam.proto:885-890` still says "create an admin, or promote
+//!    one … IT IS CHECKED AT THE GATEWAY"; that sentence is stale and lives in
+//!    the `proto` repo. ADR-0945's `RevokeCredentials` is never admitted, and
 //!    neither are ADR-0972 (2)'s `ListCredentials` and `RevokeCredential`.
 //! 3. **[`Authority::actor`]** — what ADR-0534's relay carries, and on which path
 //!    it carries nothing.
-//! 4. **[`is_self_demotion`]** — D73's exclusion, which `iam.proto:664` defers to
-//!    the gateway by name because it "is a rule about who may call this".
 //!
 //! **None of these reads `unverified_actor`** (ADR-0534 forbids authorising on
 //! it) and none of them is reachable from `tools::call`: an administrative verb
@@ -33,26 +34,29 @@
 //! [`crate::tools::SERVED`] and nothing here is dispatched by name.
 
 mod bootstrap;
+mod pre_minted;
 pub use bootstrap::{Bootstrap, BootstrapToken};
+pub use pre_minted::{
+    PreMintedIds, PreMintedIdsError, REFUSE_PRE_MINTED_USER_ID, SWITCHED_OFF_BODY,
+};
 
 use crate::pb::yadgar::common::v1::UnverifiedActor;
 
 /// Every time this deployment's bootstrap token was ACCEPTED — every time a
-/// stranger holding a shared secret became, promoted, or ENROLLED an
-/// administrator.
+/// stranger holding a shared secret created or ENROLLED an administrator.
 ///
-/// **ALL THREE VERBS, AND ADR-0655'S THIRD ONE NEEDS NO NEW METRIC.** The
+/// **EVERY ADMITTED VERB, AND ADR-0655'S ENROLMENT NEEDED NO NEW METRIC.** The
 /// counter is incremented at the `Bootstrap::Accepted` arm, which every admitted
 /// bootstrap request crosses — so admitting `IssueEnrolment` extends this series'
 /// meaning for free and `deploy`'s `BootstrapTokenAccepted` rule keeps firing on
-/// the first acceptance of any of the three. That is stated here rather than
-/// assumed, because the closed-set reasoning below enumerates the verbs and a
-/// third one appearing silently would make that enumeration wrong. (`iam-db`'s
+/// the first acceptance of either. That is stated here rather than assumed,
+/// because the closed-set reasoning below enumerates the verbs and one
+/// appearing silently would make that enumeration wrong. Team access stage 10
+/// retired `SetUserAdmin`, the third verb this counter once counted. (`iam-db`'s
 /// per-conjunct refusal counter under ADR-0655 is a DIFFERENT signal — refusals,
 /// not acceptances — and replaces nothing here.) ADR-0945's `RevokeCredentials`
-/// is the fourth verb and never reaches this counter; ADR-0972 (2)'s
-/// `ListCredentials` and `RevokeCredential` are the fifth and sixth, and never
-/// reach it either.
+/// never reaches this counter; ADR-0972 (2)'s `ListCredentials` and
+/// `RevokeCredential` never reach it either.
 ///
 /// # Why a metric exists for something a log line already says
 ///
@@ -76,11 +80,11 @@ use crate::pb::yadgar::common::v1::UnverifiedActor;
 ///
 /// D67 forbids a label a caller can influence, which rules out the token, the
 /// presented value and anything derived from either. It does not rule out
-/// `verb`, whose only three reachable values here are closed by [`Verb`] —
-/// `CreateUser`, `SetUserAdmin`, `IssueEnrolment` (not `RevokeCredentials`,
+/// `verb`, whose only two reachable values here are closed by [`Verb`] —
+/// `CreateUser` and `IssueEnrolment` (not `RevokeCredentials`,
 /// `ListCredentials` or `RevokeCredential`). That label
 /// is omitted anyway, because **it would not change what the operator does**:
-/// any of the three sends them to enumerate the administrators `iam` holds and to
+/// either sends them to enumerate the administrators `iam` holds and to
 /// rotate the Secret, and the split buys a dashboard nobody has. The scrape
 /// already attaches `pod` and `namespace`, which is what an operator needs to
 /// reach the log line while that pod still lives.
@@ -98,17 +102,19 @@ use crate::pb::yadgar::common::v1::UnverifiedActor;
 /// what decides the shape of `deploy`'s alerting rule.
 pub const ACCEPTED: &str = "yadgar_gateway_bootstrap_accepted_total";
 
-/// The six administrative verbs `/admin` serves.
+/// The five administrative verbs `/admin` serves.
 ///
 /// **A CLOSED ENUM RATHER THAN A STRING**, for `tools::SERVED`'s reason one
 /// module over: the set has to be stated once so that widening it is an edit to
 /// the set rather than an arm added somewhere nobody is looking. Every rule below
-/// matches on it exhaustively, so a seventh verb does not compile until each rule
+/// matches on it exhaustively, so a sixth verb does not compile until each rule
 /// has said what it means for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
-    /// `iam.CreateUser`. The FIRST admin verb, and the one the bootstrap token
-    /// reaches when — and only when — the user being created is an admin.
+    /// `iam.CreateUser`. The FIRST admin verb. The bootstrap token reaches it
+    /// on one arm since team access stage 10: the GitOps-declared first
+    /// administrator by a pre-minted id (flow F2, ADR-0963 (5), ADR-1011). See
+    /// [`Verb::accepts_bootstrap`].
     CreateUser,
     /// `iam.IssueEnrolment`. Mints the blob a person redeems at `/auth/enrol`.
     /// **The bootstrap token reaches it under ADR-0655's zero-credential
@@ -116,9 +122,6 @@ pub enum Verb {
     /// predicate is enforced inside `iam-db`'s write, not here. See
     /// [`Verb::accepts_bootstrap`]'s doc comment for the argument.
     IssueEnrolment,
-    /// `iam.SetUserAdmin`. Promote or demote. The bootstrap token reaches the
-    /// promotion half only.
-    SetUserAdmin,
     /// `iam.RevokeAllCredentials` (ADR-0945). Never the bootstrap token.
     RevokeCredentials,
     /// `iam.ListCredentials` (ADR-0972 (2)). Never the bootstrap token.
@@ -128,12 +131,45 @@ pub enum Verb {
     RevokeCredential,
 }
 
+/// What one administrative request asks for, as far as the bootstrap rule
+/// needs to know: the request field [`Verb::accepts_bootstrap`] reads.
+///
+/// A named struct rather than a bare `bool`, so a call site says what it
+/// passes. Team access stage 10 removed its other field, `wants_admin`, with
+/// the `is_admin` arm it served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ask {
+    /// Whether a `create-user` body carries a `user_id` (team access stage 3b).
+    /// Presence only: the gateway does not judge the value (ADR-0927).
+    pub pre_minted_id: bool,
+}
+
+impl Ask {
+    /// A request that names no pre-minted id: every verb except `create-user`,
+    /// and a `create-user` body without `user_id`.
+    pub fn plain() -> Self {
+        Self::default()
+    }
+}
+
 impl Verb {
     /// Whether the BOOTSTRAP TOKEN authorises this request.
     ///
-    /// `wants_admin` is the request's own `is_admin` field — the value being
-    /// SET, not a fact about the caller. It is a parameter rather than a lookup
-    /// because the rule is about the request and not about the deployment.
+    /// `ask` carries the request's own fields, not facts about the caller. It
+    /// is a parameter rather than a lookup because the rule is about the
+    /// request and not about the deployment.
+    ///
+    /// # The pre-minted `create-user` arm (team access stages 3b and 10)
+    ///
+    /// `CreateUser` with a `user_id` is admitted: it is how the bootstrap token
+    /// creates the first administrator that GitOps names (flow F2, ADR-0963
+    /// (5), ADR-1011). This is NOT a grant of ordinary accounts, because the
+    /// narrowing is `iam-db`'s bootstrap create-user predicate inside the
+    /// insert: the id must be declared pending in `administrators`, and no
+    /// administrator may exist yet (plans/team-access.md §6). Since stage 10 it
+    /// is the ONLY `create-user` arm: ADR-0492's `is_admin: true` arm is
+    /// retired, and a body carrying `is_admin` at all is refused 400 by the
+    /// handler's shape check before this rule is asked.
     ///
     /// # The narrowest correct rule, and why nothing looser will do
     ///
@@ -142,7 +178,7 @@ impl Verb {
     /// ADR-0492's. Anything looser hands an unattributable credential the ability
     /// to create ORDINARY accounts — a power ADR-0492 never granted it, and one
     /// that would survive every happy-path test in the suite because the happy
-    /// path always sets `is_admin: true`.
+    /// path always sends a `user_id`.
     ///
     /// `iam.proto:739-741` states the same exclusion from the other direction for
     /// a verb this surface does not even serve: "Extending the bootstrap path
@@ -162,8 +198,7 @@ impl Verb {
     /// It is circular, and the circle closes on the FIRST administrator only: an
     /// enrolment is issued only to an attested administrator; an attested
     /// administrator needs a credential; a credential is minted only by
-    /// redeeming an enrolment. `SetUserAdmin` is not a way round — promoting
-    /// needs an existing ENROLLED user, and on a fresh deployment there is none.
+    /// redeeming an enrolment.
     ///
     /// ADR-0655 (amending ADR-0492), as amended by ADR-0656, admits the token to
     /// this verb and answers the takeover argument with a PREDICATE rather than
@@ -172,6 +207,13 @@ impl Verb {
     /// LIVENESS, revoked rows included. Such a user is one this token itself
     /// just made, and a row is never deleted (only tombstoned per D26), so once
     /// a user has ever held a credential they are permanently outside the grant.
+    ///
+    /// **WITH `IAM_ADMIN_FROM_TEAM` ON, THE PREDICATE IS ADR-0966's** (team
+    /// access §6): the target is a live user with a member row of the declared
+    /// `administrators` team, whatever credentials it holds. That is the
+    /// break-glass arm, and the bootstrap caller may then also set the revoke
+    /// instruction (ADR-1014). This function does not know iam's setting and
+    /// does not need to: it admits the verb, and `iam-db` decides.
     ///
     /// **THE PREDICATE IS NOT ENFORCED HERE AND CANNOT BE.** It is evaluated
     /// INSIDE THE WRITE at `iam-db`, in the same transaction as the enrolment
@@ -183,25 +225,18 @@ impl Verb {
     /// to SET the demand — a flipped arm with an unset demand is the false green
     /// the whole design exists to refuse, because proto3 reads the absent bool
     /// as `false` and `iam-db` then takes the ordinary unrestricted path.
-    pub fn accepts_bootstrap(self, wants_admin: bool) -> bool {
+    pub fn accepts_bootstrap(self, ask: Ask) -> bool {
         match self {
-            // ONLY WITH THE FLAG SET. `false` here is an ordinary account, which
-            // is the power that was never granted.
-            Verb::CreateUser => wants_admin,
-            // ONLY THE PROMOTION HALF. A bootstrap token that could set the flag
-            // to `false` could remove every administrator in the deployment —
-            // the exact denial-of-service an unattributable credential must not
-            // be able to cause.
-            Verb::SetUserAdmin => wants_admin,
-            // **UNCONDITIONALLY, AND `wants_admin` IS DELIBERATELY IGNORED.**
-            // `wants_admin` is the request's own `is_admin` field and AN
-            // ENROLMENT REQUEST HAS NO SUCH FIELD — `admin_issue_enrolment`
-            // passes `false` because there is no value being set, not because it
-            // is asking for something lesser. So `Verb::IssueEnrolment =>
-            // wants_admin` would refuse EVERY real enrolment while reading like
-            // a narrowing, and there is no flag here to narrow with anyway. The
-            // narrowing that ADR-0655 actually buys is the zero-credential
-            // predicate at `iam-db`, inside the write; see the doc comment.
+            // THE `user_id` ARM ONLY (stage 10). F2's arm, narrowed by
+            // `iam-db`'s predicate. Without a pre-minted id, `true` here would
+            // be an ordinary account: the power that was never granted.
+            Verb::CreateUser => ask.pre_minted_id,
+            // **UNCONDITIONALLY, AND `ask` IS DELIBERATELY IGNORED.** An
+            // enrolment request names no pre-minted id, so an arm gated on one
+            // would refuse EVERY real enrolment, the break-glass arm of ADR-0966
+            // included. The narrowing that ADR-0655 actually buys is the
+            // enrolment predicate at `iam-db`, inside the write; see the doc
+            // comment.
             Verb::IssueEnrolment => true,
             // NEVER (ADR-0945): a shared secret must not sign anybody out.
             Verb::RevokeCredentials => false,
@@ -217,17 +252,19 @@ impl Verb {
 /// **TWO VARIANTS AND THEY ARE NOT INTERCHANGEABLE.** ADR-0492 rules two
 /// authority mechanisms and "neither works alone"; this type is which of them
 /// admitted THIS request, and every downstream difference — what the relay
-/// carries, whether D73's self-demotion rule can even apply — follows from the
-/// variant rather than from a flag somebody has to remember to read.
+/// carries, whether the self-target rule of `revoke-credentials` can be
+/// enforced — follows from the variant rather than from a flag somebody has to
+/// remember to read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Authority {
     /// An attested administrator: `iam` resolved their credential and answered
-    /// `is_admin: true`. Their user id is a REAL identity, which is why D73's
-    /// self-demotion rule is enforceable at the gateway and nowhere else.
+    /// `is_admin: true` (derived from `administrators` membership when
+    /// `IAM_ADMIN_FROM_TEAM` is on). Their user id is a REAL identity, which is
+    /// why the self-target rule of `revoke-credentials` is enforceable at the
+    /// gateway and nowhere else.
     Administrator(String),
     /// The bootstrap token. **Nobody**, by construction — D73 calls a shared
-    /// secret "unattributable by construction", and that is precisely why the
-    /// `is_admin` flag exists beside it.
+    /// secret "unattributable by construction".
     Bootstrap,
 }
 
@@ -298,71 +335,30 @@ impl Authority {
             Authority::Administrator(_) => false,
         }
     }
-
-    /// Whether this caller may ask a re-enrolment to revoke every credential
-    /// its target holds (ADR-0943): an ATTESTED administrator may, the
-    /// bootstrap token may not.
-    ///
-    /// The bootstrap token reaches `IssueEnrolment` only for an administrator
-    /// who has never held a credential (ADR-0655 as amended by ADR-0656), so
-    /// there is nothing for it to revoke, and `iam-db` refuses the demand and
-    /// the instruction together. Refusing here as well keeps that grant exactly
-    /// as narrow as those ADRs drew it without depending on the tier below.
-    /// Beside [`Authority::demands_zero_credential_admin`] for the reason that
-    /// method gives: a downstream difference follows from the variant.
-    pub fn may_revoke_existing_credentials(&self) -> bool {
-        match self {
-            Authority::Bootstrap => false,
-            Authority::Administrator(_) => true,
-        }
-    }
 }
 
-/// D73's excluded case: an administrator removing their own flag.
+/// The bootstrap-only rule of a pre-minted id (team access stage 3b, §6).
 ///
-/// # Why this is the gateway's and could not be `iam`'s
+/// `true` when an ATTESTED administrator's `create-user` carries a `user_id`.
+/// The caller answers that with the opaque 503 and makes no upstream call. A
+/// caller-chosen id is needed only for the first administrator, who must be
+/// named in GitOps before the user exists; every later user gets an id that
+/// `iam-db` mints. `iam-db` would refuse the id anyway once an administrator
+/// exists, and an attested administrator is one, so a defect here would still
+/// be refused one tier down.
+pub fn refuses_pre_minted_id(authority: &Authority, pre_minted_id: bool) -> bool {
+    pre_minted_id && matches!(authority, Authority::Administrator(_))
+}
+
+/// The upstream form of a pre-minted id: `yadgar:user:` and the bare value, as
+/// declared.
 ///
-/// `iam.proto:664` defers it here by name — D73 "excludes admin SELF-demotion
-/// from the first cut, which is a rule about who may call this and belongs in the
-/// service rather than in the shape" — and `iam` cannot take it, because the only
-/// caller identity `iam` has is `unverified_actor`, which ADR-0534 forbids
-/// reading as an authorisation input. **At this boundary there is a real
-/// identity**: `iam` resolved the credential, so `Authority::Administrator`
-/// carries a user id nobody asserted about themselves.
-///
-/// # It is also the last-administrator guard, and that is worth stating exactly
-///
-/// Nothing in `iam` or `iam-db` counts administrators before clearing a flag
-/// (`iam-db/src/service.rs:1341-1388` has no count check), so `/admin` is where
-/// the count is protected or nowhere. It is protected, by two facts together
-/// rather than by a count:
-///
-/// - The bootstrap token can only ever SET the flag ([`Verb::accepts_bootstrap`]),
-///   so it can never reduce the number of administrators.
-/// - An administrator cannot clear their OWN flag (this function).
-///
-/// So a demotion always has a demoter who stays an administrator, and `/admin`
-/// cannot reach zero. **The residual is a race and it is named rather than
-/// claimed away**: two administrators demoting each other are each authorised
-/// against a CACHED `is_admin` (`YADGAR_CREDENTIAL_TTL_SECONDS`, shortened but
-/// not closed by `SetUserAdmin`'s `CREDENTIAL_REVOKED` publish), so within that
-/// window both can be admitted and the deployment can reach zero. Closing it
-/// needs a count inside the write's own transaction, which is `iam-db`'s and
-/// cannot be done from here.
-pub fn is_self_demotion(authority: &Authority, target_user_id: &str, wants_admin: bool) -> bool {
-    match authority {
-        // NOT `!wants_admin` ALONE, and not `actor == target` alone. Promoting
-        // yourself is a no-op for somebody who is already an administrator and
-        // D73 excludes DEMOTION, so a rule that refused both would invent a
-        // refusal the contract does not have.
-        Authority::Administrator(actor) => !wants_admin && actor == target_user_id,
-        // THE BOOTSTRAP PATH CANNOT REACH THIS CASE, and the reason is worth
-        // reading rather than inferring: `accepts_bootstrap` already refused
-        // every `wants_admin == false`, so a demotion never arrives here on this
-        // variant. `false` is the honest answer for "is this a self-demotion" —
-        // there is no self — and it is not what admits the request.
-        Authority::Bootstrap => false,
-    }
+/// **NOT JUDGED HERE.** Body validation runs before authorization, so a format
+/// check at this gateway would answer an unauthenticated caller (an oracle,
+/// ADR-0927). `iam` checks the format and refuses a malformed id
+/// `INVALID_ARGUMENT`, which answers the opaque 503.
+pub fn upstream_user_id(bare: &str) -> String {
+    format!("yadgar:user:{bare}")
 }
 
 #[cfg(test)]

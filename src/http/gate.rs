@@ -120,19 +120,20 @@ pub(super) fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
 ///
 /// `Some` is a response the caller must be sent; `None` means carry on.
 ///
-/// **NINE CALLERS NOW AND THIS COMMENT USED TO SAY TWO**, which is how an
+/// **EIGHT CALLERS NOW AND THIS COMMENT USED TO SAY TWO**, which is how an
 /// enumeration that reads as complete stops being one — the failure `login`'s
 /// "the two 400s" already cost this file once. `/auth/login` and `/auth/enrol`
 /// are the two UNAUTHENTICATED ones; `/admin/create-user`,
-/// `/admin/issue-enrolment`, `/admin/set-user-admin` and
-/// `/admin/revoke-credentials`, `/admin/list-credentials` and
-/// `/admin/revoke-credential` are the six administrative ones, and they call
-/// it for a reason that is not symmetry. `/auth/whoami` (ADR-0959) is the
-/// ninth: attested, on `credential_limits` under its own label.
+/// `/admin/issue-enrolment`, `/admin/revoke-credentials`,
+/// `/admin/list-credentials` and `/admin/revoke-credential` are the five
+/// administrative ones, and they call it for a reason that is not symmetry
+/// (`/admin/set-user-admin` was a sixth until team access stage 10 retired it).
+/// `/auth/whoami` (ADR-0959) is the eighth: attested, on `credential_limits`
+/// under its own label.
 /// `origin_ok` lives here rather than in a layer, so an `/admin` route that
 /// skipped this would have no `Origin` check and no throttle — reproducing the
 /// bug this function was written to fix, on the surface where a cross-origin POST
-/// buys an administrator. The `limits` parameter is why the six do not thereby
+/// buys an administrator. The `limits` parameter is why the five do not thereby
 /// share login's budget.
 ///
 /// # Everything decided here is decided WITHOUT the body, and that is the point

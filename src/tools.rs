@@ -4,8 +4,6 @@
 //! D67 rolls up per `tool`, and the number a person tunes is "what did
 //! `create_task` cost me" — so the label has to be the string the client sent.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use crate::pb::yadgar::common::v1::Scope;
@@ -13,7 +11,7 @@ use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::{
     read_task_request::Key, task_service_client::TaskServiceClient, ReadTaskRequest,
 };
-use crate::upstream::TaskUpstream;
+use crate::upstream::{CallError, TaskUpstream};
 
 mod change;
 mod create;
@@ -30,6 +28,12 @@ pub const READ_TASK: &str = "read_task";
 pub const FIND_TASKS: &str = "find_tasks";
 pub const EDIT_TASK: &str = "edit_task";
 pub const TRANSITION_TASK: &str = "transition_task";
+/// The per-user project listing (ADR-0963 (8), `plans/team-access.md` §8).
+/// THE ONE TOOL EXEMPT FROM `X-Yadgar-Project`: it names no project, so it is
+/// attested without a workspace and never reaches the project validator. It
+/// is served by the gateway itself from the loaded registry, so it never
+/// reaches [`call`] either — see `http::listing`.
+pub const LIST_PROJECTS: &str = "list_projects";
 
 /// EVERY tool this gateway serves, stated ONCE.
 ///
@@ -53,12 +57,13 @@ pub const TRANSITION_TASK: &str = "transition_task";
 /// `assets/rules.md` list the served tool names. Adding, removing or renaming a
 /// member here changes what those rules must say — change them in the same
 /// release, or a rename recreates ledger 1543.
-pub const SERVED: [&str; 5] = [
+pub const SERVED: [&str; 6] = [
     CREATE_TASK,
     READ_TASK,
     FIND_TASKS,
     EDIT_TASK,
     TRANSITION_TASK,
+    LIST_PROJECTS,
 ];
 
 /// Whether `name` is a tool this gateway serves.
@@ -110,6 +115,9 @@ pub fn module_for(name: &str) -> Option<&'static str> {
     }
     match name {
         CREATE_TASK | READ_TASK | FIND_TASKS | EDIT_TASK | TRANSITION_TASK => Some("task"),
+        // Its own D74 bucket, so listing never spends `task`'s; an unconfigured
+        // `project.read` pair takes the configured fallback (`Limits::effective`).
+        LIST_PROJECTS => Some("project"),
         _ => None,
     }
 }
@@ -173,38 +181,13 @@ fn definition(name: &str) -> Value {
              number, not both. Only the fields sent are written; send at least \
              one. Status is changed with transition_task, never here. Refused if \
              the task's version is not expect_version, or if the body does not \
-             match expect_body_sha256.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "URN, e.g. yadgar:task:0192..." },
-                    "number": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Per-project task number, instead of id",
-                    },
-                    "expect_version": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "The version last read; the edit is refused if it moved",
-                    },
-                    "title": {
-                        "type": "string",
-                        "maxLength": create::TITLE_MAX,
-                        "description": "Short summary of the task, at most 128 characters (Unicode code points); put detail in the body",
-                    },
-                    "body": { "type": "string", "description": "New full description; empty clears it" },
-                    "expect_body_sha256": {
-                        "type": "string",
-                        "pattern": "^[0-9a-f]{64}$",
-                        "description": "SHA-256 of the exact body bytes (sha256sum of the \
-                                        file you send); the edit is refused if the body \
-                                        that arrives does not match, so a cut-off body \
-                                        is never saved",
-                    },
-                },
-                "required": ["expect_version"],
-            }),
+             match expect_body_sha256. To change part of a body, send `patch` \
+             instead of `body`: a literal (not regex) replace of every \
+             occurrence of `old` by `new`, refused unless `old` occurs exactly \
+             expect_count times (counted non-overlapping, left to right). With \
+             a patch, expect_body_sha256 is the hash of the pre-edit body as \
+             read. `old` and `new` are at most 65536 bytes each.",
+            change::edit_schema(),
         ),
         TRANSITION_TASK => (
             "Transition a task",
@@ -234,6 +217,7 @@ fn definition(name: &str) -> Value {
                 "required": ["expect_version", "to"],
             }),
         ),
+        LIST_PROJECTS => list_definition(),
         // Unreachable for a member of `SERVED`, and deliberately not a panic.
         _ => ("", "", Value::Null),
     };
@@ -243,6 +227,30 @@ fn definition(name: &str) -> Value {
         "description": description,
         "inputSchema": input_schema,
     })
+}
+
+/// `list_projects`' catalogue entry, split out of [`definition`] for the
+/// function-size ceiling.
+fn list_definition() -> (&'static str, &'static str, Value) {
+    (
+        "List your projects",
+        "List the projects you may reach: every organisation project one of \
+         your teams is granted, with `access` read or readWrite, and your own \
+         private projects, with `access` owner. Each entry carries `path`, \
+         `status` (active or archived) and `kind` (root, project or private). \
+         Needs no x-yadgar-project header. Takes no arguments except \
+         `page_token`, the `next_page_token` of the previous page.",
+        json!({
+            "type": "object",
+            "properties": {
+                "page_token": {
+                    "type": "string",
+                    "description": "The next_page_token a previous call answered",
+                },
+            },
+            "additionalProperties": false,
+        }),
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -309,7 +317,9 @@ pub async fn call(
         return Err(ToolError::Unknown(name.to_string()));
     }
 
-    let limit = task.timeout();
+    // ONE DEADLINE FOR THE CALL, built before its own work (ADR-1019): the
+    // chart's `task.requestTimeoutSeconds`, which `bounded` also SENDS.
+    let deadline = yadgar_dial::Deadline::after(task.timeout());
     let mut client = TaskServiceClient::new(crate::upstream::request_id::carrying(
         task.channel(),
         &scope.request_id,
@@ -318,7 +328,7 @@ pub async fn call(
     match name {
         CREATE_TASK => {
             let request = create::request(scope, args, crate::idempotency_key)?;
-            let resp = bounded(limit, client.create_task(request))
+            let resp = bounded(task, deadline, request, |r| client.create_task(r))
                 .await?
                 .into_inner();
             let meta = resp.meta.unwrap_or_default();
@@ -346,15 +356,13 @@ pub async fn call(
                     return Err(ToolError::Invalid("`id` or `number` is required".into()))
                 }
             };
-            let resp = bounded(
-                limit,
-                client.read_task(ReadTaskRequest {
-                    scope: Some(scope),
-                    key: Some(key),
-                }),
-            )
-            .await?
-            .into_inner();
+            let request = ReadTaskRequest {
+                scope: Some(scope),
+                key: Some(key),
+            };
+            let resp = bounded(task, deadline, request, |r| client.read_task(r))
+                .await?
+                .into_inner();
             Ok(Output {
                 content: serde_json::to_value(TaskView::full(resp.task)).unwrap_or(Value::Null),
                 rows: 1,
@@ -364,35 +372,49 @@ pub async fn call(
         FIND_TASKS => {
             let scope_project = scope.project_id.clone();
             let (request, fields) = find::request(scope, args)?;
-            let resp = bounded(limit, client.find_tasks(request))
+            let resp = bounded(task, deadline, request, |r| client.find_tasks(r))
                 .await?
                 .into_inner();
             Ok(find::output(resp, fields, &scope_project))
         }
 
-        EDIT_TASK => change::edit(&mut client, limit, scope, args).await,
-        TRANSITION_TASK => change::transition(&mut client, limit, scope, args).await,
+        EDIT_TASK => change::edit(&mut client, task, deadline, scope, args).await,
+        TRANSITION_TASK => change::transition(&mut client, task, deadline, scope, args).await,
 
         other => Err(ToolError::Unknown(other.to_string())),
     }
 }
 
-/// Await one `task` RPC for at most `limit`.
+/// Send one `task` RPC under `deadline`, and await it for no longer.
 ///
-/// **EVERY `TaskServiceClient` call goes through this** (yaadgaar #361). A
-/// timeout is `DEADLINE_EXCEEDED`, the code the `iam` and `attest` deadlines
-/// already use, so it reaches the caller as the same class of failure.
-/// The message carries the bound and nothing from the peer.
-pub(super) async fn bounded<T>(
-    limit: Duration,
-    rpc: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
-) -> Result<tonic::Response<T>, ToolError> {
-    match tokio::time::timeout(limit, rpc).await {
-        Ok(result) => Ok(result?),
-        Err(_elapsed) => Err(ToolError::Upstream(tonic::Status::deadline_exceeded(
-            format!("task did not answer within {}s", limit.as_secs()),
-        ))),
-    }
+/// **EVERY `TaskServiceClient` call goes through this** (yaadgaar #361), and
+/// through [`TaskUpstream::call`] (ADR-1019): `task` is sent the deadline as
+/// `grpc-timeout`, so it and the hops behind it stop when this gateway does,
+/// and the wait for a ready endpoint is bounded by the same value.
+///
+/// A timeout is `DEADLINE_EXCEEDED`, the code the `iam` and `attest` deadlines
+/// already use, so it reaches the caller as the same class of failure. The
+/// gateway's OWN timeout carries the bound and nothing from the peer; a
+/// `DEADLINE_EXCEEDED` that `task` answered itself keeps its own words.
+pub(super) async fn bounded<M, T, F, Fut>(
+    task: &TaskUpstream,
+    deadline: yadgar_dial::Deadline,
+    request: M,
+    rpc: F,
+) -> Result<tonic::Response<T>, ToolError>
+where
+    F: FnOnce(tonic::Request<M>) -> Fut,
+    Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    task.call(deadline, request, rpc)
+        .await
+        .map_err(|e| match e {
+            CallError::Expired => ToolError::Upstream(tonic::Status::deadline_exceeded(format!(
+                "task did not answer within {}s",
+                task.timeout().as_secs()
+            ))),
+            CallError::Answered(status) => ToolError::Upstream(status),
+        })
 }
 
 /// The JSON shape of a task as a CLIENT sees it.

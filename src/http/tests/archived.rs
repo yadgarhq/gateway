@@ -32,6 +32,7 @@ fn state_archiving(mode: Mode) -> std::sync::Arc<crate::http::AppState> {
         status: status as i32,
         aliases: Vec::new(),
         owner_user_id: String::new(),
+        grants: Vec::new(),
     });
     let mut state = state_with(Attestation::TrustedHeaders, Vec::new());
     std::sync::Arc::get_mut(&mut state)
@@ -39,7 +40,10 @@ fn state_archiving(mode: Mode) -> std::sync::Arc<crate::http::AppState> {
         .projects = std::sync::Arc::new(Validator::new(
         Registry::loaded_from(rows.into_iter().collect()),
         mode,
-        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        crate::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
     ));
     state
 }

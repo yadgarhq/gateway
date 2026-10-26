@@ -113,6 +113,7 @@ auth_iam_service! {
     set_user_admin(SetUserAdminRequest) -> SetUserAdminResponse;
     set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
+    sync_teams(SyncTeamsRequest) -> SyncTeamsResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
     set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
 }
@@ -148,7 +149,7 @@ async fn gateway(answer: Answer) -> Arc<AppState> {
             tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
             std::time::Duration::from_secs(1),
         ),
-        iam,
+        iam: yadgar_gateway::upstream::Upstream::new(iam, std::time::Duration::from_secs(30)),
         credentials: Credentials::new(Duration::from_secs(30)),
         limiter: Limiter::new(
             "127.0.0.1:1",
@@ -164,11 +165,15 @@ async fn gateway(answer: Answer) -> Arc<AppState> {
         credential_limits: wide(),
         admin_limits: wide(),
         bootstrap: BootstrapToken::disabled(),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         tools_poll_interval: Duration::from_secs(600),
         projects: Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),
             yadgar_gateway::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            yadgar_gateway::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     })
 }

@@ -81,7 +81,7 @@ fn as_user(
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(&path(claimed), access, &id(user), "a-request-id")
+                .check(&path(claimed), access, &id(user), &[], "a-request-id")
                 .await
         })
     });
@@ -111,8 +111,17 @@ fn series(snapshotter: &Snapshotter) -> Vec<(String, String, u64)> {
 
 /// What one call counted, as exactly ONE `(series, label)` — the property
 /// `Validator::check` promises on every path.
+///
+/// **THE RESOLUTION AND REFUSAL SERIES ONLY.** Since team access stage 8 an
+/// org call under `orgGrants: counting` also moves the grant SHADOW counter
+/// (none of these fixtures declares a grant), and the promise is one series
+/// on those two counters with at most one shadow increment BESIDE it — which
+/// `grants::red_16_...` asserts. This table is about membership.
 fn the_one_series(snapshotter: &Snapshotter) -> (String, String) {
-    let all = series(snapshotter);
+    let all: Vec<_> = series(snapshotter)
+        .into_iter()
+        .filter(|(name, ..)| name == REFUSED || name == RESOLVED)
+        .collect();
     assert_eq!(
         all.iter().map(|(_, _, n)| n).sum::<u64>(),
         1,
@@ -430,10 +439,11 @@ fn with_no_registry_membership_is_never_reached() {
     );
 }
 
-/// THE CLOSED SET (ADR-0558), every token spelled out. A seventh reason that
-/// is added without being listed here reds this test.
+/// THE CLOSED SET (ADR-0558), every token spelled out. An eighth reason that
+/// is added without being listed here reds this test; `PROJECT_READ_ONLY` is
+/// team access red 16's addition (ADR-0963 (3)).
 #[test]
-fn the_reason_set_is_closed_and_includes_not_member() {
+fn red_16_the_reason_set_is_closed_and_includes_not_member_and_read_only() {
     let tokens: Vec<&str> = [
         Reason::Invalid,
         Reason::UnregisteredOrg,
@@ -442,6 +452,7 @@ fn the_reason_set_is_closed_and_includes_not_member() {
         Reason::RegistryUnavailable,
         Reason::Archived,
         Reason::NotMember,
+        Reason::ReadOnly,
     ]
     .iter()
     .map(|r| match r {
@@ -452,7 +463,8 @@ fn the_reason_set_is_closed_and_includes_not_member() {
         | Reason::Unresolvable
         | Reason::RegistryUnavailable
         | Reason::Archived
-        | Reason::NotMember => r.token(),
+        | Reason::NotMember
+        | Reason::ReadOnly => r.token(),
     })
     .collect();
     assert_eq!(
@@ -465,6 +477,7 @@ fn the_reason_set_is_closed_and_includes_not_member() {
             "PROJECT_REGISTRY_UNAVAILABLE",
             "PROJECT_ARCHIVED",
             "PROJECT_NOT_MEMBER",
+            "PROJECT_READ_ONLY",
         ]
     );
 }
@@ -916,6 +929,7 @@ fn a_collision_with_an_archived_row_refuses_writes_in_either_order() {
     for order in both_orders(vec![
         RegisteredPath {
             owner_user_id: String::new(),
+            grants: Vec::new(),
             ..row("acme/x", ARCHIVED, &[])
         },
         wire_aliased("acme/y", "", &["acme/x"]),
@@ -959,20 +973,20 @@ fn the_gauge_counts_org_rows_with_local_aliases_and_keys_made_ownerless() {
 fn the_not_member_prose_fits_an_org_claim_too() {
     let (answer, _) = as_user(
         Registry::loaded_from(vec![
-            wire_aliased("acme/team", "", &[]),
-            wire_aliased("local/alice/q", "alice", &["acme/team/q"]),
+            wire_aliased("acme/crew", "", &[]),
+            wire_aliased("local/alice/q", "alice", &["acme/crew/q"]),
         ]),
         Mode::Enforcing,
         Access::Read,
         "bob",
-        "acme/team",
+        "acme/crew",
     );
     let prose = answer.expect_err("refused").prose;
     assert!(
         !prose.contains("this personal project"),
         "an org claim is not a personal project: {prose}"
     );
-    for leaked in ["acme", "team", "alice", "bob"] {
+    for leaked in ["acme", "crew", "alice", "bob"] {
         assert!(!prose.contains(leaked), "{leaked} leaked into: {prose}");
     }
 }

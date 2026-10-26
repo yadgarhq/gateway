@@ -124,7 +124,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     //
     // The BINARY installs the exporter, never the library — a library that
     // installs one picks the backend for every service linking it. A failure is
-    // logged and ignored: telemetry must never fail a call (D25), and that rule
+    // logged and ignored: telemetry must never fail a call (D67), and that rule
     // covers the metrics endpoint too.
     let metrics_addr: SocketAddr = env_required("METRICS_LISTEN")?
         .parse()
@@ -151,7 +151,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // phase 1 and the validation mode `boot::wiring` read. Enforcing with a
     // caller-written identity enforces nothing, so it does not boot
     // (`plans/project-membership.md` car P3).
-    boot::refuse_unverifiable_enforcement(&attestation, projects.mode())?;
+    boot::refuse_unverifiable_enforcement(&attestation, projects.mode(), projects.org_grants())?;
 
     // AFTER THE EXPORTER, NEVER BEFORE IT. A value recorded before there is a
     // recorder is a value nobody ever sees. This process serves no certificate,
@@ -160,6 +160,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     watch_inputs.export_not_after();
 
     let (allowed_origins, trust, credential_limits, admin_limits) = boot::http_configuration()?;
+    // NO COMPILED-IN DEFAULT (ADR-0569): absent or not "1"/"0" refuses the boot.
+    let pre_minted_ids = yadgar_gateway::admin::PreMintedIds::from_env()?;
     log_trust_boundary(&trust);
 
     let state = Arc::new(AppState {
@@ -173,6 +175,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         credential_limits,
         admin_limits,
         bootstrap,
+        pre_minted_ids,
         tools_poll_interval,
         projects,
     });

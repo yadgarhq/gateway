@@ -2806,7 +2806,7 @@ checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 [[package]]
 name = "yadgar-dial"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/dial.git?tag=v0.2.20#9fdf58537a9ddf1feae067801abed5206e3f07ed"
+source = "git+https://github.com/yadgarhq/dial.git?tag=v0.2.25#c5824ae6af528d17f43f33eaddf093278b0782b3"
 dependencies = [
  "metrics",
  "rustls",
@@ -2824,6 +2824,8 @@ dependencies = [
  "async-nats",
  "axum",
  "http",
+ "hyper",
+ "hyper-util",
  "metrics",
  "metrics-util",
  "prost",
@@ -2843,6 +2845,7 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "tower-http",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "uuid",

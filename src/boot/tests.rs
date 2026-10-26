@@ -71,16 +71,17 @@ fn allow_empty_accepts_empty_but_still_refuses_absence() {
 /// `bootstrap_path_message`'s own return value on both sides, per ADR-0599.
 ///
 /// MUTATION: restore the old "and nothing else \n (ADR-0492)" wording in
-/// `bootstrap_path_message` and this goes red.
+/// `bootstrap_path_message` and this goes red. Team access stage 10 rewrote it
+/// again: "promoting one" stopped being true when `set-user-admin` was retired.
 #[test]
-fn the_enabled_message_names_all_three_verbs_and_the_predicate() {
+fn the_enabled_message_names_both_verbs_and_the_predicate() {
     assert_eq!(
         bootstrap_path_message(true),
         "the administrative bootstrap path is ENABLED: a bootstrap token is configured, \
-         and it reaches creating an administrator, promoting one, and — under a \
-         predicate enforced inside iam-db's write, never at this gateway — issuing an \
-         enrolment for an administrator holding zero credentials (ADR-0492, ADR-0655, \
-         ADR-0656)"
+         and it reaches creating the declared first administrator by its pre-minted \
+         user id and — under a predicate enforced inside iam-db's write, never at this \
+         gateway — issuing an enrolment the enrolment predicate admits (ADR-0492, \
+         ADR-0655, ADR-0966, ADR-1011)"
     );
 }
 
@@ -220,10 +221,14 @@ impl Drop for MintedCa {
 #[test]
 fn enforcing_with_trusted_headers_refuses_to_boot_naming_both_settings() {
     use yadgar_gateway::attest::Attestation;
-    use yadgar_gateway::project::Mode;
+    use yadgar_gateway::project::{Mode, OrgGrants};
 
-    let err = super::refuse_unverifiable_enforcement(&Attestation::TrustedHeaders, Mode::Enforcing)
-        .expect_err("enforcing plus trusted headers must not boot");
+    let err = super::refuse_unverifiable_enforcement(
+        &Attestation::TrustedHeaders,
+        Mode::Enforcing,
+        OrgGrants::Counting,
+    )
+    .expect_err("enforcing plus trusted headers must not boot");
     for named in [
         "YADGAR_PROJECT_VALIDATION_MODE",
         "YADGAR_TRUST_UNAUTHENTICATED_HEADERS",
@@ -233,13 +238,83 @@ fn enforcing_with_trusted_headers_refuses_to_boot_naming_both_settings() {
         assert!(err.contains(named), "the refusal must name {named}: {err}");
     }
     assert!(
-        super::refuse_unverifiable_enforcement(&Attestation::TrustedHeaders, Mode::Counting)
-            .is_ok(),
+        super::refuse_unverifiable_enforcement(
+            &Attestation::TrustedHeaders,
+            Mode::Counting,
+            OrgGrants::Counting
+        )
+        .is_ok(),
         "counting with trusted headers boots: it refuses nobody"
     );
     assert!(
-        super::refuse_unverifiable_enforcement(&Attestation::Iam, Mode::Enforcing).is_ok(),
+        super::refuse_unverifiable_enforcement(
+            &Attestation::Iam,
+            Mode::Enforcing,
+            OrgGrants::Counting
+        )
+        .is_ok(),
         "enforcing with iam attestation boots"
+    );
+}
+
+/// TEAM ACCESS RED 14 (`plans/team-access.md` §5, §3): `orgGrants: enforcing`
+/// refuses to boot under `mode: counting`, naming both, and under trusted
+/// headers, where `team_ids` are always empty.
+#[test]
+fn red_14_org_grants_enforcing_refuses_to_boot_without_enforcing_mode_or_with_trusted_headers() {
+    use yadgar_gateway::attest::Attestation;
+    use yadgar_gateway::project::{Mode, OrgGrants};
+
+    let err = super::refuse_unverifiable_enforcement(
+        &Attestation::Iam,
+        Mode::Counting,
+        OrgGrants::Enforcing,
+    )
+    .expect_err("orgGrants enforcing under mode counting must not boot");
+    for named in [
+        "YADGAR_PROJECT_VALIDATION_ORG_GRANTS",
+        "YADGAR_PROJECT_VALIDATION_MODE",
+        "projectValidation.orgGrants",
+        "projectValidation.mode",
+    ] {
+        assert!(err.contains(named), "the refusal must name {named}: {err}");
+    }
+
+    let err = super::refuse_unverifiable_enforcement(
+        &Attestation::TrustedHeaders,
+        Mode::Enforcing,
+        OrgGrants::Enforcing,
+    )
+    .expect_err("orgGrants enforcing with trusted headers must not boot");
+    // THE orgGrants ARM, not the ADR-0841 one beneath it: under mode
+    // enforcing the older arm would refuse too, without naming the knob that
+    // made the operator's change.
+    for named in [
+        "YADGAR_TRUST_UNAUTHENTICATED_HEADERS",
+        "trustUnauthenticatedHeaders",
+        "YADGAR_PROJECT_VALIDATION_ORG_GRANTS",
+        "projectValidation.orgGrants",
+    ] {
+        assert!(err.contains(named), "the refusal must name {named}: {err}");
+    }
+
+    assert!(
+        super::refuse_unverifiable_enforcement(
+            &Attestation::Iam,
+            Mode::Enforcing,
+            OrgGrants::Enforcing
+        )
+        .is_ok(),
+        "both enforcing, iam attestation: boots"
+    );
+    assert!(
+        super::refuse_unverifiable_enforcement(
+            &Attestation::TrustedHeaders,
+            Mode::Counting,
+            OrgGrants::Counting
+        )
+        .is_ok(),
+        "both counting: boots with either source"
     );
 }
 

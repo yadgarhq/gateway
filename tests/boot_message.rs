@@ -200,6 +200,50 @@ fn an_unparsable_listen_names_the_variable() {
     );
 }
 
+/// The edge's header-read bound (ADR-1006, yaadgaar #218) is read in
+/// `boot::serve` beside `LISTEN`, so this needs the mount namespace too. It has
+/// no compiled-in default (ADR-0569): absent, non-numeric and out-of-range
+/// values each refuse the boot, naming the variable and its chart key.
+#[test]
+fn an_absent_or_invalid_edge_header_read_timeout_refuses_boot_naming_the_chart_key() {
+    const VAR: &str = "LISTEN_HEADER_READ_TIMEOUT_SECS";
+    for value in [None, Some("ten"), Some("0"), Some("61")] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != VAR);
+        if let Some(value) = value {
+            vars.push((VAR, value));
+        }
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(VAR) && line.contains("server.limits.headerReadTimeoutSeconds"),
+            "the refusal for {value:?} must name both the variable and its chart key: {line}"
+        );
+    }
+}
+
+/// The fail-closed switch on the pre-minted `create-user` arm (Max's ruling
+/// (b), 2026-10-24) has no compiled-in default (ADR-0569): absent, and every
+/// value other than "1" or "0", refuses the boot naming the variable and its
+/// chart key.
+#[test]
+fn an_absent_or_invalid_pre_minted_switch_refuses_boot_naming_the_chart_key() {
+    const VAR: &str = "YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID";
+    for value in [None, Some("true"), Some("")] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != VAR);
+        if let Some(value) = value {
+            vars.push((VAR, value));
+        }
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(VAR) && line.contains("adminBootstrap.refusePreMintedUserId"),
+            "the refusal for {value:?} must name both the variable and its chart key: {line}"
+        );
+    }
+}
+
 /// `TcpListener::bind` is the one call in `boot::serve` that was still a bare
 /// `?` after the Display cut-over: `io::Error`'s Display is informative about
 /// WHY ("Address already in use (os error 98)") but, unlike every other
@@ -244,4 +288,39 @@ fn enforcing_with_trusted_headers_refuses_boot_naming_both_settings() {
             "the refusal must name {named}: {line}"
         );
     }
+}
+
+/// TEAM ACCESS RED 14, through the real binary: `orgGrants: enforcing` under
+/// `mode: counting` refuses to start, naming both. The unit test proves the
+/// function; this proves `main` passes it the knob it read.
+#[test]
+fn red_14_org_grants_enforcing_under_counting_mode_refuses_boot_naming_both() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "YADGAR_PROJECT_VALIDATION_ORG_GRANTS");
+    vars.push(("YADGAR_PROJECT_VALIDATION_ORG_GRANTS", "enforcing"));
+    let (status, stderr) = run_to_exit(&vars);
+    let line = refusal_line(status, &stderr);
+    for named in [
+        "YADGAR_PROJECT_VALIDATION_ORG_GRANTS",
+        "YADGAR_PROJECT_VALIDATION_MODE",
+    ] {
+        assert!(
+            line.contains(named),
+            "the refusal must name {named}: {line}"
+        );
+    }
+}
+
+/// The knob has no compiled-in default (ADR-0569): absent, the boot refuses
+/// naming it.
+#[test]
+fn an_absent_org_grants_knob_refuses_boot_naming_it() {
+    let mut vars = cleartext_env();
+    vars.retain(|(k, _)| *k != "YADGAR_PROJECT_VALIDATION_ORG_GRANTS");
+    let (status, stderr) = run_to_exit(&vars);
+    let line = refusal_line(status, &stderr);
+    assert!(
+        line.contains("YADGAR_PROJECT_VALIDATION_ORG_GRANTS"),
+        "the refusal must name the knob: {line}"
+    );
 }

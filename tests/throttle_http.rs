@@ -110,7 +110,10 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // on a source address (task 497) rather than by D74's `(user, module,
         // kind)` one — and nothing in this file posts to it. This comment used to
         // say login spent no token at all, which was true when it was written.
-        iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        iam: yadgar_gateway::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
         // Never reached either: the trusted-header path resolves no credential, so
         // there is nothing to cache. Present because AppState holds it, not because
         // this file exercises it.
@@ -144,6 +147,7 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         // DISABLED, which is the shipped default until the chart mounts the
         // Secret, and nothing here exercises the bootstrap path.
         bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881'S VALIDATOR, in the SHIPPED configuration: `Mode::Counting`
@@ -155,7 +159,10 @@ async fn an_empty_bucket_is_429_with_an_exact_retry_after_and_a_record() {
         projects: std::sync::Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),
             yadgar_gateway::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            yadgar_gateway::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     });
 

@@ -84,6 +84,10 @@ message ResolveCredentialResponse {
   // the authentication path — which is what happened the first time this
   // response was consumed.
   string user_id = 1;
+  // The user's teams, LIVE TEAMS ONLY, relayed from
+  // yadgar.iamdb.v1.ResolveCredentialResponse.team_ids: a membership of an
+  // archived team (`iam_team.deleted_at` set) is not reported, so an archived
+  // team admits nobody (plans/team-access.md §7).
   repeated string team_ids = 2;
 
   // When this answer stops being trustworthy without re-checking. The cache
@@ -113,9 +117,20 @@ message ResolveCredentialResponse {
   int64 valid_for_seconds = 3;
 
   // D73's admin flag. The gateway needs it on every request: it gates the
-  // administrative path and it filters `tools/list` (D75). FALSE IS THE SAFE
+  // administrative path. IT DOES NOT FILTER `tools/list` TODAY. An earlier
+  // version of this comment said the gateway filters `tools/list` on it (D75);
+  // no such filter exists in the gateway, so no tool is hidden from a
+  // non-administrator by this field (ADR-1007 (2)). ADR-1007 (2) says a filter
+  // comes with team-access stage 10; none is designed yet. FALSE IS THE SAFE
   // DEFAULT — an `iam` too old to set this denies administration rather than
   // granting it.
+  //
+  // WHERE THE ANSWER COMES FROM (ADR-0962, ADR-0963). With `iam`'s setting
+  // `IAM_ADMIN_FROM_TEAM` false (the chart's shipped value), from the user's
+  // `is_admin` column, as before. With it true, from membership of the live team
+  // `yadgar:team:administrators`; the column is not read. `iam` relays the
+  // setting to the store as yadgar.iamdb.v1.ResolveCredentialRequest.
+  // admin_from_team.
   bool is_admin = 4;
 
   // THE OVERRIDES ONLY, never the effective limits. D74 says the response
@@ -878,6 +893,11 @@ message IssueEnrolmentResponse {
 // place identity is attested (ADR-0488). A second authentication mechanism
 // inside `iam` would be a second place for it to be wrong, holding the same
 // secret twice.
+//
+// DEPRECATED (ADR-0962): admin becomes membership of the declared
+// `administrators` team, and `set-user-admin` is retired. With
+// `IAM_ADMIN_FROM_TEAM` true, `iam` refuses this rpc `FAILED_PRECONDITION`.
+// Removal from the contract is a later breaking release.
 message SetUserAdminRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string user_id = 2;
@@ -1152,17 +1172,44 @@ message CreateUserRequest {
   // D73's admin flag, settable at creation because the FIRST admin has to exist
   // before anyone can log in to promote one. That chicken-and-egg problem is
   // why the bootstrap token exists, and this is the verb it reaches.
+  //
+  // DEPRECATED (ADR-0962, ADR-0963 (5)): with `IAM_ADMIN_FROM_TEAM` true, `iam`
+  // refuses `is_admin: true` `FAILED_PRECONDITION` without a store call, because
+  // a true column would be a second source of admin truth. The first
+  // administrator is then created through `user_id` below. Removal is a later
+  // breaking release.
   bool is_admin = 4;
 
   // WHO THE GATEWAY BELIEVED WAS CALLING, FOR THE AUDIT RECORD ONLY. This
   // service cannot verify it and MUST NOT authorise on it. The rule is stated
   // once, on yadgar.common.v1.UnverifiedActor, rather than restated here.
   yadgar.common.v1.UnverifiedActor unverified_actor = 5;
+
+  // THE PRE-MINTED FIRST ADMINISTRATOR (flow F2, ADR-0963 (5),
+  // plans/team-access.md §6). "yadgar:user:" followed by a lowercase canonical
+  // uuidv7 (36 characters, 8-4-4-4-12 hex, version nibble 7, variant 8, 9, a
+  // or b) that the operator chose and declared in GitOps as the only member
+  // of `administrators` before install. EMPTY MEANS "MINT ONE", today's
+  // behaviour.
+  //
+  // `iam` checks the format first (`INVALID_ARGUMENT`, no store call) and
+  // refuses a non-empty value `FAILED_PRECONDITION` while
+  // `IAM_ADMIN_FROM_TEAM` is false. `iam-db` evaluates the bootstrap
+  // create-user predicate inside the insert (see
+  // yadgar.iamdb.v1.CreateUserRequest.user_id). The gateway sends it only on
+  // the bootstrap path, and checks that the answer's `meta.id` equals it: an
+  // `iam` or `iam-db` that predates this field drops it and mints a different
+  // id, and the echo check makes that loud.
+  string user_id = 6;
 }
 message CreateUserResponse {
   yadgar.common.v1.Meta meta = 1;
 }
 
+// DEPRECATED (ADR-0963 (7)): teams are declared in GitOps and written only by
+// `SyncTeams`. `iam` answers `AddTeamMember` and `RemoveTeamMember`
+// `FAILED_PRECONDITION` ("teams are declared in GitOps") without a store call.
+// Removal from the contract is a later breaking release.
 message AddTeamMemberRequest {
   yadgar.common.v1.Idempotency idempotency = 1;
   string team_id = 2;
@@ -1187,6 +1234,66 @@ message RemoveTeamMemberRequest {
 }
 message RemoveTeamMemberResponse {}
 
+// One declared team (ADR-0962, ADR-0963 (1)). Its id is "yadgar:team:" + name,
+// so a grant in `project-db` can name it without asking `iam` for an id.
+message DeclaredTeam {
+  // Matches `^[a-z][a-z0-9-]{0,62}$`. Unique within a declaration. A rename is
+  // an archive plus a new team.
+  string name = 1;
+  // "yadgar:user:<lowercase canonical uuidv7>". The whole member set: members
+  // not listed are removed. No duplicates.
+  repeated string member_user_ids = 2;
+}
+
+// THE WHOLE TEAM DECLARATION, in one request (ADR-0963 (1), the shape of
+// ADR-0936's `SyncProjects`). The set of live teams after the call is exactly
+// what this names; a team it omits is archived (`deleted_at` set, members
+// kept), and a declared team that was archived is reactivated with the
+// declared member set. Idempotent by convergence, so no `Idempotency` and no
+// `expect_version`, for the reasons stated on yadgar.project.v1.
+// SyncProjectsRequest.
+//
+// REFUSALS, each writing nothing. `iam` checks the caller and relays every
+// store refusal with its code and message; `iam-db` checks the rest:
+// - `PERMISSION_DENIED`: the caller is not the seeder (see IamService).
+// - `INVALID_ARGUMENT`, naming the team and index: a `name` that does not
+//   match `^[a-z][a-z0-9-]{0,62}$`, a `name` declared twice, a member id that
+//   is not "yadgar:user:" + a lowercase canonical uuidv7, or a member declared
+//   twice in one team. A MALFORMED id refuses the WHOLE sync; a well-formed id
+//   with no `iam_user` row is NOT a refusal: it is skipped and listed in
+//   `unknown_member_user_ids` (or stored pending, see that response).
+// - `FAILED_PRECONDITION`: the lockout guard (ADR-0963 (6), on the rpc), or a
+//   declared name already held by a team under another id
+//   (`uq_iam_team_name`).
+message SyncTeamsRequest {
+  // THE SEEDER'S SCOPE, as on yadgar.project.v1.ProjectServiceSyncProjectsRequest:
+  // `user_id` is the fixed system principal `yadgar:system:seeder`, and `iam`
+  // refuses `PERMISSION_DENIED` when it is anything else. `request_id` is the
+  // seeder's, relayed unchanged. Every other field is empty and ignored.
+  yadgar.common.v1.Scope scope = 1;
+  repeated DeclaredTeam teams = 2;
+}
+message SyncTeamsResponse {
+  uint32 teams_inserted = 1;
+  // Live, and not declared: `deleted_at` set.
+  uint32 teams_archived = 2;
+  // Declared and archived: `deleted_at` cleared.
+  uint32 teams_reactivated = 3;
+  uint32 members_added = 4;
+  uint32 members_removed = 5;
+  // Declared members with no `iam_user` row, other than the pending
+  // administrators below. Skipped; every other member is still written. The
+  // seeder exits non-zero when this is non-empty.
+  repeated string unknown_member_user_ids = 6;
+  // F2 (ADR-0963 (5)): declared `administrators` members with no `iam_user`
+  // row, stored as PENDING because `administrators` has no live member. A
+  // pending row admits nobody; only the bootstrap `CreateUser` with that
+  // `user_id` consumes it. Empty on every sync once an administrator exists.
+  repeated string pending_administrator_user_ids = 7;
+  // Members of `administrators` whose `iam_user` row is live, after the sync.
+  uint32 administrators_live_members = 8;
+}
+
 // Holds no store. Reaches its data ONLY over IamDbService (D4).
 //
 // ONE CALLER, ON EVERY RPC (ADR-0972 (1)). An `iam` that implements ADR-0972
@@ -1197,6 +1304,12 @@ message RemoveTeamMemberResponse {}
 // That includes ResolveCredential, Login and RedeemEnrolment. An `iam` built
 // before ADR-0972 (1) checks no name, and NetworkPolicy is then the only
 // control.
+//
+// ONE EXCEPTION: `SyncTeams` (ADR-0963 (1)) admits ONLY the seeder's leaf,
+// `seeder-caller`, together with the scope user `yadgar:system:seeder`, and
+// refuses every other caller, the gateway's leaf included, `PERMISSION_DENIED`
+// before any upstream call. It is the one writer of team membership, the
+// shape ADR-0936 gives `SyncProjects` on `project`.
 //
 // THIS IS TRANSPORT IDENTITY, NOT THE ACTOR. It says which SERVICE dialled,
 // and nothing about which person the gateway acts for. The "WHO MAY CALL IT is
@@ -1218,4 +1331,9 @@ service IamService {
   rpc AddTeamMember(AddTeamMemberRequest) returns (AddTeamMemberResponse);
   rpc RemoveTeamMember(RemoveTeamMemberRequest) returns (RemoveTeamMemberResponse);
   rpc SetInheritedSetting(SetInheritedSettingRequest) returns (SetInheritedSettingResponse);
+  // The seeder's whole-set team sync; see SyncTeamsRequest and the caller
+  // exception above. The store refuses, `FAILED_PRECONDITION` and nothing
+  // written, a sync that would leave `administrators` with zero live members
+  // when it has at least one (ADR-0963 (6), the lockout guard).
+  rpc SyncTeams(SyncTeamsRequest) returns (SyncTeamsResponse);
 }

@@ -104,6 +104,13 @@
   at RENDER time: `helm upgrade` refuses and the pods already running are
   untouched. That is the same shape the four Secret mounts below already have.
 */}}
+{{/*
+  THE PRE-MINTED SWITCH (Max's ruling, 2026-10-24), guarded with the K-1 shape
+  the TLS switches use: `adminBootstrap: null` coalesces the whole block away,
+  so the schema's `required` has nothing to judge, and the `ternary` below
+  would render "0" for it.
+*/}}
+{{- if not (and (kindIs "map" .Values.adminBootstrap) (hasKey .Values.adminBootstrap "refusePreMintedUserId") (kindIs "bool" .Values.adminBootstrap.refusePreMintedUserId)) }}{{ fail "adminBootstrap.refusePreMintedUserId must be set to true or false; it renders YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID" }}{{ end }}
 {{- $bootstrapTokenSecret := .Values.adminBootstrap.tokenSecret -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -302,6 +309,15 @@ spec:
               value: "0.0.0.0:8080"
             - name: METRICS_LISTEN
               value: "0.0.0.0:9090"
+            # THE LISTENER'S PROTOCOL LIMIT (ADR-1006), from `server.limits`.
+            # No compiled-in default (ADR-0569); the schema holds the range, and
+            # `required` names the key when an overlay nulls the whole block.
+            # `$limits` is guarded so that case reaches `required` rather than a
+            # raw nil-pointer error. `| int64` because helm hands a values-file
+            # number over as a float64.
+            {{- $limits := (and (kindIs "map" .Values.server) (kindIs "map" .Values.server.limits) .Values.server.limits) | default dict }}
+            - name: LISTEN_HEADER_READ_TIMEOUT_SECS
+              value: {{ required "server.limits.headerReadTimeoutSeconds is required (ADR-1006): the binary refuses to boot without LISTEN_HEADER_READ_TIMEOUT_SECS" $limits.headerReadTimeoutSeconds | int64 | quote }}
             - name: TASK_HOST
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
@@ -460,6 +476,13 @@ spec:
             # the registry is seeded refuses essentially every call.
             - name: YADGAR_PROJECT_VALIDATION_MODE
               value: {{ .Values.projectValidation.mode | quote }}
+            # The team-grant rule on organisation projects (plans/team-access.md
+            # §5), its own knob beside the mode above. `counting` serves every
+            # call as today and counts the misses on
+            # `yadgar_gateway_project_grant_shadow_total`; the binary refuses to
+            # boot on `enforcing` while the mode above is `counting`.
+            - name: YADGAR_PROJECT_VALIDATION_ORG_GRANTS
+              value: {{ .Values.projectValidation.orgGrants | quote }}
             # How often the registered set is re-loaded: the retry after a failed
             # load and the refresh after a successful one. It bounds how long a
             # newly registered project stays unresolvable — which matters while
@@ -675,10 +698,10 @@ spec:
             {{- if $bootstrapTokenSecret }}
             # D73'S BOOTSTRAP TOKEN — the credential that lets the FIRST
             # administrator exist before an administrator exists to create one
-            # (ADR-0492, ledger 638). It reaches creating an administrator,
-            # promoting one, and — under ADR-0655's zero-credential predicate,
-            # as amended by ADR-0656 and enforced inside iam-db's write, never
-            # at this gateway — issuing an enrolment.
+            # (ADR-0492, ledger 638). It reaches creating the declared first
+            # administrator by its pre-minted user id and — under the enrolment
+            # predicate (ADR-0655, ADR-0656, ADR-0966), enforced inside iam-db's
+            # write, never at this gateway — issuing an enrolment.
             #
             # RENDERED ONLY WITH THE MOUNT, and the two are one expression at the
             # top of this file precisely because the unpaired states are the
@@ -706,6 +729,10 @@ spec:
             - name: YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE
               value: /var/run/secrets/admin-bootstrap/token
             {{- end }}
+            # RENDERED UNCONDITIONALLY, as TASK_TLS_ENABLED is, so `false` is
+            # visible on the wire. Guarded at the top of this file.
+            - name: YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID
+              value: {{ ternary "1" "0" .Values.adminBootstrap.refusePreMintedUserId | quote }}
             - name: RUST_LOG
               value: "info"
             {{- if .Values.trustUnauthenticatedHeaders }}

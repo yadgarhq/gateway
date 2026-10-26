@@ -42,8 +42,11 @@ fn estate() -> Registry {
 /// reactor, so calling this outside `block_on` panics with "there is no reactor
 /// running" — which is how the first run of this file failed, before any
 /// assertion was reached.
-fn dead_channel() -> tonic::transport::Channel {
-    tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy()
+fn dead_channel() -> crate::upstream::ProjectUpstream {
+    crate::upstream::Upstream::new(
+        tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        std::time::Duration::from_secs(30),
+    )
 }
 
 /// Classify one claim against `registry`, with no metrics and no dial.
@@ -308,7 +311,7 @@ fn checked_by(
     let answer = metrics::with_local_recorder(&recorder, || {
         rt.block_on(async {
             Validator::new(registry, mode, dead_channel())
-                .check(claimed, access, user, "a-request-id")
+                .check(claimed, access, user, &[], "a-request-id")
                 .await
         })
     });
@@ -668,13 +671,19 @@ fn the_org_remediation_is_composed_from_data_and_degrades_without_it() {
         Reason::UnregisteredOrg,
         Some("yadgarhq"),
         Some("yadgarhq/estate"),
+        OrgGrants::Counting,
     );
     assert!(
         composed.contains("yadgarhq/estate"),
         "the remediation names the repository whose PR flow governs the namespace: {composed}"
     );
 
-    let degraded = remediate::sentence(Reason::UnregisteredOrg, Some("yadgarhq"), None);
+    let degraded = remediate::sentence(
+        Reason::UnregisteredOrg,
+        Some("yadgarhq"),
+        None,
+        OrgGrants::Counting,
+    );
     assert!(
         degraded.contains("yadgarhq") && degraded.contains("could not be reached"),
         "without the datum the refusal stands and only the prose degrades: {degraded}"
@@ -804,14 +813,17 @@ impl crate::pb::yadgar::project::v1::project_service_server::ProjectService for 
 /// Serve one `ResolveProject` answer, and return a channel pointed at it.
 async fn stub_project(
     answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
-) -> tonic::transport::Channel {
+) -> crate::upstream::ProjectUpstream {
     stub_project_recording(answer).await.0
 }
 
 /// The same stub, and the request ids its `ResolveProject` calls arrived with.
 async fn stub_project_recording(
     answer: crate::pb::yadgar::project::v1::ProjectServiceResolveProjectResponse,
-) -> (tonic::transport::Channel, Arc<Mutex<Vec<Option<String>>>>) {
+) -> (
+    crate::upstream::ProjectUpstream,
+    Arc<Mutex<Vec<Option<String>>>>,
+) {
     let request_ids = Arc::new(Mutex::new(Vec::new()));
     let served = Arc::clone(&request_ids);
     let incoming = tonic::transport::server::TcpIncoming::bind(
@@ -835,7 +847,10 @@ async fn stub_project_recording(
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .expect("a URI")
         .connect_lazy();
-    (channel, request_ids)
+    (
+        crate::upstream::Upstream::new(channel, std::time::Duration::from_secs(30)),
+        request_ids,
+    )
 }
 
 /// A `ProjectService` that records the `x-yadgar-request-id` each `ListProjects`
@@ -924,7 +939,10 @@ async fn each_registry_poll_sends_its_own_well_formed_request_id() {
         .expect("a URI")
         .connect_lazy();
 
-    let _registry = Registry::start(channel, Duration::from_millis(20));
+    let _registry = Registry::start(
+        crate::upstream::Upstream::new(channel, std::time::Duration::from_secs(30)),
+        Duration::from_millis(20),
+    );
     for _ in 0..200 {
         if request_ids.lock().unwrap().len() >= 4 {
             break;
@@ -973,8 +991,13 @@ fn answered(
 #[tokio::test]
 async fn the_served_source_repo_reaches_the_composed_remediation() {
     let project = stub_project(answered("yadgarhq", "yadgarhq/estate")).await;
-    let denied =
-        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
+    let denied = remediate::compose(
+        &project,
+        Refusal::under_anchor("yadgarhq"),
+        "a-request-id",
+        OrgGrants::Counting,
+    )
+    .await;
 
     assert_eq!(
         denied.reason.token(),
@@ -1010,8 +1033,13 @@ async fn the_served_source_repo_reaches_the_composed_remediation() {
 #[tokio::test]
 async fn an_empty_served_source_repo_degrades_instead_of_interpolating_nothing() {
     let project = stub_project(answered("yadgarhq", "")).await;
-    let denied =
-        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
+    let denied = remediate::compose(
+        &project,
+        Refusal::under_anchor("yadgarhq"),
+        "a-request-id",
+        OrgGrants::Counting,
+    )
+    .await;
 
     assert!(
         denied
@@ -1042,8 +1070,13 @@ async fn an_empty_served_source_repo_degrades_instead_of_interpolating_nothing()
 #[tokio::test]
 async fn an_empty_served_resolved_path_falls_back_to_the_walked_anchor() {
     let project = stub_project(answered("", "")).await;
-    let denied =
-        remediate::compose(&project, Refusal::under_anchor("yadgarhq"), "a-request-id").await;
+    let denied = remediate::compose(
+        &project,
+        Refusal::under_anchor("yadgarhq"),
+        "a-request-id",
+        OrgGrants::Counting,
+    )
+    .await;
 
     assert!(
         denied
@@ -1069,6 +1102,7 @@ async fn an_enforced_refusal_dials_resolve_project_carrying_the_request_id() {
             "yadgarhq/gateway",
             Access::Write,
             "a-user",
+            &[],
             "the-id-on-this-call",
         )
         .await;
@@ -1101,6 +1135,7 @@ fn row(path: &str, status: ProjectStatus, aliases: &[&str]) -> RegisteredPath {
         status: status as i32,
         aliases: aliases.iter().map(|a| (*a).to_string()).collect(),
         owner_user_id: String::new(),
+        grants: Vec::new(),
     }
 }
 
@@ -1377,9 +1412,16 @@ fn the_archived_refusal_does_not_echo_the_callers_value() {
     assert!(!denied.to_string().contains("sentinel"), "{denied}");
 }
 
+/// ADR-1019 on the `project` path: each call STATES its deadline.
+mod deadline;
+
 /// Membership (`plans/project-membership.md` car P3): who may reach a resolved
 /// project, and the gauge that says whether a load carried its owners.
 mod member;
+
+/// Team grants on org rows (`plans/team-access.md` stage 8): reds 1-17 that
+/// `check` alone decides.
+mod grants;
 
 /// The first load retries on a short doubling schedule, then settles on the
 /// poll (ledger 1668).

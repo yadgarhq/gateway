@@ -115,6 +115,7 @@ recording_iam_service! {
     set_user_admin(SetUserAdminRequest) -> SetUserAdminResponse;
     set_rate_limit_override(SetRateLimitOverrideRequest) -> SetRateLimitOverrideResponse;
     add_team_member(AddTeamMemberRequest) -> AddTeamMemberResponse;
+    sync_teams(SyncTeamsRequest) -> SyncTeamsResponse;
     remove_team_member(RemoveTeamMemberRequest) -> RemoveTeamMemberResponse;
     set_inherited_setting(SetInheritedSettingRequest) -> SetInheritedSettingResponse;
     revoke_all_credentials(RevokeAllCredentialsRequest) -> RevokeAllCredentialsResponse;
@@ -373,25 +374,20 @@ async fn enrol_hands_iam_the_id_on_its_own_record() {
     assert_all_carry(&arrivals, &["redeem_enrolment"], &id);
 }
 
-/// The four administrative verbs: the attestation AND the verb carry the SAME
+/// The administrative write verbs: the attestation AND the verb carry the SAME
 /// id, because both are one inbound request.
 #[tokio::test]
 async fn each_admin_verb_hands_iam_one_id_for_attestation_and_verb() {
     let verbs = [
         (
             "/admin/create-user",
-            r#"{"external_id":"ada","display_name":"Ada","is_admin":false}"#,
+            r#"{"external_id":"ada","display_name":"Ada"}"#,
             "create_user",
         ),
         (
             "/admin/issue-enrolment",
             r#"{"user_id":"yadgar:user:someone-else"}"#,
             "issue_enrolment",
-        ),
-        (
-            "/admin/set-user-admin",
-            r#"{"user_id":"yadgar:user:someone-else","is_admin":true}"#,
-            "set_user_admin",
         ),
         (
             "/admin/revoke-credentials",
@@ -489,7 +485,7 @@ async fn an_enforced_refusal_hands_project_the_id_on_the_calls_own_record() {
     state.projects = Arc::new(crate::project::Validator::new(
         crate::project::Registry::loaded_with(["yadgarhq".to_string()]),
         crate::project::Mode::Enforcing,
-        project,
+        crate::upstream::Upstream::new(project, std::time::Duration::from_secs(30)),
     ));
 
     let body = json!({

@@ -31,7 +31,10 @@ fn state() -> Arc<AppState> {
             std::time::Duration::from_secs(1),
         ),
         // Never reached: nothing in this file posts to /auth/login.
-        iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        iam: yadgar_gateway::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
         // Never reached either: identity comes from a trusted header on this path,
         // so no credential is resolved and nothing is cached.
         credentials: yadgar_gateway::attest::Credentials::new(std::time::Duration::from_secs(30)),
@@ -79,6 +82,7 @@ fn state() -> Arc<AppState> {
         // DISABLED, which is the shipped default until the chart mounts the
         // Secret, and nothing here exercises the bootstrap path.
         bootstrap: yadgar_gateway::admin::BootstrapToken::disabled(),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881'S VALIDATOR, in the SHIPPED configuration: `Mode::Counting`
@@ -90,7 +94,10 @@ fn state() -> Arc<AppState> {
         projects: std::sync::Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),
             yadgar_gateway::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            yadgar_gateway::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     })
 }

@@ -3,13 +3,10 @@
 //! Each function is ONE CONTIGUOUS RUN of what `main` already did — see
 //! [`super`]. No dial, bind or listen is reordered.
 
-use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-
-use tonic::transport::Channel;
 
 use yadgar_lifecycle::{drain_within, shutdown, Drain, DRAIN_BUDGET};
 
@@ -17,7 +14,7 @@ use yadgar_gateway::admin::BootstrapToken;
 use yadgar_gateway::http::{router, AppState};
 use yadgar_gateway::invalidate::Broker;
 use yadgar_gateway::rotate;
-use yadgar_gateway::upstream;
+use yadgar_gateway::upstream::{self, IamUpstream, ProjectUpstream, TaskUpstream, Upstream};
 
 use super::{bootstrap_path_message, bootstrap_token, env_required, refusal};
 
@@ -32,8 +29,8 @@ pub struct Wiring {
     /// `gateway.yaml`'s `toolsPoll.intervalSeconds` (ADR-0569/0570). Carried on
     /// [`AppState`](crate::http::AppState) rather than re-read per request.
     pub tools_poll_interval: std::time::Duration,
-    pub task: upstream::TaskUpstream,
-    pub iam: Channel,
+    pub task: TaskUpstream,
+    pub iam: IamUpstream,
     /// The registry, the validation mode, and the channel a refusal is composed
     /// over (ledger 881).
     ///
@@ -221,8 +218,9 @@ fn transports() -> Result<Transports, Boxed> {
 /// service, which is the confusion the deleted `YADGAR_IAM_ADDR` was — and a
 /// `tonic::transport::Channel` clone shares the connection rather than opening
 /// another.
-fn validation(project: Channel) -> Result<Arc<yadgar_gateway::project::Validator>, Boxed> {
+fn validation(project: ProjectUpstream) -> Result<Arc<yadgar_gateway::project::Validator>, Boxed> {
     let mode = yadgar_gateway::project::Mode::from_env().map_err(|e| e.to_string())?;
+    let org_grants = yadgar_gateway::project::OrgGrants::from_env().map_err(|e| e.to_string())?;
     let poll = yadgar_gateway::project::poll_from_env().map_err(|e| e.to_string())?;
     tracing::info!(
         ?mode,
@@ -230,11 +228,14 @@ fn validation(project: Channel) -> Result<Arc<yadgar_gateway::project::Validator
         "{}",
         crate::boot::project_validation_announcement(mode)
     );
-    Ok(Arc::new(yadgar_gateway::project::Validator::new(
-        yadgar_gateway::project::Registry::start(project.clone(), poll),
-        mode,
-        project,
-    )))
+    tracing::info!(
+        ?org_grants,
+        "{}",
+        crate::boot::org_grants_announcement(org_grants)
+    );
+    let registry = yadgar_gateway::project::Registry::start(project.clone(), poll);
+    let validator = yadgar_gateway::project::Validator::new(registry, mode, project);
+    Ok(Arc::new(validator.with_org_grants(org_grants)))
 }
 
 /// PHASE 5. Start consuming D72's invalidation.
@@ -300,6 +301,8 @@ pub async fn serve(
     let addr: SocketAddr = env_required("LISTEN")?
         .parse()
         .map_err(|e| format!("LISTEN is not a host:port address: {e}"))?;
+    // ADR-1006's edge bound; absent or out of range refuses (ADR-0569).
+    let header_read_timeout = yadgar_gateway::edge::header_read_timeout(|n| std::env::var(n).ok())?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("LISTEN={addr} could not be bound: {}", refusal(&e)))?;
@@ -322,6 +325,7 @@ pub async fn serve(
         rotation_poll_secs = schedule.poll().as_secs(),
         rotation_splay_max_secs = schedule.splay_max().as_secs(),
         drain_budget_secs = DRAIN_BUDGET.as_secs(),
+        header_read_timeout_secs = header_read_timeout.as_secs(),
         "gateway listening"
     );
 
@@ -333,22 +337,17 @@ pub async fn serve(
     // process one budget after boot, on every boot — the defect `iam` shipped
     // and `yadgar-lifecycle`'s own `tests/drain.rs` keeps dead.
     let (ask_to_stop, stop_requested) = tokio::sync::oneshot::channel();
-    let serving = tokio::spawn(
-        axum::serve(
-            listener,
-            // `into_make_service_with_connect_info`, WHICH THIS CALL DID NOT
-            // HAVE. Without it nothing populates `ConnectInfo`, so the peer
-            // address is not extractable at all and every request resolves to
-            // `Source::Unknown` — an unthrottleable, unattributable request. It
-            // is the one line that makes the rest reachable in the shipped
-            // binary.
-            router(state).into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
+    // `edge::serve`, NOT `axum::serve`, which set no timer (yaadgaar #218). It
+    // also attaches `ConnectInfo<SocketAddr>`: without it every request is
+    // `Source::Unknown`, unthrottleable and unattributable.
+    let serving = tokio::spawn(yadgar_gateway::edge::serve(
+        listener,
+        router(state),
+        header_read_timeout,
+        async {
             let _ = stop_requested.await;
-        })
-        .into_future(),
-    );
+        },
+    ));
 
     // TWO WAYS THIS PROCESS STOPS, and only one of them is a signal. The other
     // is a rotated TLS file (ADR-0523), which is why the drain below is bounded
@@ -387,7 +386,7 @@ async fn upstreams(
     task_tls: Option<&upstream::UpstreamTls>,
     iam_tls: Option<&upstream::UpstreamTls>,
     project_tls: Option<&upstream::UpstreamTls>,
-) -> Result<(upstream::TaskUpstream, Channel, Channel), Boxed> {
+) -> Result<(TaskUpstream, IamUpstream, ProjectUpstream), Boxed> {
     let task_host = env_required("TASK_HOST")?;
     let task_port: u16 = env_required("TASK_PORT")?
         .parse()
@@ -492,5 +491,10 @@ async fn upstreams(
         request_timeout_secs = project_timeout.as_secs(),
         "project channel ready (connects on first use)"
     );
-    Ok((task, iam, project))
+    // Each keeps the value it was dialled with as its ceiling (ADR-1019).
+    Ok((
+        task,
+        Upstream::new(iam, iam_timeout),
+        Upstream::new(project, project_timeout),
+    ))
 }

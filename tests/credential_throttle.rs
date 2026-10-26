@@ -96,7 +96,10 @@ fn state_with_admin(
         // on to `iam` and comes back 503; a request that is throttled never gets
         // there and comes back 429. The two are therefore distinguishable by
         // status alone, with no stub server to keep in step.
-        iam: tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+        iam: yadgar_gateway::upstream::Upstream::new(
+            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            std::time::Duration::from_secs(30),
+        ),
         credentials: Credentials::new(Duration::from_secs(30)),
         limiter: Limiter::new(
             // Nothing listens on port 1, so every call degrades onto the local
@@ -122,6 +125,7 @@ fn state_with_admin(
         // authority is judged, so a throttled request is a 429 either way — but a
         // test that could not tell the two apart would be measuring nothing.
         bootstrap: yadgar_gateway::admin::BootstrapToken::from_secret(BOOTSTRAP),
+        pre_minted_ids: yadgar_gateway::admin::PreMintedIds::Admitted,
         // NOT WHAT THIS FILE MEASURES — the shipped value, unused by any assertion here.
         tools_poll_interval: std::time::Duration::from_secs(600),
         // LEDGER 881'S VALIDATOR, in the SHIPPED configuration: `Mode::Counting`
@@ -133,7 +137,10 @@ fn state_with_admin(
         projects: std::sync::Arc::new(yadgar_gateway::project::Validator::new(
             yadgar_gateway::project::Registry::never_loaded(),
             yadgar_gateway::project::Mode::Counting,
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            yadgar_gateway::upstream::Upstream::new(
+                tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+                std::time::Duration::from_secs(30),
+            ),
         )),
     })
 }
@@ -472,8 +479,10 @@ async fn admin(
         .status()
 }
 
-/// A body the bootstrap token is granted: create an ADMINISTRATOR.
-const CREATE_ADMIN: &str = r#"{"external_id":"ada","display_name":"Ada","is_admin":true}"#;
+/// A body the bootstrap token is granted: create the declared first
+/// ADMINISTRATOR by its pre-minted id (the only `create-user` arm since team
+/// access stage 10).
+const CREATE_ADMIN: &str = r#"{"external_id":"ada","display_name":"Ada","user_id":"0192f3c1-8a4e-7c2d-9b11-5f0e7a3d8400"}"#;
 
 #[tokio::test]
 async fn the_admin_surface_is_bounded_by_its_own_bucket_and_not_login_s() {
@@ -663,8 +672,8 @@ async fn each_admin_verb_has_its_own_throttle_key() {
     assert_ne!(
         admin(
             Arc::clone(&state),
-            "/admin/set-user-admin",
-            r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
+            "/admin/issue-enrolment",
+            r#"{"user_id":"yadgar:user:x"}"#,
             None,
             Some(&forwarded)
         )
@@ -683,18 +692,14 @@ async fn a_cross_origin_browser_request_is_refused_on_every_admin_path() {
     // bootstrap token creates an administrator, and the attacker never needs to
     // read the response to benefit."
     //
-    // ALL THREE PATHS, because the check is a per-handler call and the compiler
-    // cannot notice one is missing.
+    // EVERY PATH THAT READS ITS BODY FIRST, because the check is a per-handler
+    // call and the compiler cannot notice one is missing.
     let state = state_with_admin(TrustBoundary::Hops(1), wide(), wide());
     let forwarded = format!("203.0.113.1, {REAL_CLIENT}");
 
     for (path, body) in [
         ("/admin/create-user", CREATE_ADMIN),
         ("/admin/issue-enrolment", r#"{"user_id":"yadgar:user:x"}"#),
-        (
-            "/admin/set-user-admin",
-            r#"{"user_id":"yadgar:user:x","is_admin":true}"#,
-        ),
     ] {
         assert_eq!(
             admin(

@@ -114,8 +114,53 @@ message EditTaskRequest {
   //
   // A MODEL CANNOT COMPUTE THIS IN ITS HEAD. A caller holds the body in a file
   // and hashes that file (`sha256sum`), then sends the same file's content.
+  //
+  // IN PATCH MODE THE DIGEST IS OVER THE PRE-EDIT BODY, as stored (ADR-1008).
+  // The caller pins the body it read; a mismatch is refused with
+  // FAILED_PRECONDITION and the reason token BODY_SHA256_MISMATCH. The result
+  // body is computed by this service, so the caller cannot hash it.
   bytes expect_body_sha256 = 9;
+
+  // PATCH MODE: replace a literal substring of the stored body (ADR-1008),
+  // instead of sending the whole body. The result is written as a whole body.
+  //
+  // SELECTED BY NAMING `patch` IN `update_mask` AND SENDING THIS MESSAGE. One
+  // without the other is refused with INVALID_ARGUMENT. `patch` and `body` are
+  // mutually exclusive: a mask naming both, or an empty mask with a patch, is
+  // refused with INVALID_ARGUMENT. `title` may be written in the same edit.
+  // A service that predates this field refuses a mask naming `patch`, so a
+  // patch is never silently dropped.
+  //
+  // `expect_version` stays required; the compare-and-set covers the
+  // read-modify-write.
+  //
+  // REASON TOKENS. A FAILED_PRECONDITION from patch mode carries a message that
+  // starts with an upper-case reason token and a colon, for a program to
+  // branch on:
+  //   PATCH_COUNT_MISMATCH    `old` does not occur exactly `expect_count` times.
+  //   PATCH_RESULT_TOO_LARGE  the result body is over 1048576 bytes.
+  //   BODY_SHA256_MISMATCH    the stored body does not match expect_body_sha256.
+  BodyPatch patch = 10;
 }
+
+// A literal search-and-replace over a task body (ADR-1008).
+//
+// MATCHING IS LITERAL, over the exact UTF-8 bytes of the stored body: no regex,
+// no case folding, no Unicode normalisation. A precomposed character does not
+// match its decomposed form.
+//
+// OCCURRENCES ARE COUNTED NON-OVERLAPPING, LEFT TO RIGHT, and every one counted
+// is replaced. In "aaa", `old` "aa" occurs once, at the start.
+message BodyPatch {
+  // Non-empty, at most 65536 bytes. Refused with INVALID_ARGUMENT otherwise.
+  string old = 1;
+  // At most 65536 bytes; empty deletes each occurrence.
+  string new = 2;
+  // At least 1. The edit is refused with FAILED_PRECONDITION
+  // (PATCH_COUNT_MISMATCH) unless `old` occurs exactly this many times.
+  uint32 expect_count = 3;
+}
+
 message EditTaskResponse {
   yadgar.common.v1.Meta meta = 1;
 }
