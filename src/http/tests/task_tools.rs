@@ -37,7 +37,42 @@ const RETURNED_ID: &str = "yadgar:task:returned-by-the-fake-c41d";
 const RETURNED_VERSION: u64 = 9_173;
 
 /// The version the fake refuses as stale, as `task-db`'s compare-and-set does.
+/// Its message carries no reason token, as the store's refusal does not.
 const STALE_VERSION: u64 = 13_131;
+
+/// The version the fake refuses as stale WITH the reason token, as `task`
+/// does once it ships ADR-1042 and has read the task itself.
+const TOKENED_STALE_VERSION: u64 = 13_132;
+
+/// `task`'s VERSION_MISMATCH refusal. A quote, a newline and a trailing space
+/// and newline are in it on purpose: a gateway that re-renders the message
+/// (Debug escaping, as tonic's `Display` for `Status` does) or trims it
+/// changes those bytes.
+const VERSION_MISMATCH_MESSAGE: &str =
+    "VERSION_MISMATCH: the task is at version 7, not \"13132\"\nre-read it and retry \n";
+
+/// The version at which the fake answers as a `task` whose own digest check
+/// of `new` failed (ADR-1042 rule 11).
+const NEW_DIGEST_REFUSED_VERSION: u64 = 13_133;
+
+const PATCH_NEW_SHA256_MISMATCH_MESSAGE: &str =
+    "PATCH_NEW_SHA256_MISMATCH: `new` does not match \"expect_new_sha256\"";
+
+/// The version at which the fake answers UNAVAILABLE with a token-shaped
+/// message. Only FAILED_PRECONDITION and INVALID_ARGUMENT carry reason tokens,
+/// so this one must keep the gateway's usual rendering.
+const UNAVAILABLE_TOKEN_SHAPED_VERSION: u64 = 13_134;
+
+/// The versions at which the fake answers INTERNAL, PERMISSION_DENIED and
+/// NOT_FOUND with a listed token. None of these codes carries reason tokens,
+/// so each must keep the gateway's usual rendering.
+const INTERNAL_TOKEN_SHAPED_VERSION: u64 = 13_135;
+const PERMISSION_DENIED_TOKEN_SHAPED_VERSION: u64 = 13_136;
+const NOT_FOUND_TOKEN_SHAPED_VERSION: u64 = 13_138;
+
+/// The version at which the fake answers FAILED_PRECONDITION with a
+/// token-SHAPED prefix that is not one of the proto's reason tokens.
+const UNLISTED_TOKEN_VERSION: u64 = 13_137;
 
 /// The identity the forged header claims. It must never reach `task`.
 const FORGED_USER: &str = "mallory-forged-in-a-header";
@@ -70,10 +105,40 @@ impl TaskService for FakeTask {
     ) -> Result<tonic::Response<EditTaskResponse>, tonic::Status> {
         self.0.hits.fetch_add(1, Ordering::SeqCst);
         let req = request.into_inner();
-        let stale = req.expect_version == STALE_VERSION;
+        let version = req.expect_version;
         self.0.edits.lock().unwrap().push(req);
-        if stale {
-            return Err(tonic::Status::failed_precondition("version moved"));
+        match version {
+            STALE_VERSION => return Err(tonic::Status::failed_precondition("version moved")),
+            TOKENED_STALE_VERSION => {
+                return Err(tonic::Status::failed_precondition(VERSION_MISMATCH_MESSAGE))
+            }
+            NEW_DIGEST_REFUSED_VERSION => {
+                return Err(tonic::Status::invalid_argument(
+                    PATCH_NEW_SHA256_MISMATCH_MESSAGE,
+                ))
+            }
+            UNAVAILABLE_TOKEN_SHAPED_VERSION => {
+                return Err(tonic::Status::unavailable(
+                    "VERSION_MISMATCH: not a refusal",
+                ))
+            }
+            INTERNAL_TOKEN_SHAPED_VERSION => {
+                return Err(tonic::Status::internal("VERSION_MISMATCH: not a refusal"))
+            }
+            PERMISSION_DENIED_TOKEN_SHAPED_VERSION => {
+                return Err(tonic::Status::permission_denied(
+                    "VERSION_MISMATCH: not a refusal",
+                ))
+            }
+            NOT_FOUND_TOKEN_SHAPED_VERSION => {
+                return Err(tonic::Status::not_found("VERSION_MISMATCH: not a refusal"))
+            }
+            UNLISTED_TOKEN_VERSION => {
+                return Err(tonic::Status::failed_precondition(
+                    "SOMETHING_ELSE: not a listed token",
+                ))
+            }
+            _ => {}
         }
         Ok(tonic::Response::new(EditTaskResponse {
             meta: returned_meta(),
@@ -833,7 +898,8 @@ async fn a_malformed_patch_never_reaches_task() {
         (
             json!({ "id": "x", "expect_version": 5,
                     "patch": { "old": "a", "new": "b", "expect_count": 1, "regex": true } }),
-            "`patch` takes only `old`, `new` and `expect_count`, not `regex`",
+            "`patch` takes only `old`, `new`, `expect_count` and `expect_new_sha256`, \
+             not `regex`",
         ),
     ] {
         let (state, seen) = gateway().await;
@@ -846,4 +912,208 @@ async fn a_malformed_patch_never_reaches_task() {
         );
         assert_eq!(seen.hits.load(Ordering::SeqCst), 0, "{args}");
     }
+}
+
+// ---- yaadgaar #449: expect_new_sha256 and reason tokens (ADR-1042) -------
+
+/// `printf 'یادگار\n' | sha256sum`, spelled as a literal (ADR-0573). The
+/// digest of `new` only: `old` differs, so a digest over `old` fails.
+const NEW_SIDE: &str = "یادگار\n";
+const NEW_SIDE_SHA256: &str = "4b86b0e0f78bd0eb378f5a3ef9d277bc923462871b1a24b71b299927a04dede4";
+
+fn patch_guarded(version: u64, new: &str, digest: Value) -> Value {
+    json!({
+        "id": "yadgar:task:sentinel-new-sha",
+        "expect_version": version,
+        "patch": { "old": "ledger", "new": new, "expect_count": 1,
+                   "expect_new_sha256": digest },
+    })
+}
+
+/// A `new` that matches its digest reaches `task` with the digest as all 32
+/// raw bytes, so `task` checks it again for callers that do not come through
+/// here.
+#[tokio::test]
+async fn a_new_matching_its_digest_reaches_task_with_the_digest() {
+    let (state, seen) = gateway().await;
+    let args = patch_guarded(5, NEW_SIDE, json!(NEW_SIDE_SHA256));
+    let (status, body) = call(state, "edit_task", args).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], true, "{body}");
+    let edits = seen.edits.lock().unwrap();
+    let patch = edits[0].patch.clone().expect("the patch is forwarded");
+    assert_eq!(patch.new, NEW_SIDE);
+    let expected: Vec<u8> = (0..64)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&NEW_SIDE_SHA256[i..i + 2], 16).unwrap())
+        .collect();
+    assert_eq!(patch.expect_new_sha256, expected);
+    assert!(
+        edits[0].expect_body_sha256.is_empty(),
+        "no body digest was sent"
+    );
+}
+
+/// Absent, or null (ADR-0819: null is absent): nothing is forwarded and no
+/// check runs, so a `new` with no digest is never refused for one.
+#[tokio::test]
+async fn an_absent_new_digest_forwards_nothing_and_checks_nothing() {
+    for digest in [None, Some(Value::Null)] {
+        let (state, seen) = gateway().await;
+        let mut args = json!({
+            "id": "yadgar:task:x",
+            "expect_version": 5,
+            "patch": { "old": "ledger", "new": "cut off mid-wo", "expect_count": 1 },
+        });
+        if let Some(d) = digest.clone() {
+            args["patch"]["expect_new_sha256"] = d;
+        }
+        let (status, body) = call(state, "edit_task", args).await;
+        assert_eq!(status, StatusCode::OK, "{digest:?}: {body}");
+        assert_ne!(body["result"]["isError"], true, "{digest:?}: {body}");
+        let edits = seen.edits.lock().unwrap();
+        let patch = edits[0].patch.clone().expect("the patch is forwarded");
+        assert!(patch.expect_new_sha256.is_empty(), "{digest:?}");
+    }
+}
+
+/// **THE CASE THE GUARD EXISTS FOR.** A `new` cut off in transit, or one that
+/// lost only its trailing newline, is refused here with the reason token and
+/// never reaches `task`: a `task` older than the field would apply it.
+#[tokio::test]
+async fn a_new_cut_off_before_its_digest_never_reaches_task() {
+    const MISMATCH: &str = "PATCH_NEW_SHA256_MISMATCH: `patch.new` does not match \
+                            `patch.expect_new_sha256`; it may have been cut off in transit, \
+                            so nothing was written. Re-send the patch";
+    for new in ["یاد", "یادگار"] {
+        let (state, seen) = gateway().await;
+        let args = patch_guarded(5, new, json!(NEW_SIDE_SHA256));
+        let (status, body) = call(state, "edit_task", args).await;
+        assert_eq!(status, StatusCode::OK, "{new}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{new}: {body}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("PATCH_NEW_SHA256_MISMATCH:"), "{text}");
+        assert_eq!(text, MISMATCH, "{new}");
+        assert_eq!(seen.hits.load(Ordering::SeqCst), 0, "{new}");
+    }
+}
+
+/// A digest that is not 64 lowercase hex characters is refused before `task`,
+/// as `expect_body_sha256` is: upper case, too short, too long, a non-hex
+/// character, empty, and not a string.
+#[tokio::test]
+async fn a_malformed_new_digest_never_reaches_task() {
+    const NOT_HEX: &str = "`patch.expect_new_sha256` must be 64 lowercase hex characters";
+    let not_hex = format!("{}g", &NEW_SIDE_SHA256[..63]);
+    for digest in [
+        json!(NEW_SIDE_SHA256.to_uppercase()),
+        json!(&NEW_SIDE_SHA256[..62]),
+        json!(format!("{NEW_SIDE_SHA256}00")),
+        json!(not_hex),
+        json!(""),
+        json!(42),
+    ] {
+        let (state, seen) = gateway().await;
+        let args = patch_guarded(5, NEW_SIDE, digest.clone());
+        let (status, body) = call(state, "edit_task", args).await;
+        assert_eq!(status, StatusCode::OK, "{digest}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{digest}: {body}");
+        assert_eq!(
+            body["result"]["content"][0]["text"], NOT_HEX,
+            "{digest}: {body}"
+        );
+        assert_eq!(seen.hits.load(Ordering::SeqCst), 0, "{digest}");
+    }
+}
+
+/// `task`'s reason-token refusals reach the caller as `task` wrote them, byte
+/// for byte, so a program can branch on the prefix before the first colon.
+#[tokio::test]
+async fn a_reason_token_from_task_reaches_the_caller_unchanged() {
+    for (args, message) in [
+        (
+            json!({ "id": "yadgar:task:x", "expect_version": TOKENED_STALE_VERSION, "title": "t" }),
+            VERSION_MISMATCH_MESSAGE,
+        ),
+        (
+            patch_guarded(TOKENED_STALE_VERSION, NEW_SIDE, json!(NEW_SIDE_SHA256)),
+            VERSION_MISMATCH_MESSAGE,
+        ),
+        (
+            patch_guarded(NEW_DIGEST_REFUSED_VERSION, NEW_SIDE, json!(NEW_SIDE_SHA256)),
+            PATCH_NEW_SHA256_MISMATCH_MESSAGE,
+        ),
+    ] {
+        let (state, seen) = gateway().await;
+        let (status, body) = call(state, "edit_task", args.clone()).await;
+        assert_eq!(seen.hits.load(Ordering::SeqCst), 1, "{args} reached task");
+        assert_eq!(status, StatusCode::OK, "{args}: {body}");
+        assert_eq!(body["result"]["isError"], true, "{args}: {body}");
+        assert_eq!(
+            body["result"]["content"][0]["text"], message,
+            "{args}: {body}"
+        );
+    }
+}
+
+/// A refusal with no reason token, and a token-shaped message on a code that
+/// carries no tokens, keep the gateway's usual rendering, which names the
+/// code. Only a listed refusal is passed through bare.
+#[tokio::test]
+async fn an_untokened_refusal_keeps_the_usual_rendering() {
+    for (version, needle) in [
+        (STALE_VERSION, "version moved"),
+        (
+            UNAVAILABLE_TOKEN_SHAPED_VERSION,
+            "VERSION_MISMATCH: not a refusal",
+        ),
+        (
+            INTERNAL_TOKEN_SHAPED_VERSION,
+            "VERSION_MISMATCH: not a refusal",
+        ),
+        (
+            PERMISSION_DENIED_TOKEN_SHAPED_VERSION,
+            "VERSION_MISMATCH: not a refusal",
+        ),
+        (
+            NOT_FOUND_TOKEN_SHAPED_VERSION,
+            "VERSION_MISMATCH: not a refusal",
+        ),
+        (UNLISTED_TOKEN_VERSION, "SOMETHING_ELSE: not a listed token"),
+    ] {
+        let (state, _) = gateway().await;
+        let (_, body) = call(
+            state,
+            "edit_task",
+            json!({ "id": "yadgar:task:x", "expect_version": version, "title": "t" }),
+        )
+        .await;
+        assert_eq!(body["result"]["isError"], true, "{body}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("code: "), "{version}: {text}");
+        assert!(text.contains(needle), "{version}: {text}");
+    }
+}
+
+/// An `expect_new_sha256` sent at the TOP LEVEL, beside an otherwise valid
+/// patch, is refused before `task`. Ignoring it would apply the patch with no
+/// guard while the caller believes one ran.
+#[tokio::test]
+async fn a_top_level_new_digest_is_refused_and_never_reaches_task() {
+    let (state, seen) = gateway().await;
+    let args = json!({
+        "id": "yadgar:task:x",
+        "expect_version": 5,
+        "patch": { "old": "ledger", "new": NEW_SIDE, "expect_count": 1 },
+        "expect_new_sha256": NEW_SIDE_SHA256,
+    });
+    let (status, body) = call(state, "edit_task", args).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    assert_eq!(
+        body["result"]["content"][0]["text"],
+        "`expect_new_sha256` goes inside `patch`, beside the `new` it guards",
+        "{body}"
+    );
+    assert_eq!(seen.hits.load(Ordering::SeqCst), 0);
 }

@@ -86,6 +86,28 @@ message EditTaskRequest {
   // oneof is a breaking change under `buf breaking`'s FILE rules (D15), so the
   // rule is stated here and enforced by the logic service instead.
   string id = 3;
+
+  // THE VERSION THE CALLER READ: the compare half of a compare-and-set. It is
+  // required in both modes; a write never lands on a version the caller did not
+  // name.
+  //
+  // A STALE VERSION IS REFUSED WITH FAILED_PRECONDITION. Once task ships
+  // ADR-1042, a refusal where this service has read the task within the
+  // caller's reach and found a version other than this one starts with the
+  // reason token VERSION_MISMATCH (see REASON TOKENS on `patch`); until then it
+  // carries no token. The caller re-reads and retries with the version it then
+  // sees.
+  //
+  // A WHOLE-BODY RETRY WITH THE SAME IDEMPOTENCY KEY IS STILL REPLAYED (D9).
+  // This service's version check never runs ahead of the store's replay of a
+  // recorded key. Only patch mode refuses such a retry; see `patch`.
+  //
+  // ONCE task SHIPS ADR-1042, A FAILED_PRECONDITION WITH NO REASON TOKEN is the
+  // store's compare-and-set refusing the write: a writer landed between this
+  // service's read and the write, or the task is out of reach or read-only for
+  // this caller. The store does not say which, deliberately, so no token is
+  // claimed for it. The caller re-reads: a moved version means retry with it;
+  // the same version, or no task, means the retry fails identically.
   uint64 expect_version = 4;
   // At most 128 Unicode scalar values when the mask writes `title`. A longer
   // title is refused with INVALID_ARGUMENT once enforcement ships; the unit,
@@ -134,12 +156,33 @@ message EditTaskRequest {
   // `expect_version` stays required; the compare-and-set covers the
   // read-modify-write.
   //
-  // REASON TOKENS. A FAILED_PRECONDITION from patch mode carries a message that
-  // starts with an upper-case reason token and a colon, for a program to
-  // branch on:
-  //   PATCH_COUNT_MISMATCH    `old` does not occur exactly `expect_count` times.
-  //   PATCH_RESULT_TOO_LARGE  the result body is over 1048576 bytes.
-  //   BODY_SHA256_MISMATCH    the stored body does not match expect_body_sha256.
+  // REASON TOKENS. A refusal listed here carries a message that starts with an
+  // upper-case reason token and a colon, for a program to branch on. The list
+  // covers EditTask in both modes and is kept here, in one place:
+  //   VERSION_MISMATCH           FAILED_PRECONDITION, either mode, once task
+  //                              ships ADR-1042: the task as read is not at
+  //                              `expect_version`.
+  //   PATCH_COUNT_MISMATCH       FAILED_PRECONDITION: `old` does not occur
+  //                              exactly `expect_count` times.
+  //   PATCH_RESULT_TOO_LARGE     FAILED_PRECONDITION: the result body is over
+  //                              1048576 bytes.
+  //   BODY_SHA256_MISMATCH       FAILED_PRECONDITION: the stored body does not
+  //                              match expect_body_sha256.
+  //   PATCH_NEW_SHA256_MISMATCH  INVALID_ARGUMENT, once task ships ADR-1042:
+  //                              `new` does not match
+  //                              BodyPatch.expect_new_sha256.
+  // A refusal not listed here carries no token; a program must not parse one
+  // out of it.
+  //
+  // A RETRY OF AN APPLIED PATCH WITH THE SAME IDEMPOTENCY KEY IS REFUSED, NOT
+  // REPLAYED. This service reads the task before it writes. After the first
+  // attempt is applied, that read returns the patched body at the next
+  // version, so the retry is refused as a stale version before the store sees
+  // the key (VERSION_MISMATCH once task ships ADR-1042; today the message
+  // carries no token). The patch is applied once. A direct gRPC caller that
+  // retries after a lost response re-reads the task and finds its edit there.
+  // Through the gateway this cannot happen: every gateway EditTask call mints a
+  // fresh key.
   BodyPatch patch = 10;
 }
 
@@ -159,6 +202,32 @@ message BodyPatch {
   // At least 1. The edit is refused with FAILED_PRECONDITION
   // (PATCH_COUNT_MISMATCH) unless `old` occurs exactly this many times.
   uint32 expect_count = 3;
+
+  // A GUARD AGAINST A `new` CUT OFF IN TRANSIT: the SHA-256 digest of the
+  // `new` the caller MEANT to send. When set, the edit is refused with
+  // INVALID_ARGUMENT and the reason token PATCH_NEW_SHA256_MISMATCH unless
+  // SHA-256 over `new` equals it. The check needs only the request, so it runs
+  // before the store is read.
+  //
+  // THE DIGEST IS OVER THE EXACT UTF-8 BYTES OF `new`, with no normalisation:
+  // no trimming, no line-ending conversion, and a trailing newline counts. An
+  // empty `new` can be guarded too; its digest is the SHA-256 of no bytes.
+  //
+  // THE FIELD IS THE 32 RAW DIGEST BYTES, NOT A HEX STRING, as on
+  // EditTaskRequest.expect_body_sha256. Hex exists only on the gateway's MCP
+  // surface: once the gateway ships this field (ADR-1042), it takes 64
+  // lowercase hex characters and decodes them before it sends this field.
+  //
+  // EMPTY MEANS NO GUARD, which is what every caller that predates this field
+  // sends. Present, it must be exactly 32 bytes, or the edit is refused with
+  // INVALID_ARGUMENT.
+  //
+  // A SERVICE THAT PREDATES THIS FIELD IGNORES IT. Unlike `patch`, this guard
+  // is not selected through `update_mask`, so an older task applies the patch
+  // without the check. Once the gateway ships ADR-1042 it checks the digest
+  // itself, because it holds `new`, so an MCP caller is guarded whatever task
+  // version runs. A gateway that predates this field offers no such argument.
+  bytes expect_new_sha256 = 4;
 }
 
 message EditTaskResponse {

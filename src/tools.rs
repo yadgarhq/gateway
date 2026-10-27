@@ -16,6 +16,7 @@ use crate::upstream::{CallError, TaskUpstream};
 mod change;
 mod create;
 mod find;
+mod reason;
 
 /// A tool's name, as a bounded value.
 ///
@@ -186,7 +187,12 @@ fn definition(name: &str) -> Value {
              occurrence of `old` by `new`, refused unless `old` occurs exactly \
              expect_count times (counted non-overlapping, left to right). With \
              a patch, expect_body_sha256 is the hash of the pre-edit body as \
-             read. `old` and `new` are at most 65536 bytes each.",
+             read, and patch.expect_new_sha256 is the hash of `new`. `old` and \
+             `new` are at most 65536 bytes each. A refusal a program can act on \
+             starts with a reason token and a colon: VERSION_MISMATCH (re-read, \
+             then retry with the version you see), PATCH_COUNT_MISMATCH, \
+             PATCH_RESULT_TOO_LARGE, BODY_SHA256_MISMATCH or \
+             PATCH_NEW_SHA256_MISMATCH. Any other refusal carries no token.",
             change::edit_schema(),
         ),
         TRANSITION_TASK => (
@@ -261,8 +267,9 @@ pub enum ToolError {
     #[error("{0}")]
     Invalid(String),
 
-    /// The upstream module's fault, or the network's.
-    #[error("{0}")]
+    /// The upstream module's fault, or the network's, or a refusal the module
+    /// answered. Rendered by [`reason::upstream_text`].
+    #[error("{}", reason::upstream_text(.0))]
     Upstream(#[from] tonic::Status),
 
     #[error("unknown tool: {0}")]

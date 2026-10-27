@@ -51,7 +51,7 @@ message RateLimitOverride {
 //
 // THE ONLY RPC ON THE REQUEST PATH, and the reason the module exists. The
 // gateway calls it on a cache miss, never per request (D72): `recall` is the
-// latency-critical path (D25) and every call crosses this boundary.
+// latency-critical path (D67, after D25) and every call crosses this boundary.
 message ResolveCredentialRequest {
   // The token as presented, NEVER its hash. Hashing is the module's job — a
   // caller that hashed it first would have to agree on the algorithm forever,

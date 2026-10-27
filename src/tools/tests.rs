@@ -914,6 +914,40 @@ fn the_edit_schema_offers_a_literal_patch() {
     }
 }
 
+/// The `new` digest on the catalogue (ADR-1042 rule 11): inside `patch`,
+/// beside the `new` it guards, spelled as `expect_body_sha256` is, and not
+/// required. The description names the guard and the reason tokens a caller
+/// branches on.
+#[test]
+fn the_edit_schema_offers_a_digest_of_new_and_names_the_reason_tokens() {
+    let all = definitions();
+    let edit = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "edit_task")
+        .cloned()
+        .unwrap();
+    let patch = &edit["inputSchema"]["properties"]["patch"];
+    let digest = &patch["properties"]["expect_new_sha256"];
+    assert_eq!(digest["type"], "string");
+    assert_eq!(digest["pattern"], "^[0-9a-f]{64}$");
+    assert!(
+        digest["description"].as_str().unwrap().contains("`new`"),
+        "{digest}"
+    );
+    assert_eq!(patch["required"], json!(["old", "new", "expect_count"]));
+    let text = edit["description"].as_str().unwrap();
+    for needle in [
+        "expect_new_sha256",
+        "VERSION_MISMATCH",
+        "PATCH_NEW_SHA256_MISMATCH",
+        "PATCH_COUNT_MISMATCH",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing from: {text}");
+    }
+}
+
 /// THE DESCRIPTION CAP, as a FLOOR for older clients. Claude Code 2.1.84
 /// began cutting an MCP tool description at 2048 characters; 2.1.280 added
 /// the `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH` override; 2.1.295 allows 16384
@@ -1005,5 +1039,34 @@ async fn every_task_rpc_states_its_deadline_and_answers_its_timeout() {
             stated >= BOUND - Duration::from_millis(500),
             "{name} stated {stated:?}, far below its {BOUND:?} deadline"
         );
+    }
+}
+
+/// A reason token is one of the five the proto lists (ADR-1042), exactly,
+/// before the first colon. A token-shaped prefix that is not listed, a listed
+/// token in another case or with padding, or a token after the first colon is
+/// prose, which keeps tonic's rendering.
+#[test]
+fn a_reason_token_is_one_the_proto_lists_before_the_first_colon() {
+    for (message, token) in [
+        ("VERSION_MISMATCH: moved", true),
+        ("VERSION_MISMATCH: at 7: re-read", true),
+        ("PATCH_COUNT_MISMATCH: 2, not 3", true),
+        ("PATCH_RESULT_TOO_LARGE: over", true),
+        ("BODY_SHA256_MISMATCH: stored body", true),
+        ("PATCH_NEW_SHA256_MISMATCH:x", true),
+        ("SOMETHING_ELSE: x", false),
+        ("A:", false),
+        ("VERSION_MISMATCHED: moved", false),
+        ("ERSION_MISMATCH: moved", false),
+        ("version_mismatch: moved", false),
+        (" VERSION_MISMATCH: moved", false),
+        ("VERSION_MISMATCH : moved", false),
+        ("note: VERSION_MISMATCH: moved", false),
+        ("VERSION_MISMATCH", false),
+        ("version moved", false),
+        ("", false),
+    ] {
+        assert_eq!(reason::has_reason_token(message), token, "{message:?}");
     }
 }

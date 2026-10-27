@@ -17,6 +17,8 @@
 //! THIS TEST.** Recapture then: run this file's `golden_lines` on the new
 //! `main` against the same registry without grants, and replace the golden
 //! file in the same PR as the change, so the diff shows exactly what moved.
+//! Recaptured once so far: yaadgaar #449 (ADR-1042) changed the `edit_task`
+//! entry of the eight `tools/list` lines, and no other byte.
 //!
 //! Minted request ids are normalised to `<UUID>`, and the transport error a
 //! served call meets at the unserved `task` to `<task unreachable>`; nothing
