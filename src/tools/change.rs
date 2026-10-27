@@ -135,10 +135,11 @@ fn body_patch(args: &Value) -> Result<Option<BodyPatch>, ToolError> {
     // than ignored, so a caller never believes an option took effect.
     if let Some(extra) = fields
         .keys()
-        .find(|k| !["old", "new", "expect_count"].contains(&k.as_str()))
+        .find(|k| !["old", "new", "expect_count", "expect_new_sha256"].contains(&k.as_str()))
     {
         return Err(ToolError::Invalid(format!(
-            "`patch` takes only `old`, `new` and `expect_count`, not `{extra}`"
+            "`patch` takes only `old`, `new`, `expect_count` and `expect_new_sha256`, \
+             not `{extra}`"
         )));
     }
     let side = |field: &str| -> Result<String, ToolError> {
@@ -159,11 +160,44 @@ fn body_patch(args: &Value) -> Result<Option<BodyPatch>, ToolError> {
                 u32::MAX
             ))
         })? as u32;
+    let expect_new_sha256 = new_digest(patch, &new)?;
     Ok(Some(BodyPatch {
         old,
         new,
         expect_count,
+        expect_new_sha256,
     }))
+}
+
+/// The digest `patch.expect_new_sha256` names, checked against the `new` this
+/// gateway RECEIVED (ADR-1042 rule 11, yaadgaar #449).
+///
+/// **CHECKED HERE AS WELL AS IN `task`**, for the reason [`body_digest`] is: a
+/// `task` older than the field ignores it, because the guard is not selected
+/// through the mask, so without this check a `new` cut off in transit would
+/// be applied during any rollout in which this gateway is newer than `task`.
+///
+/// Spelled as 64 lowercase hex characters; sent upstream as the 32 bytes they
+/// encode. The digest is over the exact UTF-8 bytes of `new`, with no
+/// normalisation. Absent or null sends no bytes, which is no guard. The
+/// mismatch message starts with the reason token `task` uses for the same
+/// refusal, so a caller branches on one token whichever side refused.
+fn new_digest(patch: &Value, new: &str) -> Result<Vec<u8>, ToolError> {
+    let Some(hex) = present(patch, "expect_new_sha256") else {
+        return Ok(Vec::new());
+    };
+    let digest = hex.as_str().and_then(decode_sha256_hex).ok_or_else(|| {
+        ToolError::Invalid("`patch.expect_new_sha256` must be 64 lowercase hex characters".into())
+    })?;
+    if sha2::Sha256::digest(new.as_bytes()).as_slice() != digest.as_slice() {
+        return Err(ToolError::Invalid(
+            "PATCH_NEW_SHA256_MISMATCH: `patch.new` does not match \
+             `patch.expect_new_sha256`; it may have been cut off in transit, so nothing \
+             was written. Re-send the patch"
+                .into(),
+        ));
+    }
+    Ok(digest)
 }
 
 /// 64 lowercase hex characters as 32 bytes, or `None`.
@@ -229,6 +263,14 @@ pub(super) async fn edit(
         return Err(ToolError::Invalid(format!(
             "`{key}` cannot be edited; change a task's status with transition_task"
         )));
+    }
+    // Unknown top-level keys are ignored, but this one would be ignored into a
+    // false belief: the patch is applied with no guard while the caller thinks
+    // `new` was checked (ADR-1042).
+    if present(args, "expect_new_sha256").is_some() {
+        return Err(ToolError::Invalid(
+            "`expect_new_sha256` goes inside `patch`, beside the `new` it guards".into(),
+        ));
     }
     let (id, number, expect_version) = target_task(args)?;
     let title = optional_str(args, "title")?;
@@ -326,6 +368,14 @@ pub(super) fn edit_schema() -> Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "How many times `old` occurs; refused otherwise",
+                    },
+                    "expect_new_sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "SHA-256 of the exact bytes of `new`; the \
+                                        edit is refused if the `new` that arrives \
+                                        does not match, so a cut-off `new` is \
+                                        never applied",
                     },
                 },
                 "required": ["old", "new", "expect_count"],
