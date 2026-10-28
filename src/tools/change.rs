@@ -422,9 +422,10 @@ pub(super) async fn transition(
         .into_inner();
     let meta = resp.meta.unwrap_or_default();
     Ok(Output {
-        // `from` as `task` reported it. On a replay of an applied
-        // transition it equals the target — a known gap in `task`, not
-        // something this gateway can correct. This gateway has no retry
+        // `from` as `task` reported it. Since task 0.8.6 it is the
+        // recorded previous_status on both paths, the first call and a
+        // replay. UNSPECIFIED means unknown: a replay of an old claim
+        // that holds no previous_status. This gateway has no retry
         // layer toward modules, so it never replays a key itself.
         content: json!({
             "id": meta.id,
