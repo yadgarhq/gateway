@@ -1,5 +1,8 @@
 # In git the image points at a moving TAG; the PUBLISHED chart pins a DIGEST,
 # rewritten by ci-release at package time (D65).
+# Install from the published OCI chart (oci://ghcr.io/yadgarhq/charts/gateway); the
+# release pins it to the image digest. A checkout of chart/ renders `latest`, a
+# moving tag, and is for development only.
 image:
   repository: ghcr.io/yadgarhq/gateway
   tag: latest

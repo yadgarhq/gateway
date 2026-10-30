@@ -825,6 +825,12 @@ set to — `iam` and `task` in the reference deployment. There is no `service`
 label: `dial` writes one dimension and the exporter adds no global one, so the
 pod and the job come from the scrape.
 
+## Installing
+
+Install gateway from the published OCI chart: `helm install gateway oci://ghcr.io/yadgarhq/charts/gateway --version <version>`. The release pins that chart to the image digest.
+
+A checkout of `chart/` renders `image.tag: latest`, a moving tag. Use a checkout for development only.
+
 ## Development
 
 ```bash
