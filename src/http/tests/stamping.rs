@@ -33,9 +33,11 @@ const SUBPATH: &str = "yadgarhq/docs/services/api";
 const KEY: &str = "io.yadgarhq/projectResolution";
 
 /// What `origin/main` answered a COUNTING `find_tasks` claiming [`SUBPATH`],
-/// byte for byte. The dead `task` channel makes it a tool-level failure, and
-/// the text is the Linux refusal of a connect to port 1.
-const GOLDEN_COUNTING: &str = r#"{"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"code: 'The service is currently unavailable', message: \"tcp connect error\", source: tonic::transport::Error(Transport, ConnectError(ConnectError(\"tcp connect error\", 127.0.0.1:1, Os { code: 111, kind: ConnectionRefused, message: \"Connection refused\" })))","type":"text"}],"isError":true,"resultType":"complete"}}"#;
+/// byte for byte. The dead `task` channel makes it a tool-level failure.
+/// Recaptured by yaadgaar #452: the text was tonic's rendering of the Linux
+/// refusal of a connect to port 1, address and OS error included, and is now
+/// the code and `tools::reason::TRANSPORT_FAILED`.
+const GOLDEN_COUNTING: &str = r#"{"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"code: 'The service is currently unavailable', message: \"the call to the upstream failed below gRPC; the detail is in the gateway's log\"","type":"text"}],"isError":true,"resultType":"complete"}}"#;
 
 /// What `origin/main` answered an ENFORCING `find_tasks` claiming
 /// `nobody/x`, byte for byte: a refusal, which stamping must not touch.

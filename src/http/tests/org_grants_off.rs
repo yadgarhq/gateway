@@ -232,7 +232,7 @@ fn served_or(bytes: &[u8]) -> String {
     for item in items {
         let unreachable = item["text"]
             .as_str()
-            .is_some_and(|t| t.contains("tcp connect error"));
+            .is_some_and(|t| t.contains("failed below gRPC"));
         if unreachable {
             item["text"] = serde_json::Value::String("<task unreachable>".into());
         }

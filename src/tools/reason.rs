@@ -19,6 +19,13 @@
 /// Every other answer keeps tonic's rendering, which names the code. A token
 /// shape on any other code (UNAVAILABLE, say) is not a refusal and gets no
 /// pass-through.
+///
+/// **A STATUS WITH A `source` IS A TRANSPORT FAILURE, AND ITS WORDS STAY HERE**
+/// (yaadgaar #452). tonic sets a source only on a status it built from a local
+/// error (connect, hyper, h2); one decoded off the wire never has one. tonic's
+/// Display appends that source Debug-formatted, which named the upstream's
+/// address and the OS error, and the message is that error's own text. Such a
+/// status renders as its code and [`TRANSPORT_FAILED`].
 pub(super) fn upstream_text(status: &tonic::Status) -> String {
     let refusal = matches!(
         status.code(),
@@ -26,10 +33,17 @@ pub(super) fn upstream_text(status: &tonic::Status) -> String {
     );
     if refusal && has_reason_token(status.message()) {
         status.message().to_string()
+    } else if std::error::Error::source(status).is_some() {
+        tonic::Status::new(status.code(), TRANSPORT_FAILED).to_string()
     } else {
         status.to_string()
     }
 }
+
+/// What a caller reads in place of a transport failure's own words (yaadgaar
+/// #452). The detail is in the gateway's log, written by `super::bounded`.
+pub(super) const TRANSPORT_FAILED: &str =
+    "the call to the upstream failed below gRPC; the detail is in the gateway's log";
 
 /// The reason tokens a refusal may start with.
 ///
