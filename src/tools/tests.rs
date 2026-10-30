@@ -1070,3 +1070,58 @@ fn a_reason_token_is_one_the_proto_lists_before_the_first_colon() {
         assert_eq!(reason::has_reason_token(message), token, "{message:?}");
     }
 }
+
+/// yaadgaar #452: a status tonic built from a transport error carries that
+/// error as its `source`, and tonic's Display appends it Debug-formatted —
+/// the upstream's address and the OS error. The caller reads the code and a
+/// fixed sentence; the detail is not in the text.
+#[test]
+fn a_transport_status_renders_without_its_source_or_its_words() {
+    let mut status = tonic::Status::unavailable("tcp connect error 10.0.0.7:8443");
+    status.set_source(std::sync::Arc::new(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "10.0.0.7:8443 refused",
+    )));
+    let text = ToolError::Upstream(status).to_string();
+    assert!(!text.contains("source"), "{text}");
+    assert!(!text.contains("10.0.0.7"), "{text}");
+    assert!(!text.contains("refused"), "{text}");
+    assert_eq!(
+        text,
+        tonic::Status::unavailable(reason::TRANSPORT_FAILED).to_string()
+    );
+}
+
+/// yaadgaar #452, through the real dial: `find_tasks` against a closed port.
+/// tonic's rendering of this status named `127.0.0.1:<port>` and
+/// `ConnectionRefused`.
+#[tokio::test]
+async fn an_unreachable_task_is_reported_without_its_address() {
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        l.local_addr().expect("its address").port()
+    };
+    let channel = crate::upstream::connect_task("127.0.0.1", port, None, Duration::from_secs(2))
+        .await
+        .expect("a lazy channel");
+    let task = TaskUpstream::new(channel, Duration::from_secs(2));
+    let text = match call(&task, Scope::default(), "find_tasks", &json!({})).await {
+        Err(e @ ToolError::Upstream(_)) => e.to_string(),
+        Err(e) => panic!("expected an upstream failure, got {e:?}"),
+        Ok(_) => panic!("a closed port cannot answer"),
+    };
+    assert!(!text.contains(&port.to_string()), "{text}");
+    assert!(!text.contains("127.0.0.1"), "{text}");
+    assert!(!text.contains("source"), "{text}");
+    assert!(text.contains(reason::TRANSPORT_FAILED), "{text}");
+}
+
+/// A status with no source — the module's own answer off the wire, or the
+/// gateway's own words — keeps tonic's rendering, message included.
+#[test]
+fn a_status_with_no_source_keeps_its_words() {
+    let status = tonic::Status::not_found("no task 7 in this project");
+    let expected = status.to_string();
+    assert_eq!(ToolError::Upstream(status).to_string(), expected);
+    assert!(expected.contains("no task 7 in this project"));
+}
