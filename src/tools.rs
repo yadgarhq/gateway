@@ -420,7 +420,14 @@ where
                 "task did not answer within {}s",
                 task.timeout().as_secs()
             ))),
-            CallError::Answered(status) => ToolError::Upstream(status),
+            CallError::Answered(status) => {
+                // THE ONLY PLACE A TRANSPORT FAILURE'S DETAIL IS WRITTEN DOWN
+                // (yaadgaar #452): the caller reads `reason::TRANSPORT_FAILED`.
+                if std::error::Error::source(&status).is_some() {
+                    tracing::warn!(error = ?status, "a task call failed below gRPC");
+                }
+                ToolError::Upstream(status)
+            }
         })
 }
 
