@@ -228,6 +228,12 @@ fn a_boundary_that_is_not_a_number_is_refused_rather_than_defaulted() {
         TrustBoundary::parse("-1"),
         Err(TrustBoundaryError::NotANumber(_))
     ));
+    // The STRING "null" too (yaadgaar 280): what a chart would hand over if it
+    // ever quoted a YAML null. Refused like any other word, never `Undeclared`.
+    assert!(matches!(
+        TrustBoundary::parse("null"),
+        Err(TrustBoundaryError::NotANumber(_))
+    ));
 }
 
 #[test]
