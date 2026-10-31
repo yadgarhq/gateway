@@ -2806,7 +2806,7 @@ checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 [[package]]
 name = "yadgar-dial"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/dial.git?tag=v0.2.26#c9662c02b8b2ecc10fdc2b878ac8414bb6c68bcb"
+source = "git+https://github.com/yadgarhq/dial.git?tag=v0.2.28#b84dd71f5deddcc2e26820caaee0370b8926169d"
 dependencies = [
  "metrics",
  "rustls",
@@ -2857,7 +2857,7 @@ dependencies = [
 [[package]]
 name = "yadgar-lifecycle"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/lifecycle.git?tag=v0.3.2#12e1e930d8afdead8cf3e2814ead82086eb99b5e"
+source = "git+https://github.com/yadgarhq/lifecycle.git?tag=v0.3.4#c04731d3bc83a0d2f43b2c7d7fd0dda73fd56cf1"
 dependencies = [
  "metrics",
  "rustls-pki-types",
@@ -2873,7 +2873,7 @@ dependencies = [
 [[package]]
 name = "yadgar-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/yadgarhq/telemetry.git?tag=v0.2.7#2382d610391f5fc245040aa574659c2177c2d51a"
+source = "git+https://github.com/yadgarhq/telemetry.git?tag=v0.2.9#16740c278480375ddede0bab84dc1a9059167256"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
