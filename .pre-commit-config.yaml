@@ -46,7 +46,7 @@ repos:
     # every one of those commits (#89, #95, #96, #101) is a bugfix tightening
     # an existing check, and this tree's full pre-commit run at the new rev is
     # green, so none of the three changes this repository's verdict.
-    rev: v1.47.0
+    rev: v1.48.3
     hooks:
       - id: gitleaks
       - id: prettier
