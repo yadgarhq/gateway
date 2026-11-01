@@ -12,7 +12,7 @@ name = "yadgar-gateway"
 # and read as `crate::VERSION`; see both for the rest of the reasoning.
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.99.1"
 license = "Apache-2.0"
 description = "The bilingual edge: MCP over HTTP outward, gRPC inward (D16)."
 
