@@ -132,7 +132,7 @@ spec:
   # Rendering nothing hands the field to the HPA, which is what `minReplicas`
   # exists to floor. `replicaCount` still applies to every deployment that has
   # not enabled autoscaling, which is the chart's own default (D80).
-  replicas: {{ .Values.replicaCount }}
+  replicas: {{ .Values.replicaCount | int64 }}
   {{- end }}
   {{- with .Values.rollingUpdate }}
   # THE ROLL'S SHAPE, WRITTEN OUT BECAUSE THE DEFAULT IS COUNT-DEPENDENT
@@ -321,7 +321,7 @@ spec:
             - name: TASK_HOST
               value: {{ .Values.task.host | quote }}
             - name: TASK_PORT
-              value: {{ .Values.task.port | quote }}
+              value: {{ .Values.task.port | int64 | quote }}
             # The per-request bound on this hop (ADR-0925 Q-C1). Required by the
             # binary with no default; the schema holds the range. See values.yaml.
             - name: TASK_REQUEST_TIMEOUT_SECONDS
@@ -377,7 +377,7 @@ spec:
             - name: IAM_HOST
               value: {{ .Values.iam.host | quote }}
             - name: IAM_PORT
-              value: {{ .Values.iam.port | quote }}
+              value: {{ .Values.iam.port | int64 | quote }}
             # The per-request bound on this hop (ADR-0925 Q-C1). Required by the
             # binary with no default; the schema holds the range. See values.yaml.
             - name: IAM_REQUEST_TIMEOUT_SECONDS
@@ -432,7 +432,7 @@ spec:
             - name: PROJECT_HOST
               value: {{ .Values.project.host | quote }}
             - name: PROJECT_PORT
-              value: {{ .Values.project.port | quote }}
+              value: {{ .Values.project.port | int64 | quote }}
             # The per-request bound on this hop (ADR-0925 Q-C1). Required by the
             # binary with no default; the schema holds the range. See values.yaml.
             - name: PROJECT_REQUEST_TIMEOUT_SECONDS
@@ -488,7 +488,7 @@ spec:
             # newly registered project stays unresolvable — which matters while
             # the refusal counter above is what gates the flip.
             - name: YADGAR_PROJECT_REGISTRY_POLL_SECONDS
-              value: {{ .Values.projectValidation.registryPollSeconds | quote }}
+              value: {{ .Values.projectValidation.registryPollSeconds | int64 | quote }}
             # D72. How long one resolved credential is reused before iam is asked
             # again. SET UNCONDITIONALLY rather than only when it differs from the
             # binary's default: it is the backstop for a missed invalidation event
@@ -497,7 +497,7 @@ spec:
             # running pod. Set it to 0 to disable the cache and go back to a round
             # trip per call. See values.yaml.
             - name: YADGAR_CREDENTIAL_TTL_SECONDS
-              value: {{ .Values.credentialCache.ttlSeconds | quote }}
+              value: {{ .Values.credentialCache.ttlSeconds | int64 | quote }}
             # The broker carrying that invalidation (D22, D72). Absent, unreachable
             # or REFUSING is survivable and loudly logged at every boot: gateway is
             # the only ingress, so a boot gate here would turn a broker outage into
@@ -621,7 +621,7 @@ spec:
             - name: YADGAR_RATE_LIMIT_DEFAULT
               value: {{ .Values.rateLimit.default | quote }}
             - name: YADGAR_RATE_LIMIT_TIMEOUT_MS
-              value: {{ .Values.rateLimit.timeoutMs | quote }}
+              value: {{ .Values.rateLimit.timeoutMs | int64 | quote }}
             {{- if .Values.rateLimit.passwordSecret }}
             # RENDERED ONLY WHEN THE CACHE ASKS FOR A PASSWORD, so a deployment
             # that has not cut over sends the binary nothing at all and dials the
@@ -650,7 +650,7 @@ spec:
             # number here would be two places that must agree, and only one of
             # them gets edited.
             - name: YADGAR_MAX_REPLICAS
-              value: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas | quote }}{{ else }}{{ .Values.replicaCount | quote }}{{ end }}
+              value: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas | int64 | quote }}{{ else }}{{ .Values.replicaCount | int64 | quote }}{{ end }}
             # HOW MANY PROXIES STAND IN FRONT (ADR-0491, D80). ALWAYS RENDERED,
             # even when empty — unlike the optional Secrets above, and for the
             # opposite reason. An empty value is a real instruction here: it says

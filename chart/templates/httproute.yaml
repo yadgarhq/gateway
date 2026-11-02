@@ -51,5 +51,5 @@ spec:
             value: /
       backendRefs:
         - name: {{ .Chart.Name }}
-          port: {{ .Values.service.port }}
+          port: {{ .Values.service.port | int64 }}
 {{- end }}

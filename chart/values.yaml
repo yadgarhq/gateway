@@ -852,6 +852,9 @@ sourceAddress:
   # default. The default refuses, so a typo silently taken would look exactly
   # like a deployment that never configured this, and the operator who set it
   # would never learn their audit records carry no address.
+  #
+  # REFUSED AT RENDER (yaadgaar 513): only null, "" or a count from 0 to 16, as an
+  # integer or a string of digits, renders. Anything else names this key and stops.
   trustedProxyHops: ""
 
 # WHICH BROWSER ORIGINS MAY CALL THIS GATEWAY.

@@ -108,3 +108,98 @@ block.
       "operator" "KEDA"
       "toggle" "autoscaling.enabled") }}
 {{- end }}
+{{/*
+EVERY NUMERIC KNOB THIS CHART RENDERS IS A WHOLE NUMBER, OR THE RENDER REFUSES NAMING THE
+KEY (yaadgaar 482, 485).
+
+A values FILE decodes a number as float64, and `quote` prints a float64 with `%v`, so
+1000000 renders "1e+06" and 2147483648 renders "2.147483648e+09": the binary parses
+neither. The rendering sites below therefore cast with `int64`. `int64` is silent on a
+value that does not fit (a 20-digit string becomes 0, 1e20 becomes
+-9223372036854775808) and parses a string base 0 (`0123` is 83, `08` is 0), so the cast
+is never the check. Measured on helm 4.3.0. This block is the check, and it runs BEFORE
+the cast: a string is at most 18 digits with no leading zero, and a number is whole and
+below 1e18. A string of digits stays valid (`--set-string projectValidation.registryPollSeconds=30`
+is accepted by design, ADR-0847), and so does any non-negative whole number in range.
+
+Three bounds ride on the same loop. A port is refused below 1 (port 0 listens on
+nothing) and above 65535, the largest TCP port. A replica count is refused above
+2147483647, the int32 field Kubernetes stores it in. ZERO IS NOT REFUSED FOR A REPLICA
+COUNT and no floor is added: whether 0 or a minimum of 2 is right is a pending ruling,
+and this block must not decide it.
+
+ONLY A KNOB THE RENDER READS IS CHECKED. `replicaCount` feeds `replicas:` and
+`YADGAR_MAX_REPLICAS` only while `autoscaling.enabled` is false, and `autoscaling.minReplicas`
+and `maxReplicas` feed the ScaledObject and `YADGAR_MAX_REPLICAS` only while it is true,
+so a bad value in the arm that is off changes nothing and is not refused.
+`terminationGracePeriodSeconds` and `preStopSleepSeconds` sit behind `with`, which skips
+nil and 0, and so are checked only when present. The grace period, the sleep and `topologySpread.maxSkew` are NOT cast: `hooks/chart_baseline.py`
+prices the grace period against the sleep and the skew and cannot read `{{ . | int64 }}`, so the
+check bounds all three at 999999 instead, the largest value a float64 prints without an exponent.
+`topologySpread.maxSkew` is checked, bounded the same way, only while `topologySpread.enabled` is true, because only
+then is it rendered. The other knobs are rendered unconditionally, so a missing key reads as
+nil here and is refused too.
+`autoscaling.enabled` is a confirmed bool by the blocks above.
+*/}}
+{{- $checks := list
+      (dict "key" "task.port" "value" .Values.task.port "min" 1 "max" 65535)
+      (dict "key" "iam.port" "value" .Values.iam.port "min" 1 "max" 65535)
+      (dict "key" "project.port" "value" .Values.project.port "min" 1 "max" 65535)
+      (dict "key" "service.port" "value" .Values.service.port "min" 1 "max" 65535)
+      (dict "key" "projectValidation.registryPollSeconds" "value" .Values.projectValidation.registryPollSeconds)
+      (dict "key" "credentialCache.ttlSeconds" "value" .Values.credentialCache.ttlSeconds)
+      (dict "key" "rateLimit.timeoutMs" "value" .Values.rateLimit.timeoutMs) }}
+{{- if .Values.autoscaling.enabled }}
+{{- $checks = append $checks (dict "key" "autoscaling.minReplicas" "value" .Values.autoscaling.minReplicas "max" 2147483647) }}
+{{- $checks = append $checks (dict "key" "autoscaling.maxReplicas" "value" .Values.autoscaling.maxReplicas "max" 2147483647) }}
+{{- else }}
+{{- $checks = append $checks (dict "key" "replicaCount" "value" .Values.replicaCount "max" 2147483647) }}
+{{- end }}
+{{- if and (hasKey .Values "terminationGracePeriodSeconds") (not (kindIs "invalid" .Values.terminationGracePeriodSeconds)) }}
+{{- $checks = append $checks (dict "key" "terminationGracePeriodSeconds" "value" .Values.terminationGracePeriodSeconds "max" 999999) }}
+{{- end }}
+{{- if and (hasKey .Values "preStopSleepSeconds") (not (kindIs "invalid" .Values.preStopSleepSeconds)) }}
+{{- $checks = append $checks (dict "key" "preStopSleepSeconds" "value" .Values.preStopSleepSeconds "max" 999999) }}
+{{- end }}
+{{- if and (kindIs "map" .Values.topologySpread) .Values.topologySpread.enabled }}
+{{- $checks = append $checks (dict "key" "topologySpread.maxSkew" "value" .Values.topologySpread.maxSkew "max" 999999) }}
+{{- end }}
+{{- range $check := $checks }}
+{{- $value := $check.value }}
+{{- $whole := false }}
+{{- if kindIs "string" $value }}
+{{- $whole = regexMatch "^(0|[1-9][0-9]{0,17})$" $value }}
+{{- else if or (kindIs "float64" $value) (kindIs "int64" $value) (kindIs "int" $value) }}
+{{- $whole = and (ge (float64 $value) 0.0) (lt (float64 $value) 1.0e18) (eq (float64 $value) (floor (float64 $value))) }}
+{{- end }}
+{{- if not $whole }}
+{{- fail (printf "gateway: `%s` must be a whole number of at least 0 and is %s. It is rendered through `int64`, which turns a fraction, an out-of-range value or a string with a leading zero into a different number without saying so. Write digits only, for example `30`." $check.key (toJson $value)) }}
+{{- end }}
+{{- if and (hasKey $check "min") (lt (int64 $value) (int64 $check.min)) }}
+{{- fail (printf "gateway: `%s` must be at least %d and is %s." $check.key (int64 $check.min) (toJson $value)) }}
+{{- end }}
+{{- if and (hasKey $check "max") (gt (int64 $value) (int64 $check.max)) }}
+{{- fail (printf "gateway: `%s` must be at most %d and is %s." $check.key (int64 $check.max) (toJson $value)) }}
+{{- end }}
+{{- end }}
+
+{{/*
+`sourceAddress.trustedProxyHops` (yaadgaar 513). The binary accepts the empty string (no
+trust boundary declared) or a count of 0..16 and exits at boot on anything else
+(`TrustBoundary::parse`: NotANumber, TooDeep), so a bad value used to pass the render and
+crash-loop the pod. `values.schema.json` types it (null, an integer 0..16 or a string)
+and bounds a number; THIS block reads a string, which a schema pattern would also reject
+but without naming the key the way the other checks here do. A string is the empty
+string or a canonical count 0..16: no sign, no space, no leading zero, no fraction.
+`TrustBoundary::parse` (src/source.rs) trims, then calls `u32::parse`, so the binary reads
+"01", " 1" and "+1" as 1 and a whitespace-only string as Undeclared. This chart refuses all
+of those, a deliberate fail-closed choice on a knob that gates source-address attribution;
+the estate uses only the empty string. A null makes helm
+delete the key, which is the documented empty instruction and renders a bare `value:`.
+*/}}
+{{- if and (kindIs "map" .Values.sourceAddress) (hasKey .Values.sourceAddress "trustedProxyHops") }}
+{{- $hops := .Values.sourceAddress.trustedProxyHops }}
+{{- if and (kindIs "string" $hops) (not (regexMatch "^(|0|[1-9]|1[0-6])$" $hops)) }}
+{{- fail (printf "gateway: `sourceAddress.trustedProxyHops` must be empty or a count from 0 to 16 and is %s. The gateway refuses to start on anything else, so a bad value here would only crash-loop the pod. Write the number of trusted proxies, for example `1`, or leave it empty." (toJson $hops)) }}
+{{- end }}
+{{- end }}
