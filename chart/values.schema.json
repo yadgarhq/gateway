@@ -206,7 +206,14 @@
     },
     "sourceAddress": {
       "properties": {
-        "trustedProxyHops": {}
+        "trustedProxyHops": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 0, "maximum": 16 },
+            { "type": "string" }
+          ],
+          "description": "How many trusted proxies stand in front of this gateway (ADR-0491, D80). Null or the empty string declares no trust boundary; otherwise a count from 0 to 16, as an integer or as a string of digits. The binary refuses to start on anything else (TrustBoundary::parse: NotANumber, TooDeep), so the schema refuses it at render instead (yaadgaar 513). A string is read by the render check in templates/render-checks.yaml, which names the key."
+        }
       },
       "additionalProperties": false
     },

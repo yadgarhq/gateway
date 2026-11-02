@@ -24,8 +24,8 @@ metadata:
 spec:
   scaleTargetRef:
     name: {{ .Chart.Name }}
-  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
-  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  minReplicaCount: {{ .Values.autoscaling.minReplicas | int64 }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas | int64 }}
   # Slow to scale down, quick to scale up. gateway is the one place every
   # client's long-lived HTTP connection lands, so removing a pod costs more than
   # adding one — the same reasoning D23 applies to a gRPC client's connection.

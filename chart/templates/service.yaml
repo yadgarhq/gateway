@@ -11,5 +11,5 @@ spec:
     app: {{ .Chart.Name }}
   ports:
     - name: http
-      port: {{ .Values.service.port }}
+      port: {{ .Values.service.port | int64 }}
       targetPort: http
