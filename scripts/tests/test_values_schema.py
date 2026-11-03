@@ -575,18 +575,17 @@ def test_the_suite_reads_the_schema_this_repository_ships():
 # schema `default` is a second source for the chart default).
 # The tables are data so ADR-0705's REQUIRED list (yaadgaar 336) can extend them.
 #
-# UNDELIBERATE? (yaadgaar 327): the entries below carry a `type`, `items` or
-# `minimum` that no ADR, ruling or yaadgaar task cited by this chart covers, and
-# ADR-0847 says a schema holds no types. The schema's own `$comment` says only
-# that they "predate" the closure. They are pinned here as shipped, not deleted:
-# `networkPolicy` and `networkPolicy.scrapeFrom` (`type: object`),
-# `networkPolicy.enabled` (`boolean`), `networkPolicy.clients` (`array` of
-# `object`), `networkPolicy.scrapeFrom.namespace` (`string`), `toolsPoll`
-# (`object`) and `toolsPoll.intervalSeconds` (`integer`, `minimum: 1`), plus the
-# bare `type: object` on the blocks `valkey`, `valkey.tls` and `nats.tls`.
+# ADR-1138 (accepted 2026-11-03, yaadgaar #327 ruling 4): these named types are
+# deliberate exceptions to ADR-0847, kept as shipped. Each census entry below
+# marked `# ADR-1138` is one of them: `networkPolicy` and
+# `networkPolicy.scrapeFrom` (`type: object`), `networkPolicy.enabled`
+# (`boolean`), `networkPolicy.clients` (`array` of `object`),
+# `networkPolicy.scrapeFrom.namespace` (`string`), `toolsPoll` (`object`) and
+# `toolsPoll.intervalSeconds` (`integer`, `minimum: 1`), plus the bare
+# `type: object` on the blocks `valkey`, `valkey.tls` and `nats.tls`.
 # ADR-0845 (TLS switches), ADR-0925 / ADR-0569 / ADR-1006 (timeouts and cache TTL)
 # and ADR-0520 / yaadgaar 513 (`sourceAddress.trustedProxyHops`) cover the rest.
-# A ruling to keep or strip an undeliberate entry edits this table in the PR.
+# Any other new type still needs its own ruling and edits this table in the PR.
 
 TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "task.requestTimeoutSeconds": {"type": "integer", "minimum": 14, "maximum": 18},
@@ -601,10 +600,10 @@ TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "server.limits.headerReadTimeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 60},
     "sourceAddress.trustedProxyHops": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 0, "maximum": 16}, {"type": "string"}]},
     "adminBootstrap.refusePreMintedUserId": {"type": "boolean"},
-    "networkPolicy.enabled": {"type": "boolean"},
-    "networkPolicy.clients": {"type": "array", "items": {"type": "object", "description": "One NetworkPolicyPeer. Selectors written in ONE entry are an AND; the same two written as two entries are an OR and admit far more."}},
-    "networkPolicy.scrapeFrom.namespace": {"type": "string"},
-    "toolsPoll.intervalSeconds": {"type": "integer", "minimum": 1},
+    "networkPolicy.enabled": {"type": "boolean"},  # ADR-1138
+    "networkPolicy.clients": {"type": "array", "items": {"type": "object", "description": "One NetworkPolicyPeer. Selectors written in ONE entry are an AND; the same two written as two entries are an OR and admit far more."}},  # ADR-1138
+    "networkPolicy.scrapeFrom.namespace": {"type": "string"},  # ADR-1138
+    "toolsPoll.intervalSeconds": {"type": "integer", "minimum": 1},  # ADR-1138
 }
 
 BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
@@ -615,14 +614,14 @@ BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "project": {"required": ["requestTimeoutSeconds"]},
     "project.tls": {"required": ["enabled"]},
     "credentialCache": {"required": ["ttlSeconds"]},
-    "nats.tls": {"type": "object", "required": ["enabled"]},
-    "valkey": {"type": "object"},
-    "valkey.tls": {"type": "object", "required": ["enabled"]},
+    "nats.tls": {"type": "object", "required": ["enabled"]},  # ADR-1138
+    "valkey": {"type": "object"},  # ADR-1138
+    "valkey.tls": {"type": "object", "required": ["enabled"]},  # ADR-1138
     "server.limits": {"required": ["headerReadTimeoutSeconds"]},
     "adminBootstrap": {"required": ["refusePreMintedUserId"]},
-    "networkPolicy": {"type": "object"},
-    "networkPolicy.scrapeFrom": {"type": "object"},
-    "toolsPoll": {"type": "object"},
+    "networkPolicy": {"type": "object"},  # ADR-1138
+    "networkPolicy.scrapeFrom": {"type": "object"},  # ADR-1138
+    "toolsPoll": {"type": "object"},  # ADR-1138
 }
 
 BOUNDED_LEAF = "server.limits.headerReadTimeoutSeconds"
@@ -728,6 +727,42 @@ def test_the_census_tables_name_only_nodes_that_carry_keywords() -> None:
     assert all(TYPED_ON_PURPOSE.values()), "an empty TYPED_ON_PURPOSE entry excuses nothing"
     assert all(BLOCKS_ON_PURPOSE.values()), "an empty BLOCKS_ON_PURPOSE entry excuses nothing"
 
+
+ADR_1138_PATHS = (
+    "networkPolicy",
+    "networkPolicy.enabled",
+    "networkPolicy.clients",
+    "networkPolicy.scrapeFrom",
+    "networkPolicy.scrapeFrom.namespace",
+    "toolsPoll",
+    "toolsPoll.intervalSeconds",
+    "valkey",
+    "valkey.tls",
+    "nats.tls",
+)
+
+
+def test_each_adr_1138_exception_cites_the_adr_in_its_census_entry() -> None:
+    """ADR-1138 (accepted 2026-11-03, yaadgaar #327 ruling 4) records these named types
+    as deliberate exceptions to ADR-0847. Each census entry carries the citation."""
+    lines = Path(__file__).read_text().splitlines()
+    for path in ADR_1138_PATHS:
+        entries = [line for line in lines if line.startswith(f'    "{path}": ')]
+        assert len(entries) == 1, f"{path}: expected one census entry, found {len(entries)}"
+        assert "ADR-1138" in entries[0], f"{path}: the census entry does not cite ADR-1138"
+
+
+def test_the_schema_comment_cites_adr_1138_not_the_word_predate() -> None:
+    comment = load_schema()["$comment"]
+    assert "ADR-1138" in comment
+    assert "predate this file" not in comment
+
+
+def test_trusted_proxy_hops_cites_the_source_address_adr() -> None:
+    """ADR-0520 is the source-address trust boundary; ADR-0491 is identity resolution."""
+    description = load_schema()["properties"]["sourceAddress"]["properties"]["trustedProxyHops"]["description"]
+    assert "ADR-0520" in description
+    assert "ADR-0491" not in description
 
 def test_the_census_ignores_prose() -> None:
     mutated = copy.deepcopy(load_schema())
