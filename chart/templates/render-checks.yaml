@@ -136,7 +136,7 @@ so a bad value in the arm that is off changes nothing and is not refused.
 nil and 0, and so are checked only when present. The grace period, the sleep and `topologySpread.maxSkew` are NOT cast: `hooks/chart_baseline.py`
 prices the grace period against the sleep and the skew and cannot read `{{ . | int64 }}`, so the
 check bounds all three at 999999 instead, the largest value a float64 prints without an exponent.
-`topologySpread.maxSkew` is checked, bounded the same way, only while `topologySpread.enabled` is true, because only
+`topologySpread.maxSkew` is checked, bounded the same way and refused below 1 because the API requires it greater than zero, only while `topologySpread.enabled` is true, because only
 then is it rendered. The other knobs are rendered unconditionally, so a missing key reads as
 nil here and is refused too.
 `autoscaling.enabled` is a confirmed bool by the blocks above.
@@ -162,7 +162,7 @@ nil here and is refused too.
 {{- $checks = append $checks (dict "key" "preStopSleepSeconds" "value" .Values.preStopSleepSeconds "max" 999999) }}
 {{- end }}
 {{- if and (kindIs "map" .Values.topologySpread) .Values.topologySpread.enabled }}
-{{- $checks = append $checks (dict "key" "topologySpread.maxSkew" "value" .Values.topologySpread.maxSkew "max" 999999) }}
+{{- $checks = append $checks (dict "key" "topologySpread.maxSkew" "value" .Values.topologySpread.maxSkew "min" 1 "max" 999999) }}
 {{- end }}
 {{- range $check := $checks }}
 {{- $value := $check.value }}
