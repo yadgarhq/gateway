@@ -124,9 +124,7 @@ is accepted by design, ADR-0847), and so does any non-negative whole number in r
 
 Three bounds ride on the same loop. A port is refused below 1 (port 0 listens on
 nothing) and above 65535, the largest TCP port. A replica count is refused above
-2147483647, the int32 field Kubernetes stores it in. ZERO IS NOT REFUSED FOR A REPLICA
-COUNT and no floor is added: whether 0 or a minimum of 2 is right is a pending ruling,
-and this block must not decide it.
+2147483647, the int32 field Kubernetes stores it in. ZERO IS NOT REFUSED FOR `replicaCount`: `replicaCount` 0 stays legal while autoscaling is off (scale to zero, ruled 2026-11-03). `autoscaling.minReplicas` below 2 is refused while autoscaling is on (D55, yaadgaar 482), by the block at the end of this file.
 
 ONLY A KNOB THE RENDER READS IS CHECKED. `replicaCount` feeds `replicas:` and
 `YADGAR_MAX_REPLICAS` only while `autoscaling.enabled` is false, and `autoscaling.minReplicas`
@@ -201,5 +199,21 @@ delete the key, which is the documented empty instruction and renders a bare `va
 {{- $hops := .Values.sourceAddress.trustedProxyHops }}
 {{- if and (kindIs "string" $hops) (not (regexMatch "^(|0|[1-9]|1[0-6])$" $hops)) }}
 {{- fail (printf "gateway: `sourceAddress.trustedProxyHops` must be empty or a count from 0 to 16 and is %s. The gateway refuses to start on anything else, so a bad value here would only crash-loop the pod. Write the number of trusted proxies, for example `1`, or leave it empty." (toJson $hops)) }}
+{{- end }}
+{{- end }}
+{{- /*
+AUTOSCALING FLOOR, D55 (yaadgaar 482, ruled 2026-11-03). `autoscaling.minReplicas` feeds KEDA's
+`minReplicaCount`, and D55 makes at least two pods a correctness property, not a tuning choice.
+Refused below 2 while `autoscaling.enabled` is true. Placed after the whole-number check above, so
+`int64` reads a confirmed whole number; `autoscaling.enabled` is a confirmed bool by the shape blocks.
+While autoscaling is off the knob is not read, and `replicaCount: 0` stays legal (scale to zero).
+*/}}
+{{- if .Values.autoscaling.enabled }}
+{{- if lt (int64 .Values.autoscaling.minReplicas) 2 }}
+{{- fail (printf (join "" (list
+      "gateway: `autoscaling.minReplicas` must be at least 2 while `autoscaling.enabled` is true, and is %s. "
+      "It renders as the ScaledObject's `minReplicaCount`, and below 2 the service can run on one pod or "
+      "none, which D55 forbids. Write 2 or more, or set `autoscaling.enabled: false`."))
+      (toJson .Values.autoscaling.minReplicas)) }}
 {{- end }}
 {{- end }}
