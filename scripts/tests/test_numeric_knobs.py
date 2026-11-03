@@ -12,8 +12,9 @@ is whole and below 1e18, and the refusal names the key (`templates/render-checks
 schema accepted any type and the binary refused at boot (`TrustBoundary::parse`:
 NotANumber, TooDeep). It now allows null, "" or 0..16 and refuses the rest at render.
 
-Zero is NOT refused for any replica count and no floor is added: both are pending
-rulings, and `test_zero_replicas_still_render` pins that nothing here decided them.
+`replicaCount` 0 stays legal while autoscaling is off (ruled 2026-11-03), and
+`test_zero_replicas_still_render` pins it. `autoscaling.minReplicas` below 2 is refused
+while autoscaling is on (D55, yaadgaar 482), pinned at the end of this file.
 
 Assertions check the key name and the schema wrapper sentence only, never a per-leaf
 phrase: CI pins helm 3.18.4, whose wording differs from 4.x.
@@ -235,12 +236,11 @@ def test_a_replica_count_that_is_not_whole_refuses_naming_the_key(value, tmp_pat
 
 
 def test_zero_replicas_still_render(tmp_path):
-    """No floor and no refusal of 0: both are pending rulings (yaadgaar 482)."""
+    """`replicaCount: 0` is legal (scale to zero, ruled 2026-11-03, yaadgaar 482). The KEDA
+    floor is a separate rule, tested at the end of this file."""
     stdout = rendered(overlay("replicaCount", 0), tmp_path)
     assert "replicas: 0\n" in stdout
-    body = overlay("autoscaling.minReplicas", 0, autoscaling=True)
-    stdout = rendered(body, tmp_path, *KEDA)
-    assert "minReplicaCount: 0\n" in stdout
+
 
 
 def test_the_autoscaling_counts_render_as_integers_and_bound_both_ends(tmp_path):
@@ -323,3 +323,36 @@ def test_the_topology_skew_is_not_read_while_the_spread_is_off(tmp_path):
     body = overlay("topologySpread.maxSkew", 1.5)
     body["topologySpread"]["enabled"] = False
     assert rendered(body, tmp_path)
+
+
+# --- 482 item 2: autoscaling.minReplicas >= 2 while autoscaling is on (D55) --------
+# RULED 2026-11-03: D55 makes two pods a correctness property, so KEDA `minReplicaCount`
+# below 2 is refused at render. `replicaCount: 0` stays legal while autoscaling is off.
+
+
+@pytest.mark.parametrize("value", [0, 1, "0", "1"], ids=repr)
+def test_autoscaling_on_with_min_replicas_below_two_is_refused_by_name(tmp_path, value):
+    body = overlay("autoscaling.minReplicas", value, autoscaling=True)
+    combined = refused_naming(body, "autoscaling.minReplicas", tmp_path, *KEDA)
+    assert "at least 2" in combined, combined
+
+
+@pytest.mark.parametrize("value", [2, 3, "2"], ids=repr)
+def test_autoscaling_on_with_min_replicas_two_or_more_renders(tmp_path, value):
+    body = overlay("autoscaling.minReplicas", value, autoscaling=True)
+    assert f"minReplicaCount: {int(value)}\n" in rendered(body, tmp_path, *KEDA)
+
+
+def test_the_min_replicas_floor_is_not_read_while_autoscaling_is_off(tmp_path):
+    body = overlay("autoscaling.minReplicas", 0)
+    body["replicaCount"] = 0
+    assert "replicas: 0\n" in rendered(body, tmp_path)
+
+
+def test_a_string_autoscaling_toggle_is_refused_before_the_floor_is_read(tmp_path):
+    """`enabled: "false"` reads as off to a human and truthy to Go templates. The bool-shape
+    check must refuse it first, so `minReplicas: 0` never slips past the floor behind it."""
+    body = overlay("autoscaling.minReplicas", 0)
+    body["autoscaling"]["enabled"] = "false"
+    combined = refused_naming(body, "autoscaling.enabled", tmp_path, *KEDA)
+    assert "must be true or false" in combined and "at least 2" not in combined, combined
