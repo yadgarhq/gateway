@@ -315,7 +315,7 @@ def test_the_topology_skew_is_bounded_where_a_float_prints_plainly(tmp_path):
     for value in (1, 999999):
         spec = deployment(rendered(skew(value), tmp_path))["spec"]["template"]["spec"]
         assert spec["topologySpreadConstraints"][0]["maxSkew"] == value
-    for value in (1000000, 1.5, "abc", -1, "", "0123", 1e20):
+    for value in (0, "0", 1000000, 1.5, "abc", -1, "", "0123", 1e20):
         refused_naming(skew(value), "topologySpread.maxSkew", tmp_path)
 
 
