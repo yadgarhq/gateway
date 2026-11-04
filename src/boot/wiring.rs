@@ -20,7 +20,7 @@ use super::{bootstrap_path_message, bootstrap_token, env_required, refusal};
 
 type Boxed = Box<dyn std::error::Error>;
 
-/// What [`wiring`] resolved: the rotation watch set, and the two upstreams.
+/// What [`wiring`] resolved: the rotation watch set, and the upstreams.
 pub struct Wiring {
     pub bootstrap: BootstrapToken,
     pub watch_inputs: rotate::Inputs,
@@ -86,8 +86,8 @@ pub async fn wiring(
     // would put the rest of boot inside a window where a kubelet swap quietly
     // becomes the baseline, and the real rotation would never be noticed.
     //
-    // BOTH UPSTREAMS, AND ONE CLIENT LEAF BETWEEN THEM. `gateway-client-tls` is
-    // presented to `task` and to `iam`, so the same two paths arrive twice; the
+    // EVERY PEER, AND ONE CLIENT LEAF BETWEEN THEM. `gateway-client-tls` goes to
+    // `task`, `iam`, `project`, broker and cache, so the same paths arrive up to 5x; the
     // fold de-duplicates, so the pair is hashed once and named once in the line
     // that reports a change.
     //
