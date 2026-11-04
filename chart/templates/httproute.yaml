@@ -1,13 +1,15 @@
 # What attaches this service to the TLS edge (D71).
 #
-# IN THIS CHART, NOT IN yadgarhq/deploy, and the placement is the point. The route
+# IN THIS CHART, NOT IN THE PLATFORM LAYER, and the placement is the point. The route
 # and the Service it forwards to have one lifecycle: deploy the chart and the
-# route appears, remove it and the route goes with it. Put in `deploy` it would be
-# a second place that has to know this service's name and port, and the failure
+# route appears, remove it and the route goes with it. Put in the platform layer
+# (`deploy` until ADR-0828 moved it into `platform`) it would be a second place
+# that has to know this service's name and port, and the failure
 # mode is a route pointing at a backend that no longer exists — which Gateway API
 # reports as ResolvedRefs=False on an object nobody is looking at.
 #
-# The Gateway itself stays in `deploy`: it is shared edge infrastructure that
+# The Gateway itself stays in `platform` (`gateway-listener.yaml`; it was in
+# `deploy` before ADR-0828): it is shared edge infrastructure that
 # outlives any one module, and it holds the certificate. A module owns its route;
 # the substrate owns the listener.
 #

@@ -1,5 +1,14 @@
 # Migration notes
 
+> **Read the entries below as run logs.** `yadgarhq/deploy` is retired (ADR-0803,
+> ADR-0828) and `yadgarhq/argocd`'s `applicationsets/modules.yaml` was deleted
+> (ADR-0848). An entry that tells you to act in either was true when it was
+> written. The live places are `yadgarhq/argocd` (`applications/`, which sets
+> `gateway.adminBootstrap` and `gateway.sourceAddress`) and the `platform` chart
+> (the broker, the cache, and the `bootstrap-secrets` and `admin-bootstrap-token`
+> hook Jobs that create `valkey-password`, `nats-auth-gateway` and
+> `admin-bootstrap-token`). Checked at `argocd` a97616a and `platform` f41f081.
+
 ## `/admin/set-user-admin` and the `is_admin` field of `create-user` are retired (team access stage 10)
 
 **Breaking.** `POST /admin/set-user-admin` answers `404`. A `create-user` body

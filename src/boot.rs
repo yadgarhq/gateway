@@ -118,7 +118,7 @@ pub(crate) fn env_required_allow_empty(key: &str) -> Result<String, String> {
 }
 
 /// A boot refusal as the TEXT `run` returns, flattened through the estate's one
-/// error-chain walker (ledger 733, ADR-0591).
+/// error-chain walker (ledger 733).
 ///
 /// **NOT A SIXTH COPY.** The body is a call to `yadgar_telemetry::diagnose::chain`
 /// and nothing else; the source walk lives there and is written once. What this

@@ -37,7 +37,8 @@
 //! What is given up is worth naming: this proves the bytes on the wire and the
 //! eviction they cause, NOT that a real `nats-server` accepts the password the
 //! deployment sets or that its `authorization` block permits this subject. That
-//! second half belongs to `yadgarhq/deploy`.
+//! second half belongs to the deployment that declares the broker, which is the
+//! `platform` chart since ADR-0828 (`yadgarhq/deploy` before it).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
