@@ -131,7 +131,14 @@ ONLY A KNOB THE RENDER READS IS CHECKED. `replicaCount` feeds `replicas:` and
 and `maxReplicas` feed the ScaledObject and `YADGAR_MAX_REPLICAS` only while it is true,
 so a bad value in the arm that is off changes nothing and is not refused.
 `terminationGracePeriodSeconds` and `preStopSleepSeconds` sit behind `with`, which skips
-nil and 0, and so are checked only when present. The grace period, the sleep and `topologySpread.maxSkew` are cast like the rest (yaadgaar 550):
+nil and the NUMBER 0, and so are checked only when present. `with` PASSES THE STRING "0":
+every non-empty string is true to a Go template, so `--set-string terminationGracePeriodSeconds=0`
+used to render `terminationGracePeriodSeconds: 0`, an immediate SIGKILL. For these two keys a
+string whose `int64` is 0 is therefore refused by name, after the whole-number check (yaadgaar
+639). It is the one carve-out from ADR-0847. Today the regex admits exactly one such string,
+"0" ("00", " 0", "0.0" and "-0" are refused as not whole); comparing `int64` and not the
+exact string keeps "00" refused if the regex is ever loosened. The number 0 is not refused.
+The grace period, the sleep and `topologySpread.maxSkew` are cast like the rest (yaadgaar 550):
 `hooks/chart_baseline.py` reads `{{ . | int64 }}` since yadgarhq/actions v1.64.0. All three stay
 bounded at 999999, the largest value a float64 prints without an exponent. The gate no longer
 forces that bound, and lifting it is a separate decision.
@@ -155,10 +162,10 @@ nil here and is refused too.
 {{- $checks = append $checks (dict "key" "replicaCount" "value" .Values.replicaCount "max" 2147483647) }}
 {{- end }}
 {{- if and (hasKey .Values "terminationGracePeriodSeconds") (not (kindIs "invalid" .Values.terminationGracePeriodSeconds)) }}
-{{- $checks = append $checks (dict "key" "terminationGracePeriodSeconds" "value" .Values.terminationGracePeriodSeconds "max" 999999) }}
+{{- $checks = append $checks (dict "key" "terminationGracePeriodSeconds" "value" .Values.terminationGracePeriodSeconds "max" 999999 "refuseZeroString" true) }}
 {{- end }}
 {{- if and (hasKey .Values "preStopSleepSeconds") (not (kindIs "invalid" .Values.preStopSleepSeconds)) }}
-{{- $checks = append $checks (dict "key" "preStopSleepSeconds" "value" .Values.preStopSleepSeconds "max" 999999) }}
+{{- $checks = append $checks (dict "key" "preStopSleepSeconds" "value" .Values.preStopSleepSeconds "max" 999999 "refuseZeroString" true) }}
 {{- end }}
 {{- if and (kindIs "map" .Values.topologySpread) .Values.topologySpread.enabled }}
 {{- $checks = append $checks (dict "key" "topologySpread.maxSkew" "value" .Values.topologySpread.maxSkew "min" 1 "max" 999999) }}
@@ -173,6 +180,9 @@ nil here and is refused too.
 {{- end }}
 {{- if not $whole }}
 {{- fail (printf "gateway: `%s` must be a whole number of at least 0 and is %s. It is rendered through `int64`, which turns a fraction, an out-of-range value or a string with a leading zero into a different number without saying so. Write digits only, for example `30`." $check.key (toJson $value)) }}
+{{- end }}
+{{- if and (hasKey $check "refuseZeroString") (kindIs "string" $value) (eq (int64 $value) 0) }}
+{{- fail (printf "gateway: `%s` is the string %s, which a `with` guard treats as set, so it would render as 0 and not as the API default. Write the number 0 (`--set`, not `--set-string`) or delete the key to leave the field unset (yaadgaar 639)." $check.key (toJson $value)) }}
 {{- end }}
 {{- if and (hasKey $check "min") (lt (int64 $value) (int64 $check.min)) }}
 {{- fail (printf "gateway: `%s` must be at least %d and is %s." $check.key (int64 $check.min) (toJson $value)) }}
