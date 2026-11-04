@@ -185,18 +185,23 @@ impl Server {
             .unwrap_or_else(|| panic!("no published port in {text:?}"))
     }
 
+    /// Everything the container has printed so far.
+    fn log(&self) -> String {
+        let out = Command::new("docker")
+            .args(["logs", &self.name])
+            .output()
+            .expect("docker logs");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
     fn wait_until_ready(&self) {
         let deadline = Instant::now() + READY;
         loop {
-            let out = Command::new("docker")
-                .args(["logs", &self.name])
-                .output()
-                .expect("docker logs");
-            let log = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+            let log = self.log();
             if log.contains("Server is ready") {
                 return;
             }
@@ -211,6 +216,64 @@ impl Server {
     fn url(&self) -> String {
         format!("nats://localhost:{}", self.port)
     }
+
+    /// Asserts that THIS broker refused a handshake for `reason`, by its own
+    /// log line. The broker writes the line when its verifier fails, before it
+    /// closes the socket, so the line is there whichever way the close reaches
+    /// the client (see [`assert_refused`]). The wait is for `docker logs` to
+    /// catch up, not for the broker.
+    fn assert_logged_refusal(&self, reason: &str) {
+        let deadline = Instant::now() + REFUSAL_LOGGED;
+        loop {
+            let log = self.log();
+            if log
+                .lines()
+                .any(|line| line.contains("TLS handshake error") && line.contains(reason))
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the broker logged no TLS handshake error naming {reason:?}:\n{log}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+/// How long `docker logs` may lag the broker's refusal line.
+const REFUSAL_LOGGED: Duration = Duration::from_secs(10);
+
+/// THE BROKER REFUSED THIS DIAL, for `reason`, and the client saw it.
+///
+/// **WHY A RESET IS ALSO A REFUSAL HERE (yaadgaar #415).** In TLS 1.3 the
+/// client's handshake is done when it SENDS its certificate and Finished; the
+/// broker's verdict on that certificate comes after. So async-nats writes
+/// `CONNECT` at once, and the broker then sends its alert and closes with that
+/// `CONNECT` still unread, which makes the close a TCP reset. The reset can
+/// reach the client before the alert, and the alert is then lost. Measured
+/// under load with rootless podman behind the `docker` CLI: the
+/// foreign-authority case failed 25 of 50 runs on that reset, and the no-leaf
+/// case 1 of 50. `strace` shows the client's first read after its `CONNECT`
+/// return `ECONNRESET`, with no alert read before it. Which hop drops the
+/// alert (most likely the proxy that publishes the container's port) was not
+/// measured.
+///
+/// So the client may see either the broker's `alert` or a reset, and nothing
+/// else: any other error (this gateway's own verifier, a refused dial, a
+/// timeout) still fails. Which side refused, and why, is then proved by the
+/// broker's own log on EVERY run, not only on the runs that lost the alert.
+fn assert_refused(server: &Server, error: &async_nats::ConnectError, alert: &str, reason: &str) {
+    let printed = format!("{error:?}");
+    let reset = std::error::Error::source(error)
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionReset);
+    assert!(
+        printed.contains(alert) || reset,
+        "the client must see the broker's {alert} alert, or the reset that can overtake it: \
+         {printed}"
+    );
+    server.assert_logged_refusal(reason);
 }
 
 impl Drop for Server {
@@ -306,10 +369,14 @@ async fn a_verifying_broker_refuses_a_gateway_that_presents_no_leaf() {
         .connect(server.url())
         .await
         .expect_err("--tlsverify refuses a client with no certificate");
-    // THE BROKER's refusal, by its alert: this gateway verified the broker
-    // and the broker then asked for a certificate it was not given.
-    let printed = format!("{error:?}");
-    assert!(printed.contains("CertificateRequired"), "{printed}");
+    // THE BROKER's refusal, by its alert and its log: this gateway verified
+    // the broker and the broker then asked for a certificate it was not given.
+    assert_refused(
+        &server,
+        &error,
+        "CertificateRequired",
+        "client didn't provide a certificate",
+    );
     assert!(!invalidate::start(Some(broker), |_: &str| {}).await);
 }
 
@@ -329,10 +396,14 @@ async fn a_verifying_broker_refuses_a_leaf_from_a_foreign_authority() {
         .connect(server.url())
         .await
         .expect_err("a foreign leaf is refused by the broker");
-    // THE BROKER's refusal, by its alert, so this cannot pass on a failure of
-    // this gateway's own verification.
-    let printed = format!("{error:?}");
-    assert!(printed.contains("UnknownCA"), "{printed}");
+    // THE BROKER's refusal, by its alert and its log, so this cannot pass on a
+    // failure of this gateway's own verification.
+    assert_refused(
+        &server,
+        &error,
+        "UnknownCA",
+        "certificate signed by unknown authority",
+    );
 }
 
 #[tokio::test]

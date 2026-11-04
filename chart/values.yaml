@@ -748,6 +748,18 @@ server:
     # connections to this Service should close an idle one sooner than this, or
     # it may reuse one at the moment it is closed.
     #
+    # BEHIND THE PLATFORM EDGE, 1 DOES NOT RENDER. `yadgarhq/chart` refuses a
+    # `platform.gatewayListener.upstreamIdleTimeoutSeconds` that is not strictly
+    # below this value (ADR-1016), and a
+    # `platform.gatewayListener.requestHeadersTimeoutSeconds` above it (yaadgaar
+    # #218). So with that edge this value must be at least 10 with platform's
+    # defaults (above `upstreamIdleTimeoutSeconds` 8, and not below
+    # `requestHeadersTimeoutSeconds` 10); 2 at the lowest, with
+    # `upstreamIdleTimeoutSeconds` lowered to 1 and `requestHeadersTimeoutSeconds`
+    # to 2 or less. Platform accepts `upstreamIdleTimeoutSeconds` only in whole
+    # seconds 1..59. The binary and this chart alone still accept 1, for an
+    # install without that edge.
+    #
     # No binary default (ADR-0569); the binary and the schema both refuse a value
     # outside 1..=60.
     headerReadTimeoutSeconds: 10
