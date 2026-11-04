@@ -943,7 +943,7 @@ spec:
               readOnly: true
             {{- end }}
             {{- if .Values.iam.tls.enabled }}
-            # SEPARATE FROM task's, and not a shared bundle. The two upstreams
+            # SEPARATE FROM task's, and not a shared bundle. `iam` and `task`
             # may be issued by different authorities, and one that trusts both
             # would make each hop's trust depend on the other's rotation.
             - name: iam-ca

@@ -691,7 +691,7 @@ bucket" instead of becoming a refusal.
 ## Mutual TLS, and a renewed certificate arriving by restart
 
 **This gateway serves no certificate**, so unlike every other module the material
-it holds is entirely inbound-facing: the CA bundles it verifies `iam` and `task`
+it holds is entirely inbound-facing: the CA bundles it verifies `task`, `iam`, `project`, NATS and Valkey
 against, and — once ADR-0516's cut-over runs — the client certificate it presents
 to its peers. TLS at the edge is terminated by the ingress in front of it (D71, D80),
 and `gateway-tls` is never read by this process.
@@ -767,7 +767,8 @@ lives in `yadgar-dial`, shared with `task` rather than copied, because two
 services holding their own copy is how they come to disagree about how they find
 their peers.
 
-**BOTH upstreams go through that crate.** The `iam` hop used to build its own
+**ALL THREE gRPC upstreams — `task`, `iam` and `project` — go through that
+crate.** The `iam` hop used to build its own
 `Endpoint`, because `iam`'s Service was a ClusterIP rather than headless at the
 time. That made no difference to the balancing — a ClusterIP resolves to one address, so
 one endpoint is all there ever was to hold, and kube-proxy picks the pod — and
