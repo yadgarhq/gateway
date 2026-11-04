@@ -242,7 +242,6 @@ def test_zero_replicas_still_render(tmp_path):
     assert "replicas: 0\n" in stdout
 
 
-
 def test_the_autoscaling_counts_render_as_integers_and_bound_both_ends(tmp_path):
     body = overlay("autoscaling.minReplicas", 1000000, autoscaling=True)
     body["autoscaling"]["maxReplicas"] = 2000000

@@ -47,3 +47,20 @@ def test_a_declared_count_renders_as_a_string(tmp_path):
     body = all_enabled()
     body["sourceAddress"] = {"trustedProxyHops": 1}
     assert rendered_entry(body, tmp_path).get("value") == "1"
+
+
+def test_the_hop_count_comments_cite_the_trust_boundary_adr() -> None:
+    """ADR-0520 is the source-address trust boundary, and `values.schema.json` cites it for
+    this knob. The two comments beside the knob must agree (yaadgaar #562). ADR-0491 stays only
+    where `values.yaml` quotes its requirement, by name."""
+    deployment = (CHART / "templates" / "deployment.yaml").read_text().splitlines()
+    (header,) = [line for line in deployment if "HOW MANY PROXIES STAND IN FRONT" in line]
+    assert "ADR-0520" in header, header
+    assert "ADR-0491" not in header, header
+    values = (CHART / "values.yaml").read_text()
+    block = values.split("# WHERE A REQUEST CAME FROM", 1)[1].split("\nsourceAddress:\n", 1)[0]
+    opening = block.splitlines()[:2]
+    assert any("ADR-0520" in line for line in opening), opening
+    assert not any("ADR-0491" in line for line in opening), opening
+    quoting = [line for line in block.splitlines() if "ADR-0491" in line]
+    assert len(quoting) == 1 and "requires a source address" in quoting[0], quoting
