@@ -1,4 +1,5 @@
 use super::*;
+use crate::pb::yadgar::task::v1::TaskStatus;
 use crate::pb::yadgar::taskapi::v1::FindTasksResponse;
 use std::time::Duration;
 
