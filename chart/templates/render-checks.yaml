@@ -131,9 +131,10 @@ ONLY A KNOB THE RENDER READS IS CHECKED. `replicaCount` feeds `replicas:` and
 and `maxReplicas` feed the ScaledObject and `YADGAR_MAX_REPLICAS` only while it is true,
 so a bad value in the arm that is off changes nothing and is not refused.
 `terminationGracePeriodSeconds` and `preStopSleepSeconds` sit behind `with`, which skips
-nil and 0, and so are checked only when present. The grace period, the sleep and `topologySpread.maxSkew` are NOT cast: `hooks/chart_baseline.py`
-prices the grace period against the sleep and the skew and cannot read `{{ . | int64 }}`, so the
-check bounds all three at 999999 instead, the largest value a float64 prints without an exponent.
+nil and 0, and so are checked only when present. The grace period, the sleep and `topologySpread.maxSkew` are cast like the rest (yaadgaar 550):
+`hooks/chart_baseline.py` reads `{{ . | int64 }}` since yadgarhq/actions v1.64.0. All three stay
+bounded at 999999, the largest value a float64 prints without an exponent. The gate no longer
+forces that bound, and lifting it is a separate decision.
 `topologySpread.maxSkew` is checked, bounded the same way and refused below 1 because the API requires it greater than zero, only while `topologySpread.enabled` is true, because only
 then is it rendered. The other knobs are rendered unconditionally, so a missing key reads as
 nil here and is refused too.
