@@ -19,8 +19,9 @@ fn lookup<'a>(pairs: &'a [(&'static str, &'static str)]) -> impl Fn(&str) -> Opt
 }
 
 /// REQUIRED, WITH NO COMPILED-IN DEFAULT (ADR-0845): absent `TLS_ENABLED`
-/// refuses the boot naming the variable and the chart key, for both
-/// upstreams, rather than falling back to the cleartext path.
+/// refuses the boot naming the variable and the chart key, for every
+/// upstream, rather than falling back to the cleartext path. This case drives
+/// `task` and `iam`; `project` goes through the same `from_lookup`.
 #[test]
 fn absent_tls_enabled_refuses_boot() {
     assert!(matches!(
@@ -211,9 +212,10 @@ fn the_bundle_and_the_domain_both_arrive() {
     assert_eq!(tls.domain(), Some(SENTINEL_DOMAIN));
 }
 
-/// TWO UPSTREAMS IN ONE PROCESS, cut over one at a time. `task` encrypted
+/// THREE UPSTREAMS IN ONE PROCESS, cut over one at a time. `task` encrypted
 /// while `iam` is not is a state this deployment will actually pass
-/// through, so the prefixes have to keep the two apart.
+/// through, so the prefixes have to keep them apart. This case drives two of
+/// the three prefixes; `project` has a prefix of its own on the same rule.
 #[test]
 fn one_upstream_can_be_encrypted_while_the_other_is_not() {
     let vars = [
@@ -392,9 +394,9 @@ fn one_upstream_can_present_an_identity_while_the_other_does_not() {
 /// every enrolment and every attestation — and the alert over the gauge
 /// could not fire for it. [`connect_iam`] goes through `yadgar_dial` now,
 /// and the `iam` series is asserted end to end in
-/// `tests/upstream_absence.rs`, which drives BOTH hops under one recorder
-/// so neither can pass on an empty snapshot. This case stays as the unit
-/// of the pair, on the hop whose gauge has existed longest.
+/// `tests/upstream_absence.rs`, which drives the `task` and `iam` hops under
+/// one recorder so neither can pass on an empty snapshot. This case stays as
+/// the unit of the pair, on the hop whose gauge has existed longest.
 #[test]
 fn an_absent_task_is_published_as_a_gauge() {
     let (emitted, _channel) = dial_under_a_recorder(UNRESOLVABLE);

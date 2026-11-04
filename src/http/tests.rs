@@ -1802,7 +1802,8 @@ async fn state_resolving_to_with_task(
     (state_with_upstreams(iam, task, ttl), resolves)
 }
 
-/// The same gateway, with BOTH upstreams supplied by the caller.
+/// The same gateway, with the `task` and `iam` channels supplied by the caller.
+/// The `project` channel stays an unreachable lazy endpoint, as above.
 ///
 /// For a test whose subject is what arrives at `iam` as well as at `task` — the
 /// request id each hop is handed (D67, ledger 1248) — so `iam` is a recording

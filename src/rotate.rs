@@ -369,7 +369,7 @@ pub enum ToolsPollError {
 /// to every peer, so the same two paths arrive up to five times; the fold watches a
 /// path once, in the position it first appeared.
 ///
-/// **THE TWO PASSWORDS ARE MEMBERS THREE AND FOUR, and neither is transport.**
+/// **THE TWO PASSWORDS ARE MEMBERS FOUR AND SIX, and neither is transport.**
 /// `broker` is `crate::invalidate::Broker`, which keeps the path beside the
 /// value precisely so this set can be built from the RESOLVED credential rather
 /// than by reading the environment a second time; a second reading could name a
@@ -383,7 +383,7 @@ pub enum ToolsPollError {
 /// **BOTH ARE `Option`, AND BOTH ARE `Some` IN THE DEPLOYMENT RUNNING TODAY.**
 /// The chart sets `rateLimit.passwordSecret` by default and points `nats.url` at
 /// a broker whose authorization block declares a `gateway` user, so a reference
-/// pod resolves both credentials and this set is FIVE members rather than three.
+/// pod resolves both credentials and watches both password files.
 /// Both files are read boot-fatally — an unreadable or empty one refuses the
 /// start — so a pod that is up has read both, and a rotation of either now ends
 /// it. The `Option` is for the off-reference deployment that runs an open cache
@@ -392,8 +392,8 @@ pub enum ToolsPollError {
 /// [`WATCHED_FILES_UNREADABLE`] off zero by watching a path that never
 /// existed.
 ///
-/// **THE CACHE HOP'S TRANSPORT IS A NEW MEMBER, RIGHT AFTER `broker` AND
-/// BEFORE THE TWO PASSWORDS (B-V3, ADR-0852).** `valkey` is `Option<&
+/// **THE CACHE HOP'S TRANSPORT IS MEMBER FIVE, RIGHT AFTER `broker` AND
+/// BEFORE `cache_password` (B-V3, ADR-0852).** `valkey` is `Option<&
 /// UpstreamTls>`, the same type [`task`], [`iam`] and [`project`] already
 /// are — unlike `broker`'s own TLS, which folds into `Broker`'s own
 /// [`Material`] impl because `async-nats` re-reads its paths on every
@@ -409,7 +409,7 @@ pub enum ToolsPollError {
 /// as a rotated `task` bundle does, rather than being the one hop whose
 /// rotation is silent.
 ///
-/// **D73'S BOOTSTRAP TOKEN IS MEMBER FIVE, AND IT IS ABSENT ON THE DEPLOYMENT
+/// **D73'S BOOTSTRAP TOKEN IS MEMBER SEVEN, AND IT IS ABSENT ON THE DEPLOYMENT
 /// RUNNING TODAY.** The chart mounts no `admin-bootstrap-token` Secret yet
 /// (ledger 638's step 7), so this arm folds to nothing and the reference pod
 /// watches what it always did. What it buys on the day the mount lands: the token
@@ -421,7 +421,7 @@ pub enum ToolsPollError {
 /// a [`Material`] on, and inventing one to satisfy the shape would be a
 /// restructuring rather than a fix.
 ///
-/// **THE MOUNTED CONFIGURATION DOCUMENT IS MEMBER SIX (step 2a).**
+/// **THE MOUNTED CONFIGURATION DOCUMENT IS MEMBER EIGHT (step 2a).**
 /// `config` is `shared/shared.yaml`, mounted from `yadgarhq/config`'s `shared`
 /// ConfigMap, and it is a [`Material`] like the others: `Configuration`
 /// implements the trait by returning the one file it read its schedule from
@@ -431,8 +431,8 @@ pub enum ToolsPollError {
 /// operator editing `shared.yaml` restarts this pod exactly as editing a CA
 /// bundle would.
 ///
-/// **`gateway.yaml` IS MEMBER SEVEN, and the first one this service ever
-/// watched.** Until the `tools/list` poll interval, `config-gateway` was
+/// **`gateway.yaml` IS MEMBER NINE, THE LAST, and the first gateway-only
+/// document this service ever watched.** Until the `tools/list` poll interval, `config-gateway` was
 /// mounted and unread — see `chart/templates/deployment.yaml`'s volume-mount
 /// comment, which named this exact gap and said the fix belongs in the same
 /// pull request as the first gateway-only knob. This is that pull request:

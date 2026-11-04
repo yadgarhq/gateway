@@ -77,8 +77,9 @@ mount --bind "$1/shared" /etc/yadgar/config/shared
 mount --bind "$1/gateway" /etc/yadgar/config/gateway
 exec "$2""#;
 
-/// A full, cleartext boot, down to the two upstream ports and the project
-/// registry's own cadence. Port 0 on both listeners, because the cases in a
+/// A full, cleartext boot, down to the three upstream ports (`task`, `iam`,
+/// `project`) and the project registry's own cadence. Port 0 on both
+/// listeners, because the cases in a
 /// target run in parallel. Every `*_HOST` is an address rather than a name, so
 /// no case depends on DNS: every dial is lazy (ADR-0532), so nothing needs to
 /// answer on it. The three gRPC `*_TLS_ENABLED` are stated as `"0"` rather
