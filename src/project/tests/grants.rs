@@ -319,6 +319,35 @@ fn red_12_an_org_row_with_no_effective_grant_is_denied_and_moves_the_gauge() {
     );
 }
 
+/// yaadgaar #252: the size of the loaded set is a gauge, so the path count is
+/// visible after boot and not only in the one INFO line of the first load.
+/// SET ON EVERY LOAD: a second, smaller load replaces the first value.
+#[test]
+fn the_registry_path_count_is_a_gauge_set_on_every_load() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let registry = Registry::never_loaded();
+    let all = rows();
+    let smaller = all[..2].to_vec();
+    let mut sizes = Vec::new();
+    for set in [all, smaller] {
+        metrics::with_local_recorder(&recorder, || install(&registry, set));
+        let size = registry.loaded().expect("a loaded set").len();
+        let gauge = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, ..)| key.key().name() == "yadgar_gateway_project_registry_paths")
+            .map(|(_, _, _, value)| value);
+        assert_eq!(gauge, Some(DebugValue::Gauge((size as f64).into())));
+        sizes.push(size);
+    }
+    assert!(
+        sizes[0] > sizes[1],
+        "the two loads differ in size: {sizes:?}"
+    );
+}
+
 #[test]
 fn red_13_a_caller_with_no_teams_is_denied_every_org_row() {
     let org = [

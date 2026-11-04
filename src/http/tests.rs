@@ -873,7 +873,7 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
 
     for code in ALL_CODES {
         let status = tonic::Status::new(code, "an upstream message that must not leak");
-        let resp = admin_failure(admin_call(), ADMIN_CREATE_USER, status);
+        let resp = admin_failure(admin_call(), ADMIN_CREATE_USER, "req", status);
         let resp_status = resp.status();
 
         assert_eq!(
@@ -938,12 +938,83 @@ async fn admin_failure_failed_precondition_gets_a_distinct_body() {
 /// (yaadgaar #202, ledger 1738).
 async fn failed_precondition_on(endpoint: &'static str) -> (u16, String) {
     let status = tonic::Status::failed_precondition("an upstream message that must not leak");
-    let resp = admin_failure(admin_call(), endpoint, status);
+    let resp = admin_failure(admin_call(), endpoint, "req", status);
     let code = resp.status().as_u16();
     let bytes = to_bytes(resp.into_body(), usize::MAX)
         .await
         .expect("read the body");
     (code, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A `MakeWriter` that keeps every formatted log line for a test to read.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Captured {
+    /// The `fields` of the one JSON log line whose message contains `message`.
+    fn fields_of(&self, message: &str) -> serde_json::Value {
+        let logs = String::from_utf8(self.0.lock().expect("log buffer").clone()).expect("utf8");
+        let line = logs
+            .lines()
+            .find(|l| l.contains(message))
+            .expect("the line is logged");
+        let line: serde_json::Value = serde_json::from_str(line).expect("a JSON log line");
+        line["fields"].clone()
+    }
+}
+
+fn capture() -> (Captured, tracing::subscriber::DefaultGuard) {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(captured.clone())
+        .finish();
+    (captured, tracing::subscriber::set_default(subscriber))
+}
+
+/// yaadgaar #436: the warn that keeps an administrative RPC's real code and
+/// message carries the request id, so it joins to the CallRecord and to iam's
+/// records by id and not by timestamp.
+#[tokio::test]
+async fn the_administrative_warn_carries_the_request_id() {
+    let (captured, _guard) = capture();
+    let status = tonic::Status::unavailable("an upstream message");
+    let _ = admin_failure(admin_call(), ADMIN_CREATE_USER, "req-436-sentinel", status);
+    let fields = captured.fields_of("an administrative RPC was refused or failed");
+    assert_eq!(fields["request_id"], "req-436-sentinel");
+    assert_eq!(fields["endpoint"], ADMIN_CREATE_USER);
+}
+
+/// The sixth change of that kind: revoke-credential's NOT_FOUND answer has its
+/// own warn, and it carries the request id too.
+#[tokio::test]
+async fn the_revoke_credential_not_found_warn_carries_the_request_id() {
+    let (captured, _guard) = capture();
+    let resp = super::admin::credentials::revoke_refused(
+        admin_call(),
+        "req-436-notfound",
+        tonic::Status::not_found("no such credential"),
+    );
+    assert_eq!(resp.status().as_u16(), 404);
+    let fields = captured.fields_of("revoke-credential named no credential");
+    assert_eq!(fields["request_id"], "req-436-notfound");
 }
 
 const OPAQUE_ADMIN_BODY: &str = r#"{"error":"the administrative service is unavailable"}"#;

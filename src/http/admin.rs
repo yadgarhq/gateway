@@ -121,7 +121,6 @@ pub(super) async fn admin_issue_enrolment(
         Kind::Write,
         tel(request_id.clone()),
     );
-
     let Some(req) = parsed(&body) else {
         call.fail("INVALID_ARGUMENT");
         return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);
@@ -193,7 +192,9 @@ pub(super) async fn admin_issue_enrolment(
     };
     let resp = match state.iam_rpc(request, |r| client.issue_enrolment(r)).await {
         Ok(r) => r.into_inner(),
-        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_ISSUE_ENROLMENT, e),
+        Err(CallError::Answered(e)) => {
+            return admin_failure(call, ADMIN_ISSUE_ENROLMENT, &request_id, e)
+        }
         Err(CallError::Expired) => return admin_timeout(call, ADMIN_ISSUE_ENROLMENT),
     };
 

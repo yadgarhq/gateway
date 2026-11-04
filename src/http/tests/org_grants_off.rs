@@ -20,9 +20,9 @@
 //! Recaptured once so far: yaadgaar #449 (ADR-1042) changed the `edit_task`
 //! entry of the eight `tools/list` lines, and no other byte.
 //!
-//! Minted request ids are normalised to `<UUID>`, and the transport error a
-//! served call meets at the unserved `task` to `<task unreachable>`; nothing
-//! else is.
+//! Minted request ids are normalised to `<UUID>`, and the one text a served
+//! call meets at the unserved `task` (the fixed transport-failure status, matched
+//! by exact equality) to `<task unreachable>`; nothing else is.
 
 use axum::body::{to_bytes, Body};
 use axum::http::StatusCode;
@@ -214,11 +214,13 @@ fn normalised(bytes: &[u8]) -> String {
 }
 
 /// A call that passed attestation reaches `task`, which nothing serves here,
-/// so its content is the transport error's text, which is OS- and
-/// dependency-specific and is not the gateway's answer. That one text is
-/// replaced; every other byte (status, `_meta` stamp, `isError`, every
-/// refusal body) is kept.
+/// so its content is the fixed transport-failure status (yaadgaar #452), which
+/// is not what the capture saw on `main` and is not the gateway's answer here.
+/// That one text, matched by EXACT equality, is replaced; every other byte
+/// (status, `_meta` stamp, `isError`, every refusal body) is kept.
 fn served_or(bytes: &[u8]) -> String {
+    let transport_failed =
+        || tonic::Status::unavailable(crate::tools::reason::TRANSPORT_FAILED).to_string();
     let body = normalised(bytes);
     let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) else {
         return body;
@@ -232,7 +234,7 @@ fn served_or(bytes: &[u8]) -> String {
     for item in items {
         let unreachable = item["text"]
             .as_str()
-            .is_some_and(|t| t.contains("failed below gRPC"));
+            .is_some_and(|t| t == transport_failed());
         if unreachable {
             item["text"] = serde_json::Value::String("<task unreachable>".into());
         }
