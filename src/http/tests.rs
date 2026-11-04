@@ -367,6 +367,60 @@ async fn an_empty_allowlist_denies_every_origin() {
     );
 }
 
+/// The request-side mutation table for the Origin allowlist (yaadgaar #294).
+///
+/// The comparison is EXACT, and every variant below is one a lenient compare
+/// would admit. A browser serializes an origin in lowercase, with no path and
+/// no default port, so exactness costs a real browser nothing.
+#[tokio::test]
+async fn the_allowlist_matches_one_origin_exactly() {
+    let listed = || vec!["https://gateway.example.com".to_string()];
+    let status = |origin: &'static [u8]| origin_status(listed(), Some(origin));
+    assert_eq!(status(b"https://gateway.example.com").await, StatusCode::OK);
+    // MUTANT: compare the host only. A different scheme is a different origin.
+    assert_eq!(
+        status(b"http://gateway.example.com").await,
+        StatusCode::FORBIDDEN
+    );
+    // MUTANT: `starts_with`. A different port is a different origin.
+    assert_eq!(
+        status(b"https://gateway.example.com:8443").await,
+        StatusCode::FORBIDDEN
+    );
+    // MUTANT: `ends_with` or a suffix match on the host.
+    assert_eq!(
+        status(b"https://evilgateway.example.com").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(b"https://gateway.example.com.evil.example").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(b"https://other.example.com").await,
+        StatusCode::FORBIDDEN
+    );
+    // MUTANT: `eq_ignore_ascii_case`.
+    assert_eq!(
+        status(b"HTTPS://GATEWAY.EXAMPLE.COM").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        status(b"https://Gateway.example.com").await,
+        StatusCode::FORBIDDEN
+    );
+    // MUTANT: `trim_end_matches('/')` on the header.
+    assert_eq!(
+        status(b"https://gateway.example.com/").await,
+        StatusCode::FORBIDDEN
+    );
+    // The opaque origin a sandboxed frame or a `file://` page sends.
+    assert_eq!(status(b"null").await, StatusCode::FORBIDDEN);
+    // MUTANT: an absent Origin refused. A non-browser client (every agent)
+    // sends none, and the spec's MUST covers a PRESENT invalid Origin only.
+    assert_eq!(origin_status(listed(), None).await, StatusCode::OK);
+}
+
 /// The `outcome` this route writes is a value the SHARED MAPPING can produce.
 ///
 /// **`yadgar_calls_total` has ONE `outcome` label space, and this binary writes

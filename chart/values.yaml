@@ -872,8 +872,30 @@ sourceAddress:
 #
 # Comma-separated, and each entry is a full scheme-and-authority origin —
 # "https://console.example.com", never a bare hostname and never a trailing path.
+#
+# NOT CORS, despite the block's name: no CORS header is ever sent. The list
+# feeds the gateway's Origin check, which refuses a browser request whose
+# Origin is present and not listed (the MCP spec's DNS-rebinding defence). A
+# request with no Origin, which is every agent's, is not affected.
+#
+# EMPTY HERE FALLS BACK TO `global.hostname` (yaadgaar #294, ADR-0808): with
+# the estate's hostname set, the allowlist is `https://<global.hostname>`, the
+# edge's own origin, with NO PORT. With no hostname anywhere it stays empty and
+# closed. A value set here still wins; a deployment whose browsers reach the
+# edge on another port (kind's 18443) sets the full origin here.
+# `templates/_origins.tpl` holds the order.
+#
+# REFUSED AT BOOT, naming the entry: a wildcard; an http:// origin unless
+# `allowHttpOrigins` below is true; and any entry a browser could never send
+# (uppercase, a path or trailing slash, a default port such as :443).
 cors:
   allowedOrigins: ""
+  # DEVELOPMENT ONLY. true admits http:// entries in `allowedOrigins`. A
+  # cleartext origin is one any network attacker can serve, so the shipped
+  # value is false. Rendered as YADGAR_ALLOWED_ORIGINS_ALLOW_HTTP, "1" or "0",
+  # unconditionally: the binary requires it (ADR-0569). Only the bare words
+  # true and false render; a string such as "false" is refused.
+  allowHttpOrigins: false
 
 # WHAT BOUNDS THE TWO UNAUTHENTICATED ENDPOINTS (ledger 497), AND /auth/whoami.
 #
