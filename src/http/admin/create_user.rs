@@ -121,7 +121,6 @@ pub(in crate::http) async fn admin_create_user(
         Kind::Write,
         tel(request_id.clone()),
     );
-
     let Some(req) = parsed(&body) else {
         call.fail("INVALID_ARGUMENT");
         return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);
@@ -196,7 +195,9 @@ pub(in crate::http) async fn admin_create_user(
     };
     let resp = match state.iam_rpc(request, |r| client.create_user(r)).await {
         Ok(r) => r.into_inner(),
-        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_CREATE_USER, e),
+        Err(CallError::Answered(e)) => {
+            return admin_failure(call, ADMIN_CREATE_USER, &request_id, e)
+        }
         Err(CallError::Expired) => return admin_timeout(call, ADMIN_CREATE_USER),
     };
 

@@ -16,7 +16,7 @@ use crate::upstream::{CallError, TaskUpstream};
 mod change;
 mod create;
 mod find;
-mod reason;
+pub(crate) mod reason;
 
 /// A tool's name, as a bounded value.
 ///
@@ -332,6 +332,8 @@ pub async fn call(
     // ONE DEADLINE FOR THE CALL, built before its own work (ADR-1019): the
     // chart's `task.requestTimeoutSeconds`, which `bounded` also SENDS.
     let deadline = yadgar_dial::Deadline::after(task.timeout());
+    // The request id and tool `bounded` logs, read before `scope` moves.
+    let who = (scope.request_id.clone(), name);
     let mut client = TaskServiceClient::new(crate::upstream::request_id::carrying(
         task.channel(),
         &scope.request_id,
@@ -340,7 +342,7 @@ pub async fn call(
     match name {
         CREATE_TASK => {
             let request = create::request(scope, args, crate::idempotency_key)?;
-            let resp = bounded(task, deadline, request, |r| client.create_task(r))
+            let resp = bounded(task, deadline, &who, request, |r| client.create_task(r))
                 .await?
                 .into_inner();
             let meta = resp.meta.unwrap_or_default();
@@ -372,7 +374,7 @@ pub async fn call(
                 scope: Some(scope),
                 key: Some(key),
             };
-            let resp = bounded(task, deadline, request, |r| client.read_task(r))
+            let resp = bounded(task, deadline, &who, request, |r| client.read_task(r))
                 .await?
                 .into_inner();
             Ok(Output {
@@ -384,7 +386,7 @@ pub async fn call(
         FIND_TASKS => {
             let scope_project = scope.project_id.clone();
             let (request, fields) = find::request(scope, args)?;
-            let resp = bounded(task, deadline, request, |r| client.find_tasks(r))
+            let resp = bounded(task, deadline, &who, request, |r| client.find_tasks(r))
                 .await?
                 .into_inner();
             Ok(find::output(resp, fields, &scope_project))
@@ -411,6 +413,7 @@ pub async fn call(
 pub(super) async fn bounded<M, T, F, Fut>(
     task: &TaskUpstream,
     deadline: yadgar_dial::Deadline,
+    who: &(String, &str),
     request: M,
     rpc: F,
 ) -> Result<tonic::Response<T>, ToolError>
@@ -418,6 +421,7 @@ where
     F: FnOnce(tonic::Request<M>) -> Fut,
     Fut: std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 {
+    let (request_id, tool) = (who.0.as_str(), who.1);
     task.call(deadline, request, rpc)
         .await
         .map_err(|e| match e {
@@ -429,7 +433,7 @@ where
                 // THE ONLY PLACE A TRANSPORT FAILURE'S DETAIL IS WRITTEN DOWN
                 // (yaadgaar #452): the caller reads `reason::TRANSPORT_FAILED`.
                 if std::error::Error::source(&status).is_some() {
-                    tracing::warn!(error = ?status, "a task call failed below gRPC");
+                    tracing::warn!(request_id, tool, error = ?status, "a task call failed below gRPC");
                 }
                 ToolError::Upstream(status)
             }

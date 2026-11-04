@@ -307,6 +307,7 @@ pub(super) async fn edit(
         ));
     }
 
+    let who = (scope.request_id.clone(), super::EDIT_TASK);
     let request = EditTaskRequest {
         idempotency: Some(Idempotency {
             key: crate::idempotency_key(),
@@ -321,7 +322,7 @@ pub(super) async fn edit(
         expect_body_sha256,
         patch,
     };
-    let resp = super::bounded(task, deadline, request, |r| client.edit_task(r))
+    let resp = super::bounded(task, deadline, &who, request, |r| client.edit_task(r))
         .await?
         .into_inner();
     let meta = resp.meta.unwrap_or_default();
@@ -407,6 +408,7 @@ pub(super) async fn transition(
     let to = target(required_str(args, "to")?)
         .ok_or_else(|| ToolError::Invalid(format!("`to` must be one of {}", TARGETS.join(", "))))?;
 
+    let who = (scope.request_id.clone(), super::TRANSITION_TASK);
     let request = TransitionTaskRequest {
         idempotency: Some(Idempotency {
             key: crate::idempotency_key(),
@@ -417,7 +419,7 @@ pub(super) async fn transition(
         to: to as i32,
         number,
     };
-    let resp = super::bounded(task, deadline, request, |r| client.transition_task(r))
+    let resp = super::bounded(task, deadline, &who, request, |r| client.transition_task(r))
         .await?
         .into_inner();
     let meta = resp.meta.unwrap_or_default();

@@ -395,10 +395,17 @@ pub(super) fn bootstrap_authority(
 ///
 /// Everything else is opaque, from a `tonic::Code` and a constant — never
 /// `e.to_string()` — for [`login_failure`]'s reason.
-pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status) -> Response {
+pub(super) fn admin_failure(
+    call: Call,
+    endpoint: &'static str,
+    request_id: &str,
+    e: tonic::Status,
+) -> Response {
     // THE ONLY PLACE THE REAL CODE AND MESSAGE ARE WRITTEN DOWN, and they go to
     // the log rather than to the caller.
-    tracing::warn!(code = ?e.code(), message = e.message(), endpoint, "an administrative RPC was refused or failed");
+    // `request_id` is the same id the CallRecord and iam's records carry, so
+    // this line joins to them (yaadgaar #436).
+    tracing::warn!(code = ?e.code(), message = e.message(), endpoint, request_id, "an administrative RPC was refused or failed");
     let code = e.code();
     // THE ENROLMENT PREDICATE'S REFUSAL, and only on the endpoint it can come
     // from. Computed once so the label and the body cannot disagree about which

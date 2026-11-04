@@ -1124,6 +1124,73 @@ async fn an_unreachable_task_is_reported_without_its_address() {
     assert!(text.contains(reason::TRANSPORT_FAILED), "{text}");
 }
 
+/// A `MakeWriter` that keeps every formatted log line for the test to read.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// yaadgaar #486: the WARN that keeps a transport failure's detail names the
+/// request and the tool, so an operator joins it to the CallRecord by id and not
+/// by timestamp.
+#[tokio::test]
+async fn the_transport_failure_warn_carries_the_request_id_and_the_tool() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(captured.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        l.local_addr().expect("its address").port()
+    };
+    let channel = crate::upstream::connect_task("127.0.0.1", port, None, Duration::from_secs(2))
+        .await
+        .expect("a lazy channel");
+    let task = TaskUpstream::new(channel, Duration::from_secs(2));
+    for (tool, args) in [
+        ("find_tasks", json!({})),
+        (
+            "edit_task",
+            json!({ "number": 1, "expect_version": 1, "title": "t" }),
+        ),
+        (
+            "transition_task",
+            json!({ "number": 1, "expect_version": 1, "to": "done" }),
+        ),
+    ] {
+        let scope = Scope {
+            request_id: "req-486-sentinel".into(),
+            ..Scope::default()
+        };
+        let _ = call(&task, scope, tool, &args).await;
+        let logs = String::from_utf8(captured.0.lock().expect("log buffer").clone()).expect("utf8");
+        let line = logs
+            .lines()
+            .filter(|l| l.contains("failed below gRPC"))
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("a JSON log line"))
+            .find(|l| l["fields"]["tool"] == tool)
+            .unwrap_or_else(|| panic!("the transport failure of {tool} is logged with its tool"));
+        assert_eq!(line["fields"]["request_id"], "req-486-sentinel");
+    }
+}
+
 /// A status with no source — the module's own answer off the wire, or the
 /// gateway's own words — keeps tonic's rendering, message included.
 #[test]

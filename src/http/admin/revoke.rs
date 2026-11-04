@@ -143,7 +143,9 @@ pub(in crate::http) async fn admin_revoke_credentials(
             call.fail("NOT_FOUND");
             return text(StatusCode::NOT_FOUND, r#"{"error":"no such user"}"#);
         }
-        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_REVOKE_CREDENTIALS, e),
+        Err(CallError::Answered(e)) => {
+            return admin_failure(call, ADMIN_REVOKE_CREDENTIALS, &request_id, e)
+        }
         Err(CallError::Expired) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIALS),
     };
 

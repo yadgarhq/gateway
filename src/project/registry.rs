@@ -64,6 +64,13 @@ pub const LOADED: &str = "yadgar_gateway_project_registry_loaded";
 /// arrived" about a set nobody has seen.
 pub const PRIVATE_WITHOUT_OWNER: &str = "yadgar_gateway_project_registry_private_without_owner";
 
+/// Paths in the last load: registered paths and their aliases, as the INFO line
+/// of the first load reports them (yaadgaar #252).
+///
+/// **SET ON EVERY LOAD, AND NOT AT BOOT**, for [`PRIVATE_WITHOUT_OWNER`]'s
+/// reason: a `0` published before a load would read as an empty registry.
+pub const PATHS: &str = "yadgar_gateway_project_registry_paths";
+
 /// How long one `ListProjects` page may take before the load is abandoned and
 /// retried.
 ///
@@ -412,6 +419,7 @@ pub(super) fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
     // loaded while the request path still answers `None` is a window in which the
     // instrument disagrees with the service.
     metrics::gauge!(LOADED).set(1.0);
+    metrics::gauge!(PATHS).set(count as f64);
     metrics::gauge!(PRIVATE_WITHOUT_OWNER).set(without_owner as f64);
     metrics::gauge!(ORG_ROWS_WITHOUT_EFFECTIVE_GRANT).set(ungranted as f64);
     if first {
