@@ -244,6 +244,50 @@ fn an_absent_or_invalid_pre_minted_switch_refuses_boot_naming_the_chart_key() {
     }
 }
 
+/// The Origin allowlist is CHECKED at boot, not only split (yaadgaar #294).
+/// `src/origin/tests.rs` holds the parser's table; this proves the binary calls
+/// it, so a wiring that went back to a bare split turns this red.
+#[test]
+fn a_wildcard_or_cleartext_origin_refuses_boot_naming_the_chart_key() {
+    const LIST: &str = "YADGAR_ALLOWED_ORIGINS";
+    const SWITCH: &str = "YADGAR_ALLOWED_ORIGINS_ALLOW_HTTP";
+    for (list, switch, says) in [
+        ("*", "1", "wildcard"),
+        ("http://localhost:3000", "0", SWITCH),
+        ("https://gateway.example.com/", "0", "not a browser origin"),
+    ] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != LIST && *k != SWITCH);
+        vars.push((LIST, list));
+        vars.push((SWITCH, switch));
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(says) && line.contains("cors.allowedOrigins"),
+            "the refusal for {list:?} must say {says:?} and name the chart key: {line}"
+        );
+    }
+}
+
+/// The development switch has no compiled-in default (ADR-0569).
+#[test]
+fn an_absent_or_invalid_http_origin_switch_refuses_boot_naming_the_chart_key() {
+    const VAR: &str = "YADGAR_ALLOWED_ORIGINS_ALLOW_HTTP";
+    for value in [None, Some("true"), Some("")] {
+        let mut vars = cleartext_env();
+        vars.retain(|(k, _)| *k != VAR);
+        if let Some(value) = value {
+            vars.push((VAR, value));
+        }
+        let (status, stderr) = run_to_exit(&vars);
+        let line = refusal_line(status, &stderr);
+        assert!(
+            line.contains(VAR) && line.contains("cors.allowHttpOrigins"),
+            "the refusal for {value:?} must name both the variable and its chart key: {line}"
+        );
+    }
+}
+
 /// `TcpListener::bind` is the one call in `boot::serve` that was still a bare
 /// `?` after the Display cut-over: `io::Error`'s Display is informative about
 /// WHY ("Address already in use (os error 98)") but, unlike every other

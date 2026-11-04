@@ -106,6 +106,7 @@ pub fn cleartext_env() -> Vec<(&'static str, &'static str)> {
         ("PROJECT_HOST", "127.0.0.1"),
         ("PROJECT_PORT", "50053"),
         ("YADGAR_ALLOWED_ORIGINS", ""),
+        ("YADGAR_ALLOWED_ORIGINS_ALLOW_HTTP", "0"),
         ("YADGAR_LOGIN_RATE_LIMIT", "100:10"),
         ("YADGAR_LOGIN_UNATTRIBUTED_RATE_LIMIT", "50:5"),
         ("YADGAR_ADMIN_RATE_LIMIT", "20:5"),
