@@ -484,8 +484,9 @@ nats:
   # loud either way: a pod that exits at boot naming
   # `/var/run/secrets/nats/password`, or one whose log says the broker refused it.
   #
-  # `nats-auth-gateway` is the Secret `yadgarhq/deploy` creates for this service's
-  # OWN account. It is inert whenever `url` above is empty, because the binary
+  # `nats-auth-gateway` is the Secret the `platform` chart's `bootstrap-secrets`
+  # hook Job creates for this service's OWN account (`yadgarhq/deploy` created it
+  # before its retirement, ADR-0828). It is inert whenever `url` above is empty, because the binary
   # reads the url first and stops there — which is what let this value land before
   # the account did.
   #
@@ -618,10 +619,12 @@ rateLimit:
   # corrects an earlier revision of this comment, which argued the opposite
   # reason — that argocd had nowhere else to put it. That was false: D54's
   # generator enumerates modules rather than listing them, but its shared
-  # `values:` block already carries gateway-only entries —
+  # `values:` block already carried gateway-only entries —
   # `sourceAddress.trustedProxyHops` and `adminBootstrap.tokenSecret` below
-  # are both examples, measured in `yadgarhq/argocd`'s
-  # `applicationsets/modules.yaml` — so a per-module Secret name is available
+  # were both examples, measured in `yadgarhq/argocd`'s
+  # `applicationsets/modules.yaml`, which ADR-0848 has since deleted. Both
+  # entries now sit under `gateway:` in that repository's
+  # `applications/yadgar.yaml`, so a per-module Secret name is available
   # there too, same as it is here). The module's own values.yaml is simply
   # the override point that comment names.
   #
@@ -632,8 +635,10 @@ rateLimit:
   # `/var/run/secrets/valkey/password`, not one that quietly serves.
   #
   # THE SECRET MUST EXIST BEFORE THIS CHART SYNCS. It is not created here and not
-  # in git; `yadgarhq/deploy`'s MIGRATION_NOTES.md has the `kubectl create secret`
-  # for it, alongside the one the cache itself reads. Same object, both ends.
+  # in git; the `platform` chart's `bootstrap-secrets` hook Job mints
+  # `valkey-password`, create-only, and the cache reads the same Secret. Same
+  # object, both ends. (`yadgarhq/deploy`'s MIGRATION_NOTES.md, now history, held
+  # the `kubectl create secret` for it before ADR-0810.)
   #
   # WHILE IT IS EMPTY THE HOP IS UNAUTHENTICATED and gateway says so in a warning
   # at every boot. Anything on the pod network can read and rewrite D74's token
@@ -698,16 +703,17 @@ trustUnauthenticatedHeaders: false
 autoscaling:
   # D80: KEDA's CRD is not something every adopter has installed. `false` here
   # is the chart's own default so `helm template`/`helm install` succeed on a
-  # bare cluster; the reference deployment in yadgarhq/deploy sets this true
-  # (autoscaling.enabled=true in its values for this chart) to get the scaling
-  # behaviour described below.
+  # bare cluster; the reference deployment sets this true (`gateway:
+  # autoscaling: { enabled: true }` in `yadgarhq/argocd`'s
+  # `applications/yadgar.yaml`) to get the scaling behaviour described below.
   enabled: false
 
   # THE GROUP-AND-VERSION STRING THE RENDER CHECK NAMES, recorded here beside the
   # toggle so an operator upgrade that moved the version turns the check red rather
   # than silently weakening it. Read off KEDA at the version the estate pins,
-  # `yadgarhq/deploy`'s `infra/keda.yaml` — chart `keda` from
-  # https://kedacore.github.io/charts.
+  # `yadgarhq/argocd`'s `applications/keda.yaml`, which installs the `keda`
+  # subchart of the `platform` chart. (`yadgarhq/deploy`'s `infra/keda.yaml`
+  # pinned chart `keda` from https://kedacore.github.io/charts before D4.)
   # `chart/templates/render-checks.yaml` passes the same string as a literal, because
   # the suite reads the invocation's arguments off the template;
   # `test_autoscaling.py::test_the_render_check_names_the_group_the_values_file_records`
@@ -765,7 +771,9 @@ server:
     headerReadTimeoutSeconds: 10
 
 # Where this service attaches to the TLS edge (D71). The Gateway and its
-# certificate live in yadgarhq/deploy — shared edge infrastructure outlives any
+# certificate live in the `platform` chart (`gateway-listener.yaml` renders the
+# Gateway; `gateway-tls` is the certificate Secret; both were in
+# yadgarhq/deploy until its retirement, per the table in `deploy`'s README at c8ae93f) — shared edge infrastructure outlives any
 # one module — while the HTTPRoute lives in this chart, so the route and the
 # backend it names share a lifecycle.
 #
@@ -787,13 +795,15 @@ server:
 # (Board Resolution 2024.07.29.06) from the DNS root zone for private use, and no
 # resolver treats it specially — it is NOT an IETF special-use domain — so it
 # resolves wherever the local network says. Moving it needs the root CA reissued
-# under a matching name constraint; the ordering is in yadgarhq/deploy's
-# MIGRATION_NOTES.
+# under a matching name constraint; the ordering is in the MIGRATION_NOTES of
+# the retired yadgarhq/deploy, section "Move the development domain to
+# `yadgar.internal`", kept there as history.
 gateway:
   # D80: an HTTPRoute needs the `gateway.networking.k8s.io` CRD, which does not
   # exist on a cluster whose ingress is not a Gateway API implementation. `true`
-  # is the reference-deployment default — yadgarhq/deploy runs Envoy Gateway and
-  # ships this chart against it unmodified.
+  # is the reference-deployment default — the estate runs Envoy Gateway
+  # (`yadgarhq/argocd`'s `applications/envoy-gateway.yaml`, sourced from the
+  # `platform` chart) and ships this chart against it unmodified.
   #
   # SET FALSE ON ANY OTHER INGRESS. This chart still creates its own Service
   # (see `service.port` above) whether the route is enabled or not; set this to
@@ -1034,8 +1044,9 @@ adminLimits:
 # it HAD to, on the grounds that `yadgarhq/argocd`'s ApplicationSet enumerates
 # modules rather than listing them (D54) and so could carry no per-module value.
 # **That was false, and the file it named refutes it.**
-# `applicationsets/modules.yaml` already carries `sourceAddress.trustedProxyHops`
-# in its shared `values:` block, under a comment reading:
+# `applicationsets/modules.yaml` (deleted since, under ADR-0848) carried
+# `sourceAddress.trustedProxyHops` in its shared `values:` block, under a
+# comment reading:
 #
 #   CONSUMED ONLY BY `gateway`, and inert everywhere else — helm ignores a value
 #   a chart does not read. It sits in this shared block because D54's generator
@@ -1043,12 +1054,14 @@ adminLimits:
 #   per-module value that would not reintroduce the central list D54 exists to
 #   delete.
 #
-# So the mechanism exists and is already in use for a gateway-only value. D54
-# forbids a central per-module LIST; a gateway-only value in the shared block is
-# how that constraint is already resolved, and the file states the resolution
-# itself. **One entry in that block is what enables this in the reference
-# deployment**, and until it lands the surface stays disabled and answers 503 —
-# the safe direction, which outages nothing.
+# So the mechanism existed and was in use for a gateway-only value. D54
+# forbids a central per-module LIST; a gateway-only value in the shared block was
+# how that constraint was resolved, and the file stated the resolution
+# itself. **One entry is what enables this in the reference deployment**:
+# `gateway: adminBootstrap: { tokenSecret: admin-bootstrap-token }` in
+# `yadgarhq/argocd`'s `applications/yadgar.yaml`, which replaced the shared
+# block. Without that entry the surface stays disabled and answers 503 — the
+# safe direction, which outages nothing.
 #
 # WITH THAT MECHANISM AVAILABLE, EMPTY IS STRICTLY BETTER, and the asymmetry with
 # the two passwords above is what decides it. `nats.passwordSecret` and
@@ -1082,13 +1095,14 @@ adminBootstrap:
   # volume — the bootstrap path disabled, everything else serving.
   #
   # `admin-bootstrap-token` is the value the reference deployment sets: the Secret
-  # `yadgarhq/deploy` creates, in namespace `yadgar`, generated only-if-absent by
-  # a Job. It is ADR-0517's human-facing generated credential, NOT a
+  # the `platform` chart's `admin-bootstrap-token` hook Job creates, in namespace
+  # `yadgar`, create-only (`yadgarhq/deploy` created it before its retirement, ADR-0803). It is ADR-0517's human-facing generated credential, NOT a
   # `make secrets` block and NOT a fifth credential under ADR-0580, whose count
   # stays at four.
   #
   # RETRIEVING IT is the mechanism ADR-0517 requires, and the command lives in
-  # this repository's MIGRATION_NOTES.md as well as in that manifest. A cluster
+  # this repository's MIGRATION_NOTES.md as well as in the `platform` chart's
+  # README.md (the `jsonpath='{.data.token}'` line). A cluster
   # rebuild mints a DIFFERENT token while the old one still looks valid in an
   # operator's notes, so retrieve it again after every recreate.
   tokenSecret: ""

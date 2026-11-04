@@ -227,7 +227,7 @@ async fn a_password_offered_to_a_cache_that_wants_none_is_also_refused() {
 
     // THE MERGE ORDER, PINNED AS A TEST rather than left as a claim in a pull
     // request body. The deployment sequence for ledger 518 rests on this
-    // asymmetry: `yadgarhq/deploy` must merge BEFORE this repository, because
+    // asymmetry: `yadgarhq/deploy` (retired since) had to merge BEFORE this repository, because
     // this direction is an outage and the other is a bounded degradation.
     //
     // - `deploy` first: the cache gains a password while the running gateway has
