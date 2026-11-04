@@ -96,7 +96,10 @@ fn a_user_with_no_password_refuses_the_boot_rather_than_connecting_anonymously()
         ("NATS_USER", "gateway"),
     ]))
     .expect_err("an account with no password cannot authenticate");
-    assert!(err.contains("NATS_PASSWORD_FILE"), "{err}");
+    assert!(
+        err.contains("NATS_PASSWORD_FILE"),
+        "refusal must contain NATS_PASSWORD_FILE"
+    );
 }
 
 #[test]
@@ -108,7 +111,7 @@ fn a_password_with_no_user_refuses_the_boot() {
         ("NATS_PASSWORD_FILE", path.as_str()),
     ]))
     .expect_err("a password with no account to present it as cannot authenticate");
-    assert!(err.contains("NATS_USER"), "{err}");
+    assert!(err.contains("NATS_USER"), "refusal must contain NATS_USER");
 }
 
 #[test]
@@ -123,7 +126,7 @@ fn an_empty_password_file_refuses_the_boot() {
         ("NATS_PASSWORD_FILE", path.as_str()),
     ]))
     .expect_err("a blank password is not a password");
-    assert!(err.contains("empty"), "{err}");
+    assert!(err.contains("empty"), "refusal must contain empty");
 }
 
 #[test]
@@ -135,7 +138,10 @@ fn an_unreadable_password_file_refuses_the_boot_naming_the_path() {
         ("NATS_PASSWORD_FILE", "/nowhere/at/all"),
     ]))
     .expect_err("a deployment that asked for a credential and cannot produce one");
-    assert!(err.contains("/nowhere/at/all"), "{err}");
+    assert!(
+        err.contains("/nowhere/at/all"),
+        "refusal must contain /nowhere/at/all"
+    );
 }
 
 #[test]
@@ -150,9 +156,12 @@ fn a_credential_never_prints_itself() {
     );
     assert!(
         !printed.contains("sentinel-of-the-nats-password"),
-        "{printed}"
+        "the Debug output must not print the password"
     );
-    assert!(printed.contains("gateway"), "{printed}");
+    assert!(
+        printed.contains("gateway"),
+        "the Debug output must still name the user"
+    );
 }
 
 #[tokio::test]
@@ -207,8 +216,14 @@ fn a_configured_broker_without_the_tls_switch_refuses_the_boot_naming_it_and_the
     // the chart key an operator edits, which is what makes it actionable.
     let err = Broker::from_lookup(env_of(&[("NATS_URL", "nats://nats:4222")]))
         .expect_err("a broker hop with no TLS switch is a deployment mistake");
-    assert!(err.contains("NATS_TLS_ENABLED"), "{err}");
-    assert!(err.contains("nats.tls.enabled"), "{err}");
+    assert!(
+        err.contains("NATS_TLS_ENABLED"),
+        "refusal must contain NATS_TLS_ENABLED"
+    );
+    assert!(
+        err.contains("nats.tls.enabled"),
+        "refusal must contain nats.tls.enabled"
+    );
 }
 
 #[test]
@@ -218,7 +233,10 @@ fn an_empty_tls_switch_is_the_same_refusal_as_an_absent_one() {
         ("NATS_TLS_ENABLED", ""),
     ]))
     .expect_err("an empty switch is an absent one");
-    assert!(err.contains("NATS_TLS_ENABLED"), "{err}");
+    assert!(
+        err.contains("NATS_TLS_ENABLED"),
+        "refusal must contain NATS_TLS_ENABLED"
+    );
 }
 
 #[test]
@@ -228,8 +246,11 @@ fn a_tls_switch_that_is_neither_one_nor_zero_refuses_the_boot() {
         ("NATS_TLS_ENABLED", "true"),
     ]))
     .expect_err("only \"1\" or \"0\"");
-    assert!(err.contains("NATS_TLS_ENABLED"), "{err}");
-    assert!(err.contains("\"true\""), "{err}");
+    assert!(
+        err.contains("NATS_TLS_ENABLED"),
+        "refusal must contain NATS_TLS_ENABLED"
+    );
+    assert!(err.contains("\"true\""), "refusal must contain true");
 }
 
 #[test]
@@ -274,7 +295,10 @@ fn tls_on_without_a_ca_bundle_refuses_the_boot() {
         ("NATS_TLS_ENABLED", "1"),
     ]))
     .expect_err("TLS with nothing to verify the broker against");
-    assert!(err.contains("NATS_TLS_CA_FILE"), "{err}");
+    assert!(
+        err.contains("NATS_TLS_CA_FILE"),
+        "refusal must contain NATS_TLS_CA_FILE"
+    );
 }
 
 #[test]
@@ -289,8 +313,11 @@ fn tls_on_with_a_verification_domain_refuses_the_boot() {
         ("NATS_TLS_DOMAIN", "nats.example"),
     ]))
     .expect_err("a domain the client cannot honour");
-    assert!(err.contains("NATS_TLS_DOMAIN"), "{err}");
-    assert!(err.contains("NATS_URL"), "{err}");
+    assert!(
+        err.contains("NATS_TLS_DOMAIN"),
+        "refusal must contain NATS_TLS_DOMAIN"
+    );
+    assert!(err.contains("NATS_URL"), "refusal must contain NATS_URL");
 }
 
 #[test]
@@ -305,8 +332,11 @@ fn a_ca_bundle_holding_no_certificate_refuses_the_boot_naming_the_path() {
         ("NATS_TLS_CA_FILE", ca.as_str()),
     ]))
     .expect_err("a bundle with nothing in it");
-    assert!(err.contains(ca.as_str()), "{err}");
-    assert!(err.contains("NATS_TLS_CA_FILE"), "{err}");
+    assert!(err.contains(ca.as_str()), "refusal must name the CA path");
+    assert!(
+        err.contains("NATS_TLS_CA_FILE"),
+        "refusal must contain NATS_TLS_CA_FILE"
+    );
 }
 
 #[test]
@@ -317,7 +347,10 @@ fn an_unreadable_ca_bundle_refuses_the_boot_naming_the_path() {
         ("NATS_TLS_CA_FILE", "/nowhere/nats-ca.pem"),
     ]))
     .expect_err("an optional CA mount whose Secret is missing is an empty directory");
-    assert!(err.contains("/nowhere/nats-ca.pem"), "{err}");
+    assert!(
+        err.contains("/nowhere/nats-ca.pem"),
+        "refusal must contain /nowhere/nats-ca.pem"
+    );
 }
 
 #[test]
@@ -331,7 +364,10 @@ fn a_client_certificate_without_its_key_refuses_the_boot() {
         ("NATS_TLS_CLIENT_CERT_FILE", cert.as_str()),
     ]))
     .expect_err("a certificate cannot be presented without its key");
-    assert!(err.contains("NATS_TLS_CLIENT_KEY_FILE"), "{err}");
+    assert!(
+        err.contains("NATS_TLS_CLIENT_KEY_FILE"),
+        "refusal must contain NATS_TLS_CLIENT_KEY_FILE"
+    );
 }
 
 #[test]
@@ -346,7 +382,10 @@ fn an_unreadable_client_key_refuses_the_boot_naming_the_path() {
         ("NATS_TLS_CLIENT_KEY_FILE", "/nowhere/client.key"),
     ]))
     .expect_err("an optional client-cert mount whose Secret is missing");
-    assert!(err.contains("/nowhere/client.key"), "{err}");
+    assert!(
+        err.contains("/nowhere/client.key"),
+        "refusal must contain /nowhere/client.key"
+    );
 }
 
 #[test]

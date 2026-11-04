@@ -405,7 +405,7 @@ clientCertificate:
 # (ADR-0523).
 #
 # So the gateway hashes the TLS files it read at boot — the two CA bundles, and
-# the client certificate and key it presents to both upstreams — and when one of
+# the client certificate and key it presents to its peers — and when one of
 # them changes it logs which, and the old and new fingerprint, waits out this
 # pod's splay, drains, and exits 0. Kubelet restarts the container and the new
 # process reads the fresh files.
@@ -965,7 +965,7 @@ credentialLimits:
 # force spend a bucket an operator watching a dashboard reads as login pressure.
 #
 # EACH VERB KEYS ITS OWN BUCKET within these numbers: the key is
-# (source address, endpoint), and the three endpoints are three labels — so
+# (source address, endpoint), and the five administrative endpoints are five labels — so
 # emptying one verb's budget does not refuse another.
 #
 # `<rate>:<burst>`, the same spelling rateLimit and credentialLimits use.

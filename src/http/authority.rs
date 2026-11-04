@@ -437,7 +437,7 @@ pub(super) fn admin_failure(call: Call, endpoint: &'static str, e: tonic::Status
     // credential verbs have no such refusal in iam.
     let precondition_body = match endpoint {
         ADMIN_ISSUE_ENROLMENT => Some(
-            r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#,
+            r#"{"error":"enrolment is not configured: iam is serving but either has no enrolment gateway or could not read the CA it names, so it cannot mint an enrolment token"}"#,
         ),
         _ => None,
     };

@@ -279,7 +279,7 @@ pub(super) async fn guard(
 
 /// The 429 every endpoint behind [`guard`] answers with.
 ///
-/// **NINE, NOT TWO** — the two credential endpoints, the six administrative
+/// **EIGHT, NOT TWO** — the two credential endpoints, the five administrative
 /// ones and `/auth/whoami`. See [`guard`] for why the count is spelled out rather than left as
 /// "both".
 ///
