@@ -68,33 +68,6 @@ multiple-versions = "warn"
 [advisories]
 yanked = "deny"
 
-# RUSTSEC-2023-0071 — "Marvin Attack", a timing sidechannel in the `rsa` crate.
-# ACCEPTED DELIBERATELY, 2026-08-30, with the reasoning written down rather than
-# the finding silenced. cargo-deny reports "No safe upgrade is available!" and
-# the advisory remains open upstream, so this is not a version bump anyone can
-# make.
-#
-# WHY IT IS NOT EXPLOITABLE HERE, and each of these would have to stop being
-# true for that to change:
-#
-# 1. The attack recovers a PRIVATE key by timing many decryptions. sqlx-mysql
-#    uses `rsa` on the CLIENT side to ENCRYPT a password with the server's
-#    public key. This process holds no RSA private key, so there is nothing for
-#    the attack to recover.
-# 2. That code path is only taken when MySQL's caching_sha2_password
-#    authentication runs over an INSECURE connection. Over TLS the password goes
-#    through the existing secure channel and the RSA exchange never happens —
-#    and D58 puts every `-db` on TLS to its engine.
-# 3. Both -db and engine sit inside the cluster (D27), so an attacker able to
-#    time this traffic is already inside the trust boundary.
-#
-# REVISIT: when `rsa` publishes a fixed release, when sqlx drops the dependency,
-# or if any of the three points above stops holding — particularly a decision to
-# run a `-db` to its engine without TLS.
-ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "client-side RSA encryption only; no private key held, and the path is skipped over TLS. No fix exists upstream. See the note above." },
-]
-
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
