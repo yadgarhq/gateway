@@ -967,14 +967,6 @@ credentialLimits:
   # your deployment, set sourceAddress.trustedProxyHops.
   unattributed: "10:100"
 
-# HOW LONG THIS POD STAYS ROUTABLE AFTER DELETION BEGINS (ledger 690). Kubelet
-# runs this sleep BEFORE it sends SIGTERM, so it buys the EndpointSlice removal
-# time to reach whatever routes here. It is spent INSIDE
-# `terminationGracePeriodSeconds` below, never added to it. The number `0`
-# renders no `lifecycle` block at all; the string "0" is refused (yaadgaar 639).
-# The reasoning, and why an `exec` of /bin/sleep is
-# not an option on a distroless image, is in `templates/deployment.yaml`.
-
 # WHAT BOUNDS THE ADMINISTRATIVE ENDPOINTS (ADR-0492, D73, ledger 638).
 #
 # /admin/create-user and /admin/issue-enrolment are reached by an attested
@@ -1127,6 +1119,13 @@ adminBootstrap:
   # it boolean, and the template refuses `adminBootstrap: null`.
   refusePreMintedUserId: false
 
+# HOW LONG THIS POD STAYS ROUTABLE AFTER DELETION BEGINS (ledger 690). Kubelet
+# runs this sleep BEFORE it sends SIGTERM, so it buys the EndpointSlice removal
+# time to reach whatever routes here. It is spent INSIDE
+# `terminationGracePeriodSeconds` below, never added to it. The number `0`
+# renders no `lifecycle` block at all; the string "0" is refused (yaadgaar 639).
+# The reasoning, and why an `exec` of /bin/sleep is
+# not an option on a distroless image, is in `templates/deployment.yaml`.
 preStopSleepSeconds: 5
 
 # THE WHOLE BUDGET FOR A POD'S DEATH: the sleep above, then SIGTERM, then the
