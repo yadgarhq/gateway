@@ -42,11 +42,11 @@ pub struct Wiring {
     pub projects: Arc<yadgar_gateway::project::Validator>,
 }
 
-/// PHASE 3. TLS, the bootstrap token, the ADR-0523 watch set, and the two dials.
+/// PHASE 3. TLS, the bootstrap token, the ADR-0523 watch set, and the three dials.
 ///
 /// ONE PHASE AND NOT TWO, because the watch set is assembled from the same TLS
 /// configuration the dials use and must be built from what was RESOLVED rather
-/// than re-read (ADR-0523). Both dials are lazy (ADR-0532), so neither gates the
+/// than re-read (ADR-0523). All three dials are lazy (ADR-0532), so none gates the
 /// boot; the `?`s above them are the permanent-gap failures that do.
 pub async fn wiring(
     broker: &Option<Broker>,
@@ -377,10 +377,10 @@ pub async fn serve(
     Ok(())
 }
 
-/// The two gRPC upstreams.
+/// The three gRPC upstreams: `task`, `iam` and `project`.
 ///
 /// Its own function because it is the one part of [`wiring`] that DIALS, and
-/// the reasoning for why both dials are lazy — and for what the `?`s on them
+/// the reasoning for why all three dials are lazy — and for what the `?`s on them
 /// still cover — is the comment inside it.
 async fn upstreams(
     task_tls: Option<&upstream::UpstreamTls>,
@@ -428,7 +428,7 @@ async fn upstreams(
     // `connect_task` above used to resolve DNS eagerly, with `?` turning a name
     // that did not resolve into a failed boot, so the module comment's "the
     // upstream connection is NOT gated" did not hold for `task`. `dial` v0.2.0
-    // makes that dial lazy too (ADR-0532), so BOTH upstreams now cost a bounded
+    // makes that dial lazy too (ADR-0532), so EVERY upstream now costs a bounded
     // failure per request rather than a pod that never starts, and the claim
     // holds for the first time since it was written.
     //
@@ -444,7 +444,7 @@ async fn upstreams(
     // outage now costs the callers whose entries expire during it rather than
     // every call in flight.
     //
-    // `?` still stands on both lines, and what it now covers is configuration
+    // `?` still stands on all three lines, and what it now covers is configuration
     // rather than reachability: a port that is not a number, a host string that
     // cannot form a URI, and a CA bundle that cannot be used. Those are
     // deployment mistakes, which is exactly the class D69 says should fail boot.

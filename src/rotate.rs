@@ -14,9 +14,11 @@
 //! **THIS GATEWAY SERVES NO CERTIFICATE, and that is the first thing to know
 //! about this module.** TLS at the edge is terminated by the ingress in front
 //! (D71, D80), so `gateway-tls` is never read by this process. What IS read once
-//! and never again are the CA bundles `iam` and `task` are verified against, and
-//! the client certificate and key this gateway presents to its peers
-//! (ADR-0516). There is no serving leaf beside them.
+//! and never again are the CA bundles `task`, `iam`, `project` and Valkey are
+//! verified against, and the client certificate and key this gateway presents
+//! to those peers (ADR-0516). NATS's bundle and client pair are the exception:
+//! `async-nats` re-reads them on every dial. There is no serving leaf beside
+//! them.
 //!
 //! **AND TWO FILES THAT ARE NOT CERTIFICATES AT ALL.** The password this gateway
 //! presents to the shared cache (D74) and the one it presents to the broker
@@ -357,10 +359,10 @@ pub enum ToolsPollError {
 
 /// Everything this deployment read at boot, hashed as it was read.
 ///
-/// **THE LIST IS THE ASSERTION.** TLS is opt-in and read PER UPSTREAM so the two
+/// **THE LIST IS THE ASSERTION.** TLS is opt-in and read PER UPSTREAM so they
 /// can be cut over one at a time, and `Option<M>: Material` folds an absent one
-/// to nothing — so neither argument needs a branch. A watch set that is empty
-/// because both hops are cleartext is the ordinary deployment today, and
+/// to nothing — so no argument needs a branch. A watch set that is empty
+/// because every hop is cleartext is the ordinary deployment today, and
 /// [`yadgar_lifecycle::rotate::watch`] never ends on one.
 ///
 /// **THE SHARED CLIENT PAIR IS HASHED ONCE.** `gateway-client-tls` is presented

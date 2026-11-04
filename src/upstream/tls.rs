@@ -71,12 +71,17 @@
 //! namespace on 2026-09-12. A NetworkPolicy protects this hop on kind too.
 //! ADR-0594, as amended by ADR-0686, ranks mutual TLS and an ingress
 //! NetworkPolicy as EQUAL controls — but only on a hop where both sides hold a
-//! leaf this deployment issued AND verifies. On this hop that is not yet true:
-//! `iam` and `task`'s `serve.rs` present server TLS only and leave
-//! `client_ca_root` unbuilt, so the certificate this module presents is not
-//! checked by either upstream. Today the NetworkPolicy is the only BUILT
-//! control on this hop; the certificate stays load-bearing for availability,
-//! per the rest of this section, once the server side of mutual TLS lands.
+//! leaf this deployment issued AND verifies. Whether that is true is a setting
+//! of the upstream's deployment, which this repository cannot see: `task`,
+//! `iam` and `project` build `client_ca_root` from `LISTEN_TLS_CLIENT_CA_FILE`
+//! when `LISTEN_TLS_CLIENT_AUTH` is `optional` or `required`, and leave it
+//! unbuilt when it is `off` (`yadgar-lifecycle`'s `serve_tls`, ADR-0846,
+//! ADR-0854). Only `required` makes the upstream refuse a caller that presents
+//! no certificate this deployment issued; `optional` checks one that is
+//! presented and admits a caller that presents none. Where the mode is `off`,
+//! the NetworkPolicy is the only BUILT control on this hop. The certificate
+//! stays load-bearing for availability, per the rest of this section, wherever
+//! the server side verifies.
 //!
 //! **ONE LEAF, EVERY PEER.** `gateway-client-tls` is this process's identity
 //! rather than a property of a hop, so the chart mounts it once and points every
