@@ -24,6 +24,8 @@ Run: python3 -m pytest scripts/tests/ -q
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import yaml
 
@@ -283,9 +285,31 @@ def test_the_chart_defaults_pass_every_check(tmp_path):
     assert yaml.safe_load(open(CHART / "values.yaml"))["replicaCount"] == 2
 
 
+DEPLOYMENT = CHART / "templates" / "deployment.yaml"
+# Anchored at both ends of the line: a bare substring count also matches the pinned
+# text inside a trailing comment on an uncast line.
+CAST_SITES = [
+    r"^\s*terminationGracePeriodSeconds: \{\{ \. \| int64 \}\}$",
+    r"^\s*seconds: \{\{ \. \| int64 \}\}$",
+    r"^\s*- maxSkew: \{\{ \.Values\.topologySpread\.maxSkew \| int64 \}\}$",
+]
+
+
+@pytest.mark.parametrize("line", CAST_SITES, ids=["grace", "preStop", "maxSkew"])
+def test_the_grace_period_pre_stop_sleep_and_skew_render_through_int64(line):
+    """Cast, like every other numeric knob (yaadgaar 550). The chart-baseline gate reads
+    `| int64` since actions v1.64.0, so the cast no longer costs the gate its view of the
+    value. `| int` is not the same cast and does not count. Every value the check below
+    admits renders the same bytes with or without the cast, so this pin is the test that
+    holds the cast in place."""
+    text = DEPLOYMENT.read_text()
+    assert len(re.findall(line, text, re.M)) == 1, f"{line!r} does not match exactly one line of deployment.yaml"
+
+
 def test_the_grace_period_and_pre_stop_sleep_are_bounded_where_a_float_prints_plainly(tmp_path):
-    """Not cast through `int64`: the chart-baseline gate cannot price either through it.
-    999999 is the largest value helm prints without an exponent."""
+    """Cast through `int64` and still bounded at 999999, by choice (yaadgaar 550): the
+    gate no longer forces the bound, and lifting it is a separate decision. The
+    whole-number check runs BEFORE the cast, because `int64` turns 1.5 into 1."""
     spec = deployment(rendered(overlay("terminationGracePeriodSeconds", 999999), tmp_path))["spec"]["template"]["spec"]
     assert spec["terminationGracePeriodSeconds"] == 999999
     stdout = rendered(overlay("preStopSleepSeconds", 999999), tmp_path)
@@ -304,8 +328,9 @@ def test_an_eighteen_digit_replica_count_string_is_the_string_ceiling(tmp_path):
 
 
 def test_the_topology_skew_is_bounded_where_a_float_prints_plainly(tmp_path):
-    """Not cast through `int64`: the chart-baseline gate cannot read the skew through it.
-    999999 is the largest value helm prints without an exponent."""
+    """Cast through `int64` and still bounded, by choice (yaadgaar 550). The API needs
+    maxSkew > 0, so 0 is refused; 999999 is the largest value helm prints without an
+    exponent, and the whole-number check runs BEFORE the cast."""
     def skew(value):
         body = overlay("topologySpread.maxSkew", value)
         body["topologySpread"]["enabled"] = True
