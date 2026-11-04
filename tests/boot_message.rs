@@ -180,7 +180,7 @@ fn an_absent_request_timeout_refuses_boot_naming_the_chart_key() {
     }
 }
 
-/// `LISTEN` is parsed last, inside `boot::serve`, after the two dials and the
+/// `LISTEN` is parsed last, inside `boot::serve`, after the three dials and the
 /// project registry's own knobs resolve — so this also needs the mount
 /// namespace.
 #[test]

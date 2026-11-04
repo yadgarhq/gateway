@@ -18,11 +18,12 @@
 //! through [`yadgar_gateway::rotate::watch_set`] — the SAME function `main.rs`
 //! calls — so an upstream deleted from that list turns this red.
 //!
-//! **THE TWO BUNDLES ARE DIFFERENT AUTHORITIES ON PURPOSE.** One client leaf is
-//! presented to both upstreams, so the identity pair de-duplicates to a single
-//! entry; if `task` and `iam` also shared a CA bundle, dropping either upstream
-//! from the list would change nothing observable and the mutant above would be
-//! equivalent rather than killed. Two authorities is what makes it a real kill.
+//! **THE BUNDLES ARE DIFFERENT AUTHORITIES ON PURPOSE.** One client leaf is
+//! presented to every upstream, so the identity pair de-duplicates to a single
+//! entry; if `task`, `iam` and `project` also shared a CA bundle, dropping any
+//! upstream from the list would change nothing observable and the mutant above
+//! would be equivalent rather than killed. One authority per upstream is what
+//! makes it a real kill.
 //!
 //! CERTIFICATES ARE MINTED PER RUN, for the reason `tests/iam_tls.rs` gives: a
 //! fixture key in the repository is a secret in the repository, and it expires on
@@ -329,8 +330,8 @@ const GATEWAY_CONFIG_BODY: &str = "toolsPoll:\n  intervalSeconds: 437\n";
 
 /// How one upstream is verified, and who this gateway says it is on that hop.
 ///
-/// **THE SAME CLIENT LEAF FOR BOTH**, which is what the chart mounts: one
-/// `gateway-client-tls`, two upstreams.
+/// **THE SAME CLIENT LEAF FOR EVERY PEER**, which is what the chart mounts: one
+/// `gateway-client-tls`, five peers.
 ///
 /// **Built from the configuration rather than from paths spelled out here.** A
 /// helper naming four paths would prove only that the watcher watches what it is
@@ -547,11 +548,12 @@ fn the_cache_hop_watches_its_bundle_and_the_identity_it_presents() {
 /// neither of its own.
 ///
 /// **THE ORDER IS THE FOLD'S.** `task`'s bundle, then the shared identity pair
-/// in the position it first appeared, then `iam`'s bundle, then the broker
-/// password, then the cache password, then the mounted configuration document
-/// last — which is what one client leaf presented to two upstreams, plus the two
-/// credentials, plus the shared document every service now mounts (step 2a),
-/// looks like once de-duplicated.
+/// in the position it first appeared, then the bundles of `iam` and `project`,
+/// then the broker password, then the cache's bundle and password, then the
+/// bootstrap token, then the two mounted configuration documents last — which
+/// is what one client leaf presented to every peer, plus the credentials, plus
+/// the shared document every service now mounts (step 2a), looks like once
+/// de-duplicated.
 #[test]
 fn the_watch_set_holds_every_file_this_deployment_configured() {
     let mount = Mount::new(&generation());
@@ -670,7 +672,7 @@ fn each_configured_half_contributes_on_its_own() {
     assert_eq!(
         rotate::watch_set(None, None, None, None, None, None, None, &config, &gw_config).watched(),
         vec![config.path(), gw_config.path()],
-        "with both upstreams cleartext and neither password configured, the two mounted \
+        "with every upstream cleartext and no password or token configured, the two mounted \
          configuration documents are the only thing watched — both are unconditional, unlike \
          everything either side of them"
     );
@@ -720,7 +722,7 @@ fn each_configured_half_contributes_on_its_own() {
             config.path(),
             gw_config.path(),
         ],
-        "the other upstream on its own names a DIFFERENT bundle, which is what makes \
+        "`iam` on its own names a DIFFERENT bundle from `task`, which is what makes \
          dropping either from the list observable"
     );
 

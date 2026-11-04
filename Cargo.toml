@@ -72,12 +72,12 @@ prost-types = "0.14"
 # the THIRD copy of the watcher and one of five copies of `shutdown`. The X.509
 # parser that read a leaf's expiry is ITS dependency now, so it is gone from
 # here, and so is `rustls-pki-types` now that `upstream` reads no bundle of its
-# own either — `yadgar_dial::TlsOptions::prepare` performs that read for both
-# upstreams.
+# own either — `yadgar_dial::TlsOptions::prepare` performs that read for every
+# upstream.
 #
 # Pinned by a published tag per ADR-0526, like every other in-org crate.
 yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.3.7" }
-# HOW THIS PROCESS DIALS, for BOTH upstreams. Client-side balancing over task's
+# HOW THIS PROCESS DIALS, for EVERY upstream. Client-side balancing over task's
 # headless Service (D23), and — since the `iam` hop stopped building an
 # `Endpoint` of its own — the single implementation of ADR-0514's rule that the
 # URI scheme and the TLS configuration are decided in one expression. It is also
