@@ -847,7 +847,8 @@ async fn the_cleartext_path_cannot_reach_a_tls_server() {
 }
 
 /// AN ABSENT UPSTREAM ENDS A REQUEST RATHER THAN HANGING ON BALANCER
-/// READINESS — on BOTH hops, which are one code path now.
+/// READINESS — on the `task` and `iam` hops, which share one code path with
+/// `project` now.
 ///
 /// **IT WAS A PARITY TEST AND IS A BEHAVIOUR TEST.** It used to hold two
 /// implementations to one answer: `connect_iam` dialled directly with
@@ -855,7 +856,7 @@ async fn the_cleartext_path_cannot_reach_a_tls_server() {
 /// `yadgar_dial::connect`, and until `dial` v0.2.0 the two DISAGREED about an
 /// upstream that is not there yet — the lazy one handed back a channel, the
 /// balanced one returned `BalanceError::Dns`, and `main` turned that into a
-/// failed boot with `?`. Both hops go through `dial` now, so there is no
+/// failed boot with `?`. Every hop goes through `dial` now, so there is no
 /// second implementation to compare against and the parity framing is deleted.
 ///
 /// **THE PROPERTY IS NOT DELETED WITH IT.** What is asserted here is what a
@@ -868,7 +869,7 @@ async fn the_cleartext_path_cannot_reach_a_tls_server() {
 /// the pass. The outer timeout elapsing is the empty-balancer hang, which is
 /// the failure this case exists to catch and the reason it is not one line.
 ///
-/// **BOTH HOPS STAY IN THE TABLE even though they share a body**, because the
+/// **`task` AND `iam` STAY IN THE TABLE even though they share a body**, because the
 /// two call sites still differ in the argument that decides which environment
 /// prefix and which port they carry, and a `connect_iam` rewritten to stop
 /// dialling at all would otherwise go unnoticed here.

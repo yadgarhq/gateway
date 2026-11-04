@@ -24,9 +24,9 @@
 //! that attaches a configuration and leaves the scheme alone looks encrypted,
 //! passes any test that inspects configuration, and sends the bearer token in
 //! the clear. `yadgar_dial::endpoint` couples the two structurally, in one
-//! expression, and BOTH upstreams reach it: [`super::connect_task`] and
-//! [`super::connect_iam`] hand their settings to that crate and build no
-//! endpoint of their own.
+//! expression, and EVERY upstream reaches it: [`super::connect_task`],
+//! [`super::connect_iam`] and [`super::connect_project`] hand their settings
+//! to that crate through one `dial` and build no endpoint of their own.
 //!
 //! **THIS MODULE HELD A SECOND IMPLEMENTATION UNTIL IT DID NOT NEED TO.**
 //! `connect_iam` used to build its own `Endpoint` and read its own CA bundle,
@@ -50,7 +50,7 @@
 //! claimed the lists were identical. A parity test caught it and then had to be
 //! maintained forever. One implementation needs no parity test.
 //!
-//! **AND ROUTING BOTH HOPS THROUGH `yadgar_dial` IS WHAT PUBLISHES THE
+//! **AND ROUTING EVERY HOP THROUGH `yadgar_dial` IS WHAT PUBLISHES THE
 //! ABSENCE GAUGE.** `yadgar_dial_upstream_never_resolved` is emitted from
 //! inside that crate, so the hop that bypassed it emitted nothing and
 //! `deploy`'s `DialUpstreamNeverResolved` rule could not fire for the upstream
@@ -101,9 +101,9 @@
 //! in a process that serves no certificate of its own, they are the only
 //! material whose expiry the gauge can report.
 //!
-//! **ONE READ SERVES BOTH HOPS.** [`UpstreamTls::options`] hands the pair to
-//! `yadgar_dial`, which reads them before it resolves anything, for `task` and
-//! for `iam` alike. This module used to read them a second time for `iam` and
+//! **ONE READ SERVES EVERY HOP.** [`UpstreamTls::options`] hands the pair to
+//! `yadgar_dial`, which reads them before it resolves anything, for `task`,
+//! `iam` and `project` alike. This module used to read them a second time for `iam` and
 //! a parity test held the two spellings together; the second spelling is gone.
 //! `tests/iam_tls.rs::a_client_identity_that_cannot_be_read_is_an_error_before_any_channel_exists`
 //! is what remains, and it asserts the WIRING — that the `IAM_TLS_CLIENT_*`

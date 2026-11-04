@@ -1,7 +1,7 @@
 //! Every upstream this gateway dials publishes the absence gauge — `iam`
 //! included.
 //!
-//! **THE SILENCE THIS CLOSES.** ADR-0532 made both dials lazy, so a gateway
+//! **THE SILENCE THIS CLOSES.** ADR-0532 made the dials lazy, so a gateway
 //! whose upstream does not exist is `1/1 Running`, Argo-`Healthy`, and wrong.
 //! `deploy`'s `DialUpstreamNeverResolved` rule exists to say so, and it reads
 //! `yadgar_dial_upstream_never_resolved` — a gauge emitted from INSIDE

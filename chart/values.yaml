@@ -405,7 +405,7 @@ clientCertificate:
 # process would go on using its day-0 material until something restarted it
 # (ADR-0523).
 #
-# So the gateway hashes the TLS files it read at boot — the two CA bundles, and
+# So the gateway hashes the TLS files it read at boot — the five CA bundles, and
 # the client certificate and key it presents to its peers — and when one of
 # them changes it logs which, and the old and new fingerprint, waits out this
 # pod's splay, drains, and exits 0. Kubelet restarts the container and the new

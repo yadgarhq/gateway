@@ -77,7 +77,7 @@ VALKEY_STATED = {"valkey": {"tls": {"enabled": False}}}
 
 
 def others_enabled(upstream: str) -> dict:
-    """The other two upstreams satisfied, so only `upstream` is under test."""
+    """The other upstreams satisfied, so only `upstream` is under test."""
     return {
         **{u: {"tls": {"enabled": True}} for u in UPSTREAMS if u != upstream},
         **NATS_STATED,
