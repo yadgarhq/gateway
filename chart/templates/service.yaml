@@ -6,6 +6,12 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ .Chart.Name }}
+  # NEVER PRUNED BY ARGO CD (ADR-0851, yaadgaar #297): this Service is the
+  # HTTPRoute's backend, so losing it takes the edge's route to this gateway
+  # down as surely as losing the route. It renders whether or not the route
+  # does, and so does this annotation.
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
 spec:
   selector:
     app: {{ .Chart.Name }}
