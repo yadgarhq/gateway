@@ -62,8 +62,8 @@ pub async fn wiring(
     // boot and names the file. The chart still sets TLS_ROTATION_POLL_SECS and
     // TLS_ROTATION_SPLAY_MAX_SECS — this binary no longer reads either, but they
     // stay so a rollout that lands this chart before this binary's digest still
-    // resolves a schedule on the old one. The runbook is `yadgarhq/deploy`'s
-    // MIGRATION_NOTES.md, steps 2a and 2b — NOT this repository's, which has no
+    // resolves a schedule on the old one. The runbook was `yadgarhq/deploy`'s
+    // MIGRATION_NOTES.md, steps 2a and 2b (a retired repository; the file stays there as history, deploy c8ae93f) — NOT this repository's, which has no
     // such section.
     let config = rotate::Configuration::mounted();
 

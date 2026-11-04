@@ -1195,7 +1195,8 @@ spec:
             optional: true
             # ONE KEY, renamed to the `token` the environment names above, so
             # whatever the Secret's author called it does not travel into the
-            # binary's configuration. `yadgarhq/deploy` calls it `token`.
+            # binary's configuration. The `platform` chart's `admin-bootstrap-token`
+            # Job calls it `token`.
             #
             # `required` HERE IS THE ONE HALF OF THE PAIRING THE TEMPLATE CAN
             # ENFORCE: a Secret named with no key fails at render, so
