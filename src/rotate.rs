@@ -14,7 +14,8 @@
 //! **THIS GATEWAY SERVES NO CERTIFICATE, and that is the first thing to know
 //! about this module.** TLS at the edge is terminated by the ingress in front
 //! (D71, D80), so `gateway-tls` is never read by this process. What IS read once
-//! and never again are the CA bundles `iam` and `task` are verified against, and
+//! and never again are the CA bundles `task`, `iam`, `project`, NATS and Valkey are
+//! verified against, and
 //! the client certificate and key this gateway presents to its peers
 //! (ADR-0516). There is no serving leaf beside them.
 //!

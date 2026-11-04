@@ -428,7 +428,7 @@ async fn upstreams(
     // `connect_task` above used to resolve DNS eagerly, with `?` turning a name
     // that did not resolve into a failed boot, so the module comment's "the
     // upstream connection is NOT gated" did not hold for `task`. `dial` v0.2.0
-    // makes that dial lazy too (ADR-0532), so BOTH upstreams now cost a bounded
+    // makes that dial lazy too (ADR-0532), so EVERY upstream now costs a bounded
     // failure per request rather than a pod that never starts, and the claim
     // holds for the first time since it was written.
     //

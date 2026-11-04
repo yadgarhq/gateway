@@ -26,8 +26,9 @@
 //! through `yadgar_dial::connect`, which resolved DNS eagerly and returned an
 //! error for an empty answer, and the `?` on it made a `task` Service that did
 //! not exist yet a failed boot. ADR-0532 made that dial lazy as well, so the
-//! paragraph above now describes both upstreams rather than one — and both by
-//! the SAME mechanism, since `connect_iam` goes through `yadgar_dial` too.
+//! paragraph above now describes `task` as well as `iam` — and by the SAME
+//! mechanism, since `connect_iam` and `connect_project` go through `yadgar_dial`
+//! too.
 //!
 //! **WHAT IT COSTS, stated rather than left to be found.** The readiness probe
 //! is a `tcpSocket` on the HTTP port, so this pod reports Ready as soon as it is

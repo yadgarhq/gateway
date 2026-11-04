@@ -381,7 +381,8 @@ clientCertificate:
   # NOT A PEM PASTED INTO THIS FILE. The certificate rotates, and a copy in git
   # is correct only until the rotation nobody remembered to follow.
   #
-  # NAMING IT WITH BOTH UPSTREAMS CLEARTEXT RENDERS NOTHING, deliberately. A
+  # NAMING IT WITH EVERY PEER CLEARTEXT RENDERS NOTHING (`task`, `iam`,
+  # `project`, `nats` and `valkey` all `tls.enabled: false`), deliberately. A
   # client certificate is presented only inside an encrypted transport, so a pod
   # with nowhere to present it would otherwise carry a PRIVATE KEY it never
   # reads, behind a volume no environment variable names.
@@ -426,7 +427,7 @@ clientCertificate:
 # by a `kind` label. Here that is one series, `kind="client"`.
 #
 # THE WATCHER NO LONGER IDLES ON A DEFAULT INSTALL, and this paragraph used to
-# say it did. With both upstreams cleartext the watch set was empty and nothing
+# say it did. With every peer cleartext the watch set was empty and nothing
 # was polled; since the mounted configuration document joined the set
 # unconditionally, every pod polls `shared/shared.yaml` on any install and will
 # drain and exit when an operator edits it. That is ADR-0523 working, not a
