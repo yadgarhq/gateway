@@ -42,7 +42,7 @@ pub(super) fn upstream_text(status: &tonic::Status) -> String {
 
 /// What a caller reads in place of a transport failure's own words (yaadgaar
 /// #452). The detail is in the gateway's log, written by `super::bounded`.
-pub(super) const TRANSPORT_FAILED: &str =
+pub(crate) const TRANSPORT_FAILED: &str =
     "the call to the upstream failed below gRPC; the detail is in the gateway's log";
 
 /// The reason tokens a refusal may start with.

@@ -100,12 +100,13 @@ fn bad_body(call: Call, message: &str) -> Response {
 /// INVALID_ARGUMENT included: ADR-0927 keeps upstream refusals at 503, and
 /// only this route's NOT_FOUND has a later ruling. The 400s this gateway
 /// answers itself are request-only and are not this.
-fn revoke_refused(call: Call, e: tonic::Status) -> Response {
+fn revoke_refused(call: Call, request_id: &str, e: tonic::Status) -> Response {
     if e.code() != tonic::Code::NotFound {
-        return admin_failure(call, ADMIN_REVOKE_CREDENTIAL, e);
+        return admin_failure(call, ADMIN_REVOKE_CREDENTIAL, request_id, e);
     }
     tracing::warn!(
         endpoint = ADMIN_REVOKE_CREDENTIAL,
+        request_id,
         "revoke-credential named no credential of this user"
     );
     call.fail("NOT_FOUND");
@@ -194,7 +195,9 @@ pub(in crate::http) async fn admin_list_credentials(
         Ok(r) => r.into_inner(),
         // EVERY REFUSAL IS OPAQUE HERE (ADR-0927). `iam-db` answers an unknown
         // user with an empty page, not NOT_FOUND, so there is no 404 to map.
-        Err(CallError::Answered(e)) => return admin_failure(call, ADMIN_LIST_CREDENTIALS, e),
+        Err(CallError::Answered(e)) => {
+            return admin_failure(call, ADMIN_LIST_CREDENTIALS, &request_id, e)
+        }
         Err(CallError::Expired) => return admin_timeout(call, ADMIN_LIST_CREDENTIALS),
     };
 
@@ -278,7 +281,7 @@ pub(in crate::http) async fn admin_revoke_credential(
         .await
     {
         Ok(_) => {}
-        Err(CallError::Answered(e)) => return revoke_refused(call, e),
+        Err(CallError::Answered(e)) => return revoke_refused(call, &request_id, e),
         Err(CallError::Expired) => return admin_timeout(call, ADMIN_REVOKE_CREDENTIAL),
     }
 
