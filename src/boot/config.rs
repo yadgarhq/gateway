@@ -11,6 +11,7 @@ use yadgar_gateway::attest::{Attestation, Credentials};
 use yadgar_gateway::http::CredentialLimits;
 use yadgar_gateway::invalidate::Broker;
 use yadgar_gateway::limit::{Limiter, Limits};
+use yadgar_gateway::origin;
 use yadgar_gateway::source::TrustBoundary;
 use yadgar_gateway::upstream::UpstreamTls;
 
@@ -293,12 +294,14 @@ pub fn http_configuration() -> Result<
     // Comma-separated, and EMPTY BY DEFAULT. An empty list rejects every browser
     // origin, which is right for a server whose clients are agents: a default
     // that allowed one would be a default nobody chose.
-    let allowed_origins: Vec<String> = env_required_allow_empty("YADGAR_ALLOWED_ORIGINS")?
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
+    //
+    // CHECKED, NOT ONLY SPLIT (yaadgaar #294): a wildcard, an http:// origin
+    // without the development switch, and any entry no browser could send
+    // refuse the boot naming the entry. See `yadgar_gateway::origin`.
+    let allowed_origins = origin::parse_allowlist(
+        &env_required_allow_empty(origin::ALLOWED_ORIGINS)?,
+        origin::HttpOrigins::from_env()?,
+    )?;
 
     // HOW MANY PROXIES STAND IN FRONT (D80, ADR-0491), and UNSET IS A REAL
     // ANSWER: it says nobody knows, and an unknown source address is recorded as

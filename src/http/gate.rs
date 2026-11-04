@@ -95,11 +95,18 @@ pub(super) fn label_ok(req: &Value) -> Option<Response> {
 /// headers. Absence is allowed because a non-browser client sends no Origin —
 /// which is exactly why it cannot substitute for attestation.
 pub(super) fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(raw) = headers.get(axum::http::header::ORIGIN) else {
+    let mut all = headers.get_all(axum::http::header::ORIGIN).iter();
+    let Some(raw) = all.next() else {
         // Absent, and allowed: a non-browser client sends no Origin — which is
         // exactly why this cannot substitute for attestation.
         return true;
     };
+    // MORE THAN ONE IS PRESENT AND INVALID (yaadgaar #294 review). A request has
+    // one origin; `HeaderMap::get` reads only the first value, so a second one
+    // would pass on the first one's listing, unchecked.
+    if all.next().is_some() {
+        return false;
+    }
     // PRESENT AND UNPARSEABLE IS PRESENT AND INVALID, and the spec's MUST covers
     // it: "If the Origin header is present and invalid, servers MUST respond with
     // HTTP 403 Forbidden."

@@ -671,8 +671,16 @@ spec:
             # keeps the pod booting. Before it, an absent variable and a
             # deliberately-closed policy were the same observable state and the
             # compiled-in "" was the only source.
+            #
+            # `cors.allowedOrigins`, else `https://` + `global.hostname`, else
+            # empty (yaadgaar #294); see `_origins.tpl` for the order.
             - name: YADGAR_ALLOWED_ORIGINS
-              value: {{ .Values.cors.allowedOrigins | quote }}
+              value: {{ include "gateway.allowedOrigins" (dict "local" .Values.cors.allowedOrigins "context" $) | quote }}
+            # The development switch for http:// origins, RENDERED
+            # UNCONDITIONALLY so "0" is visible on the wire: the binary
+            # requires it (ADR-0569) and refuses an http:// entry without "1".
+            - name: YADGAR_ALLOWED_ORIGINS_ALLOW_HTTP
+              value: {{ include "gateway.allowHttpOrigins" .Values.cors | quote }}
             # The two buckets bounding /auth/login and /auth/enrol (ledger 497).
             # SEPARATE FROM YADGAR_RATE_LIMITS above, because D74's buckets key on
             # a user and a login has none yet — see values.yaml.

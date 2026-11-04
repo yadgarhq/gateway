@@ -219,7 +219,8 @@
     },
     "cors": {
       "properties": {
-        "allowedOrigins": {}
+        "allowedOrigins": {},
+        "allowHttpOrigins": {}
       },
       "additionalProperties": false
     },
