@@ -651,7 +651,7 @@ spec:
             # them gets edited.
             - name: YADGAR_MAX_REPLICAS
               value: {{ if .Values.autoscaling.enabled }}{{ .Values.autoscaling.maxReplicas | int64 | quote }}{{ else }}{{ .Values.replicaCount | int64 | quote }}{{ end }}
-            # HOW MANY PROXIES STAND IN FRONT (ADR-0491, D80). ALWAYS RENDERED,
+            # HOW MANY PROXIES STAND IN FRONT (ADR-0520, D80). ALWAYS RENDERED,
             # even when empty — unlike the optional Secrets above, and for the
             # opposite reason. An empty value is a real instruction here: it says
             # nobody knows, and gateway then records no source address at all and

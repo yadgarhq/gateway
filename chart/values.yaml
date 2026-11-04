@@ -802,11 +802,12 @@ gateway:
   hostname: ""
 
 # WHERE A REQUEST CAME FROM, and whether this deployment can vouch for it
-# (ADR-0491, D80).
+# (ADR-0520, D80).
 #
 # ADR-0491 requires a source address on every authentication event including
 # failures, "read from X-Forwarded-For and trusted only from the known proxy".
 # This block is where the known proxy is declared, and it is the only place.
+# ADR-0520 is the source-address trust boundary this block declares.
 sourceAddress:
   # HOW MANY PROXIES APPEND TO `X-Forwarded-For` between a client and this
   # gateway. The gateway reads the entry that many places from the RIGHT — each
