@@ -130,6 +130,51 @@ async fn a_stalled_second_head_on_a_kept_alive_connection_is_closed() {
     );
 }
 
+/// THE CASE ADR-1016 RESTS ON: one whole request, a whole response, and then
+/// NO byte at all. The connection is idle, not half-sent, and hyper re-arms
+/// its header-read timer when it starts waiting for the next head, so the
+/// gateway closes it at the bound. Envoy's upstream idle timeout is held
+/// strictly below this bound because of exactly this close.
+#[tokio::test]
+async fn a_fully_idle_kept_alive_connection_is_closed_at_the_bound() {
+    let (addr, _stop) = serving(peer_router()).await;
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let me = stream.local_addr().expect("a local address").to_string();
+    stream
+        .write_all(b"GET /peer HTTP/1.1\r\nHost: gateway\r\n\r\n")
+        .await
+        .expect("send the only request");
+    let response = read_response(&mut stream, &me).await;
+    assert!(
+        response.starts_with("HTTP/1.1 200") && !response.contains("connection: close"),
+        "the first response must keep the connection alive: {response}"
+    );
+
+    let started = Instant::now();
+    let mut buf = [0u8; 256];
+    match tokio::time::timeout(BOUND + MARGIN, stream.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!(
+            "an idle connection must get no bytes, and got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        ),
+        Err(_) => panic!(
+            "a kept-alive connection that sent nothing after its response was held past {:?}",
+            BOUND + MARGIN
+        ),
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed + SLACK >= BOUND,
+        "closed after {elapsed:?}, before the {BOUND:?} bound: something other than the \
+         header-read timeout closed it"
+    );
+    assert!(
+        elapsed <= BOUND + MARGIN,
+        "closed after {elapsed:?}, past the {BOUND:?} bound plus {MARGIN:?}"
+    );
+}
+
 #[test]
 fn the_bound_is_read_from_its_variable() {
     let bound = edge::header_read_timeout(|n| (n == HEADER_READ_TIMEOUT_VAR).then(|| "10".into()))
