@@ -764,6 +764,7 @@ def test_trusted_proxy_hops_cites_the_source_address_adr() -> None:
     assert "ADR-0520" in description
     assert "ADR-0491" not in description
 
+
 def test_the_census_ignores_prose() -> None:
     mutated = copy.deepcopy(load_schema())
     mutated["$comment"] = "reworded"
