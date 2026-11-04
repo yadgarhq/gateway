@@ -332,8 +332,8 @@ fn a_client_certificate_alone_does_not_waive_the_flag() {
     ));
 }
 
-/// ONE LEAF, TWO UPSTREAMS, and the prefixes still have to keep them apart.
-/// The chart points both at the same mounted pair, but a deployment cutting
+/// ONE LEAF, EVERY PEER, and the prefixes still have to keep them apart.
+/// The chart points all of them at the same mounted pair, but a deployment cutting
 /// one hop over before the other must be able to.
 #[test]
 fn one_upstream_can_present_an_identity_while_the_other_does_not() {

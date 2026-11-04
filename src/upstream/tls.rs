@@ -78,9 +78,10 @@
 //! control on this hop; the certificate stays load-bearing for availability,
 //! per the rest of this section, once the server side of mutual TLS lands.
 //!
-//! **ONE LEAF, TWO UPSTREAMS.** `gateway-client-tls` is this process's identity
-//! rather than a property of a hop, so the chart mounts it once and points both
-//! prefixes at the same two files. The prefixes still keep the hops apart: a
+//! **ONE LEAF, EVERY PEER.** `gateway-client-tls` is this process's identity
+//! rather than a property of a hop, so the chart mounts it once and points every
+//! prefix (`TASK`, `IAM`, `PROJECT`, and the broker's and cache's) at the same
+//! two files. The prefixes still keep the hops apart: a
 //! deployment can present an identity to `task` before it does to `iam`.
 //!
 //! **A SEPARATE LEVER FROM THE ENCRYPTED TRANSPORT, deliberately.**
@@ -199,10 +200,11 @@ pub struct UpstreamTls {
 /// The certificate this gateway PRESENTS to an upstream, and the private key
 /// that proves it — mutual TLS (ADR-0516).
 ///
-/// **ONE LEAF, TWO UPSTREAMS.** `gateway-client-tls` is what this process shows
-/// both `task` and `iam`; the chart mounts it once and points both prefixes at
-/// the same two paths. That is why the watch set de-duplicates a path it already
-/// holds — the same pair arrives twice.
+/// **ONE LEAF, EVERY PEER.** `gateway-client-tls` is what this process shows
+/// `task`, `iam` and `project` (and the broker and cache when their TLS is on);
+/// the chart mounts it once and points every prefix at the same two paths. That
+/// is why the watch set de-duplicates a path it already holds — the same pair
+/// arrives up to five times.
 ///
 /// **THIS GATEWAY SERVES NO CERTIFICATE OF ITS OWN**, so unlike `iam` and `task`
 /// there is no serving leaf to confuse this with. `gateway-tls` is the EDGE

@@ -92,8 +92,13 @@ pub fn label_for(name: &str) -> Option<&'static str> {
 
 /// Whether a tool writes. Decides `CallRecord.kind`, and a wrong answer here
 /// makes read and write traffic indistinguishable in the roll-ups.
+///
+/// **FAIL CLOSED: THE READS ARE THE LIST.** A tool added to [`SERVED`] and not
+/// classified here is a write, so it spends the write bucket and reports as
+/// write traffic until somebody says otherwise. The opposite default would let
+/// a new writing tool pass as a read.
 pub fn is_write(name: &str) -> bool {
-    matches!(name, CREATE_TASK | EDIT_TASK | TRANSITION_TASK)
+    !matches!(name, READ_TASK | FIND_TASKS | LIST_PROJECTS)
 }
 
 /// The MODULE a tool belongs to, as a bounded value.

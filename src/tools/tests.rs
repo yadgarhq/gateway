@@ -243,7 +243,7 @@ fn no_module_contains_the_separator_the_bucket_key_is_built_from() {
 }
 
 #[test]
-fn the_three_writes_are_writes_and_the_two_reads_are_not() {
+fn the_three_writes_are_writes_and_the_three_reads_are_not() {
     // `kind_of` feeds BOTH `CallRecord.kind` and D74's bucket key, so an edit
     // or a transition read as a READ would spend the read bucket and report
     // as read traffic. Literal names, not the constants, for the reason
@@ -251,9 +251,17 @@ fn the_three_writes_are_writes_and_the_two_reads_are_not() {
     for name in ["create_task", "edit_task", "transition_task"] {
         assert!(is_write(name), "{name} writes");
     }
-    for name in ["read_task", "find_tasks"] {
+    for name in ["read_task", "find_tasks", "list_projects"] {
         assert!(!is_write(name), "{name} only reads");
     }
+}
+
+#[test]
+fn a_tool_nobody_classified_is_a_write() {
+    // FAIL CLOSED (yaadgaar 271). A tool added to `SERVED` and forgotten here
+    // must be recorded as a write and spend the write bucket, not pass as a read.
+    assert!(is_write("a_future_tool"));
+    assert!(is_write(""));
 }
 
 /// Call `name` against a channel that NEVER DIALS, and return the refusal.

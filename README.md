@@ -469,7 +469,7 @@ so it never spends login's budget.
 | `YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID`                                                           | required — from `adminBootstrap.refusePreMintedUserId`, exactly `1` or `0`, no default (ADR-0569)                                                    | `1` refuses the pre-minted `user_id` arm of bootstrap `/admin/create-user` with a `503` before the token is compared; `0` (shipped) admits it                                                                                                                                                     |
 | `RUST_LOG`                                                                                         | chart renders `info`; the binary also falls back to `info` (an argued ADR-0569 exception)                                                            | a default, because an unset `RUST_LOG` enables nothing at all                                                                                                                                                                                                                                     |
 | `TASK_TLS_CLIENT_CERT_FILE` / `TASK_TLS_CLIENT_KEY_FILE`                                           | unset                                                                                                                                                | the certificate this gateway PRESENTS to `task`, and its key — mutual TLS (ADR-0516). Off by default even when `TASK_TLS_ENABLED` is `1`. Both or neither: half an identity EXITS at boot naming the variable                                                                                     |
-| `IAM_TLS_CLIENT_CERT_FILE` / `IAM_TLS_CLIENT_KEY_FILE`                                             | unset                                                                                                                                                | the same for the `iam` hop. The chart points both prefixes at ONE mounted leaf; the prefixes exist so one hop can be cut over before the other                                                                                                                                                    |
+| `IAM_TLS_CLIENT_CERT_FILE` / `IAM_TLS_CLIENT_KEY_FILE`                                             | unset                                                                                                                                                | the same for the `iam` hop. The chart points every prefix at ONE mounted leaf; the prefixes exist so one hop can be cut over before the other                                                                                                                                                     |
 | `TLS_ROTATION_POLL_SECS` / `TLS_ROTATION_SPLAY_MAX_SECS`                                           | deleted (step 2b)                                                                                                                                    | no longer an environment variable. This binary reads the rotation schedule from `yadgarhq/config`'s `shared.yaml` (`tlsRotation.pollSeconds` / `splayMaxSeconds`), mounted at `/etc/yadgar/config/shared/shared.yaml`. No compiled-in default: an absent or empty knob refuses to boot (ADR-0569) |
 
 ## The workspace a caller claims, and why nothing is refused yet
@@ -693,12 +693,12 @@ bucket" instead of becoming a refusal.
 **This gateway serves no certificate**, so unlike every other module the material
 it holds is entirely inbound-facing: the CA bundles it verifies `iam` and `task`
 against, and — once ADR-0516's cut-over runs — the client certificate it presents
-to both. TLS at the edge is terminated by the ingress in front of it (D71, D80),
+to its peers. TLS at the edge is terminated by the ingress in front of it (D71, D80),
 and `gateway-tls` is never read by this process.
 
-**One leaf, two upstreams.** `gateway-client-tls` is this process's identity
+**One leaf, every peer.** `gateway-client-tls` is this process's identity
 rather than a property of a hop, so the chart mounts it once at
-`/var/run/secrets/client-cert` and points both prefixes at the same two files.
+`/var/run/secrets/client-cert` and points every prefix at the same two files.
 The prefixes still keep the hops apart, so `task` can be cut over before `iam`.
 
 **Both files are read ONCE**, and nothing re-reads a dialled channel's material.

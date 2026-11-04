@@ -956,7 +956,7 @@ async fn failed_precondition_on_issue_enrolment_names_enrolment() {
         failed_precondition_on(ADMIN_ISSUE_ENROLMENT).await,
         (
             503,
-            r#"{"error":"enrolment is not configured: iam is serving but has no enrolment gateway, so it cannot mint an enrolment token"}"#.to_string()
+            r#"{"error":"enrolment is not configured: iam is serving but either has no enrolment gateway or could not read the CA it names, so it cannot mint an enrolment token"}"#.to_string()
         )
     );
 }

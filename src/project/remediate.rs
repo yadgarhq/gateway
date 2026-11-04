@@ -260,15 +260,18 @@ pub(super) fn sentence(
                 .to_string(),
         },
 
-        // THE ONE CLASS WHOSE REMEDIATION ENDS IN CREATING SOMETHING, and it
-        // names no account segment: how an account is rendered into a
-        // `local/<account>/…` id is ADR-0605's open choice, owned by ledger 641,
-        // and inventing one here would hand a caller an id the store refuses.
+        // THE ONE CLASS WHOSE REMEDIATION ENDS IN CREATING SOMETHING. The
+        // canonical path is `local/<your-user-uuid>/…` in lowercase, the user
+        // id without its `yadgar:user:` prefix (ADR-0954) — the same spelling
+        // `not_member` gives.
         Reason::UnregisteredPersonal => "this private workspace is not registered. Declare it \
                                          with a .yadgar/project-id file at the directory you \
                                          mean to be its root, then register it with the \
                                          project-create tool — private projects are the one \
-                                         namespace a caller may create in (ADR-0605)."
+                                         namespace a caller may create in (ADR-0605). Spell the \
+                                         path in lowercase as local/<your-user-uuid>/..., where \
+                                         <your-user-uuid> is your user id without its \
+                                         yadgar:user: prefix (ADR-0954)."
             .to_string(),
 
         // NO REMEDIATION. Everything this gateway could suggest here ends in a

@@ -15,7 +15,7 @@
 //! about this module.** TLS at the edge is terminated by the ingress in front
 //! (D71, D80), so `gateway-tls` is never read by this process. What IS read once
 //! and never again are the CA bundles `iam` and `task` are verified against, and
-//! the client certificate and key this gateway presents to both of them
+//! the client certificate and key this gateway presents to its peers
 //! (ADR-0516). There is no serving leaf beside them.
 //!
 //! **AND TWO FILES THAT ARE NOT CERTIFICATES AT ALL.** The password this gateway
@@ -59,11 +59,12 @@
 //! warned. It is also the ONLY certificate this process holds, so it is the only
 //! one the expiry gauge can speak for.
 //!
-//! **ONE LEAF, TWO UPSTREAMS.** `gateway-client-tls` is presented to both `iam`
-//! and `task`, so the same pair of paths arrives twice. The crate's fold
-//! de-duplicates, which is what keeps the pair from being hashed twice, named
-//! twice in the change log line, and counted twice by anything asserting
-//! membership.
+//! **ONE LEAF, EVERY PEER.** `gateway-client-tls` is presented to the three gRPC
+//! upstreams (`task`, `iam` and `project`), and to the broker and the shared
+//! cache when their TLS is on, so the same pair of paths arrives up to five
+//! times. The crate's fold de-duplicates, which is what keeps the pair from
+//! being hashed more than once, named more than once in the change log line,
+//! and counted more than once by anything asserting membership.
 //!
 //! In-process hot reload was rejected and is not available anyway: nothing
 //! re-reads a dialled channel's material. A reloader operator was rejected
@@ -363,7 +364,7 @@ pub enum ToolsPollError {
 /// [`yadgar_lifecycle::rotate::watch`] never ends on one.
 ///
 /// **THE SHARED CLIENT PAIR IS HASHED ONCE.** `gateway-client-tls` is presented
-/// to both upstreams, so the same two paths arrive twice; the fold watches a
+/// to every peer, so the same two paths arrive up to five times; the fold watches a
 /// path once, in the position it first appeared.
 ///
 /// **THE TWO PASSWORDS ARE MEMBERS THREE AND FOUR, and neither is transport.**

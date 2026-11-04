@@ -690,6 +690,22 @@ fn the_org_remediation_is_composed_from_data_and_degrades_without_it() {
     );
 }
 
+/// yaadgaar 212: the personal-unregistered remediation names the canonical
+/// lowercase `local/<your-user-uuid>/` path.
+#[test]
+fn the_personal_remediation_names_the_canonical_local_path() {
+    let said = remediate::sentence(
+        Reason::UnregisteredPersonal,
+        None,
+        None,
+        OrgGrants::Counting,
+    );
+    assert!(
+        said.contains("lowercase as local/<your-user-uuid>/..."),
+        "{said}"
+    );
+}
+
 /// THE GRAMMAR REFUSAL NEVER REPEATS THE VALUE.
 ///
 /// `project-db`'s `validate` applies the same rule, on the ground that a refusal
