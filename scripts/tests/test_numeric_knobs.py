@@ -254,6 +254,7 @@ def test_the_autoscaling_counts_render_as_integers_and_bound_both_ends(tmp_path)
     assert "1e+06" not in stdout and "2e+06" not in stdout
     for key in ("minReplicas", "maxReplicas"):
         top = overlay(f"autoscaling.{key}", INT32_MAX, autoscaling=True)
+        top["autoscaling"]["maxReplicas"] = INT32_MAX  # 645: the ceiling may not sit below the floor
         assert rendered(top, tmp_path, *KEDA)
         over = overlay(f"autoscaling.{key}", INT32_MAX + 1, autoscaling=True)
         refused_naming(over, f"autoscaling.{key}", tmp_path, *KEDA)
@@ -385,6 +386,38 @@ def test_the_min_replicas_floor_is_not_read_while_autoscaling_is_off(tmp_path):
     body = overlay("autoscaling.minReplicas", 0)
     body["replicaCount"] = 0
     assert "replicas: 0\n" in rendered(body, tmp_path)
+
+
+# --- 645: autoscaling.maxReplicas >= autoscaling.minReplicas while autoscaling is on ----
+# KEDA took `maxReplicaCount` below `minReplicaCount` without a word. Every case keeps
+# `minReplicas` at 2 or more, so the D55 floor above cannot be what refuses it, and sets
+# `replicaCount` to a third value, so a check that compared against it is caught.
+
+
+def max_overlay(minimum, maximum, replica_count) -> dict:
+    body = overlay("autoscaling.minReplicas", minimum, autoscaling=True)
+    body["autoscaling"]["maxReplicas"] = maximum
+    body["replicaCount"] = replica_count
+    return body
+
+
+@pytest.mark.parametrize("minimum,maximum", [(2, 0), (2, 1), (5, 4), ("3", "2"), (3, "2")], ids=repr)
+def test_autoscaling_on_with_max_replicas_below_min_replicas_is_refused_by_name(tmp_path, minimum, maximum):
+    body = max_overlay(minimum, maximum, 1)
+    combined = refused_naming(body, "autoscaling.maxReplicas", tmp_path, *KEDA)
+    assert "at least `autoscaling.minReplicas`" in combined, combined
+
+
+@pytest.mark.parametrize("minimum,maximum", [(2, 2), ("3", "3"), (5, 5), (2, 3), ("2", 6)], ids=repr)
+def test_autoscaling_on_with_max_replicas_at_or_above_min_replicas_renders(tmp_path, minimum, maximum):
+    stdout = rendered(max_overlay(minimum, maximum, 9), tmp_path, *KEDA)
+    assert f"minReplicaCount: {int(minimum)}\n" in stdout and f"maxReplicaCount: {int(maximum)}\n" in stdout
+
+
+def test_the_max_replicas_ceiling_is_not_read_while_autoscaling_is_off(tmp_path):
+    body = max_overlay(5, 1, 3)
+    body["autoscaling"]["enabled"] = False
+    assert "replicas: 3\n" in rendered(body, tmp_path)
 
 
 def test_a_string_autoscaling_toggle_is_refused_before_the_floor_is_read(tmp_path):

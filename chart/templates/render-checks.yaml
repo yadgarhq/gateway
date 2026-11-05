@@ -218,6 +218,8 @@ AUTOSCALING FLOOR, D55 (yaadgaar 482, ruled 2026-11-03). `autoscaling.minReplica
 Refused below 2 while `autoscaling.enabled` is true. Placed after the whole-number check above, so
 `int64` reads a confirmed whole number; `autoscaling.enabled` is a confirmed bool by the shape blocks.
 While autoscaling is off the knob is not read, and `replicaCount: 0` stays legal (scale to zero).
+`autoscaling.maxReplicas` is refused below `autoscaling.minReplicas` under the same toggle (yaadgaar 645):
+KEDA takes a `maxReplicaCount` below its `minReplicaCount` without a word. Equal is legal (a fixed size).
 */}}
 {{- if .Values.autoscaling.enabled }}
 {{- if lt (int64 .Values.autoscaling.minReplicas) 2 }}
@@ -226,5 +228,13 @@ While autoscaling is off the knob is not read, and `replicaCount: 0` stays legal
       "It renders as the ScaledObject's `minReplicaCount`, and below 2 the service can run on one pod or "
       "none, which D55 forbids. Write 2 or more, or set `autoscaling.enabled: false`."))
       (toJson .Values.autoscaling.minReplicas)) }}
+{{- end }}
+{{- if lt (int64 .Values.autoscaling.maxReplicas) (int64 .Values.autoscaling.minReplicas) }}
+{{- fail (printf (join "" (list
+      "gateway: `autoscaling.maxReplicas` must be at least `autoscaling.minReplicas` while `autoscaling.enabled` "
+      "is true, and is %s against %s. They render as the ScaledObject's `maxReplicaCount` and "
+      "`minReplicaCount`, and a ceiling below the floor is a ScaledObject KEDA cannot scale. Raise "
+      "`autoscaling.maxReplicas`, or set `autoscaling.enabled: false`."))
+      (toJson .Values.autoscaling.maxReplicas) (toJson .Values.autoscaling.minReplicas)) }}
 {{- end }}
 {{- end }}
