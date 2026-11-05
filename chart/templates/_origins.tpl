@@ -3,6 +3,13 @@ THE BROWSER ORIGIN THIS GATEWAY ADMITS, DERIVED FROM THE ESTATE'S HOSTNAME
 (yaadgaar #294, ADR-0808). Not CORS: the value feeds the binary's Origin check.
 `YADGAR_ALLOWED_ORIGINS` resolves in this order:
 
+  0. `cors.enabled: false` (yaadgaar #582, ruled by Max 2026-11-05): EMPTY, no
+     browser origin, whatever `global.hostname` or `cors.allowedOrigins` says.
+     It is the off switch the derived origin otherwise lacks, and it WINS over
+     a set `cors.allowedOrigins` without a refusal: in an incident the switch
+     must close the origin with one key, and a refused render would leave the
+     running pods open. The shipped value is `true`, so steps 1 to 3 are the
+     render before #582;
   1. `cors.allowedOrigins`, when it is set: an explicit value still wins;
   2. `https://` + `global.hostname`, when `cors.allowedOrigins` is empty. NO
      PORT, as in iam's enrolment URL: the edge listener answers on 443. A
@@ -20,12 +27,26 @@ would refuse the derived `https://*...` anyway, but as a crash-loop on rollout.
 
 `global` MAY BE ABSENT OR NULL, as in `_hostname.tpl`; both fall through to 3.
 
+`cors.enabled` must be the bare word true or false (ADR-0797), checked HERE for
+the reason `gateway.allowHttpOrigins` below is: a string "false" is truthy in a
+template and would leave the origin open. The schema refuses a string first;
+this check also refuses an absent or null key, which reads as neither on nor off.
+
   {{ include "gateway.allowedOrigins" (dict "local" .Values.cors.allowedOrigins "context" $) }}
 */}}
 {{- define "gateway.allowedOrigins" -}}
 {{- $global := .context.Values.global | default dict -}}
 {{- $hostname := get $global "hostname" -}}
-{{- if .local -}}
+{{- $cors := .context.Values.cors -}}
+{{- if not (and (kindIs "map" $cors) (hasKey $cors "enabled") (kindIs "bool" $cors.enabled)) -}}
+{{- $found := "absent" -}}
+{{- if and (kindIs "map" $cors) (hasKey $cors "enabled") -}}
+{{- $found = toJson $cors.enabled -}}
+{{- end -}}
+{{- fail (printf "gateway: `cors.enabled` must be true or false and is %s. It is the off switch for every browser origin, and a string such as \"false\" would read as on. Write the bare word `true` (shipped) or `false`." $found) -}}
+{{- end -}}
+{{- if not $cors.enabled -}}
+{{- else if .local -}}
 {{- .local -}}
 {{- else if $hostname -}}
 {{- if contains "*" (toString $hostname) -}}
