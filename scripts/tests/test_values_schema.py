@@ -585,6 +585,8 @@ def test_the_suite_reads_the_schema_this_repository_ships():
 # `type: object` on the blocks `valkey`, `valkey.tls` and `nats.tls`.
 # ADR-0845 (TLS switches), ADR-0925 / ADR-0569 / ADR-1006 (timeouts and cache TTL)
 # and ADR-0520 / yaadgaar 513 (`sourceAddress.trustedProxyHops`) cover the rest.
+# `cors.enabled` (`boolean`) is the yaadgaar #582 ruling (Max, 2026-11-05): a
+# string "false" is truthy in a template and would leave the origin open.
 # Any other new type still needs its own ruling and edits this table in the PR.
 
 TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
@@ -604,6 +606,7 @@ TYPED_ON_PURPOSE: dict[str, dict[str, Any]] = {
     "networkPolicy.clients": {"type": "array", "items": {"type": "object", "description": "One NetworkPolicyPeer. Selectors written in ONE entry are an AND; the same two written as two entries are an OR and admit far more."}},  # ADR-1138
     "networkPolicy.scrapeFrom.namespace": {"type": "string"},  # ADR-1138
     "toolsPoll.intervalSeconds": {"type": "integer", "minimum": 1},  # ADR-1138
+    "cors.enabled": {"type": "boolean"},  # yaadgaar #582 ruling
 }
 
 BLOCKS_ON_PURPOSE: dict[str, dict[str, Any]] = {
