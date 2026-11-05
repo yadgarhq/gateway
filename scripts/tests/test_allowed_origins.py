@@ -113,3 +113,78 @@ def test_a_wildcard_global_hostname_is_refused_at_render() -> None:
     explicit = "https://gateway.example.com"
     rendered = env("--set", "global.hostname=*.example.com", "--set", f"cors.allowedOrigins={explicit}")
     assert rendered["YADGAR_ALLOWED_ORIGINS"] == explicit
+
+
+# ── THE OFF SWITCH, `cors.enabled` (yaadgaar #582, ruled by Max 2026-11-05) ──
+#
+# Shipped `true`, so every render that does not state the key is the render
+# before it. `false` renders NO origin, whatever `global.hostname` says.
+# `false` beside a non-empty `cors.allowedOrigins` is contradictory and is
+# REFUSED at render, naming both keys (fail closed): the alternative, silently
+# dropping a list somebody wrote, is a mistake nobody sees.
+
+EXPLICIT = "https://gateway.yadgar.internal:18443"
+
+
+def test_enabled_an_explicit_allowlist_wins() -> None:
+    rendered = env(
+        "--set", "cors.enabled=true",
+        "--set", f"global.hostname={GLOBAL}",
+        "--set", f"cors.allowedOrigins={EXPLICIT}",
+    )
+    assert rendered["YADGAR_ALLOWED_ORIGINS"] == EXPLICIT
+
+
+def test_enabled_the_hostname_alone_derives_the_origin() -> None:
+    rendered = env("--set", "cors.enabled=true", "--set", f"global.hostname={GLOBAL}")
+    assert rendered["YADGAR_ALLOWED_ORIGINS"] == f"https://{GLOBAL}"
+
+
+def test_enabled_with_neither_renders_the_closed_posture() -> None:
+    assert env("--set", "cors.enabled=true")["YADGAR_ALLOWED_ORIGINS"] == ""
+
+
+def test_disabled_a_set_hostname_renders_no_origin() -> None:
+    rendered = env("--set", "cors.enabled=false", "--set", f"global.hostname={GLOBAL}")
+    assert rendered["YADGAR_ALLOWED_ORIGINS"] == ""
+    # The variable is still rendered: the binary refuses to boot without it.
+    assert "YADGAR_ALLOWED_ORIGINS" in rendered
+
+
+def test_disabled_does_not_read_the_hostname_at_all() -> None:
+    # A wildcard hostname is refused only when the origin derives from it. Off,
+    # nothing derives, so the render succeeds and stays closed.
+    rendered = env("--set", "cors.enabled=false", "--set", "global.hostname=*.example.com")
+    assert rendered["YADGAR_ALLOWED_ORIGINS"] == ""
+
+
+def test_disabled_with_an_explicit_allowlist_is_refused() -> None:
+    result = render(
+        "--set", "cors.enabled=false",
+        "--set", f"global.hostname={GLOBAL}",
+        "--set", f"cors.allowedOrigins={EXPLICIT}",
+    )
+    assert result.returncode != 0
+    assert "`cors.enabled` is false" in result.stderr
+    assert "`cors.allowedOrigins`" in result.stderr
+    # Refused without a hostname too: the contradiction is the two keys alone.
+    result = render("--set", "cors.enabled=false", "--set", f"cors.allowedOrigins={EXPLICIT}")
+    assert result.returncode != 0
+    assert "`cors.enabled` is false" in result.stderr
+
+
+def test_the_off_switch_is_a_boolean() -> None:
+    # A string "false" is truthy in a template and would leave the origin OPEN.
+    # The schema refuses it first; the wording differs between helm 3 and 4, so
+    # the assertion is the key's name, not one version's sentence.
+    result = render("--set-string", "cors.enabled=false", "--set", f"global.hostname={GLOBAL}")
+    assert result.returncode != 0
+    assert "enabled" in result.stderr
+    assert "boolean" in result.stderr
+
+
+def test_the_off_switch_is_refused_when_absent() -> None:
+    # `null` deletes the key in helm. Absent is not read as on or as off.
+    result = render("--set", "cors.enabled=null", "--set", f"global.hostname={GLOBAL}")
+    assert result.returncode != 0
+    assert "`cors.enabled` must be true or false and is absent" in result.stderr

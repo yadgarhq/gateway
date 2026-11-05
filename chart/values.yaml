@@ -894,8 +894,7 @@ sourceAddress:
 # "somebody chose the closed one" must not look identical. The empty string
 # states the closed one ONLY while `global.hostname` is empty too: once the
 # estate's hostname is set, an empty value here falls back to the derived
-# origin below, and the chart has no off switch for that (open ruling,
-# yaadgaar #582).
+# origin below, unless `enabled` below is false (yaadgaar #582).
 #
 # Comma-separated, and each entry is a full scheme-and-authority origin —
 # "https://console.example.com", never a bare hostname and never a trailing path.
@@ -916,6 +915,13 @@ sourceAddress:
 # `allowHttpOrigins` below is true; and any entry a browser could never send
 # (uppercase, a path or trailing slash, a default port such as :443).
 cors:
+  # THE OFF SWITCH (yaadgaar #582, ruled by Max 2026-11-05). false admits NO
+  # browser origin and renders YADGAR_ALLOWED_ORIGINS empty, even with
+  # `global.hostname` set. false beside a non-empty `allowedOrigins` is refused
+  # at render as a contradiction. Shipped true, so the order above is
+  # unchanged. Only the bare words true and false render; a string such as
+  # "false" is refused.
+  enabled: true
   allowedOrigins: ""
   # DEVELOPMENT ONLY. true admits http:// entries in `allowedOrigins`. A
   # cleartext origin is one any network attacker can serve, so the shipped
