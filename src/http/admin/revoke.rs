@@ -60,6 +60,7 @@ pub(in crate::http) async fn admin_revoke_credentials(
     if let Some(refusal) = guard(
         &state,
         ADMIN_REVOKE_CREDENTIALS,
+        Kind::Write,
         state.admin_limits,
         peer,
         &headers,

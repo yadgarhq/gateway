@@ -1442,3 +1442,6 @@ mod grants;
 /// The first load retries on a short doubling schedule, then settles on the
 /// poll (ledger 1668).
 mod retry;
+
+/// A failed poll's log line names the id the poll sent (yaadgaar 275).
+mod poll_failure;

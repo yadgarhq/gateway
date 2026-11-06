@@ -10,6 +10,12 @@ use crate::upstream::CallError;
 use super::PAGE_DEADLINE;
 
 /// One whole load: every page, until the token comes back empty.
+///
+/// **A FAILED LOAD CARRIES THE ID IT SENT** (yaadgaar 275), in the status's
+/// `x-yadgar-request-id` metadata, which [`super::report`] reads. The id is
+/// minted here and the caller of this function has no other way to learn it, so
+/// without this the log line for a failed poll could not be joined to
+/// `project`'s records for the same call.
 pub(super) async fn load(
     project: &crate::upstream::ProjectUpstream,
 ) -> Result<Vec<RegisteredPath>, tonic::Status> {
@@ -17,9 +23,24 @@ pub(super) async fn load(
     // id it could inherit, so it is its own call; every page of one load shares
     // the id and the next load gets another. Sent so `project` and `project-db`
     // can join their records for it (ledger 1254).
+    let request_id = crate::request_id();
+    load_as(project, &request_id).await.map_err(|mut status| {
+        if let Ok(value) = request_id.parse() {
+            status
+                .metadata_mut()
+                .insert(crate::upstream::request_id::HEADER, value);
+        }
+        status
+    })
+}
+
+async fn load_as(
+    project: &crate::upstream::ProjectUpstream,
+    request_id: &str,
+) -> Result<Vec<RegisteredPath>, tonic::Status> {
     let mut client = ProjectServiceClient::new(crate::upstream::request_id::carrying(
         project.channel(),
-        &crate::request_id(),
+        request_id,
     ));
     let mut out = Vec::new();
     let mut token = String::new();

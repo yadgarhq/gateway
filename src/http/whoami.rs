@@ -66,7 +66,15 @@ pub(super) async fn whoami(
     // a credential surface: a token-validity answer is what a stranger holding a
     // pile of tokens would come here for, and the bucket bounds that the way it
     // bounds login. The label keeps the budget separate from login's.
-    if let Some(refusal) = guard(&state, AUTH_WHOAMI, state.credential_limits, peer, &headers).await
+    if let Some(refusal) = guard(
+        &state,
+        AUTH_WHOAMI,
+        Kind::Read,
+        state.credential_limits,
+        peer,
+        &headers,
+    )
+    .await
     {
         return refusal;
     }

@@ -792,3 +792,161 @@ async fn the_revoke_credentials_route_is_throttled_on_its_own_key() {
         "revoke-credentials has its own key; emptying it must not refuse create-user"
     );
 }
+
+// ---- The kind on the record `guard` writes (yaadgaar 295) -------------------
+
+/// A sink that keeps every `CallRecord` line the thread writes.
+#[derive(Default)]
+struct Lines(std::sync::Mutex<Vec<String>>);
+
+impl yadgar_telemetry::record::Sink for Lines {
+    fn write_record(&self, line: &str) -> std::io::Result<()> {
+        self.0
+            .lock()
+            .expect("the record log")
+            .push(line.to_string());
+        Ok(())
+    }
+}
+
+/// Every `(tool, kind, outcome)` the sink caught. `kind` is the record's proto
+/// number: 1 is read, 2 is write.
+fn call_records(sink: &Lines) -> Vec<(String, i64, String)> {
+    sink.0
+        .lock()
+        .expect("the record log")
+        .iter()
+        .map(|line| {
+            let record: serde_json::Value = serde_json::from_str(line).expect("a JSON record");
+            (
+                record["tool"].as_str().unwrap_or_default().to_string(),
+                record["kind"].as_i64().unwrap_or_default(),
+                record["outcome"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// One request to `method path` from [`PROXY`], with an optional `Origin`.
+async fn send(
+    state: &Arc<AppState>,
+    method: Method,
+    path: &str,
+    origin: Option<&str>,
+) -> StatusCode {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer some-token")
+        .header("x-yadgar-bootstrap-token", BOOTSTRAP)
+        .header("x-forwarded-for", format!("203.0.113.1, {REAL_CLIENT}"));
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let mut request = request.body(Body::from("{}")).expect("the request builds");
+    request.extensions_mut().insert(ConnectInfo(
+        PROXY
+            .parse::<SocketAddr>()
+            .expect("the peer address parses"),
+    ));
+    router(Arc::clone(state))
+        .oneshot(request)
+        .await
+        .expect("the router answers")
+        .status()
+}
+
+/// `guard` writes the record for a call it refuses, and the record's `kind` is
+/// the endpoint's own: `Read` for `whoami` and `list-credentials`, `Write` for
+/// the rest.
+///
+/// It hardcoded `Write` for the 403 (origin), the 429 (throttle) and the 503
+/// (limiter unauthenticated) records, so a refused read was counted as a write
+/// and read and write traffic stopped being separable in the roll-ups. The 503
+/// arm needs a limiter that answers `Unauthenticated` (a live Valkey that
+/// refuses the AUTH), which this file does not have; it passes the same `kind`
+/// argument as the other two and is covered by the compiler, not by this test.
+#[tokio::test]
+async fn the_records_guard_writes_carry_the_endpoints_own_kind() {
+    // Installed BEFORE any `Call` starts: a `Call` emits from `Drop`.
+    let sink = Arc::new(Lines::default());
+    let _installed = yadgar_telemetry::record::set_sink(sink.clone());
+
+    let one = CredentialLimits {
+        attributed: one_token(),
+        unattributed: one_token(),
+    };
+    let state = state_with_admin(TrustBoundary::Hops(1), one, one);
+
+    let endpoints = [
+        (Method::POST, "/auth/login", "auth/login", 2),
+        (Method::POST, "/auth/enrol", "auth/enrol", 2),
+        (Method::GET, "/auth/whoami", "auth/whoami", 1),
+        (Method::POST, "/admin/create-user", "admin/create-user", 2),
+        (
+            Method::POST,
+            "/admin/issue-enrolment",
+            "admin/issue-enrolment",
+            2,
+        ),
+        (
+            Method::POST,
+            "/admin/revoke-credentials",
+            "admin/revoke-credentials",
+            2,
+        ),
+        (
+            Method::POST,
+            "/admin/list-credentials",
+            "admin/list-credentials",
+            1,
+        ),
+        (
+            Method::POST,
+            "/admin/revoke-credential",
+            "admin/revoke-credential",
+            2,
+        ),
+    ];
+
+    for (method, path, _, _) in &endpoints {
+        let refused = send(
+            &state,
+            method.clone(),
+            path,
+            Some("https://attacker.example"),
+        )
+        .await;
+        assert_eq!(refused, StatusCode::FORBIDDEN, "{path}: the origin check");
+        // First plain request spends the only token, the second is throttled.
+        let _ = send(&state, method.clone(), path, None).await;
+        let throttled = send(&state, method.clone(), path, None).await;
+        assert_eq!(
+            throttled,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{path}: the bucket"
+        );
+    }
+
+    let records = call_records(&sink);
+    for (_, _, tool, kind) in &endpoints {
+        // EVERY record for the endpoint, not just one: a handler's own record
+        // already carried the right kind, so "some record matches" passes
+        // against the hardcoded `Write`.
+        let wrong: Vec<_> = records
+            .iter()
+            .filter(|(t, k, _)| t == tool && k != kind)
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{tool} records must all carry kind {kind} (1 read, 2 write); wrong: {wrong:?}"
+        );
+        for outcome in ["PERMISSION_DENIED", "RESOURCE_EXHAUSTED"] {
+            assert!(
+                records.iter().any(|(t, _, o)| t == tool && o == outcome),
+                "{tool} must have recorded {outcome}; got {records:?}"
+            );
+        }
+    }
+}
