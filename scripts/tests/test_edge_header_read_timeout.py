@@ -15,6 +15,8 @@ Run: python3 -m pytest scripts/tests/ -q
 
 from __future__ import annotations
 
+import pytest
+
 from test_adr_0845_tls_required import (
     SCHEMA_WRAPPER,
     all_enabled,
@@ -85,6 +87,23 @@ def test_a_null_server_block_is_refused_naming_the_key(tmp_path):
     result = helm("template", CHART_NAME, str(CHART), "-f", str(write_overlay(body, tmp_path)))
     assert result.returncode != 0, result.stdout
     assert "server.limits.headerReadTimeoutSeconds" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "server",
+    [{"limits": None}, {"limits": "x"}, "x"],
+    ids=["null limits block", "string limits block", "string server block"],
+)
+def test_a_server_block_that_is_not_a_map_is_refused_naming_the_key(server, tmp_path):
+    """The template guards BOTH levels with `kindIs "map"`, so a `server` or a
+    `server.limits` that is not a map reaches the refusal naming the key, not a
+    raw nil-pointer or type error from the field access.
+    """
+    body = all_enabled()
+    body["server"] = server
+    result = helm("template", CHART_NAME, str(CHART), "-f", str(write_overlay(body, tmp_path)))
+    assert result.returncode != 0, result.stdout
+    assert "server.limits.headerReadTimeoutSeconds is required" in result.stdout + result.stderr
 
 
 def test_a_null_value_is_a_schema_refusal(tmp_path):
