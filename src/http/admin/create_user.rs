@@ -100,12 +100,14 @@ pub(in crate::http) async fn admin_create_user(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let kind = Kind::Write;
     // FIRST, BEFORE THE BODY, exactly as on `/auth/*` — see [`guard`] for why an
     // `/admin` route that skipped it would have no `Origin` check and no
     // throttle, on the surface where a cross-origin POST buys an administrator.
     if let Some(refusal) = guard(
         &state,
         ADMIN_CREATE_USER,
+        kind,
         state.admin_limits,
         peer,
         &headers,
@@ -115,12 +117,7 @@ pub(in crate::http) async fn admin_create_user(
         return refusal;
     }
     let request_id = crate::request_id();
-    let call = Call::start(
-        SERVICE,
-        ADMIN_CREATE_USER,
-        Kind::Write,
-        tel(request_id.clone()),
-    );
+    let call = Call::start(SERVICE, ADMIN_CREATE_USER, kind, tel(request_id.clone()));
     let Some(req) = parsed(&body) else {
         call.fail("INVALID_ARGUMENT");
         return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);

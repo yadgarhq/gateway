@@ -451,9 +451,17 @@ pub(super) fn install(registry: &Registry, rows: Vec<RegisteredPath>) {
 /// `retry` is the wait before the NEXT load, which differs from the poll while
 /// nothing has loaded (ledger 1668) — so the log states the real one.
 pub(super) fn report(registry: &Registry, e: &tonic::Status, retry: Duration) {
+    // The id the failed load SENT, which `load` leaves on the status (yaadgaar
+    // 275). Empty when the status did not come from `load`.
+    let request_id = e
+        .metadata()
+        .get(crate::upstream::request_id::HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
     if registry.loaded().is_none() {
         tracing::error!(
             error = %e,
+            request_id,
             retry_secs = retry.as_secs(),
             "the project registry has NEVER loaded, so no claimed workspace can be checked on \
              this replica (ADR-0674). Unscoped surfaces — login, enrolment, health — are \
@@ -462,6 +470,7 @@ pub(super) fn report(registry: &Registry, e: &tonic::Status, retry: Duration) {
     } else {
         tracing::warn!(
             error = %e,
+            request_id,
             retry_secs = retry.as_secs(),
             "the project registry could not be refreshed; the previously loaded set stays in \
              force"

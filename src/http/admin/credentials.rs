@@ -144,6 +144,7 @@ pub(in crate::http) async fn admin_list_credentials(
     if let Some(refusal) = guard(
         &state,
         ADMIN_LIST_CREDENTIALS,
+        Kind::Read,
         state.admin_limits,
         peer,
         &headers,
@@ -228,6 +229,7 @@ pub(in crate::http) async fn admin_revoke_credential(
     if let Some(refusal) = guard(
         &state,
         ADMIN_REVOKE_CREDENTIAL,
+        Kind::Write,
         state.admin_limits,
         peer,
         &headers,

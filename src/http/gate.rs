@@ -171,6 +171,7 @@ pub(super) fn origin_ok(state: &AppState, headers: &HeaderMap) -> bool {
 pub(super) async fn guard(
     state: &AppState,
     endpoint: &'static str,
+    kind: Kind,
     limits: CredentialLimits,
     peer: Option<IpAddr>,
     headers: &HeaderMap,
@@ -216,8 +217,7 @@ pub(super) async fn guard(
         // caller refused on identity rather than on credentials, which is what
         // an unlisted `Origin` is, and it is what this refusal would report if
         // it were an RPC.
-        Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id()))
-            .fail("PERMISSION_DENIED");
+        Call::start(SERVICE, endpoint, kind, tel(crate::request_id())).fail("PERMISSION_DENIED");
         return Some(text(
             StatusCode::FORBIDDEN,
             r#"{"error":"origin not allowed"}"#,
@@ -245,7 +245,7 @@ pub(super) async fn guard(
 
     match state.limiter.check_source(addr, endpoint, bucket).await {
         Decision::Allowed => None,
-        Decision::Throttled { retry_after } => Some(too_many(endpoint, retry_after)),
+        Decision::Throttled { retry_after } => Some(too_many(endpoint, kind, retry_after)),
         Decision::Degraded(why) => {
             degraded(endpoint, AUTH_MODULE, why, "allowed");
             None
@@ -255,7 +255,7 @@ pub(super) async fn guard(
             retry_after,
         } => {
             degraded(endpoint, AUTH_MODULE, reason, "throttled");
-            Some(too_many(endpoint, retry_after))
+            Some(too_many(endpoint, kind, retry_after))
         }
         // A 503 AND NOT A 429, for `throttled`'s reason: nothing the caller does
         // changes it. The message says nothing an unauthenticated stranger could
@@ -268,7 +268,7 @@ pub(super) async fn guard(
                 crate::limit::Degrade::Unauthenticated,
                 "refused",
             );
-            Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id())).fail("INTERNAL");
+            Call::start(SERVICE, endpoint, kind, tel(crate::request_id())).fail("INTERNAL");
             Some(text(
                 StatusCode::SERVICE_UNAVAILABLE,
                 r#"{"error":"login is unavailable"}"#,
@@ -289,13 +289,16 @@ pub(super) async fn guard(
 /// the address, the bucket or which endpoint's budget ran out would tell them
 /// how the limiter is keyed, which is the first thing anyone trying to evade it
 /// wants. The `Retry-After` is the whole of the useful content.
-pub(super) fn too_many(endpoint: &'static str, retry_after: std::time::Duration) -> Response {
+pub(super) fn too_many(
+    endpoint: &'static str,
+    kind: Kind,
+    retry_after: std::time::Duration,
+) -> Response {
     // A throttled call is a call, for the reason `tools_call` gives: without a
     // record a throttling storm is indistinguishable from silence. NO ADDRESS
     // rides on it — ADR-0491 puts a source address in the audit store and only
     // there, and this is the telemetry store.
-    Call::start(SERVICE, endpoint, Kind::Write, tel(crate::request_id()))
-        .fail("RESOURCE_EXHAUSTED");
+    Call::start(SERVICE, endpoint, kind, tel(crate::request_id())).fail("RESOURCE_EXHAUSTED");
     // WHOLE SECONDS (RFC 9110) and never zero, for `refusal`'s reason: `0` reads
     // as "retry immediately", which is the herd this exists to avoid.
     let seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;

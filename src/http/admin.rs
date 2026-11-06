@@ -103,9 +103,11 @@ pub(super) async fn admin_issue_enrolment(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let kind = Kind::Write;
     if let Some(refusal) = guard(
         &state,
         ADMIN_ISSUE_ENROLMENT,
+        kind,
         state.admin_limits,
         peer,
         &headers,
@@ -115,12 +117,8 @@ pub(super) async fn admin_issue_enrolment(
         return refusal;
     }
     let request_id = crate::request_id();
-    let call = Call::start(
-        SERVICE,
-        ADMIN_ISSUE_ENROLMENT,
-        Kind::Write,
-        tel(request_id.clone()),
-    );
+    let scope = tel(request_id.clone());
+    let call = Call::start(SERVICE, ADMIN_ISSUE_ENROLMENT, kind, scope);
     let Some(req) = parsed(&body) else {
         call.fail("INVALID_ARGUMENT");
         return text(StatusCode::BAD_REQUEST, r#"{"error":"invalid JSON"}"#);

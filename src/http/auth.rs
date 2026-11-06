@@ -80,8 +80,8 @@ pub(super) async fn login(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(refusal) = guard(&state, AUTH_LOGIN, state.credential_limits, peer, &headers).await
-    {
+    let limits = state.credential_limits;
+    if let Some(refusal) = guard(&state, AUTH_LOGIN, Kind::Write, limits, peer, &headers).await {
         return refusal;
     }
     // Started before the work, and NOT carrying an identity: nothing has been
@@ -295,8 +295,8 @@ pub(super) async fn enrol(
     // path pays TWO Argon2id operations per attempt rather than one — the
     // contract requires the refusal to cost what the success costs — so it is the
     // cheaper of the two surfaces to amplify with.
-    if let Some(refusal) = guard(&state, AUTH_ENROL, state.credential_limits, peer, &headers).await
-    {
+    let limits = state.credential_limits;
+    if let Some(refusal) = guard(&state, AUTH_ENROL, Kind::Write, limits, peer, &headers).await {
         return refusal;
     }
     // NOT carrying an identity, for the same reason `login`'s does not: nothing
